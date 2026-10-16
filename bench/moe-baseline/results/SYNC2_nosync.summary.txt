@@ -1,0 +1,22 @@
+﻿tag            : SYNC2_nosync
+bin            : llama-bench
+args           : -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -ncmoe 27 -fa on -p 0 -n 256 -r 2 -o md
+gpu            : AMD Radeon RX 6700S  drv 32.0.21045.5002
+cpu            : AMD Ryzen 7 6800HS with Radeon Graphics           cores 8/16
+ram            : 39.2 GB
+os             : Microsoft Windows 11 Pro for Workstations 10.0.26300
+date           : 2026-10-16T17:38:54.9244056+08:00
+--- disks ---
+  Micron_2450_MTFDKBA1T0TFK SSD 954GB
+--- resource summary ---
+  wall_s               49.1
+  samples              12
+  cpu_pct_avg          19.3
+  cpu_pct_max          32.5
+  mem_used_gb_peak     19.92
+  disk_read_mbs_avg    0.1
+  disk_read_mbs_max    0.5
+  gpu_util_pct_avg     42.4
+  gpu_util_pct_max     59.1
+  gpu_ded_mb_peak      8194
+  proc_ws_gb_peak      7.58

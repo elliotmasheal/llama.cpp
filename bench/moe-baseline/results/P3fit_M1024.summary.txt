@@ -1,0 +1,22 @@
+﻿tag            : P3fit_M1024
+bin            : llama-bench
+args           : -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -ncmoe 27 -fa on -n 0 -r 2 -o md -p 1024 -ub 1024
+gpu            : AMD Radeon RX 6700S  drv 32.0.21045.5002
+cpu            : AMD Ryzen 7 6800HS with Radeon Graphics           cores 8/16
+ram            : 39.2 GB
+os             : Microsoft Windows 11 专业工作站版 10.0.26300
+date           : 2026-10-16T18:32:44.1060814+08:00
+--- disks ---
+  Micron_2450_MTFDKBA1T0TFK SSD 954GB
+--- resource summary ---
+  wall_s               74.4
+  samples              13
+  cpu_pct_avg          12.1
+  cpu_pct_max          18.1
+  mem_used_gb_peak     30.79
+  disk_read_mbs_avg    8.3
+  disk_read_mbs_max    106.3
+  gpu_util_pct_avg     73.8
+  gpu_util_pct_max     116.1
+  gpu_ded_mb_peak      8059
+  proc_ws_gb_peak      19.11

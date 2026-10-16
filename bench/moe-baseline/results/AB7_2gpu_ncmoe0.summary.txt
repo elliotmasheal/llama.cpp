@@ -1,0 +1,22 @@
+﻿tag            : AB7_2gpu_ncmoe0
+bin            : llama-bench
+args           : -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -ngl 99 -fa on -p 0 -n 256 -r 3 -o md -dev Vulkan0/Vulkan1 -sm layer -ncmoe 0
+gpu            : AMD Radeon RX 6700S  drv 32.0.21045.5002
+cpu            : AMD Ryzen 7 6800HS with Radeon Graphics           cores 8/16
+ram            : 39.2 GB
+os             : Microsoft Windows 11 Pro for Workstations 10.0.26300
+date           : 2026-10-16T17:15:11.1630130+08:00
+--- disks ---
+  Micron_2450_MTFDKBA1T0TFK SSD 954GB
+--- resource summary ---
+  wall_s               93.7
+  samples              17
+  cpu_pct_avg          26.9
+  cpu_pct_max          77.4
+  mem_used_gb_peak     29.4
+  disk_read_mbs_avg    284.4
+  disk_read_mbs_max    1263.5
+  gpu_util_pct_avg     58.1
+  gpu_util_pct_max     106.2
+  gpu_ded_mb_peak      5212
+  proc_ws_gb_peak      15.73
