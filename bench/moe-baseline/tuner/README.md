@@ -59,3 +59,19 @@ ubatch and `-ncmoe` (residency) are not independent: the best residency measured
 from the best at ub 2048. That is why the service re-sweeps residency after picking the ubatch (step 3).
 Some ubatch values also land on pathological code paths (a non-monotonic point was measured at M=1024 with
 one residency setting), so the fit should be eye-checked against the raw `pp_points` in the store.
+
+## TG is not tunable here
+
+The tuner optimises PP (ubatch) and the residency split; it does not move TG. Measured at the best config
+(`-ncmoe 27 -fa on`): TG ~13-14 t/s, GPU engine utilisation 36-42% but GPU kernel execution only ~16% of the
+token time, aggregate weight bandwidth ~11% of peak (individual kernels already hit peak). KV quantisation
+(`-ctk/-ctv q8_0`), `-fa off` and extra residency were all within +-0.7 t/s noise (see `../AB-TUNING.md` batch 7).
+So TG is latency/serialisation bound (per-kernel latency plus the CPU MoE / GPU alternation at batch=1), and no
+launch-config knob raises it. TG work has to go to prefetch/streaming (`../PREFETCH-DESIGN.md`), not the tuner.
+
+## Prefetch/streaming has a low TG ceiling here too
+
+The end state of prefetch/streaming is "all experts resident on a GPU tier". Measured on this box (dGPU + iGPU/UMA),
+that tops out at ~12-16 t/s, i.e. no better than the single-GPU `-ncmoe 27` baseline of 14.2 (the 2-GPU path also
+pulls experts from SSD and OOMs under a large ubatch). So expert placement is not the TG lever either; the ceiling
+is the Vulkan backend's per-kernel latency. See `../AB-TUNING.md` batch 8.

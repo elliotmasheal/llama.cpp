@@ -1,0 +1,22 @@
+﻿tag            : TG8b_ceiling_2gpu_n10
+bin            : llama-bench
+args           : -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan0/Vulkan1 -sm layer -ngl 99 -ncmoe 10 -fa on -ub 512 -p 0 -n 256 -r 3 -o md
+gpu            : AMD Radeon RX 6700S  drv 32.0.21045.5002
+cpu            : AMD Ryzen 7 6800HS with Radeon Graphics           cores 8/16
+ram            : 39.2 GB
+os             : Microsoft Windows 11 Pro for Workstations 10.0.26300
+date           : 2026-10-16T23:25:09.0431377+08:00
+--- disks ---
+  Micron_2450_MTFDKBA1T0TFK SSD 954GB
+--- resource summary ---
+  wall_s               91.4
+  samples              15
+  cpu_pct_avg          12.3
+  cpu_pct_max          17.6
+  mem_used_gb_peak     31.48
+  disk_read_mbs_avg    239.2
+  disk_read_mbs_max    1262.9
+  gpu_util_pct_avg     59.6
+  gpu_util_pct_max     77.8
+  gpu_ded_mb_peak      5154
+  proc_ws_gb_peak      15.87
