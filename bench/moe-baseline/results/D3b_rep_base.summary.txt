@@ -1,0 +1,22 @@
+﻿tag            : D3b_rep_base
+bin            : llama-cli
+args           : -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -ncmoe 27 -fa on -c 8192 -st -n 160 --temp 0 --seed 1 -f E:\fastLlama\bench\moe-baseline\d3\prompt_repeat.txt
+gpu            : AMD Radeon RX 6700S  drv 32.0.21045.5002
+cpu            : AMD Ryzen 7 6800HS with Radeon Graphics           cores 8/16
+ram            : 39.2 GB
+os             : Microsoft Windows 11 Pro for Workstations 10.0.26300
+date           : 2026-10-17T09:00:11.3679490+08:00
+--- disks ---
+  Micron_2450_MTFDKBA1T0TFK SSD 954GB
+--- resource summary ---
+  wall_s               49
+  samples              8
+  cpu_pct_avg          13.9
+  cpu_pct_max          24.3
+  mem_used_gb_peak     33.76
+  disk_read_mbs_avg    0
+  disk_read_mbs_max    0.1
+  gpu_util_pct_avg     44.7
+  gpu_util_pct_max     71.7
+  gpu_ded_mb_peak      8101
+  proc_ws_gb_peak      18

@@ -224,7 +224,29 @@ sched_trace: splits=56 sync=0.000ms copy=20.5ms (mb=1.923 n=91 hw=0) cpu=47.6ms 
 - 两条攻击线：**(a) 摊薄**——D3 投机一次前向验证多 token，把每 token 的 CPU MoE + 91 拷贝 + 56 提交按命中长度摊薄（你已实测重复负载 2.25x）；**(b) 削减**——减少 split/copy 的**调用次数**（当前 21 KB/次也走完整提交路径）。
 - 依据 `PROGRESS.md` 排序与本节数据，本轮先做 **D3（最小 prototype + 真实负载 A/B）**，并测 **D3 × `-ncmoe`（验证步更便宜 -> 最优 n_max 更大）** 的耦合。
 
-## AB 总结（截至批次 8）
+## AB 批次 10：D3 ngram 投机复核（生产配置 + 真实负载）
+
+固定 `-dev Vulkan1 -ngl 99 -ncmoe 27 -fa on -c 8192 -st -n 160 --temp 0 --seed 1`（llama-cli）。
+spec = `--spec-type ngram-mod --spec-ngram-mod-n-match 16 --spec-ngram-mod-n-min 4 --spec-ngram-mod-n-max N`。
+prompt：`d3/prompt_repeat.txt`（回显 ~120 token）、`d3/prompt_novel.txt`。
+
+| 用例 | spec | 生成 t/s | vs 基线 |
+|---|---|---:|---:|
+| 重复型 | 无 | 10.5 | 1.00x |
+| 重复型 | n_max 12 | 20.6 | 1.96x |
+| 重复型 | n_max 16 | **22.8** | **2.17x** |
+| 重复型 | n_max 20 | 22.0 | 2.10x |
+| 新颖型 | 无 | 10.2 | 1.00x |
+| 新颖型 | n_max 16 | 10.2 | 1.00x（零退化） |
+
+**结论**：复核通过，与 D3 探路一致。**推荐** `--spec-type ngram-mod --spec-ngram-mod-n-match 16 --spec-ngram-mod-n-min 4 --spec-ngram-mod-n-max 16`：
+重复型负载 **~2.2x**、新颖型 **1.00x**（不退化）。最优 `n_max` 由"验证前向的批经济学"决定（批次 9 的核
+心：每 token 的 CPU MoE+拷贝+提交开销随批宽亚线性摊薄），与本机放置强相关，**必须逐配置调**。
+
+**与归因（批次 9）的耦合**：投机把每 token 的 `CPU MoE(~50ms) + 91 拷贝 + 56 提交` 按命中长度摊薄；
+验证步越便宜（更多层在 GPU），最优 `n_max` 应越大、收益越高。
+
+## AB 总结（截至批次 10）
 
 | 手段 | 效果 | 判定 |
 |---|---|---|
@@ -240,6 +262,8 @@ sched_trace: splits=56 sync=0.000ms copy=20.5ms (mb=1.923 n=91 hw=0) cpu=47.6ms 
 | TG: KV q8_0 / `-fa off` / 多驻留 | 均落 ±0.7 噪声内（nc26 反而 10.8） | 无法提高 GPU/带宽利用率 |
 | TG 利用率量化 | GPU 执行 ~16%、带宽 ~11%、单核已达峰值 | 瓶颈是延迟/串行，转预取 |
 | 预取/流式上限（全专家在 GPU 层） | TG 12–16（≤ 单 GPU 基线 14.2） | 不是杠杆（天花板 ~+15%） |
+| TG 调用开销归因（`GGML_SCHED_TRACE`） | CPU MoE 60% + 91 拷贝(20ms) 25% + 56 提交(12ms) 15% | 归因到 CPU 侧调用开销 |
+| D3 ngram 投机（重复负载，批次 10） | 10.5→**22.8（2.17x）**；新颖 1.00x | **有效**（负载相关；唯一过 111 上限路径） |
 
 **统一结论**：TG 的 ~70 ms/token 由**多个 ~15–20% 的小因素叠加**构成（屏障 ~20%、CPU MoE ~15%、命令录制/调度、逐 kernel 延迟），
 **没有任何单一杠杆**，也没有一个能把它抬高 5–10x 的可达旋钮。这是 **batch=1 + 8 GB 显存 + RDNA2 Vulkan + 20 GB 模型** 下的

@@ -189,3 +189,48 @@ prompt 见 `d3/prompt_repeat.txt`、`d3/prompt_novel.txt`。
 > 与既有路线的衔接：D1/D2 直接攻 TG 的"延迟/串行"根因（与预取/流式是不同层次）；
 > D3 是零成本机会项；D4 服务 PP1000；D5 解决长上下文溢出场景。
 > 所有项都不改变"TG200 需 MTP/投机 + 裸 TG 逼近 ~100"的既有判断。
+
+---
+
+# 延迟/串行归因清单 + 已实现/已排除 + 下一步（2026-10-17，批次 9-10）
+
+## A. 归因清单（`GGML_SCHED_TRACE=1`，`-dev Vulkan1 -ngl 99 -ncmoe 27 -fa on`）
+
+新增 env 门控计时（`ggml/ggml-backend.cpp` `ggml_backend_sched_compute_splits`）。
+每 token ~79 ms（≈12.6 t/s）拆解：
+
+| 段 | 值 | 占 token | 归因 |
+|---|---|---|---|
+| CPU 后端计算 | ~50 ms | ~60% | 27 层 MoE 的 `MUL_MAT_ID` 在 CPU 上同步执行 |
+| 跨后端 activation 拷贝 | ~20 ms | ~25% | **91 次拷贝、共 1.92 MB（21 KB/次、0.22 ms/次）= 纯调用开销** |
+| GPU 提交（CPU 侧） | ~12 ms | ~15% | 56 次 `graph_compute_async`（0.21 ms/次） |
+| 跨后端同步 | ~0 ms | 0% | 事件同步未成瓶颈 |
+
+原始行：`sched_trace: splits=56 sync=0.000ms copy=20.5ms (mb=1.923 n=91 hw=0) cpu=47.6ms gpu_submit=12.8ms`
+
+**结论（修正此前判断）**：所谓"84% 非 kernel"是 **CPU 侧**——60% 是 CPU MoE 计算，
+25%+15% 是**随 CPU-MoE 层数（27 -> 56 split）增长的拷贝/提交"调用开销"**（每次仅 21 KB 却走完整提交）。
+**不是 GPU launch 延迟，也不是同步等待。**
+
+## B. 已实现 / 已排除（含证据）
+
+| 方向 | 状态 | 证据 |
+|---|---|---|
+| 专家驻留 `-ncmoe` | 已实现（基线） | PP 114.8->148 / TG 11.2->14.2 |
+| expert-centric prefill `-ub 2048` | 已实现（PP 7.4x） | PP 43.6->~310（`tuner/UBATCH-MODEL.md`） |
+| 配置最优固化 + 调优服务 | 已实现 | `tuner/`（自动收敛到 `-ub 2048 -ncmoe 27`） |
+| sched 调用开销归因 | 已实现（诊断，env 门控） | `GGML_SCHED_TRACE`，本文件 A 节 |
+| MoE cache `--moe-cache-mib` | 已排除（负优化） | TG 4.7 vs 11.2（每层 split+同步） |
+| 减少全局屏障（buffer-scoped） | 已排除（上界仅 +21%，复杂难推广） | AB 批次 5 |
+| 预取/流式 P1/P2 | 已排除（上限 ~+15%） | AB 批次 8（全专家在 GPU 层也只 ~12-16 t/s） |
+| KV `q8_0` / `-fa off` / 多驻留 | 已排除（±0.7 噪声内） | AB 批次 7 |
+| 双 GPU（核显 UMA） | 已排除（更差 + SSD 换页 + OOM） | AB 批次 8 |
+| D3 ngram 投机 | **进行中**（重复负载 2.25x） | D3 探路 + 批次 10 |
+
+## C. 下一步
+
+1. **D3 投机（本轮）**：真实重复/新颖负载复核，并把 `--spec-ngram-mod-n-max` 纳入 `tuner/` 自动调参；
+   测 D3 × `-ncmoe`（验证步更便宜 -> 最优 n_max 更大）的耦合。
+2. **削 split/拷贝调用开销**（归因直接指向，非 D-list）：每次仅 21 KB 的拷贝仍走完整提交路径，
+   减少 split 数或批量化跨后端拷贝可回收这 ~32 ms 的一部分。
+3. 其余按 `PROGRESS.md` 排序：D5（ReBAR 速查）、D1（FA KV-split，长上下文）、D2（独立 draft）、D4（MMQID，PP）。
