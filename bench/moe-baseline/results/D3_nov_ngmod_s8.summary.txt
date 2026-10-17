@@ -1,0 +1,22 @@
+﻿tag            : D3_nov_ngmod_s8
+bin            : llama-cli
+args           : -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -ncmoe 27 -fa on -c 8192 -lv 3 -st -n 160 --temp 0 --seed 1 --spec-type ngram-mod --spec-ngram-mod-n-min 4 --spec-ngram-mod-n-max 8 --spec-ngram-mod-n-match 16 -f E:\fastLlama\bench\moe-baseline\d3\prompt_novel.txt
+gpu            : AMD Radeon RX 6700S  drv 32.0.21045.5002
+cpu            : AMD Ryzen 7 6800HS with Radeon Graphics           cores 8/16
+ram            : 39.2 GB
+os             : Microsoft Windows 11 Pro for Workstations 10.0.26300
+date           : 2026-10-17T08:29:11.7265090+08:00
+--- disks ---
+  Micron_2450_MTFDKBA1T0TFK SSD 954GB
+--- resource summary ---
+  wall_s               43.9
+  samples              7
+  cpu_pct_avg          12.6
+  cpu_pct_max          19.9
+  mem_used_gb_peak     32.51
+  disk_read_mbs_avg    0
+  disk_read_mbs_max    0.1
+  gpu_util_pct_avg     31.9
+  gpu_util_pct_max     60.6
+  gpu_ded_mb_peak      8081
+  proc_ws_gb_peak      16.64

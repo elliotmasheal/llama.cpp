@@ -1,0 +1,1 @@
+Write a Python function that returns the n-th Fibonacci number using the fast doubling method. Then explain in two short paragraphs why its time complexity is logarithmic and where the constant factors come from.

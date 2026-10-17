@@ -1,0 +1,6 @@
+You are a verbatim text repeater. Reproduce the INPUT below exactly, character for character. Do not add any commentary, heading, or conclusion. Output the INPUT and nothing else.
+
+INPUT:
+The scheduler divides each decode step into a fixed sequence of small kernels: normalization, projection, attention, and the expert mixture. Because the batch holds a single token, every kernel is latency bound rather than throughput bound. The graphics processor spends most of its time waiting for the next command buffer, and the aggregate memory bandwidth stays far below the hardware peak. When the experts live in host memory, the runtime must copy routing ids across the bus, run the mixture on the processor, and then copy the result back before the next layer can begin. This round trip repeats for every layer in the stack, so the per token cost grows with depth even though the arithmetic is tiny.
+
+OUTPUT:

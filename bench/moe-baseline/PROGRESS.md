@@ -47,6 +47,53 @@
 - **风险**: 仅在重复工作负载有效；ngram 长度/命中阈值需调；接受率低会略降。
 - **前置**: 无（纯配置）。
 
+### D3 探路实验结果（已执行，2026-10-17）
+
+固定配置：`-dev Vulkan1 -ngl 99 -ncmoe 27 -fa on -c 8192 -lv 3 -st -n 160 --temp 0 --seed 1`。
+工具 `llama-cli`（内部起 in-process `llama-server`，spec 走 server 路径），
+`-lv 3` 使 server 打印 `draft acceptance = ... (accepted / generated), mean len = ...`。
+prompt A = 复制型（要求逐字重述一段约 120 token 的输入，回显率高）；
+prompt B = 新颖型（写 fast-doubling Fibonacci + 解释，无回显）。
+原始产物：`results/D3_*.metrics.csv` / `.summary.txt`（`.bench.log` 因 `*.log` 被 gitignore，仅保留本地）；
+prompt 见 `d3/prompt_repeat.txt`、`d3/prompt_novel.txt`。
+
+| 用例 | spec | TG (t/s) | vs 基线 | accept | mean len | 备注 |
+|---|---|---:|---:|---:|---:|---|
+| A 基线 | 无 | 10.17 | 1.00x | - | - | tag `D3_rep_base` |
+| A | ngram-mod 默认 (match 24/min 48/max 64) | 7.02 | **0.69x** | 0.982 | 55.50 | 大 draft 净负优化 |
+| A | match 16/min 4/max 32 | 8.44 | 0.83x | 0.983 | 29.75 | 仍负 |
+| A | match 16/min 4/max 16 | **22.90** | **2.25x** | 1.000 | 17.00 | **最优点** |
+| A | match 16/min 4/max 8 | 16.90 | 1.66x | 0.981 | 8.50 | 偏小，仍过线 |
+| B 基线 | 无 | 10.30 | 1.00x | - | - | 与 A 基线一致 |
+| B | match 16/min 4/max 8 | 10.22 | 0.99x | 无 draft | - | 新颖文本零退化 |
+
+**判定线（重复型 TG >= 1.5x）: 通过**（`n_max=16` 时 2.25x）。D3 值得继续。
+
+**关键发现（反直觉，且是本机核心机制）**:
+1. **接受率不是瓶颈**：复制任务上 ngram-mod 接受率 0.98-1.00、mean len 可到 55，
+   但 TG 反而从 10.17 掉到 7.02。**大 draft 是净负优化**。
+2. **瓶颈是验证步的开销随批宽超线性增长**：本机是 batch=1 延迟受限 + 混合 CPU/GPU MoE
+   （27 层专家在 CPU）+ SSM/线性注意力层，`k+1` 宽的验证前向里每 token 的边际成本很高
+   （与 `BASELINE.md` §5.7 PP p512->p2048 退化同源：批越大越不划算）。
+   所以"命中越长越好"在本机不成立，存在**最优 draft 宽度**：`n_max` 约 16（本配置实测）。
+3. **曲线非单调**：8 -> 16 上升（16.9 -> 22.9），16 -> 32 -> 64 下降（8.4 -> 7.0）。
+   最优 `n_max` 由"验证前向的批经济学"决定，与硬件/放置强相关，**必须逐配置调**，
+   不能用默认值（默认 max 64 在本机正好落在最差区间）。
+4. **无命中即零开销**：新颖文本下 ngram-mod 不产生任何 draft（draft 计数为 0），TG 0.99x。
+
+**对本项目目标的含义**:
+- D3 是**真实可用**的等效 TG 杠杆，但上限取决于工作负载回显率：纯新颖 = 1.0x，
+  纯复制 = 2.25x，真实 agent 场景（工具结果回显、编辑式代码、重复 system prompt）落在中间。
+- **与 TG200 的关系**：D3 是"零模型成本"的等效吞吐路径，可与 MTP/独立 draft 叠加；
+  但它是负载相关的，不能作为唯一依赖。
+- **直接产出的一条可复现调参结论**：`--spec-type ngram-mod --spec-ngram-mod-n-max 16`
+  （配 `--spec-ngram-mod-n-match 16 --spec-ngram-mod-n-min 4`），本机复制型负载 2.25x。
+
+**待办（D3 后续，非阻塞）**:
+- 更真实负载：长 system prompt + 多轮/工具回显，测回显率与 `n_max` 最优值；
+- 扫 `n_match`（16/24/32）与 `n_min`；试 `ngram-simple` / `ngram-cache + -lcd` 对比；
+- 在 `-ncmoe` 全 GPU（`-ncmoe 0`）下重测：验证步越便宜，最优 `n_max` 应越大、收益越高。
+
 ## D1. 长上下文注意力：FA 的 KV-split / row-split 调优  [针对 256K 用例]
 
 - **原理**: decode 时每个 KV head 的 attention reduction 沿 **key 维在一个工作组内串行**；
@@ -121,7 +168,7 @@
 
 | 序 | 方向 | 收益（预期） | 成本 | 成功概率 | 风险/前置 |
 |---|---|---|---|---|---|
-| 1 | D3 ngram/prompt-lookup | 重复负载 TG x2-x4 | 极低（配置） | 中（依赖负载） | 低；无前置 |
+| 1 | D3 ngram/prompt-lookup | 重复负载 TG **实测 2.25x**（n_max 16） | 极低（配置） | 中（依赖负载） | 低；无前置；**已验证** |
 | 2 | D5 ReBAR / shared 路径 | 溢出场景 +10-50% | 极低（先查） | 中（看 BIOS） | 系统层；需 BIOS 支持 |
 | 3 | D1 FA KV-split | 长上下文 TG +20-60% | 中（kernel） | 中高 | FA 正确性；无前置 |
 | 4 | D2 独立 draft 投机 | TG x1.6-2.2 | 中 | 中（看 draft 可用性） | 需同 tokenizer draft |
@@ -129,8 +176,9 @@
 
 ## 下一步计划（执行顺序）
 
-1. **D3 探路（0.5 天）**: 配置级 AB，先确认本工作负载的 n-gram 命中/接受率值不值得做。
-   判定线：重复型 prompt TG >= 1.5x 才继续。
+1. ~~**D3 探路（0.5 天）**~~ **已完成**（见"D3 探路实验结果"）：判定线通过，
+   最优 `--spec-ngram-mod-n-max 16` 下重复型 TG **2.25x**；默认 max 64 反而 0.69x。
+   后续留作"更真实负载 + `n_max` 调参"的非阻塞项。
 2. **D5 速查（10 分钟）**: 查 dGPU BAR 大小；若可开 ReBAR 且当前为小 BAR，开一档再测。
 3. **D1 量化 + 原型（1-2 天）**: 先用 perf logger 确认长上下文 FA 占比与当前 split 行为；
    若占比显著，改 split 启发式 + `test-backend-ops` 回归，再 AB 20K/64K 深度 TG。
