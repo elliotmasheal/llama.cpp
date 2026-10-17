@@ -1868,6 +1868,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // EXPERIMENT: per-token split timing, gated by GGML_SCHED_TRACE
+    static const bool trace = getenv("GGML_SCHED_TRACE") != nullptr;
+    int64_t t_sync = 0, t_copy = 0, t_cpu = 0, t_gpu = 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1876,13 +1880,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            const int64_t t0 = ggml_time_us();
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
+            t_sync += ggml_time_us() - t0;
         }
 
+        const int64_t t1 = ggml_time_us();
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1895,9 +1902,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        t_copy += ggml_time_us() - t1;
 
         if (!sched->callback_eval) {
+            const bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            const int64_t t2 = ggml_time_us();
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            const int64_t dt = ggml_time_us() - t2;
+            if (is_cpu) { t_cpu += dt; } else { t_gpu += dt; }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1941,6 +1953,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (trace) {
+        fprintf(stderr, "sched_trace: splits=%d sync=%.3fms copy=%.3fms cpu=%.3fms gpu_submit=%.3fms\n",
+                sched->n_splits, t_sync/1000.0, t_copy/1000.0, t_cpu/1000.0, t_gpu/1000.0);
     }
 
     return GGML_STATUS_SUCCESS;

@@ -191,6 +191,31 @@ KV 量化省下的显存没有转化为可用驻留（受 compute buffer/对齐�
 - 因此**预取/流式对 TG 的天花板约 +15%**，离 TG200（需 ~14x）差一个数量级以上。
 - 结合批次 7（GPU 执行 ~16%、带宽 ~11%）与批次 4/5（屏障/CPU-MoE 各 ~15-20%）：**TG 的瓶颈是 Vulkan 后端的逐 kernel 延迟与串行，不是专家放置**。预取解决的是"专家传输"，而传输本就不在关键路径上（磁盘读≈0、单核已达峰值带宽）。
 
+## AB 批次 9：84% 非-kernel 时间的归因（sched 分片计时）
+
+新增 env 门控 `GGML_SCHED_TRACE`（`ggml/ggml-backend.cpp` `ggml_backend_sched_compute_splits`），
+每 token 打印 4 段耗时：跨后端同步 / activation 拷贝 / CPU 后端计算 / GPU 提交。
+
+`-dev Vulkan1 -ngl 99 -ncmoe 27 -fa on -p 0`：
+
+```
+sched_trace: splits=56  sync=0.000ms  copy=20.9ms  cpu=53.6ms  gpu_submit=11.6ms
+```
+
+每 token ~79 ms（≈ 1/12.6 t/s）拆解为：
+
+| 段 | 值 | 占比 | 含义 |
+|---|---|---|---|
+| CPU 后端计算 | **~47 ms** | **~60%** | 27 层 MoE 的 `MUL_MAT_ID` 在 CPU 上算（阻塞） |
+| activation 拷贝 | **~20 ms** | **~25%** | 56 个 split 的跨后端拷贝（GPU<->CPU 往返） |
+| GPU 提交（CPU 侧） | ~12 ms | ~15% | 56 次 `graph_compute_async` 的 CPU 提交开销 |
+| 跨后端同步 | 0 ms | 0% | `sync=0`（事件同步未成为瓶颈） |
+
+**判定**：
+- 64% 的时间确实是"非 kernel 的串行/等待"，但**主要不是 launch 延迟，而是 CPU MoE 计算本身（47 ms）+ 56 个 split 的拷贝/提交（32 ms）**。
+- 这两者都随 **CPU-MoE 层数**增长：27 层 CPU MoE 造成 ~56 个 split 的 GPU<->CPU 摆渡。
+- 因此本轮首选 **D3 投机解码（MTP）**：一次前向验证 K 个 token，把"逐 token 固定开销（CPU MoE + 56 split + 提交）"摊薄到 K 个 token；同时 CPU `MUL_MAT_ID` 在 batch=K 下效率更高。次选 D4（MMQID 调参）直接压 CPU MoE 这 47 ms。
+
 ## AB 总结（截至批次 8）
 
 | 手段 | 效果 | 判定 |
