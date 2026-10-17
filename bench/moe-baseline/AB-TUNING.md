@@ -206,15 +206,23 @@ sched_trace: splits=56  sync=0.000ms  copy=20.9ms  cpu=53.6ms  gpu_submit=11.6ms
 
 | 段 | 值 | 占比 | 含义 |
 |---|---|---|---|
-| CPU 后端计算 | **~47 ms** | **~60%** | 27 层 MoE 的 `MUL_MAT_ID` 在 CPU 上算（阻塞） |
-| activation 拷贝 | **~20 ms** | **~25%** | 56 个 split 的跨后端拷贝（GPU<->CPU 往返） |
-| GPU 提交（CPU 侧） | ~12 ms | ~15% | 56 次 `graph_compute_async` 的 CPU 提交开销 |
+| CPU 后端计算 | **~47-52 ms** | **~60%** | 27 层 MoE 的 `MUL_MAT_ID` 在 CPU 上算（阻塞） |
+| activation 拷贝 | **~20 ms** | **~25%** | 91 次跨后端拷贝，**共仅 1.92 MB**（~21 KB/次） |
+| GPU 提交（CPU 侧） | ~12 ms | ~15% | 56 次 `graph_compute_async` 的 CPU 提交（~0.21 ms/次） |
 | 跨后端同步 | 0 ms | 0% | `sync=0`（事件同步未成为瓶颈） |
 
+**细化（第二次计时，含字节/次数）**：
+```
+sched_trace: splits=56 sync=0.000ms copy=20.5ms (mb=1.923 n=91 hw=0) cpu=47.6ms gpu_submit=12.8ms
+```
+- 91 次拷贝只搬 **1.923 MB** → 有效 ~0.1 GB/s，**比任何带宽低 1000 倍**：这是**每次调用的固定开销（~0.22 ms/次）**，不是数据搬运。
+- 56 次 GPU 提交 ~0.21 ms/次，同为**调用开销**。
+- 二者合计 ~32 ms/token（40%），**属于调用链上可消除的开销**；其数量由 **CPU-MoE 层数（27）→ split 数（56）**决定。
+
 **判定**：
-- 64% 的时间确实是"非 kernel 的串行/等待"，但**主要不是 launch 延迟，而是 CPU MoE 计算本身（47 ms）+ 56 个 split 的拷贝/提交（32 ms）**。
-- 这两者都随 **CPU-MoE 层数**增长：27 层 CPU MoE 造成 ~56 个 split 的 GPU<->CPU 摆渡。
-- 因此本轮首选 **D3 投机解码（MTP）**：一次前向验证 K 个 token，把"逐 token 固定开销（CPU MoE + 56 split + 提交）"摊薄到 K 个 token；同时 CPU `MUL_MAT_ID` 在 batch=K 下效率更高。次选 D4（MMQID 调参）直接压 CPU MoE 这 47 ms。
+- "非 kernel 的 84%" 实为 **CPU 侧**：60% 是 CPU MoE 计算，25%+15% 是随 split 数增长的**拷贝/提交调用开销**（不是 GPU launch 延迟、不是同步等待）。
+- 两条攻击线：**(a) 摊薄**——D3 投机一次前向验证多 token，把每 token 的 CPU MoE + 91 拷贝 + 56 提交按命中长度摊薄（你已实测重复负载 2.25x）；**(b) 削减**——减少 split/copy 的**调用次数**（当前 21 KB/次也走完整提交路径）。
+- 依据 `PROGRESS.md` 排序与本节数据，本轮先做 **D3（最小 prototype + 真实负载 A/B）**，并测 **D3 × `-ncmoe`（验证步更便宜 -> 最优 n_max 更大）** 的耦合。
 
 ## AB 总结（截至批次 8）
 

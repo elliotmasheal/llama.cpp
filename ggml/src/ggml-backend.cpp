@@ -1871,6 +1871,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // EXPERIMENT: per-token split timing, gated by GGML_SCHED_TRACE
     static const bool trace = getenv("GGML_SCHED_TRACE") != nullptr;
     int64_t t_sync = 0, t_copy = 0, t_cpu = 0, t_gpu = 0;
+    int64_t t_copy_mb = 0;
+    int64_t n_copy = 0, n_copy_hw = 0;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1895,11 +1897,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                t_copy_mb += ggml_nbytes(split->inputs[input_id]);
+                n_copy++;
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                n_copy_hw++;
             }
         }
         t_copy += ggml_time_us() - t1;
@@ -1956,8 +1961,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (trace) {
-        fprintf(stderr, "sched_trace: splits=%d sync=%.3fms copy=%.3fms cpu=%.3fms gpu_submit=%.3fms\n",
-                sched->n_splits, t_sync/1000.0, t_copy/1000.0, t_cpu/1000.0, t_gpu/1000.0);
+        fprintf(stderr, "sched_trace: splits=%d sync=%.3fms copy=%.3fms (mb=%.3f n=%lld hw=%lld) cpu=%.3fms gpu_submit=%.3fms\n",
+                sched->n_splits, t_sync/1000.0, t_copy/1000.0, t_copy_mb/1048576.0,
+                (long long) n_copy, (long long) n_copy_hw, t_cpu/1000.0, t_gpu/1000.0);
     }
 
     return GGML_STATUS_SUCCESS;
