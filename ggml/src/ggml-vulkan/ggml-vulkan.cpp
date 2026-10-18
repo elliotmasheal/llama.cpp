@@ -1227,7 +1227,10 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     const uint32_t D = hsk | hsv;
 
-    const bool reduce_block_rows = D & 8 || n_kv < 1024 || device->vendor_id == VK_VENDOR_ID_INTEL;
+    // AMD wave64 halves the per-thread VGPR budget, so the 16-row tile spills to scratch (measured 78x slower).
+    const bool amd_block_rows_spill = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN &&
+                                      result.subgroup_size > 32 && hsk > 128;
+    const bool reduce_block_rows = D & 8 || n_kv < 1024 || amd_block_rows_spill || device->vendor_id == VK_VENDOR_ID_INTEL;
 
     if (n_rows == 1) {
         result.block_rows = 1;
