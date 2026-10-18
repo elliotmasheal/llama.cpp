@@ -209,6 +209,10 @@ struct llama_moe_cache::impl {
 
     bool resident = false;               // the static residency is built
     std::vector<uint32_t> usage;         // [n_layer*n_expert] selections counted in the large-batch path
+    size_t n_cached_layers = 0;          // layers with a residency map, one log line per token
+    size_t win_hits = 0;
+    size_t win_ids  = 0;
+    size_t win_calls = 0;
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -469,6 +473,10 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+
+        for (const layer & l : layers) {
+            n_cached_layers += l.ig >= 0;
+        }
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -545,6 +553,7 @@ struct llama_moe_cache::impl {
     // one-time upload of the most used experts of each layer into the slots that the residency map assigns to them
     void build_residency() {
         std::vector<int32_t> order(n_expert);
+        int64_t n_uploaded_total = 0;
         for (group & g : groups) {
             if (g.n_slots == 0) {
                 continue;
@@ -555,6 +564,7 @@ struct llama_moe_cache::impl {
             const int32_t n_layers_g = (int32_t) g.layers.size();
             const int32_t quota      = g.n_slots / n_layers_g;
             const int32_t remainder  = g.n_slots % n_layers_g;
+            int64_t n_uploaded = 0;
             int32_t slot = 0;
             for (int32_t j = 0; j < n_layers_g; ++j) {
                 const int32_t il     = g.layers[j];
@@ -582,9 +592,14 @@ struct llama_moe_cache::impl {
                     }
                     stats_hybrid.bytes += (size_t) n_keep*expert_size;
                 }
+                n_uploaded += n_keep;
                 slot += n_keep;
             }
             GGML_ASSERT(slot == g.n_slots);
+            n_uploaded_total += n_uploaded;
+            LLAMA_LOG_INFO("%s: group %td: %4d layers, %5d slots, quota %d (+%d), %5.1f%% of the experts resident, %6lld experts frozen\n",
+                __func__, &g - groups.data(), n_layers_g, g.n_slots, quota, remainder,
+                100.0*g.n_slots/(double) (n_layers_g*n_expert), (long long) n_uploaded);
         }
         for (device & d : devices) {
             if (d.buf) {
@@ -592,7 +607,8 @@ struct llama_moe_cache::impl {
             }
         }
         resident = true;
-        LLAMA_LOG_INFO("%s: hybrid residency built from the prompt routing statistics\n", __func__);
+        LLAMA_LOG_INFO("%s: hybrid residency frozen: %lld experts, %.2f MiB uploaded once\n",
+            __func__, (long long) n_uploaded_total, stats_hybrid.bytes/1024.0/1024.0);
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
@@ -689,6 +705,15 @@ struct llama_moe_cache::impl {
             }
             stats_hybrid.hits   += n_hit;
             stats_hybrid.misses += (size_t) n_ids - n_hit;
+
+            // one line per token: the average hit rate of the last n_cached_layers lookups
+            win_hits += n_hit;
+            win_ids  += (size_t) n_ids;
+            if (++win_calls >= n_cached_layers && win_ids > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: hybrid: hit rate = %.2f%% (%zu of %zu)\n",
+                    100.0*win_hits/win_ids, win_hits, win_ids);
+                win_hits = win_ids = win_calls = 0;
+            }
 
             // the residency map is copied as is, the misses are computed by the CPU branch from the host experts
             ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));

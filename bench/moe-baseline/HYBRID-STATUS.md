@@ -65,18 +65,42 @@ runs the normal CPU kernel and is bit-exact in isolation. If `--load-mode none` 
 used, `ggml/src/ggml-cpu/repack.cpp` must learn `GGML_OP_MUL_MAT_ID_MASK` in
 `supports_op`/`get_tensor_traits`.
 
-## Performance (llama-cli, 846-char prompt, -n 32, -fa on, -dev Vulkan1)
+## Performance (llama-cli, ~600 token prompt, -n 64, -fa on, -dev Vulkan1)
 
-| config | PP t/s | TG t/s |
-|---|---:|---:|
-| `-ncmoe 27` (baseline) | 30.2 | 15.6 |
-| `-ncmoe 41 --moe-cache-mib 4096` (ref) | 21.0 | 8.3 |
-| same + `--moe-hybrid` | 26.0 | 5.7 |
+| config | PP t/s | TG t/s | splits | copy ms | cpy_sync | h2d | cpu ms | submit ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `-ncmoe 27` (baseline) | 70.4 | 15.9 | 56 | 16.1 | 15.2 | 0.6 | 28.9 | 10.8 |
+| `-ncmoe 41 --moe-cache-mib 4096` (LRU) | 49.3 | 11.0 | 42 | 84.4 | 14.3 | 70.1 | 0.0 | 8.3 |
+| same + `--moe-hybrid` (4096) | 61.5 | 6.1 | 122 | 103.8 | 72.5 | 30.9 | 41.8 | 15.0 |
+| same + `--moe-hybrid` (6144) | 56.5 | 5.1 | 122 | 140.0 | 102.9 | 36.6 | 38.8 | 13.7 |
 
-The hybrid is slower because the hit rate is only ~23.5% at 22% coverage: the residency is built
-during the 1-token warmup run (before prefill counts exist) and frozen, so the prompt routing
-statistics are never used. Next step is to build the residency on the first small batch after
-prefill, then re-measure.
+Per decode token; `GGML_SCHED_TRACE=1` averages over 64 graphs. Hit rates with the residency
+frozen from prefill counts: 22.2% at 4096 (coverage 22.0%), 34-38% at 6144 (coverage 33.0%).
+Static popularity residency therefore gives almost no gain over the coverage: the 65% hit rate at
+22% coverage recorded in HYBRID-PLAN.md comes from LRU temporal locality, not from prefill counts.
+
+Cause of the 3x slowdown (concrete, from the trace):
+
+1. The CPU branch adds 2 splits per layer (GPU hit branch, CPU miss branch, GPU final add):
+   122 splits vs 42 (LRU ref) and 56 (`-ncmoe 27`).
+2. The CPU split needs `inp` and `ids` from the device, so the scheduler synchronizes the Vulkan
+   queue once per CPU split: 80 async_get copies and `cpy_sync` 72.5 ms/token at 4096
+   (102.9 ms at 6144). This also means the two branches never overlap: the CPU miss branch runs
+   after the GPU hit branch has fully drained, so the token costs the sum of both plus copies.
+3. 78% of the experts are still computed on the CPU at 22% hit rate: `cpu` 41.8 ms/token
+   (`-ncmoe 27` pays 28.9 ms for 27 layers).
+4. The per-layer cache copy callback (ids readback + full device synchronize + slot map upload) is
+   traced as h2d 30.9 ms/token; the same cost exists in the LRU ref path.
+5. submit 15.0 ms vs 10.8/8.3 because of the split count.
+
+The mask view itself is not copied across backends (it is only consumed by CPU nodes); the extra
+splits come from the CPU branch, not from the mask.
+
+Verdict on the Phase B acceptance: hybrid does NOT beat `-ncmoe 27` (TG 6.1 vs 15.9 at 4096,
+5.1 at 6144). A static prefill-count residency cannot reach 60% hit rate on this model with an
+8 GB card (needs ~60% coverage, i.e. ~11 GB of experts); reaching the target requires dynamic
+residency (temporal locality, Phase C), removal of the per-layer device synchronize in the copy
+callback, and real CPU/GPU overlap of the two branches.
 
 ## Reproduction helpers (untracked)
 

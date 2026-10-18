@@ -552,10 +552,9 @@ llama_context::llama_context(
             LLAMA_LOG_WARN("%s: --moe-hybrid requires --moe-cache-mib > 0, ignored\n", __func__);
         }
         if (cparams.moe_cache_size > 0) {
-            // TODO: enable the hybrid CPU branch once its output matches the reference, see bench/moe-baseline/HYBRID-STATUS.md
-            const bool moe_hybrid = false;
-            if (params.moe_hybrid) {
-                LLAMA_LOG_WARN("%s: --moe-hybrid is disabled in this build, using the existing path\n", __func__);
+            const bool moe_hybrid = params.moe_hybrid;
+            if (moe_hybrid) {
+                LLAMA_LOG_INFO("%s: MoE cache: the experts that are not resident are computed on the CPU\n", __func__);
             }
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, moe_hybrid);
         }

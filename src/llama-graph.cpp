@@ -2300,7 +2300,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // in hybrid mode the experts of a small batch that are not in the MoE cache are computed on the CPU, exactly
     // the CPU branch reuses the router weights and the ids of the GPU branch, so it needs the same expert path
-    ggml_tensor * miss_mask = moe_cache != nullptr && !weight_before_ffn ? moe_cache->get_miss_mask(il, n_tokens, n_expert_used) : nullptr;
+    // the warmup run is skipped so that the residency is frozen from the prefill routing, not from an empty run
+    ggml_tensor * miss_mask = moe_cache != nullptr && !weight_before_ffn && !cparams.warmup ? moe_cache->get_miss_mask(il, n_tokens, n_expert_used) : nullptr;
     const bool hybrid = miss_mask != nullptr &&
         gate_up_exps == nullptr && gate_exps != nullptr &&
         up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr &&
