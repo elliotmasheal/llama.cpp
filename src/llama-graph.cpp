@@ -1659,6 +1659,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
     cur = build_hadamard_input(w, cur);
+    // a whole layer is resident in the MoE cache: the bank view replaces the host tensor and keeps the expert ids
+    if (slots == nullptr && moe_cache != nullptr) {
+        ggml_tensor * w_static = moe_cache->get_experts_static(w);
+        if (w_static != nullptr) {
+            w = w_static;
+        }
+    }
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :

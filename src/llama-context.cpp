@@ -617,6 +617,9 @@ llama_context::llama_context(
         if (params.moe_hybrid && cparams.moe_cache_size == 0) {
             LLAMA_LOG_WARN("%s: --moe-hybrid requires --moe-cache-mib > 0, ignored\n", __func__);
         }
+        if (params.moe_hybrid) {
+            LLAMA_LOG_WARN("%s: --moe-hybrid is experimental and about 2x slower, the residency cache alone is the fast path\n", __func__);
+        }
         if (cparams.moe_cache_size > 0) {
             const bool moe_hybrid = params.moe_hybrid;
             if (moe_hybrid) {

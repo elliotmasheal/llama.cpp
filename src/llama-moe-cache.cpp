@@ -192,8 +192,9 @@ struct llama_moe_cache::impl {
 
     struct binding {
         int32_t il;
-        int32_t ip;           // index of the bank
-        ggml_tensor * cached; // view of the bank used in place of the host experts
+        int32_t ip;                       // index of the bank
+        ggml_tensor * cached;             // view of the bank used in place of the host experts
+        ggml_tensor * cached_static;      // the same view when the whole layer is resident
     };
 
     struct stats {
@@ -359,7 +360,7 @@ struct llama_moe_cache::impl {
             // the rest of the slots are an LRU on the remaining layers
             g.lru.slot_base = g.n_full*n_expert;
             g.lru.init(model.layers.size(), n_expert, g.n_slots - g.lru.slot_base);
-            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size() + g.n_full);
             n_tensors_host  += g.layers.size()*(hybrid_mode ? 2 : 1);
         }
         if (n_tensors_host == 0) {
@@ -413,7 +414,13 @@ struct llama_moe_cache::impl {
                     ggml_tensor * bank   = g.banks[ip];
                     ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], n_view, bank->nb[1], bank->nb[2], 0);
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
-                    bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
+                    // a whole layer keeps its experts at slot j*n_expert, so the bank view is a drop in replacement of the host tensor
+                    ggml_tensor * cached_static = nullptr;
+                    if (l.full) {
+                        cached_static = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], n_expert, bank->nb[1], bank->nb[2], (size_t) j*n_expert*bank->nb[2]);
+                        ggml_format_name(cached_static, "moe_cache.static.%s", l.experts[ip]->name);
+                    }
+                    bindings[l.experts[ip]] = { il, (int32_t) ip, cached, cached_static };
                 }
                 l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
@@ -541,9 +548,9 @@ struct llama_moe_cache::impl {
         const layer & l = layers[il];
         const group & g = groups[l.ig];
 
-        // a whole layer is resident, so it reads the bank for any batch size and never copies the host weights
+        // a whole layer reads the bank through a static view, it needs no slot map
         if (l.full) {
-            return n_tokens > 0 ? l.slot_map : nullptr;
+            return nullptr;
         }
 
         // in hybrid mode the misses are computed on the CPU, so the residency map is always used for small batches
@@ -556,6 +563,12 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         return l.slot_map;
+    }
+
+    // the bank view of w when the whole layer is resident, the plain ids can index it directly
+    ggml_tensor * get_experts_static(const ggml_tensor * w) const {
+        const auto it = bindings.find(w);
+        return it == bindings.end() ? nullptr : it->second.cached_static;
     }
 
     ggml_tensor * get_experts(const ggml_tensor * w) const {
@@ -888,6 +901,10 @@ ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
+}
+
+ggml_tensor * llama_moe_cache::get_experts_static(const ggml_tensor * w) const {
+    return pimpl->get_experts_static(w);
 }
 
 bool llama_moe_cache::hybrid(int32_t il) const {
