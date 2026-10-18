@@ -14,9 +14,11 @@
 namespace {
 
 // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
+// the slots [slot_base, slot_base + n_slots) of the group are managed here, the slots of the fully resident layers are below it
 struct moe_cache_lru {
     int32_t n_expert = 0;
     int32_t n_slots  = 0;
+    int32_t slot_base = 0;
 
     std::vector<int32_t *> slot_map; // [n_layer] data of the slot maps, -1 if the expert is not cached
     std::vector<int32_t>   key_of;   // [n_slots] il*n_expert + expert, -1 if empty
@@ -44,6 +46,9 @@ struct moe_cache_lru {
         }
         head = 0;
         tail = n_slots - 1;
+        if (n_slots == 0) {
+            head = -1;
+        }
         seen.assign(n_expert, 0);
     }
 
@@ -97,7 +102,7 @@ struct moe_cache_lru {
         // hits go to the tail first, so the head can be evicted below
         for (int32_t e : uniq) {
             if (slots[e] >= 0) {
-                touch(slots[e]);
+                touch(slots[e] - slot_base);
                 n_hit++;
             }
         }
@@ -112,9 +117,9 @@ struct moe_cache_lru {
                 slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
             }
             key_of[s] = il*n_expert + e;
-            slots[e] = s;
+            slots[e] = slot_base + s;
             touch(s);
-            fills.push_back({ e, s });
+            fills.push_back({ e, slot_base + s });
         }
         return true;
     }
@@ -172,12 +177,14 @@ struct llama_moe_cache::impl {
         std::vector<int32_t> layers;
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
         size_t host_bytes = 0;
-        int32_t n_slots = 0;
+        int32_t n_slots = 0;              // total hub slots, zero slot included at the end only when hybrid
+        int32_t n_full  = 0;              // first n_full layers keep every expert in the bank
         moe_cache_lru lru;
     };
 
     struct layer {
         int32_t ig = -1;                    // -1 if the layer is not cached
+        bool full = false;                  // every expert of the layer is in the bank
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
         ggml_tensor * miss_mask = nullptr;  // I32 [n_expert_used_max, max_batch] in host memory, hybrid only
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
@@ -340,7 +347,13 @@ struct llama_moe_cache::impl {
                 g.n_slots = 0;
                 continue;
             }
-            g.lru.init(model.layers.size(), n_expert, g.n_slots);
+            // whole layers never copy host experts during prefill, at most 5 per group so the LRU pool still helps decode
+            constexpr int32_t max_full = 5;
+            g.n_full = std::min(max_full, g.n_slots / n_expert);
+            g.n_full = std::min(g.n_full, (int32_t) g.layers.size() - 1);
+            // the rest of the slots are an LRU on the remaining layers
+            g.lru.slot_base = g.n_full*n_expert;
+            g.lru.init(model.layers.size(), n_expert, g.n_slots - g.lru.slot_base);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size()*(hybrid_mode ? 2 : 1);
         }
@@ -383,9 +396,11 @@ struct llama_moe_cache::impl {
                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
             }
-            for (int32_t il : g.layers) {
+            for (size_t j = 0; j < g.layers.size(); ++j) {
+                const int32_t il = g.layers[j];
                 layer & l = layers[il];
                 l.ig      = (int32_t) ig;
+                l.full    = (int32_t) j < g.n_full;
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
                 // in hybrid mode the misses read the zero slot at the end of the bank, so the views include it
                 const int64_t n_view = g.n_slots + (hybrid_mode ? 1 : 0);
@@ -408,6 +423,32 @@ struct llama_moe_cache::impl {
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
         }
 
+        // log the bank layout: whole layers plus the LRU pool of the remaining layers
+        {
+            size_t n_moe = 0;
+            size_t n_full = 0;
+            size_t n_partial = 0;
+            for (size_t il = 0; il < model.layers.size(); ++il) {
+                if (llama_moe_cache_layer_experts(model.layers[il]).empty()) {
+                    continue;
+                }
+                n_moe++;
+                if (layers[il].full) {
+                    n_full++;
+                } else if (layers[il].ig >= 0) {
+                    n_partial++;
+                }
+            }
+            LLAMA_LOG_INFO("%s: %zu of %zu MoE layers have a bank: %zu whole layers, %zu layers share the LRU pool\n",
+                __func__, n_full + n_partial, n_moe, n_full, n_partial);
+            for (const group & g : groups) {
+                if (g.n_slots == 0) {
+                    continue;
+                }
+                LLAMA_LOG_INFO("%s: group %td: %zu layers, %d whole layers, %d LRU slots for %zu layers\n",
+                    __func__, &g - groups.data(), g.layers.size(), g.n_full, g.lru.n_slots, g.layers.size() - g.n_full);
+            }
+        }
         if (model.hparams.no_alloc) {
             // only used to measure the memory use, see llama_context::memory_breakdown
             for (device & d : devices) {
@@ -449,6 +490,7 @@ struct llama_moe_cache::impl {
                     }
                 }
             }
+            prepopulate();
         }
 
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
@@ -492,6 +534,12 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         const layer & l = layers[il];
+        const group & g = groups[l.ig];
+
+        // a whole layer is resident, so it reads the bank for any batch size and never copies the host weights
+        if (l.full) {
+            return n_tokens > 0 ? l.slot_map : nullptr;
+        }
 
         // in hybrid mode the misses are computed on the CPU, so the residency map is always used for small batches
         if (hybrid_mode) {
@@ -499,7 +547,7 @@ struct llama_moe_cache::impl {
         }
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
-        if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+        if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > g.lru.n_slots) {
             return nullptr;
         }
         return l.slot_map;
@@ -548,6 +596,42 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+    }
+
+    // put a deterministic slice of every layer's experts into the bank, so that large batches can copy them from the
+    // keep every expert of the first n_full layers of each group in the bank: those layers never copy host experts
+    // to the device, which removes the per-layer weight copy that serializes the prefill
+    void prepopulate() {
+        if (hybrid_mode) {
+            return;
+        }
+        size_t n_pre = 0;
+        for (group & g : groups) {
+            if (g.n_slots == 0 || g.n_full == 0) {
+                continue;
+            }
+            const int32_t n_expert = g.ref[0]->ne[2];
+            ggml_backend_t backend = devices[g.id].backend;
+            for (int32_t j = 0; j < g.n_full; ++j) {
+                const int32_t il = g.layers[j];
+                int32_t * map = g.lru.slot_map[il];
+                GGML_ASSERT(map != nullptr);
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    map[e] = j*n_expert + e;
+                }
+                for (size_t ip = 0; ip < layers[il].experts.size(); ++ip) {
+                    const ggml_tensor * w = layers[il].experts[ip];
+                    ggml_backend_tensor_set_async(backend, g.banks[ip],
+                            (const uint8_t *) w->data, (size_t) j*n_expert*w->nb[2], (size_t) n_expert*w->nb[2]);
+                }
+                // submit the layer, the staging buffers of the next layer would otherwise pile up
+                ggml_backend_synchronize(backend);
+                n_pre += n_expert;
+            }
+        }
+        LLAMA_LOG_INFO("%s: %zu whole layers resident, %zu experts (%.1f%% of the host experts), %d slots left for the LRU\n",
+            __func__, n_pre/n_expert, n_pre, 100.0*n_pre/((double) layers.size()*n_expert),
+            (int) (groups.empty() ? 0 : groups[0].lru.n_slots));
     }
 
     // one-time upload of the most used experts of each layer into the slots that the residency map assigns to them
@@ -657,6 +741,12 @@ struct llama_moe_cache::impl {
         group & g = groups[l.ig];
 
         GGML_ASSERT(backend == devices[g.id].backend);
+
+        // a whole layer is resident, its slot map is static: no selected experts to read back
+        if (l.full) {
+            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+            return true;
+        }
 
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
