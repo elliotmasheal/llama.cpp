@@ -297,10 +297,26 @@ void * ggml_vk_host_malloc(size_t size) {
         return ptr;
     }
 
-    vk_device dev0 = ggml_vk_get_device(0);
+    return ggml_vk_host_malloc_on_device(ggml_vk_get_device(0), size);
+}
+
+// The pinned memory belongs to one VkDevice: a buffer cannot be used by another device without host import,
+// so callers that copy to a specific device must allocate on that device.
+void * ggml_vk_host_malloc_on_device(const vk_device & device_arg, size_t size) {
+    VK_LOG_MEMORY("ggml_vk_host_malloc_on_device(" << size << ")");
+
+    ggml_vk_instance_init();
+
+    if (vk_instance.multi_device) {
+        return ggml_vk_host_malloc(size);
+    }
+
+    GGML_ASSERT(device_arg != nullptr);
+    vk_device device = device_arg;
+
     vk_buffer buf;
     try {
-        buf = ggml_vk_create_buffer(dev0, size,
+        buf = ggml_vk_create_buffer(device, size,
             {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
              vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
     } catch (vk::SystemError&) {
@@ -316,7 +332,7 @@ void * ggml_vk_host_malloc(size_t size) {
     vk_host_allocation entry;
     entry.base             = buf->ptr;
     entry.size             = size;
-    entry.views[dev0->idx] = buf;
+    entry.views[device->idx] = buf;
 
     std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
     vk_instance.host_allocations.push_back(std::move(entry));

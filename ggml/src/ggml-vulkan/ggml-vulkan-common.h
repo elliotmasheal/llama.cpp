@@ -46,6 +46,7 @@ vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::Memory
 vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size);
 void ggml_vk_destroy_buffer(vk_buffer& buf);
 void * ggml_vk_host_malloc(size_t size);
+void * ggml_vk_host_malloc_on_device(const vk_device & device, size_t size);
 void ggml_vk_host_free(void * ptr);
 void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf, size_t& buf_offset);
 void ggml_vk_ensure_sync_staging_buffer(vk_device& device, size_t size);
@@ -217,6 +218,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
 // backend
 bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer);
+ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_for_device(size_t dev_num);
 void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer);
 void * ggml_backend_vk_buffer_get_base(ggml_backend_buffer_t buffer);
 enum ggml_status ggml_backend_vk_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor);
