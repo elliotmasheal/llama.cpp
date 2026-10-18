@@ -2887,6 +2887,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     // group consecutive experts and copy them together
+    int64_t n_host = 0; // bytes uploaded from the host experts
+    int64_t n_bank = 0; // bytes copied from the device bank
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
             first++;
@@ -2907,7 +2909,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             }
             if (next < e) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                n_host += (e - next)*expert_size;
             }
+            n_bank += n*expert_size;
             e   += n;
             next = e;
         }
@@ -2918,9 +2922,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            n_host += size;
         }
 
         first = last + 1;
+    }
+
+    // diagnostic: GGML_MOE_COPY_TRACE prints the host and bank bytes of the prefill expert copies
+    static const bool trace_copy = getenv("GGML_MOE_COPY_TRACE") != nullptr;
+    if (trace_copy) {
+        fprintf(stderr, "moe_copy: %s host=%.2f MiB bank=%.2f MiB\n", src->name, n_host/1048576.0, n_bank/1048576.0);
     }
 
     return true;

@@ -647,9 +647,60 @@ struct llama_moe_cache::impl {
                 n_pre += n_expert;
             }
         }
-        LLAMA_LOG_INFO("%s: %zu whole layers resident, %zu experts (%.1f%% of the host experts), %d slots left for the LRU\n",
+
+        // [GGML_MOE_CACHE_PREFILL=0 disables] fill the LRU pool with a deterministic slice of the experts of the
+        // layers that share it, so that a prefill copy reads those experts from the bank instead of the host
+        const char * env_prefill = getenv("GGML_MOE_CACHE_PREFILL");
+        const bool prefill_lru = env_prefill == nullptr || atoi(env_prefill) != 0;
+        int32_t n_lru = 0;
+        for (group & g : groups) {
+            if (!prefill_lru || g.n_slots <= g.n_full*g.ref[0]->ne[2] || g.layers.size() <= (size_t) g.n_full) {
+                continue;
+            }
+            const int32_t n_expert   = g.ref[0]->ne[2];
+            const int32_t n_partial  = (int32_t) g.layers.size() - g.n_full;
+            const int32_t lru_slots  = g.n_slots - g.n_full*n_expert;
+            const int32_t quota      = lru_slots / n_partial;
+            const int32_t remainder  = lru_slots % n_partial;
+            ggml_backend_t backend = devices[g.id].backend;
+            int32_t slot = g.lru.slot_base;
+            for (int32_t j = 0; j < n_partial; ++j) {
+                const int32_t il = g.layers[g.n_full + j];
+                const int32_t n_keep = quota + (j < remainder ? 1 : 0);
+                int32_t * map = g.lru.slot_map[il];
+                GGML_ASSERT(map != nullptr);
+                GGML_ASSERT(slot + n_keep <= g.n_slots);
+                for (int32_t k = 0; k < n_keep; ++k) {
+                    int32_t e = j*n_keep + k;
+                    if (e >= n_expert) {
+                        e -= n_expert*(e/n_expert);
+                    }
+                    map[e] = slot + k;
+                    g.lru.key_of[slot + k - g.lru.slot_base] = il*n_expert + e;
+                }
+                for (size_t ip = 0; ip < layers[il].experts.size(); ++ip) {
+                    const ggml_tensor * w = layers[il].experts[ip];
+                    const size_t expert_size = w->nb[2];
+                    for (int32_t k = 0; k < n_keep; ++k) {
+                        int32_t e = j*n_keep + k;
+                        if (e >= n_expert) {
+                            e -= n_expert*(e/n_expert);
+                        }
+                        ggml_backend_tensor_set_async(backend, g.banks[ip],
+                                (const uint8_t *) w->data + (size_t) e*expert_size, (size_t) (slot + k)*expert_size, expert_size);
+                    }
+                }
+                ggml_backend_synchronize(backend);
+                slot += n_keep;
+                n_lru += n_keep;
+            }
+            GGML_ASSERT(slot == g.n_slots);
+        }
+
+        LLAMA_LOG_INFO("%s: %zu whole layers resident, %zu experts (%.1f%% of the host experts), "
+                "%d LRU slots prefilled (%.1f%% of the host experts)\n",
             __func__, n_pre/n_expert, n_pre, 100.0*n_pre/((double) layers.size()*n_expert),
-            (int) (groups.empty() ? 0 : groups[0].lru.n_slots));
+            n_lru, 100.0*n_lru/((double) layers.size()*n_expert));
     }
 
     // one-time upload of the most used experts of each layer into the slots that the residency map assigns to them
