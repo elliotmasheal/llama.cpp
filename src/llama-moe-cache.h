@@ -13,7 +13,8 @@ struct llama_model;
 class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
+    // in hybrid mode the experts that are not resident stay in host memory and are computed on the CPU
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool hybrid = false);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -21,6 +22,15 @@ public:
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+
+    // true if the experts of layer il that are not in the cache are computed on the CPU from the host weights
+    bool hybrid(int32_t il) const;
+
+    // the host I32 mask of layer il for n_tokens tokens, same shape as the selected experts, 1 = not in the cache
+    ggml_tensor * get_miss_mask(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+
+    // counts the experts selected by a large batch, the static residency is built from these counts
+    void count_usage(const ggml_tensor * w, const ggml_tensor * ids, const std::vector<int32_t> & ids_data);
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;

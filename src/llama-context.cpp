@@ -548,8 +548,16 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (params.moe_hybrid && cparams.moe_cache_size == 0) {
+            LLAMA_LOG_WARN("%s: --moe-hybrid requires --moe-cache-mib > 0, ignored\n", __func__);
+        }
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+            // TODO: enable the hybrid CPU branch once its output matches the reference, see bench/moe-baseline/HYBRID-STATUS.md
+            const bool moe_hybrid = false;
+            if (params.moe_hybrid) {
+                LLAMA_LOG_WARN("%s: --moe-hybrid is disabled in this build, using the existing path\n", __func__);
+            }
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, moe_hybrid);
         }
 
         sched_reserve();
@@ -2801,6 +2809,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         st.ids = ids;
+
+        // the static residency of the hybrid mode is built from the routing of the prompt
+        if (lctx->moe_cache) {
+            lctx->moe_cache->count_usage(src, ids, st.ids_data);
+        }
     }
 
     // group consecutive experts and copy them together
@@ -4002,6 +4015,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_hybrid                  =*/ false,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

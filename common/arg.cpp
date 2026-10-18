@@ -2788,6 +2788,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-hybrid"},
+        "small batches compute the MoE experts that are not in the GPU cache on the CPU (requires --moe-cache-mib)",
+        [](common_params & params) {
+            params.moe_hybrid = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_HYBRID"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

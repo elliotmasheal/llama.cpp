@@ -1212,13 +1212,15 @@ struct llm_graph_context {
                    float   post_exp_norm_eps = 1e-5f) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
+    // with hybrid, the misses are computed on the CPU, so the cache is used even if the residency map has no room for them
     ggml_tensor * build_moe_cache_slots(
              ggml_tensor * selected_experts,
              ggml_tensor * up_exps,
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
-                     int   il) const;
+                     int   il,
+                    bool   hybrid = false) const;
 
     //
     // inputs

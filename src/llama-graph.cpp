@@ -2298,13 +2298,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
+    // in hybrid mode the experts of a small batch that are not in the MoE cache are computed on the CPU, exactly
+    // the CPU branch reuses the router weights and the ids of the GPU branch, so it needs the same expert path
+    ggml_tensor * miss_mask = moe_cache != nullptr && !weight_before_ffn ? moe_cache->get_miss_mask(il, n_tokens, n_expert_used) : nullptr;
+    const bool hybrid = miss_mask != nullptr &&
+        gate_up_exps == nullptr && gate_exps != nullptr &&
+        up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr &&
+        up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr &&
+        type_op == LLM_FFN_SILU && gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX &&
+        post_exp_norm == nullptr &&
+        (il < 0 || (hparams.swiglu_clamp_exp[il] <= 1e-6f && n_expert_used == hparams.n_expert_used(il))) &&
+        (hdmd == nullptr || (hdmd->rot.count(up_exps) + hdmd->rot.count(gate_exps) + hdmd->rot.count(down_exps) == 0));
+
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
     // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, hybrid);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * inp = cur;
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2505,6 +2518,42 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_build_forward_expand(gf, moe_out);
     }
 
+    if (hybrid) {
+        // the CPU computes the misses from the host expert tensors, the GPU result holds the cached experts only
+        ggml_tensor * mask = ggml_view_2d(ctx0, miss_mask, n_expert_used, n_tokens, miss_mask->nb[1], 0);
+        cb(mask, "ffn_moe_miss_mask", il);
+
+        ggml_tensor * up_cpu   = ggml_mul_mat_id_mask(ctx0, up_exps,   inp, selected_experts, mask);
+        ggml_tensor * gate_cpu = ggml_mul_mat_id_mask(ctx0, gate_exps, inp, selected_experts, mask);
+        cb(up_cpu,   "ffn_moe_up_cpu",   il);
+        cb(gate_cpu, "ffn_moe_gate_cpu", il);
+
+        ggml_tensor * cur_cpu = ggml_swiglu_split(ctx0, gate_cpu, up_cpu);
+        cb(cur_cpu, "ffn_moe_swiglu_cpu", il);
+
+        cur_cpu = ggml_mul_mat_id_mask(ctx0, down_exps, cur_cpu, selected_experts, mask);
+        cb(cur_cpu, "ffn_moe_down_cpu", il);
+
+        cur_cpu = ggml_mul(ctx0, cur_cpu, weights);
+        cb(cur_cpu, "ffn_moe_weighted_cpu", il);
+
+        ggml_tensor * moe_out_cpu = nullptr;
+        for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+            ggml_tensor * view = ggml_view_2d(ctx0, cur_cpu, n_embd, n_tokens, cur_cpu->nb[2], i*cur_cpu->nb[1]);
+            moe_out_cpu = i == 0 ? view : ggml_add(ctx0, moe_out_cpu, view);
+        }
+        ggml_build_forward_expand(gf, moe_out_cpu);
+
+        moe_out = ggml_add(ctx0, moe_out, moe_out_cpu);
+        ggml_build_forward_expand(gf, moe_out);
+
+        // only the CPU partial sum is copied, the final add runs on the device of the cached experts
+        ggml_backend_t backend = moe_cache->backend(il);
+        if (ggml_backend_supports_op(backend, moe_out)) {
+            ggml_backend_sched_set_tensor_backend(sched, moe_out, backend);
+        }
+    }
+
     if (n_expert_used_il == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
@@ -2521,13 +2570,18 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * gate_exps,
          ggml_tensor * down_exps,
          ggml_tensor * gate_up_exps,
-                 int   il) const {
+                 int   il,
+                bool   hybrid) const {
     if (moe_cache == nullptr) {
         return nullptr;
     }
 
     ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
     if (slot_map == nullptr) {
+        return nullptr;
+    }
+    // in hybrid mode the residency map leaves the misses to the CPU branch, so it may only replace the host experts there
+    if (moe_cache->hybrid(il) && !hybrid) {
         return nullptr;
     }
     for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
