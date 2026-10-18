@@ -60,7 +60,51 @@
 - CPU `MUL_MAT_ID` GEMV 效率（repack 路径 / 线程绑定 / NUMA）；
 - 按层路由偏斜分配 bank 槽位（当前按 host 字节均分）。
 
-## 3. 环境阻塞（待解决）
+## 2.1 Phase B 实现规格（定稿）
+
+### 数据流（每层，仅小 batch；PP 走原路径）
+
+1. host 在 token 边界维护**驻留表** `resident[group][layer][expert] -> slot`（-1 = 未驻留），
+   不随 token 内 ids 变化；slot 总数 = bank 槽位数，最后一个槽是**全零槽**。
+2. 图内：`slots = GET_ROWS(resident_map_layer, ids)`，未驻留 -> 零槽，GPU 分支照旧
+   （`MUL_MAT_ID` 三连 + 加权 + 聚合），零槽贡献 0，**GPU 分支不需要 mask**。
+3. host 回调（读 32B ids 后）为每层写两张 host 小表：`slot_map` 不变式已在 1 完成，
+   另写 `miss_mask`（I32[n_expert_used, n_tokens]）；不做任何专家上传。
+4. CPU 分支：用**原始 host 专家张量** + `ids` + `miss_mask`，通过新的
+   `GGML_OP_MUL_MAT_ID_MASK` 三连跑 gate/up/down（内核按 mask 压缩行表，**不读也不算**
+   被 mask 的行），再加权/聚合，输出 `[n_embd, n_tokens]` 拷回 GPU 与 GPU 分支相加。
+5. 精确正确性：不预测、不投机；miss 由 CPU 用原权重精确计算。
+6. 后台上传只写**当前 token 驻留表未引用**的槽位；token 开始时等待传输 fence，
+   然后把已完成的上传并入驻留表（对下一 token 生效），淘汰只在 token 边界发生。
+
+### 新算子
+
+- `GGML_OP_MUL_MAT_ID_MASK`：`(as, b, ids, mask) -> dst`，mask 为 host I32，shape 同 ids；
+  仅 CPU 实现，其它 backend `supports_op=false`；内核复用现有 `mul_mat_id` 的行表构建，
+  跳过 mask==0 的 (token, slot) 对；dst 先清零，避免未选中槽位残留。
+- `ggml.c/h` 增加构造器与 op 名称；`ggml-cpu` 增加 case；图里通过 `ggml_backend_sched`
+  自动落到 CPU split。
+
+### 代码改动点
+
+| 文件 | 改动 |
+|---|---|
+| `src/llama-moe-cache.{h,cpp}` | 驻留表/LRU → token 边界更新；`copy()` 改为写 slot_map + miss_mask、无关键路径上传；零槽；后台上传队列 |
+| `src/llama-graph.{h,cpp}` | `build_ffn`/`build_moe_ffn` 增加 hybrid 分支（CPU masked 三连 + add），仅小 batch |
+| `ggml/include/ggml.h`, `ggml/src/ggml.c` | 新 op 枚举/构造器/名称 |
+| `ggml/src/ggml-cpu/ggml-cpu.c` | masked 内核 |
+| `src/llama-context.{h,cpp}` | 开关接线（`--moe-hybrid` 或 env），与 `--moe-cache-mib` 复用 |
+
+### 验收
+
+- 正确性：`--temp 0` 输出与 `-ncmoe 27` 基线逐字符一致（同一 prompt/seed）；`test-backend-ops` 新 op CPU 通过。
+- 性能：`-ncmoe 41 --moe-cache-mib 6000 --moe-hybrid` 的 TG > `-ncmoe 27` 基线 14 t/s；
+  期望 25-35 t/s（命中率 65-75%）；PP 不退化（大 batch 走原路径）。
+
+## 3. 环境阻塞（已解决）
+
+本轮已切换到完全权限：`cmake` 配置与 759 个目标编译通过，worktree 二进制可用。
+（受限模式下 `cmake -B` 的探针编译会因沙箱禁止孙进程管道而挂起。）
 
 本会话的受限 shell **无法编译**：`cmake -B` 需要探针编译并捕获编译器输出，
 被沙箱的"孙进程管道"限制挂起（`build.ninja`/`CMakeCache.txt` 均未生成，ninja 空转）。
