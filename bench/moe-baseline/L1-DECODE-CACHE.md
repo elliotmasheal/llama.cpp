@@ -31,10 +31,14 @@ coverage. Nothing doubles the hit rate at a fixed bank size.
 | test | static `-ncmoe 27` | cache `-ncmoe 41 --moe-cache-mib 6144` | delta |
 |---|---:|---:|---:|
 | tg32, `-ub 512` | 18.02 | 24.09 | +33.7% |
-| tg32, `-ub 2048` | 18.97 | 24.91 | +31.3% |
-| pp512, `-ub 512` | 344.5 | 359.0 | +4.2% |
-| pp2048, `-ub 2048` | 575.0 | 578.75 | +0.7% |
+| tg32, `-ub 2048` | 18.97 | 24.79 | +30.7% |
+| pp512, `-ub 512` | 344.5 | 358.0 | +3.9% |
+| pp2048, `-ub 2048` | 576.0 | 578.3 | +0.4% |
 | pp2048, `-ub 512` | 163.9 | 59.0 | -64% |
+
+At `--moe-cache-mib 4096` the whole-layer reservation is capped by the smaller bank: tg32 22.6 and
+pp512 328 (safety rule: leave at least 1/5 of the slots to the LRU pool). 4096 is therefore below the
+pp512 target; 6144 is the recommended size.
 
 TG >= 23, PP512 >= 340 and pp2048 ub2048 are met. pp2048 with `-ub 512` regresses: the whole-layer
 residency makes the scheduler's copy-buffer reuse pattern alternate, so the wait before each host

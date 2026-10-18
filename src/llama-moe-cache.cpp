@@ -349,8 +349,13 @@ struct llama_moe_cache::impl {
             }
             // whole layers never copy host experts during prefill, at most 5 per group so the LRU pool still helps decode
             constexpr int32_t max_full = 5;
-            g.n_full = std::min(max_full, g.n_slots / n_expert);
-            g.n_full = std::min(g.n_full, (int32_t) g.layers.size() - 1);
+            int32_t n_full = std::min(max_full, g.n_slots / n_expert);
+            n_full = std::min(n_full, (int32_t) g.layers.size() - 1);
+            // do not starve the LRU pool: a bank that is mostly whole layers is worse than the plain static placement
+            while (n_full > 0 && g.n_slots - n_full*n_expert < g.n_slots/5) {
+                n_full--;
+            }
+            g.n_full = n_full;
             // the rest of the slots are an LRU on the remaining layers
             g.lru.slot_base = g.n_full*n_expert;
             g.lru.init(model.layers.size(), n_expert, g.n_slots - g.lru.slot_base);
