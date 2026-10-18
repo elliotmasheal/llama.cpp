@@ -1293,6 +1293,13 @@ struct test_case {
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
+    // Optional exact check of the final output against a host-side reference.
+    virtual bool check_output(ggml_backend_t backend, ggml_tensor * out) {
+        GGML_UNUSED(backend);
+        GGML_UNUSED(out);
+        return true;
+    }
+
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
 
@@ -1558,9 +1565,11 @@ struct test_case {
                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                                fused_nodes_to_verify.size());
 
+        const bool ref_ok = check_output(backend1, out);
+
         // Create test result
-        bool        test_passed = ud.ok && cmp_ok;
-        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        bool        test_passed = ud.ok && cmp_ok && ref_ok;
+        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : !ref_ok ? "reference mismatch" : "test failed");
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -5709,6 +5718,119 @@ struct test_mul_mat_id_shared : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, 8);
+    }
+};
+
+// GGML_OP_MUL_MAT_ID_MASK
+struct test_mul_mat_id_mask : public test_case {
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int mask_mode; // 0 = random, 1 = all zero, 2 = all one
+
+    ggml_tensor * as   = nullptr;
+    ggml_tensor * b    = nullptr;
+    ggml_tensor * ids  = nullptr;
+    ggml_tensor * mask = nullptr;
+
+    test_mul_mat_id_mask(int n_mats = 8, int n_used = 2, int64_t m = 32, int64_t n = 16, int64_t k = 64,
+            int mask_mode = 0)
+        : n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), mask_mode(mask_mode) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_mats, n_used, m, n, k, mask_mode);
+    }
+
+    std::string op_desc(ggml_tensor *) override {
+        return "MUL_MAT_ID_MASK";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, n_mats);
+        ggml_set_name(as, "as");
+        b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_set_name(b, "b");
+        ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+        mask = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * out = ggml_mul_mat_id_mask(ctx, as, b, ids, mask);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            std::vector<int32_t> data(t->ne[0]);
+            const bool is_mask = strcmp(t->name, "mask") == 0;
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                for (int64_t i = 0; i < t->ne[0]; i++) {
+                    if (!is_mask) {
+                        data[i] = (int32_t) (rng() % n_mats);
+                    } else if (mask_mode == 0) {
+                        data[i] = (int32_t) (rng() % 2);
+                    } else {
+                        data[i] = mask_mode == 2 ? 1 : 0;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+
+    bool check_output(ggml_backend_t backend, ggml_tensor * out) override {
+        GGML_UNUSED(backend);
+
+        std::vector<float>   h_as(k*m*n_mats);
+        std::vector<float>   h_b(k*n_used*n);
+        std::vector<int32_t> h_ids(n_used*n);
+        std::vector<int32_t> h_mask(n_used*n);
+        std::vector<float>   h_out(m*n_used*n);
+        ggml_backend_tensor_get(as,   h_as.data(),   0, h_as.size()*sizeof(float));
+        ggml_backend_tensor_get(b,    h_b.data(),    0, h_b.size()*sizeof(float));
+        ggml_backend_tensor_get(ids,  h_ids.data(),  0, h_ids.size()*sizeof(int32_t));
+        ggml_backend_tensor_get(mask, h_mask.data(), 0, h_mask.size()*sizeof(int32_t));
+        ggml_backend_tensor_get(out,  h_out.data(),  0, h_out.size()*sizeof(float));
+
+        double  max_diff    = 0.0;
+        int64_t n_bad_zero  = 0;
+        for (int64_t t = 0; t < n; t++) {
+            for (int64_t s = 0; s < n_used; s++) {
+                const int64_t e = h_ids[t*n_used + s];
+                const bool masked = h_mask[t*n_used + s] == 0;
+                for (int64_t r = 0; r < m; r++) {
+                    double ref = 0.0;
+                    if (!masked) {
+                        for (int64_t c = 0; c < k; c++) {
+                            ref += (double) h_as[c + r*k + e*k*m] * h_b[c + s*k + t*k*n_used];
+                        }
+                    }
+                    const double got = h_out[r + s*m + t*m*n_used];
+                    if (masked) {
+                        n_bad_zero += got != 0.0f;
+                    } else {
+                        max_diff = std::max(max_diff, (double) fabsf((float) (got - ref)));
+                    }
+                }
+            }
+        }
+
+        const bool ok = n_bad_zero == 0 && max_diff < 1e-4;
+        if (!ok) {
+            printf("[MUL_MAT_ID_MASK] reference mismatch: masked entries != 0: %" PRId64 ", max diff: %.9f ", n_bad_zero, max_diff);
+        }
+        return ok;
     }
 };
 
@@ -11027,6 +11149,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
         }
     }
+
+    // masked MoE matmul: random mask, all-zero mask and all-one mask
+    for (int mask_mode : {0, 1, 2}) {
+        test_cases.emplace_back(new test_mul_mat_id_mask(8, 2, 32, 16, 64, mask_mode));
+    }
+    test_cases.emplace_back(new test_mul_mat_id_mask(4, 4, 64, 9, 128, 0));
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));

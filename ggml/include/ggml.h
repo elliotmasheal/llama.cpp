@@ -601,6 +601,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MUL_MAT_ID_MASK,
+
         GGML_OP_COUNT,
     };
 
@@ -1507,6 +1509,14 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // like ggml_mul_mat_id, but (token, slot) pairs with mask == 0 are not computed and are set to 0
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * mask);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

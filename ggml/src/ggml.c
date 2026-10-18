@@ -1110,9 +1110,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MUL_MAT_ID_MASK",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,9 +1227,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "X[i]*Y*mask",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3432,6 +3436,26 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_mul_mat_id_mask
+
+struct ggml_tensor * ggml_mul_mat_id_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * mask) {
+    GGML_ASSERT(mask->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->ne[0] == ids->ne[0] && mask->ne[1] == ids->ne[1]);
+    GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_mul_mat_id(ctx, as, b, ids);
+
+    result->op     = GGML_OP_MUL_MAT_ID_MASK;
+    result->src[3] = mask;
 
     return result;
 }

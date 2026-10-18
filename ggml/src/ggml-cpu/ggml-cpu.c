@@ -1553,7 +1553,8 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
+              struct ggml_tensor * dst,
+        const struct ggml_tensor * mask) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1643,6 +1644,11 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
+    if (mask != NULL && ith == 0) {
+        // masked pairs are skipped by the row table and must read as exactly 0
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
@@ -1650,6 +1656,13 @@ static void ggml_compute_forward_mul_mat_id(
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
+                if (mask != NULL) {
+                    const int32_t mv = *(const int32_t *) ((const char *) mask->data + iid1*mask->nb[1] + id*mask->nb[0]);
+                    if (mv == 0) {
+                        continue;
+                    }
+                }
+
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(i02 >= 0 && i02 < n_as);
@@ -1868,7 +1881,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
-                ggml_compute_forward_mul_mat_id(params, tensor);
+                ggml_compute_forward_mul_mat_id(params, tensor, NULL);
+            } break;
+        case GGML_OP_MUL_MAT_ID_MASK:
+            {
+                ggml_compute_forward_mul_mat_id(params, tensor, tensor->src[3]);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2359,6 +2376,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID_MASK:
         case GGML_OP_OUT_PROD:
         case GGML_OP_SET_ROWS:
             {
@@ -2891,6 +2909,7 @@ struct ggml_cplan ggml_graph_plan(
                         cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
                 case GGML_OP_MUL_MAT_ID:
+                case GGML_OP_MUL_MAT_ID_MASK:
                     {
                         cur = 0;
                         const struct ggml_tensor * src0 = node->src[0];
