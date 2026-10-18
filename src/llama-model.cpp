@@ -1587,6 +1587,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+#ifdef _WIN32
+    // Windows reclaims mapped file pages after load, so a resident copy is much faster when it fits
+    if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO && !ml.no_alloc) {
+        bool auto_resident = true;
+        const char * env = getenv("LLAMA_AUTO_RESIDENT");
+        if (env != nullptr && atoi(env) == 0) {
+            auto_resident = false;
+        }
+
+        size_t free_ram  = 0;
+        size_t total_ram = 0;
+        ggml_backend_dev_t cpu_dev0 = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev0 != nullptr) {
+            ggml_backend_dev_memory(cpu_dev0, &free_ram, &total_ram);
+        }
+
+        const size_t need = ml.n_bytes + ml.n_bytes/4 + (size_t) (1ull << 30);
+        if (auto_resident && free_ram > need) {
+            ml.use_mmap = false;
+            LLAMA_LOG_INFO("%s: model fits in RAM (%.1f of %.1f GiB available), loading it resident; set LLAMA_AUTO_RESIDENT=0 to keep mmap\n",
+                    __func__, free_ram/1024.0/1024.0/1024.0, total_ram/1024.0/1024.0/1024.0);
+        } else {
+            LLAMA_LOG_DEBUG("%s: keeping mmap, resident copy needs %.1f GiB, %.1f GiB available\n",
+                    __func__, need/1024.0/1024.0/1024.0, free_ram/1024.0/1024.0/1024.0);
+        }
+    }
+#endif
+
     // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
     if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
         for (const auto & dev : devices) {

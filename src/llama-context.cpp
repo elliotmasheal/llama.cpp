@@ -16,15 +16,81 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 
+#if defined(_WIN32)
+    #define WIN32_LEAN_AND_MEAN
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+    #include <psapi.h>
+#endif
+
 //
 // llama_context
 //
+
+// LLAMA_FAULT_DIAG: page-fault/working-set deltas per phase, for mmap residency diagnostics
+static bool llama_fault_diag_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("LLAMA_FAULT_DIAG");
+        enabled = env != nullptr && atoi(env) != 0 ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+#if defined(_WIN32)
+typedef BOOL (WINAPI * llama_process_memory_info_fn)(HANDLE, PPROCESS_MEMORY_COUNTERS_EX, DWORD);
+
+static llama_process_memory_info_fn llama_process_memory_info() {
+    static llama_process_memory_info_fn fn = []() -> llama_process_memory_info_fn {
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        auto * p = (llama_process_memory_info_fn) (void *) GetProcAddress(k32, "K32GetProcessMemoryInfo");
+        if (p == nullptr) {
+            HMODULE psapi = LoadLibraryA("psapi.dll");
+            if (psapi != nullptr) {
+                p = (llama_process_memory_info_fn) (void *) GetProcAddress(psapi, "GetProcessMemoryInfo");
+            }
+        }
+        return p;
+    }();
+    return fn;
+}
+#endif
+
+static void llama_fault_diag(const char * phase, int64_t n_tokens) {
+    if (!llama_fault_diag_enabled()) {
+        return;
+    }
+#if defined(_WIN32)
+    auto * fn = llama_process_memory_info();
+    if (fn == nullptr) {
+        return;
+    }
+    PROCESS_MEMORY_COUNTERS_EX pmc = {};
+    if (!fn(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return;
+    }
+    static uint64_t faults_last = 0;
+    const uint64_t faults = (uint64_t) pmc.PageFaultCount;
+    fprintf(stderr, "fault_diag: %-12s tokens=%6lld faults=+%-9llu total=%-10llu ws=%.0f MiB private=%.0f MiB\n",
+            phase, (long long) n_tokens,
+            (unsigned long long) (faults - faults_last), (unsigned long long) faults,
+            (double) pmc.WorkingSetSize / (1024.0*1024.0), (double) pmc.PrivateUsage / (1024.0*1024.0));
+    faults_last = faults;
+#else
+    GGML_UNUSED(phase);
+    GGML_UNUSED(n_tokens);
+#endif
+}
 
 // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
 // without this check, an arch that skips the transform helpers loads and computes wrong results
@@ -577,6 +643,8 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    llama_fault_diag("load_done", 0);
 }
 
 llama_context::~llama_context() {
@@ -4638,6 +4706,7 @@ int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
     const int ret = ctx->decode(batch);
+    llama_fault_diag("decode", batch.n_tokens);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
@@ -4714,7 +4783,11 @@ void llama_opt_epoch(
 int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_ext * batch) {
     switch (type) {
         case LLAMA_PROCESS_TYPE_ENCODE: return ctx->encode(*batch);
-        case LLAMA_PROCESS_TYPE_DECODE: return ctx->decode(*batch);
+        case LLAMA_PROCESS_TYPE_DECODE: {
+            const int32_t ret = ctx->decode(*batch);
+            llama_fault_diag("decode", (int64_t) batch->tokens.size());
+            return ret;
+        }
     }
     return -1;
 }
