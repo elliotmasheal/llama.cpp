@@ -12,6 +12,31 @@
 
 以Qwen3.6 35B A3B Q4量化为测试模型(F盘LLM目录下：Ornith-1.5-35B-Q4_K_M.gguf)，VULKAN Backend下在8G RX 6700S显卡硬件基础上实现PP1000+/TG200+的第一阶段目标(这是一个肯定可以且必须达到的目标，但是需要你综合多方面知识并不断深入技术底层，因此需要你不畏艰难、不断探索，基于实际PP和TG过程在不同阶段的时间消耗现状，逐项优化甚至是打破传统，另辟蹊径，最终完成第一阶段的优化目标)。
 
+## 当前最优配置与实测基线
+
+本机：RX 6700S 8 GiB（`-dev Vulkan1`），Ryzen 7 7735HS，39.2 GiB RAM。默认加载模式在 Windows 上是
+AUTO -> resident（整模型读入内存；如需 mmap 设 `LLAMA_AUTO_RESIDENT=0`）。以下为 merge 后的 master 实测
+（llama-bench，`-fa on -t 5`，交叉 r=3）：
+
+| 配置 | 命令要点 | pp512 | tg32 | pp2048 ub2048 |
+|---|---|---:|---:|---:|
+| static（默认推荐，显存省） | `-ncmoe 27` | 359-363 | 18.7-19.1 | 578 |
+| cache（TG 最优） | `-ncmoe 41 --moe-cache-mib 6144 -ub 2048` | 383-387 | 26.2-26.5 | 578-590 |
+
+- 两条命令都加：`-m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on -t 5`；
+  benchmark 用 `-p 512 -n 32`（cache 再加 `-p 2048 -n 0 -ub 2048`）。
+- `--moe-cache-mib 6144` 是这张卡的上限（6400 起会崩到 ~57 t/s）；bank 峰值 device 8028 MiB / 总 8176 MiB。
+- 现状结论：PP 被 host->device 上传限制（10.4-8.0 GiB/eval，实测 H2D 天花板 13.9 GB/s，已用到 96%），
+  且 MoE 层间依赖链（routing 依赖上一层 MoE 输出）使调度层重叠无效；TG 由 decode 的 MoE cache 命中决定。
+  已达成 PP 386 / TG 26.4，PP1000/TG200 尚未达成；继续冲 PP 需要更大显存、MUL_MAT_ID GEMM 或换权重访问范式。
+- 证据与设计记录：`bench/moe-baseline/` 下的 `PROGRESS.md`、`BASELINE.md`、`PROFILE-*.md`、
+  `L4-HOST-WEIGHT-PIPELINE.md`、`L5-PREFILL-UPLOAD-FLOOR.md`、`L6-PREFILL-RESIDENT.md`、
+  `L8-H2D-AND-BANK-DIAGNOSIS.md`、`L9-OVERLAP-BLOCKED-BY-IDS-DRAIN.md`、`L10-DEPENDENCY-CHAIN-LIMIT.md`。
+- 回归基线（改 Vulkan/调度/GEMM 后必跑）：`test-backend-ops -o MUL_MAT_ID -b CPU` = 945/945、
+  `-o MUL_MAT_ID -b Vulkan1` = 939/939、`-o MUL_MAT -b Vulkan1` = 2275/2275、
+  `-o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332。
+
+
 ## 现成基础设施（不要重复造）
 
 - MoE 专家 GPU cache：`src/llama-moe-cache.{h,cpp}`；开关 `--moe-cache-mib N`（`cparams.moe_cache_size`）。图接线：`build_moe_cache_slots()` 与 `src/llama-graph.{h,cpp}` 里的 `moe_cache` 字段。
