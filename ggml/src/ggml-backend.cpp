@@ -990,6 +990,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
+    ggml_backend_sched_pre_split_callback callback_split_pre;
+    void * callback_split_pre_user_data;
+
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
@@ -2060,6 +2063,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         t_copy += ggml_time_us() - t1;
 
+        // [deferred copies] the caller can wait for a deferred batch that this split consumes
+        if (sched->callback_split_pre != NULL) {
+            sched->callback_split_pre(split_backend, &split->graph, sched->callback_split_pre_user_data);
+        }
+
         if (!sched->callback_eval) {
             const bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
             const int64_t t2 = ggml_time_us();
@@ -2323,6 +2331,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_pre_split_callback(ggml_backend_sched_t sched, ggml_backend_sched_pre_split_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_split_pre = callback;
+    sched->callback_split_pre_user_data = user_data;
 }
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {

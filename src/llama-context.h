@@ -65,6 +65,9 @@ struct llama_context {
 
     ggml_backend_sched_t get_sched() const;
 
+    // the MoE expert cache, nullptr when disabled
+    llama_moe_cache * get_moe_cache() const;
+
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;
