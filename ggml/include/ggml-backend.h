@@ -380,6 +380,10 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // Set a callback to be called right before each split is submitted to its backend
+    typedef void (*ggml_backend_sched_pre_split_callback)(ggml_backend_t backend, struct ggml_cgraph * graph, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_pre_split_callback(ggml_backend_sched_t sched, ggml_backend_sched_pre_split_callback callback, void * user_data);
+
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 

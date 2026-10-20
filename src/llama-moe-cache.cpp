@@ -231,6 +231,13 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> ids;
     std::vector<moe_cache_lru::fill> fills;
 
+    // [LLAMA_MOE_DEFER_UPLOAD] last expert tensor of a layer uploaded as a deferred batch
+    const ggml_tensor * deferred_bank = nullptr;
+    ggml_backend_t deferred_backend = nullptr;
+    size_t n_deferred_bytes  = 0;
+    size_t n_deferred_waits  = 0;
+    size_t n_deferred_missed = 0;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -764,6 +771,24 @@ struct llama_moe_cache::impl {
             __func__, (long long) n_uploaded_total, stats_hybrid.bytes/1024.0/1024.0);
     }
 
+    bool wait_deferred(ggml_backend_t backend, ggml_cgraph * graph) {
+        if (deferred_bank == nullptr || deferred_backend != backend) {
+            return false;
+        }
+        const int n_nodes = ggml_graph_n_nodes(graph);
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node->op == GGML_OP_MUL_MAT_ID &&
+                (node->src[0] == deferred_bank || node->src[0]->view_src == deferred_bank)) {
+                ggml_backend_wait_deferred(backend);
+                deferred_bank = nullptr;
+                n_deferred_waits++;
+                return true;
+            }
+        }
+        return false;
+    }
+
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
@@ -804,6 +829,13 @@ struct llama_moe_cache::impl {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
+        }
+
+        // a pending batch must have been consumed by the previous layer, otherwise fall back to a full wait
+        if (deferred_bank != nullptr) {
+            ggml_backend_synchronize(backend);
+            deferred_bank = nullptr;
+            n_deferred_missed++;
         }
         const int32_t il = it->second;
         const layer & l = layers[il];
@@ -885,19 +917,33 @@ struct llama_moe_cache::impl {
         }
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+        // with LLAMA_MOE_DEFER_UPLOAD the last expert tensor goes to a deferred batch that overlaps the
+        // gate/up compute of this layer and is waited only by the split that consumes it
+        static const char * env_defer = getenv("LLAMA_MOE_DEFER_UPLOAD");
+        static const bool defer_upload = env_defer != nullptr && atoi(env_defer) != 0;
         size_t bytes = 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * bank = g.banks[ip];
             const size_t expert_size = w->nb[2];
+            const bool deferred = defer_upload && l.experts.size() > 1 && ip + 1 == l.experts.size();
             for (size_t i = 0; i < fills.size();) {
                 size_t n = 1;
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                if (deferred) {
+                    ggml_backend_set_tensor_async_deferred(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                    n_deferred_bytes += n*expert_size;
+                } else {
+                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                }
                 bytes += n*expert_size;
                 i += n;
+            }
+            if (deferred && !fills.empty()) {
+                deferred_bank    = bank;
+                deferred_backend = backend;
             }
         }
 
@@ -913,6 +959,10 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
+        if (n_deferred_bytes > 0 || n_deferred_waits > 0 || n_deferred_missed > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: deferred upload: bytes = %.2f MiB, waits = %zu, missed = %zu\n",
+                n_deferred_bytes/1024.0/1024.0, n_deferred_waits, n_deferred_missed);
+        }
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {
@@ -972,6 +1022,10 @@ void llama_moe_cache::count_usage(const ggml_tensor * w, const ggml_tensor * ids
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
     return pimpl->copy(backend, src, dst, graph);
+}
+
+bool llama_moe_cache::wait_deferred(ggml_backend_t backend, ggml_cgraph * graph) {
+    return pimpl->wait_deferred(backend, graph);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {

@@ -41,6 +41,9 @@ public:
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
+    // if a deferred upload batch is pending and this split consumes it, wait for it before the compute
+    bool wait_deferred(ggml_backend_t backend, ggml_cgraph * graph);
+
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
