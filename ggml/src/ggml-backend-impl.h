@@ -154,6 +154,11 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) deferred host->device copies: they signal a separate semaphore and are only waited
+        // by a compute submitted after wait_deferred
+        void (*set_tensor_async_deferred)(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+        void (*wait_deferred)             (ggml_backend_t backend);
     };
 
     struct ggml_backend {
