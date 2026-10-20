@@ -5535,6 +5535,8 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
         ci.setPNext(&tci);
         ctx->transfer_semaphore.s = ctx->device->device.createSemaphore(ci);
         ctx->transfer_semaphore.value = 0;
+        ctx->transfer_semaphore_deferred.s = ctx->device->device.createSemaphore(ci);
+        ctx->transfer_semaphore_deferred.value = 0;
 
         ctx->transfer_cmd_pool.init(ctx->device, ctx->device->transfer_queue.get());
     }
@@ -5874,9 +5876,25 @@ vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
         ggml_vk_ctx_begin(ctx->device, result);
     }
 
+    bool waited_a = false;
+    bool waited_b = false;
     if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
         result->s->wait_semaphores.push_back(ctx->transfer_semaphore);
         ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+        waited_a = true;
+    }
+    if (ctx->device->async_use_transfer_queue && ctx->wait_deferred_pending) {
+        if (ctx->transfer_semaphore_deferred_last_submitted < ctx->transfer_semaphore_deferred.value) {
+            result->s->wait_semaphores.push_back(ctx->transfer_semaphore_deferred);
+            ctx->transfer_semaphore_deferred_last_submitted = ctx->transfer_semaphore_deferred.value;
+            waited_b = true;
+        }
+        ctx->wait_deferred_pending = false;
+    }
+    static const bool log_waits = getenv("GGML_VK_LOG_WAITS") != nullptr;
+    if (log_waits) {
+        fprintf(stderr, "vk_wait: compute ctx waits A=%d B=%d (A_val=%llu B_val=%llu)\n", (int) waited_a, (int) waited_b,
+                (unsigned long long) ctx->transfer_semaphore.value, (unsigned long long) ctx->transfer_semaphore_deferred.value);
     }
 
     return result;
@@ -5896,24 +5914,61 @@ vk_context ggml_vk_get_transfer_ctx(ggml_backend_vk_context * ctx) {
     return result;
 }
 
+vk_context ggml_vk_get_transfer_ctx_deferred(ggml_backend_vk_context * ctx) {
+    vk_context result;
+    if (!ctx->transfer_ctx_deferred.expired()) {
+        result = ctx->transfer_ctx_deferred.lock();
+    } else {
+        result = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
+
+        ctx->transfer_ctx_deferred = result;
+        ggml_vk_ctx_begin(ctx->device, result);
+    }
+
+    return result;
+}
+
 bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx) {
-    if (!ctx->device->async_use_transfer_queue || ctx->transfer_ctx.expired()) {
+    if (!ctx->device->async_use_transfer_queue) {
         return false;
     }
 
-    vk_context cpy_ctx = ctx->transfer_ctx.lock();
-    ggml_vk_ctx_end(cpy_ctx);
+    bool submitted = false;
 
-    for (auto& cpy : cpy_ctx->in_memcpys) {
-        memcpy(cpy.dst, cpy.src, cpy.n);
+    if (!ctx->transfer_ctx.expired()) {
+        vk_context cpy_ctx = ctx->transfer_ctx.lock();
+        ggml_vk_ctx_end(cpy_ctx);
+
+        for (auto& cpy : cpy_ctx->in_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+
+        ctx->transfer_semaphore.value++;
+        cpy_ctx->seqs.back().back().signal_semaphores.push_back(ctx->transfer_semaphore);
+
+        ggml_vk_submit(cpy_ctx, {});
+        ctx->transfer_ctx.reset();
+        submitted = true;
     }
 
-    ctx->transfer_semaphore.value++;
-    cpy_ctx->seqs.back().back().signal_semaphores.push_back(ctx->transfer_semaphore);
+    // the deferred batch is submitted on the same queue but signals its own semaphore
+    if (!ctx->transfer_ctx_deferred.expired()) {
+        vk_context cpy_ctx = ctx->transfer_ctx_deferred.lock();
+        ggml_vk_ctx_end(cpy_ctx);
 
-    ggml_vk_submit(cpy_ctx, {});
-    ctx->transfer_ctx.reset();
-    return true;
+        for (auto& cpy : cpy_ctx->in_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+
+        ctx->transfer_semaphore_deferred.value++;
+        cpy_ctx->seqs.back().back().signal_semaphores.push_back(ctx->transfer_semaphore_deferred);
+
+        ggml_vk_submit(cpy_ctx, {});
+        ctx->transfer_ctx_deferred.reset();
+        submitted = true;
+    }
+
+    return submitted;
 }
 
 size_t ggml_vk_align_size(size_t width, size_t align) {
@@ -13033,6 +13088,7 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->compute_cmd_pool.destroy(ctx->device->device);
     if (ctx->device->async_use_transfer_queue) {
         ctx->device->device.destroySemaphore(ctx->transfer_semaphore.s);
+    ctx->device->device.destroySemaphore(ctx->transfer_semaphore_deferred.s);
 
         ctx->transfer_cmd_pool.destroy(ctx->device->device);
     }
@@ -13331,8 +13387,8 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
     return &ctx->device->buffer_type;
 }
 
-static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
-                                                size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+static void ggml_backend_vk_set_tensor_2d_async_impl(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
+                                                size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data, bool deferred) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || ggml_backend_vk_buft_is_host(tensor->buffer->buft)) && "unsupported buffer type");
@@ -13345,7 +13401,10 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
     vk_context cpy_ctx;
 
-    if (ctx->device->async_use_transfer_queue) {
+    static const bool deferred_enabled = getenv("GGML_VK_DEFERRED_COPIES") != nullptr;
+    if (deferred && deferred_enabled && ctx->device->async_use_transfer_queue) {
+        cpy_ctx = ggml_vk_get_transfer_ctx_deferred(ctx);
+    } else if (ctx->device->async_use_transfer_queue) {
         cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
     } else {
         cpy_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -13391,7 +13450,22 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
 static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_async(" << size << ")");
-    ggml_backend_vk_set_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
+    ggml_backend_vk_set_tensor_2d_async_impl(backend, tensor, data, offset, size, 1, size, size, false);
+}
+
+static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
+                                                size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_backend_vk_set_tensor_2d_async_impl(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data, false);
+}
+
+static void ggml_backend_vk_set_tensor_async_deferred(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    VK_LOG_DEBUG("ggml_backend_vk_set_tensor_async_deferred(" << size << ")");
+    ggml_backend_vk_set_tensor_2d_async_impl(backend, tensor, data, offset, size, 1, size, size, true);
+}
+
+static void ggml_backend_vk_wait_deferred(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ctx->wait_deferred_pending = true;
 }
 
 static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
@@ -15306,6 +15380,8 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .event_record            = */ ggml_backend_vk_event_record,
     /* .event_wait              = */ ggml_backend_vk_event_wait,
     /* .graph_optimize          = */ ggml_vk_graph_optimize,
+    /* .set_tensor_async_deferred = */ ggml_backend_vk_set_tensor_async_deferred,
+    /* .wait_deferred           = */ ggml_backend_vk_wait_deferred,
 };
 
 static ggml_guid_t ggml_backend_vk_guid() {

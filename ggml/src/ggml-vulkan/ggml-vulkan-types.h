@@ -1257,6 +1257,12 @@ struct ggml_backend_vk_context {
     vk_semaphore transfer_semaphore;
     uint64_t transfer_semaphore_last_submitted {};
 
+    // [GGML_VK_DEFERRED_COPIES] second transfer batch, signaled separately and only waited on demand
+    vk_context_ref transfer_ctx_deferred;
+    vk_semaphore transfer_semaphore_deferred {};
+    uint64_t transfer_semaphore_deferred_last_submitted {};
+    bool wait_deferred_pending {};
+
     std::vector<vk_context_ref> tensor_ctxs;
 
     std::vector<vk::DescriptorPool> descriptor_pools;

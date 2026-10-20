@@ -402,6 +402,27 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
     return ggml_backend_buft_get_max_size(ggml_backend_get_default_buffer_type(backend));
 }
 
+void ggml_backend_set_tensor_async_deferred(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    GGML_ASSERT(backend != NULL);
+    if (backend->iface.set_tensor_async_deferred != NULL) {
+        backend->iface.set_tensor_async_deferred(backend, tensor, data, offset, size);
+        return;
+    }
+    // no deferred support: a normal async copy is waited by the next compute, which is still correct
+    if (backend->iface.set_tensor_async != NULL) {
+        backend->iface.set_tensor_async(backend, tensor, data, offset, size);
+        return;
+    }
+    ggml_backend_tensor_set(tensor, data, offset, size);
+}
+
+void ggml_backend_wait_deferred(ggml_backend_t backend) {
+    GGML_ASSERT(backend != NULL);
+    if (backend->iface.wait_deferred != NULL) {
+        backend->iface.wait_deferred(backend);
+    }
+}
+
 void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
