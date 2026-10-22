@@ -384,6 +384,11 @@ extern "C" {
     typedef void (*ggml_backend_sched_pre_split_callback)(ggml_backend_t backend, struct ggml_cgraph * graph, void * user_data);
     GGML_API void                 ggml_backend_sched_set_pre_split_callback(ggml_backend_sched_t sched, ggml_backend_sched_pre_split_callback callback, void * user_data);
 
+    // Set a callback to be called right after each split is computed and before its event is recorded
+    // the backend queue is still open, so the callback can add work that the split submission carries
+    typedef void (*ggml_backend_sched_post_split_callback)(ggml_backend_t backend, struct ggml_cgraph * graph, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_post_split_callback(ggml_backend_sched_t sched, ggml_backend_sched_post_split_callback callback, void * user_data);
+
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 

@@ -993,6 +993,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_pre_split_callback callback_split_pre;
     void * callback_split_pre_user_data;
 
+    ggml_backend_sched_post_split_callback callback_split_post;
+    void * callback_split_post_user_data;
+
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
@@ -2111,6 +2114,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // the backend queue is still open here, work added by the callback rides the split submission
+        if (sched->callback_split_post != NULL) {
+            sched->callback_split_post(split_backend, &split->graph, sched->callback_split_post_user_data);
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
@@ -2337,6 +2345,12 @@ void ggml_backend_sched_set_pre_split_callback(ggml_backend_sched_t sched, ggml_
     GGML_ASSERT(sched);
     sched->callback_split_pre = callback;
     sched->callback_split_pre_user_data = user_data;
+}
+
+void ggml_backend_sched_set_post_split_callback(ggml_backend_sched_t sched, ggml_backend_sched_post_split_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_split_post = callback;
+    sched->callback_split_post_user_data = user_data;
 }
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
