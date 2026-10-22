@@ -10,6 +10,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-exec.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -2860,6 +2861,36 @@ ggml_status llama_context::graph_compute(
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    // [LLAMA_MOE_EXEC_SELFTEST] one-shot Stage 2 executor check, after the weights are addressable
+    {
+        static bool selftest_done = false;
+        const char * env_moe_selftest = getenv("LLAMA_MOE_EXEC_SELFTEST");
+        if (!selftest_done && env_moe_selftest != nullptr && atoi(env_moe_selftest) != 0) {
+            selftest_done = true;
+            ggml_backend_sched_synchronize(sched.get());
+            ggml_backend_t exec_backend = nullptr;
+            for (ggml_backend_t backend : backend_ptrs) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    exec_backend = backend;
+                    break;
+                }
+            }
+            const char * env_layer = getenv("LLAMA_MOE_EXEC_LAYER");
+            const char * env_iters = getenv("LLAMA_MOE_EXEC_ITERS");
+            const int32_t exec_layer = env_layer != nullptr ? (int32_t) atoi(env_layer) : 20;
+            const int     exec_iters = env_iters != nullptr ? std::max(1, atoi(env_iters)) : 1;
+            if (exec_backend != nullptr) {
+                const int exec_slots = getenv("LLAMA_MOE_EXEC_PROBE") != nullptr ? 256 : 32;
+                llama_moe_exec exec(model, exec_backend, exec_layer, exec_slots);
+                if (exec.ok()) {
+                    const double per_layer = exec.self_test(40, exec_iters);
+                    LLAMA_LOG_INFO("%s: MoE executor self test: %.3f ms/layer, projected MoE cost %.1f ms/token at 40 layers\n",
+                            __func__, per_layer, per_layer * 40.0);
+                }
+            }
+        }
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
