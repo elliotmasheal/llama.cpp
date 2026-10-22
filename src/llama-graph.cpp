@@ -3039,7 +3039,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // FA is limited to 8 rows per K/V read for hsk > 128 on AMD, so a long cross-chunk span runs at
+    // ~1 TFLOPS against 4 for the matmul path. Decode and short spans keep FA (bench/longctx/FA-LONG-KV.md).
+    static const int64_t fa_long_kv_max_mib = [] {
+        const char * env = getenv("LLAMA_FA_LONG_KV_MIB");
+        return env != nullptr ? atoll(env) : (int64_t) 1536;
+    }();
+    const int64_t n_tok_q  = q->ne[1];
+    const int64_t n_tok_kv = k->ne[1];
+    const bool fa_long_kv = fa_long_kv_max_mib > 0 && kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
+                            n_tok_q >= 512 && n_tok_kv > n_tok_q + n_tok_q / 2 &&
+                            n_tok_kv * n_tok_q * q->ne[2] * (int64_t) sizeof(float) <= fa_long_kv_max_mib << 20;
+
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !fa_long_kv;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
