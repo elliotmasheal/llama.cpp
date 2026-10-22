@@ -11181,9 +11181,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // The SYCL backend picks between one and two output rows per subgroup by row count when there
-    // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
-    // sides of that boundary, including an odd row count above it for the row-pair tail.
+    // The Q4_K row-pair mmvq kernels pick between one and two output rows per subgroup by row count
+    // when there are two destination columns. Cover both sides of that boundary, including an odd
+    // row count above it for the row-pair tail.
     for (int64_t m : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2, 1024, { 1, 1 }, { 1, 1 }));
     }

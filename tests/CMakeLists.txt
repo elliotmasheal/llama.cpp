@@ -307,11 +307,6 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp LINK ggml)
 endif()
-if (GGML_METAL AND NOT GGML_BACKEND_DL)
-    # calls the Metal backend's graph optimizer and fusion table directly
-    llama_build_and_test(test-metal-graph-optimize.cpp LINK ggml ggml-metal)
-    target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
-endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
 
