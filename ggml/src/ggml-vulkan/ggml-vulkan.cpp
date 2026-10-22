@@ -10616,6 +10616,14 @@ void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subctx, con
 void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     int * op_params = (int *)dst->op_params;
 
+    if (getenv("GGML_VK_CONCAT_DEBUG") != nullptr) {
+        fprintf(stderr, "vk_concat: dim %d, src0 %s {%lld,%lld,%lld,%lld}, src1 %s {%lld,%lld,%lld,%lld}, dst %s {%lld,%lld,%lld,%lld}\n",
+                op_params[0],
+                src0->name, (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+                src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+                dst->name,  (long long) dst->ne[0],  (long long) dst->ne[1],  (long long) dst->ne[2],  (long long) dst->ne[3]);
+    }
+
     const uint32_t unit_size = ggml_vk_concat_unit_size(dst->type);
     const uint32_t units_per_block = ggml_type_size(dst->type) / unit_size;
     const uint32_t block_size = ggml_blck_size(dst->type);
@@ -13429,7 +13437,14 @@ static void ggml_backend_vk_set_tensor_2d_async_impl(ggml_backend_t backend, ggm
 
     auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
+    static const bool time_copies = getenv("GGML_VK_TIME_COPIES") != nullptr;
+    const int64_t t_copy0 = time_copies && size >= 1048576 ? ggml_time_us() : 0;
+
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
+    if (time_copies && size >= 1048576) {
+        fprintf(stderr, "vk_set_async: size %.1f MiB, pinned %s, recorded %lld us\n",
+                size/1048576.0, ret ? "yes" : "NO", (long long) (ggml_time_us() - t_copy0));
+    }
 
     if (!ret) {
         const size_t staging_size = size * n_copies;
