@@ -38,21 +38,24 @@ pp512 直接腰斩（180 vs 373），所以基准测试要显式加 `-lm none` �
 
 | 配置 | 命令要点 | pp512 | tg32 | pp2048 ub2048 |
 |---|---|---:|---:|---:|
-| static（默认推荐，显存省） | `-ncmoe 27` | 359-363 | 18.7-19.1 | 578 |
-| cache（TG 最优） | `-ncmoe 41 --moe-cache-mib 6144 -ub 2048` | 383-387 | 26.2-26.5 | 578-590 |
+| static（默认推荐，显存省） | `-ncmoe 27 -lm none` | 373-376 | 18.7 | 566 |
+| cache（TG 最优） | `-ncmoe 41 --moe-cache-mib 6144 -ub 2048 -lm none` | 405 | 26.2-26.5 | 582 |
 
 - 两条命令都加：`-m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on -t 5`；
   benchmark 用 `-p 512 -n 32`（cache 再加 `-p 2048 -n 0 -ub 2048`）。
+- 上表是 merge 上游 113 个提交并裁剪到 Vulkan+CPU / qwen35moe 之后重测的（`trim-vulkan-cpu-qwen35moe` 分支，
+  2026-10-22，`-r 3`），比裁剪前略快：static pp512 359-363 -> 373-376，cache pp512 383-387 -> 405。
 - `--moe-cache-mib 6144` 是这张卡的上限（6400 起会崩到 ~57 t/s）；bank 峰值 device 8028 MiB / 总 8176 MiB。
 - 现状结论：PP 被 host->device 上传限制（10.4-8.0 GiB/eval，实测 H2D 天花板 13.9 GB/s，已用到 96%），
   且 MoE 层间依赖链（routing 依赖上一层 MoE 输出）使调度层重叠无效；TG 由 decode 的 MoE cache 命中决定。
-  已达成 PP 386 / TG 26.4，PP1000/TG200 尚未达成；继续冲 PP 需要更大显存、MUL_MAT_ID GEMM 或换权重访问范式。
+  已达成 PP 405 / TG 26.2，PP1000/TG200 尚未达成；继续冲 PP 需要更大显存、MUL_MAT_ID GEMM 或换权重访问范式。
 - 证据与设计记录：`bench/moe-baseline/` 下的 `PROGRESS.md`、`BASELINE.md`、`PROFILE-*.md`、
   `L4-HOST-WEIGHT-PIPELINE.md`、`L5-PREFILL-UPLOAD-FLOOR.md`、`L6-PREFILL-RESIDENT.md`、
   `L8-H2D-AND-BANK-DIAGNOSIS.md`、`L9-OVERLAP-BLOCKED-BY-IDS-DRAIN.md`、`L10-DEPENDENCY-CHAIN-LIMIT.md`。
-- 回归基线（改 Vulkan/调度/GEMM 后必跑）：`test-backend-ops -o MUL_MAT_ID -b CPU` = 945/945、
-  `-o MUL_MAT_ID -b Vulkan1` = 939/939、`-o MUL_MAT -b Vulkan1` = 2275/2275、
-  `-o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332。
+- 回归基线（改 Vulkan/调度/GEMM 后必跑，命令在 `build-vulkan/bin/` 下）：`test-backend-ops -o MUL_MAT_ID -b CPU` = 945/945、
+  `-o MUL_MAT_ID_MASK -b CPU` = 4/4、`-o MUL_MAT_ID -b Vulkan1` = 939/939、
+  `-o MUL_MAT_ID_MASK -b Vulkan1` = 0/0（Vulkan 没有该 op 的用例）、`-o MUL_MAT -b Vulkan1` = 2275/2275、
+  `-o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332。`ctest --test-dir build-vulkan` = 32/32（不含 test-backend-ops）。
 
 
 ## 现成基础设施（不要重复造）
