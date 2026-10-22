@@ -337,6 +337,12 @@ struct llama_moe_cache::impl {
     size_t buf_host_size = 0;
     ggml_tensor * ids_host = nullptr; // pinned destination of the selected-expert readback
 
+    // the selected experts of each layer of the graph being built, and the last ones staged for readback
+    mutable std::unordered_map<const ggml_tensor *, int32_t> ids_tensors;
+    mutable const ggml_tensor * ids_staged = nullptr;
+    mutable int32_t ids_staged_il = -1;
+    mutable size_t  ids_staged_bytes = 0;
+
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
@@ -1262,6 +1268,51 @@ struct llama_moe_cache::impl {
         return n;
     }
 
+    // graph build: remember which tensor holds the selected experts of each cached layer
+    void register_ids(int32_t il, const ggml_tensor * ids) const {
+        ids_tensors[ids] = il;
+    }
+
+    void clear_ids() const {
+        ids_tensors.clear();
+        ids_staged = nullptr;
+        ids_staged_il = -1;
+        ids_staged_bytes = 0;
+    }
+
+    // the selected experts of a layer are computed by one split, the readback joins that split's submission
+    // the host reads ids_host only after the scheduler waits for the backend before the next copy callback
+    void stage_ids(ggml_backend_t backend, ggml_cgraph * graph) const {
+        static const bool enabled = getenv("LLAMA_MOE_STAGE_IDS") == nullptr || atoi(getenv("LLAMA_MOE_STAGE_IDS")) != 0;
+        if (!enabled || ids_tensors.empty() || ids_host == nullptr || ids_host->data == nullptr) {
+            return;
+        }
+        const int n_nodes = ggml_graph_n_nodes(graph);
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            const auto it = ids_tensors.find(node);
+            if (it == ids_tensors.end()) {
+                continue;
+            }
+            const int32_t il = it->second;
+            if (il < 0 || il >= (int32_t) layers.size()) {
+                continue;
+            }
+            const layer & l = layers[il];
+            if (l.ig < 0 || backend != devices[l.ig].backend || node->type != GGML_TYPE_I32 || !ggml_is_contiguous(node)) {
+                continue;
+            }
+            const size_t bytes = ggml_nbytes(node);
+            if (bytes > ggml_nbytes(ids_host)) {
+                continue;
+            }
+            ggml_backend_tensor_get_async(backend, node, ids_host->data, 0, bytes);
+            ids_staged = node;
+            ids_staged_il = il;
+            ids_staged_bytes = bytes;
+        }
+    }
+
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
@@ -1343,14 +1394,22 @@ struct llama_moe_cache::impl {
 
         ids.resize(ggml_nelements(sel));
         const size_t ids_bytes = ggml_nbytes(sel);
-        int32_t * ids_dst = ids.data();
-        if (ids_host != nullptr && ids_host->data != nullptr && ids_bytes <= ggml_nbytes(ids_host)) {
-            ids_dst = (int32_t *) ids_host->data;
-        }
-        ggml_backend_tensor_get_async(backend, sel, ids_dst, 0, ids_bytes);
-        ggml_backend_synchronize(backend);
-        if (ids_dst != ids.data()) {
-            memcpy(ids.data(), ids_dst, ids_bytes);
+        if (ids_staged_il == il && ids_staged == sel && ids_staged_bytes == ids_bytes) {
+            // the split that computed the ids already copied them to pinned host memory
+            memcpy(ids.data(), ids_host->data, ids_bytes);
+            ids_staged = nullptr;
+            ids_staged_il = -1;
+            ids_staged_bytes = 0;
+        } else {
+            int32_t * ids_dst = ids.data();
+            if (ids_host != nullptr && ids_host->data != nullptr && ids_bytes <= ggml_nbytes(ids_host)) {
+                ids_dst = (int32_t *) ids_host->data;
+            }
+            ggml_backend_tensor_get_async(backend, sel, ids_dst, 0, ids_bytes);
+            ggml_backend_synchronize(backend);
+            if (ids_dst != ids.data()) {
+                memcpy(ids.data(), ids_dst, ids_bytes);
+            }
         }
 
         trace_ids(il, ids);
@@ -1515,6 +1574,18 @@ void llama_moe_cache::set_batch_tokens(int64_t n_tokens) const {
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
     return pimpl->copy(backend, src, dst, graph);
+}
+
+void llama_moe_cache::register_ids(int32_t il, const ggml_tensor * ids) const {
+    pimpl->register_ids(il, ids);
+}
+
+void llama_moe_cache::clear_ids() const {
+    pimpl->clear_ids();
+}
+
+void llama_moe_cache::stage_ids(ggml_backend_t backend, ggml_cgraph * graph) const {
+    pimpl->stage_ids(backend, graph);
 }
 
 bool llama_moe_cache::wait_deferred(ggml_backend_t backend, ggml_cgraph * graph) {

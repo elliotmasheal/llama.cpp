@@ -44,6 +44,14 @@ public:
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
+    // graph build: the selected experts of layer il are the given tensor
+    void register_ids(int32_t il, const ggml_tensor * ids) const;
+    void clear_ids() const;
+
+    // ggml_backend_sched post-split callback: stages the readback of the selected experts in the split
+    // that computes them, so the copy callback finds them in host memory
+    void stage_ids(ggml_backend_t backend, ggml_cgraph * graph) const;
+
     // if a deferred upload batch is pending and this split consumes it, wait for it before the compute
     bool wait_deferred(ggml_backend_t backend, ggml_cgraph * graph);
 

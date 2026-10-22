@@ -808,6 +808,14 @@ static void sched_pre_split(ggml_backend_t backend, ggml_cgraph * graph, void * 
     }
 }
 
+static void sched_post_split(ggml_backend_t backend, ggml_cgraph * graph, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    llama_moe_cache * moe_cache = lctx->get_moe_cache();
+    if (moe_cache != nullptr) {
+        moe_cache->stage_ids(backend, graph);
+    }
+}
+
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
@@ -815,6 +823,11 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_pre_split_callback(sched.get(), sched_pre_split, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+    // without events the scheduler drains the backend before the next copy callback, so the staged
+    // readback is visible to the host there; with events the wait is device-side and it is not
+    if (moe_cache && !parallel) {
+        ggml_backend_sched_set_post_split_callback(sched.get(), sched_post_split, this);
+    }
 }
 
 void llama_context::sched_reserve() {

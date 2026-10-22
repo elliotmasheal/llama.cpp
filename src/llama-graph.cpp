@@ -1578,6 +1578,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
+        if (moe_cache != nullptr) {
+            moe_cache->clear_ids();
+        }
         res->set_params(params);
     }
 
@@ -2677,6 +2680,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     if (!ggml_backend_supports_op(moe_cache->backend(il), slots)) {
         return nullptr;
     }
+    moe_cache->register_ids(il, ids);
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
     cb(slots, "ffn_moe_slots", il);
 
