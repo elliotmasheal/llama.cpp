@@ -15,12 +15,7 @@ int llama_server(int argc, char ** argv);
 int llama_cli(int argc, char ** argv);
 
 // hidden
-int llama_completion(int argc, char ** argv);
 int llama_bench(int argc, char ** argv);
-int llama_batched_bench(int argc, char ** argv);
-int llama_fit_params(int argc, char ** argv);
-int llama_quantize(int argc, char ** argv);
-int llama_perplexity(int argc, char ** argv);
 int llama_download(int argc, char ** argv);
 
 // Self-update is only supported for binaries built with llama-install.sh
@@ -66,12 +61,7 @@ static const command cmds[] = {
     {"cli",           "Command-line interactive interface",                 {"client"},   false,         llama_cli          },
     {"update",        "Update llama to the latest release",                 {},           UPDATE_HIDDEN, llama_update       },
     {"download",      "Download a model",                                   {"get"},      false,         llama_download     },
-    {"completion",    "Text completion",                                    {"complete"}, true,          llama_completion   },
     {"bench",         "Benchmark prompt processing and text generation",    {},           true,          llama_bench        },
-    {"batched-bench", "Benchmark batched decoding performance",             {},           true,          llama_batched_bench},
-    {"fit-params",    "Compute parameters to fit a model in device memory", {},           true,          llama_fit_params   },
-    {"quantize",      "Quantize a model",                                   {},           true,          llama_quantize     },
-    {"perplexity",    "Compute model perplexity and KL divergence",         {},           true,          llama_perplexity   },
     {"version",       "Show version",                                       {},           false,         version,           true },
     {"licenses",      "Show third-party licenses",                          {"credits"},  false,         licenses,          true },
     {"help",          "Show available commands",                            {},           false,         help,              true },
