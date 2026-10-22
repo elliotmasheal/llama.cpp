@@ -1,0 +1,17 @@
+# Round 2: expert cache, fa, threads, load-mode, KV type, VRAM cliff.
+# risky (possible OOM) cases are last.
+r2_c40_m2048   |-ngl 99 -ncmoe 40 --moe-cache-mib 2048 -fa on -p 512 -n 32
+r2_c40_m4096   |-ngl 99 -ncmoe 40 --moe-cache-mib 4096 -fa on -p 512 -n 32
+r2_c40_m5120   |-ngl 99 -ncmoe 40 --moe-cache-mib 5120 -fa on -p 512 -n 32
+r2_c40_m6144   |-ngl 99 -ncmoe 40 --moe-cache-mib 6144 -fa on -p 512 -n 32
+r2_c30_m4096   |-ngl 99 -ncmoe 30 --moe-cache-mib 4096 -fa on -p 512 -n 32
+r2_c22_m2048   |-ngl 99 -ncmoe 22 --moe-cache-mib 2048 -fa on -p 512 -n 32
+r2_faoff       |-ngl 99 -ncmoe 22 -fa off -p 512 -n 32
+r2_thr6        |-ngl 99 -ncmoe 22 -fa on -t 6 -p 512 -n 32
+r2_thr12       |-ngl 99 -ncmoe 22 -fa on -t 12 -p 512 -n 32
+r2_thr16       |-ngl 99 -ncmoe 22 -fa on -t 16 -p 512 -n 32
+r2_mmap        |-ngl 99 -ncmoe 22 -fa on -lm mmap -p 512 -n 32
+r2_kvq8        |-ngl 99 -ncmoe 22 -fa on -ctk q8_0 -ctv q8_0 -p 512 -n 32
+r2_ncmoe21     |-ngl 99 -ncmoe 21 -fa on -p 512 -n 32
+r2_ncmoe20     |-ngl 99 -ncmoe 20 -fa on -p 512 -n 32
+r2_ncmoe19     |-ngl 99 -ncmoe 19 -fa on -p 512 -n 32

@@ -1,0 +1,4 @@
+# Official llama.cpp - final r=3 validation (project metric definitions).
+o3_official_pp2048 |-ngl 99 -ncmoe 22 -fa on -t 6 -ub 2048 -p 2048 -n 0
+o3_official_tg128 |-ngl 99 -ncmoe 22 -fa on -t 6 -ub 512 -p 512 -n 128
+o3_official20_tg128 |-ngl 99 -ncmoe 20 -fa on -t 6 -ub 512 -p 512 -n 128

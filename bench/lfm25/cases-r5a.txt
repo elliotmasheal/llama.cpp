@@ -1,0 +1,7 @@
+# Round 5a: finalists, r=5 (short ctx). A = mixed, B = static, C = cache-only.
+r5_A_pp512_tg32  |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 512 -n 32
+r5_A_tg128       |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 512 -n 128
+r5_B_pp512_tg32  |-ngl 99 -ncmoe 20 -fa on -t 6 -p 512 -n 32
+r5_B_tg128       |-ngl 99 -ncmoe 20 -fa on -t 6 -p 512 -n 128
+r5_C_pp512_tg32  |-ngl 99 -ncmoe 40 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 512 -n 32
+r5_C_tg128       |-ngl 99 -ncmoe 40 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 512 -n 128

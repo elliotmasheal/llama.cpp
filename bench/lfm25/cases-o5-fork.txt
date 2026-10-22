@@ -1,0 +1,2 @@
+# Same realistic context as the server test: 1203-token prompt + 64 generated tokens, r=3.
+o5_fork_ctx1203 |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 1203 -n 64

@@ -1,0 +1,4 @@
+# Cold-start decode (r=1), official build.
+c1_off_512_128 |-ngl 99 -ncmoe 22 -fa on -t 6 -ub 2048 -lm none -p 512 -n 128
+c1_off_1203_128 |-ngl 99 -ncmoe 22 -fa on -t 6 -ub 2048 -lm none -p 1203 -n 128
+c1_off20_512_128 |-ngl 99 -ncmoe 20 -fa on -t 6 -ub 2048 -lm none -p 512 -n 128

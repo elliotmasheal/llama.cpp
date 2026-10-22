@@ -1,0 +1,3 @@
+# Thread scaling of pure-CPU decode (r=1), official.
+cpu_off_t1  |-ngl 0 -ncmoe 0 -fa on -t 1 -lm none -p 512 -n 64
+cpu_off_t12 |-ngl 0 -ncmoe 0 -fa on -t 12 -lm none -p 512 -n 64

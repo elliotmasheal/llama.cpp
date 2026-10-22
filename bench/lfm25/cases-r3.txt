@@ -1,0 +1,22 @@
+# Round 3: cache ceiling + threads + mixed static/cache + long-prefill.
+# A: cache size / threads
+r3_c40_m5120_t6   |-ngl 99 -ncmoe 40 --moe-cache-mib 5120 -fa on -t 6 -p 512 -n 32
+r3_c40_m5376_t6   |-ngl 99 -ncmoe 40 --moe-cache-mib 5376 -fa on -t 6 -p 512 -n 32
+r3_c40_m5632_t6   |-ngl 99 -ncmoe 40 --moe-cache-mib 5632 -fa on -t 6 -p 512 -n 32
+r3_c40_m5888_t6   |-ngl 99 -ncmoe 40 --moe-cache-mib 5888 -fa on -t 6 -p 512 -n 32
+# B: static best + threads
+r3_s20_t6         |-ngl 99 -ncmoe 20 -fa on -t 6 -p 512 -n 32
+r3_s20_t5         |-ngl 99 -ncmoe 20 -fa on -t 5 -p 512 -n 32
+r3_s20_t7         |-ngl 99 -ncmoe 20 -fa on -t 7 -p 512 -n 32
+# C: mixed static layers + cache
+r3_c38_m5120_t6   |-ngl 99 -ncmoe 38 --moe-cache-mib 5120 -fa on -t 6 -p 512 -n 32
+r3_c36_m5120_t6   |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -p 512 -n 32
+r3_c34_m4096_t6   |-ngl 99 -ncmoe 34 --moe-cache-mib 4096 -fa on -t 6 -p 512 -n 32
+# D: fa off at cache winner
+r3_c40_m5120_t6_faoff |-ngl 99 -ncmoe 40 --moe-cache-mib 5120 -fa off -t 6 -p 512 -n 32
+# E: long prefill ub sweep
+r3_pp2048_s20_ub512   |-ngl 99 -ncmoe 20 -fa on -t 6 -p 2048 -n 0 -ub 512
+r3_pp2048_s20_ub1024  |-ngl 99 -ncmoe 20 -fa on -t 6 -p 2048 -n 0 -ub 1024
+r3_pp2048_s20_ub2048  |-ngl 99 -ncmoe 20 -fa on -t 6 -p 2048 -n 0 -ub 2048
+r3_pp2048_c_m5120_ub512  |-ngl 99 -ncmoe 40 --moe-cache-mib 5120 -fa on -t 6 -p 2048 -n 0 -ub 512
+r3_pp2048_c_m5120_ub2048 |-ngl 99 -ncmoe 40 --moe-cache-mib 5120 -fa on -t 6 -p 2048 -n 0 -ub 2048

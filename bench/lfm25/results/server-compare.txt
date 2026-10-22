@@ -1,0 +1,3 @@
+tag=srv_fork_mixed prompt 1203 tok, 686.5 t/s; predicted 19.7 t/s (128 tok)
+tag=srv_official prompt 1203 tok, 261.4 t/s; predicted 20.9 t/s (128 tok)
+tag=srv_fork_mixed_c2048 prompt 1203 tok, 672.8 t/s; predicted 19.7 t/s (128 tok)

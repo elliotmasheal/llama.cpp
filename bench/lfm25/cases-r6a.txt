@@ -1,0 +1,7 @@
+# Round 6a: PP frontier - static placement with big ubatch (untested region).
+r6_pp2048_s22_ub2048 |-ngl 99 -ncmoe 22 -fa on -t 6 -ub 2048 -p 2048 -n 0
+r6_pp2048_s24_ub2048 |-ngl 99 -ncmoe 24 -fa on -t 6 -ub 2048 -p 2048 -n 0
+r6_pp2048_s26_ub2048 |-ngl 99 -ncmoe 26 -fa on -t 6 -ub 2048 -p 2048 -n 0
+r6_pp2048_s22_ub1024 |-ngl 99 -ncmoe 22 -fa on -t 6 -ub 1024 -p 2048 -n 0
+r6_s22_ub2048_512_32 |-ngl 99 -ncmoe 22 -fa on -t 6 -ub 2048 -p 512 -n 32
+r6_s24_ub2048_512_32 |-ngl 99 -ncmoe 24 -fa on -t 6 -ub 2048 -p 512 -n 32

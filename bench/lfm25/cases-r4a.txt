@@ -1,0 +1,9 @@
+# Round 4a: mixed static+cache refinement (decode focus), all t=6, 512/32.
+r4_c36_m5376_t6   |-ngl 99 -ncmoe 36 --moe-cache-mib 5376 -fa on -t 6 -p 512 -n 32
+r4_c36_m5632_t6   |-ngl 99 -ncmoe 36 --moe-cache-mib 5632 -fa on -t 6 -p 512 -n 32
+r4_c36_m4608_t6   |-ngl 99 -ncmoe 36 --moe-cache-mib 4608 -fa on -t 6 -p 512 -n 32
+r4_c35_m5120_t6   |-ngl 99 -ncmoe 35 --moe-cache-mib 5120 -fa on -t 6 -p 512 -n 32
+r4_c34_m4608_t6   |-ngl 99 -ncmoe 34 --moe-cache-mib 4608 -fa on -t 6 -p 512 -n 32
+r4_c32_m3072_t6   |-ngl 99 -ncmoe 32 --moe-cache-mib 3072 -fa on -t 6 -p 512 -n 32
+r4_c30_m2048_t6   |-ngl 99 -ncmoe 30 --moe-cache-mib 2048 -fa on -t 6 -p 512 -n 32
+r4_c36_m5120_ub2048 |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 512 -n 32
