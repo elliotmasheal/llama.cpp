@@ -153,3 +153,15 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Local scratch and bench byproducts
+
+/.worktrees/
+/.research/
+/.dsh-acl-recovery/
+/pocs/
+*.err
+*.spv
+/bench/expert-tiering/acl-recovery/
+/bench/expert-tiering/stats/
+
