@@ -23,6 +23,9 @@ public:
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
 
+    // [LLAMA_MOE_PREFETCH] the token count of the graph being built, selects the prefetch path for large ubatches
+    void set_batch_tokens(int64_t n_tokens) const;
+
     // true if the experts of layer il that are not in the cache are computed on the CPU from the host weights
     bool hybrid(int32_t il) const;
 

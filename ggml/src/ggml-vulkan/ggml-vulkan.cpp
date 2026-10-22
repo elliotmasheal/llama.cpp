@@ -5552,6 +5552,8 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
         ctx->transfer_semaphore.value = 0;
         ctx->transfer_semaphore_deferred.s = ctx->device->device.createSemaphore(ci);
         ctx->transfer_semaphore_deferred.value = 0;
+        ctx->prefetch_semaphore.s = ctx->device->device.createSemaphore(ci);
+        ctx->prefetch_semaphore.value = 0;
 
         ctx->transfer_cmd_pool.init(ctx->device, ctx->device->transfer_queue.get());
     }
@@ -5905,6 +5907,11 @@ vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
             waited_b = true;
         }
         ctx->wait_deferred_pending = false;
+    }
+    // [MoE prefetch] the value is already signaled by the host wait, this only orders the memory
+    if (ctx->device->async_use_transfer_queue && ctx->prefetch_wait_pending) {
+        result->s->wait_semaphores.push_back(ctx->prefetch_wait);
+        ctx->prefetch_wait_pending = false;
     }
     static const bool log_waits = getenv("GGML_VK_LOG_WAITS") != nullptr;
     if (log_waits) {
@@ -13110,6 +13117,12 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->compute_cmd_pool.destroy(ctx->device->device);
     if (ctx->device->async_use_transfer_queue) {
+        // an outstanding prefetch batch is not covered by the compute fence
+        if (ctx->prefetch_semaphore.value > 0) {
+            const vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, ctx->prefetch_semaphore.s, ctx->prefetch_semaphore.value};
+            VK_CHECK(ctx->device->device.waitSemaphores(swi, UINT64_MAX), "prefetch cleanup", ctx->device);
+        }
+        ctx->device->device.destroySemaphore(ctx->prefetch_semaphore.s);
         ctx->device->device.destroySemaphore(ctx->transfer_semaphore.s);
     ctx->device->device.destroySemaphore(ctx->transfer_semaphore_deferred.s);
 
@@ -13496,6 +13509,85 @@ static void ggml_backend_vk_set_tensor_async_deferred(ggml_backend_t backend, gg
 static void ggml_backend_vk_wait_deferred(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     ctx->wait_deferred_pending = true;
+}
+
+// [MoE prefetch] the prefetch copies are recorded in their own transfer batch so that the compute
+// queue never waits for them; the batch is signaled by prefetch_semaphore instead of transfer_semaphore
+static vk_context ggml_vk_get_prefetch_ctx(ggml_backend_vk_context * ctx) {
+    if (!ctx->prefetch_ctx.expired()) {
+        return ctx->prefetch_ctx.lock();
+    }
+    vk_context result = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
+    ctx->prefetch_ctx = result;
+    ggml_vk_ctx_begin(ctx->device, result);
+    return result;
+}
+
+bool ggml_backend_vk_prefetch_tensor(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    VK_LOG_DEBUG("ggml_backend_vk_prefetch_tensor(" << size << ")");
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->device->async_use_transfer_queue || size == 0) {
+        return false;
+    }
+    GGML_ASSERT(tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend));
+
+    vk_buffer src = nullptr;
+    size_t src_offset = 0;
+    ggml_vk_host_get(ctx->device, data, src, src_offset);
+    if (src == nullptr) {
+        // a pageable source would copy through the sync staging buffer and drain the device
+        return false;
+    }
+
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+    vk_context cpy_ctx = ggml_vk_get_prefetch_ctx(ctx);
+
+    const vk::BufferCopy slice{
+        /*.srcOffset =*/ src_offset,
+        /*.dstOffset =*/ vk_tensor_offset(tensor) + tensor->view_offs + offset,
+        /*.size      =*/ size,
+    };
+    ggml_vk_sync_buffers(nullptr, cpy_ctx);
+    cpy_ctx->s->buffer->buf.copyBuffer(src->buffer, buf_ctx->dev_buffer->buffer, { slice });
+    return true;
+}
+
+void ggml_backend_vk_prefetch_submit(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    // the small copy that the compute of the layer does need goes first, then the prefetch reads behind it
+    ggml_vk_submit_transfer_ctx(ctx);
+    if (ctx->prefetch_ctx.expired()) {
+        return;
+    }
+    vk_context cpy_ctx = ctx->prefetch_ctx.lock();
+    vk_command_buffer * cmd_buffer = cpy_ctx->s != nullptr ? cpy_ctx->s->buffer : nullptr;
+    ggml_vk_ctx_end(cpy_ctx);
+
+    ctx->prefetch_semaphore.value++;
+    cpy_ctx->seqs.back().back().signal_semaphores.push_back(ctx->prefetch_semaphore);
+
+    ggml_vk_submit(cpy_ctx, {});
+    ctx->prefetch_ctx.reset();
+    ctx->prefetch_cmd_buffer = cmd_buffer;
+}
+
+void ggml_backend_vk_prefetch_wait(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (ctx->prefetch_semaphore.value == 0) {
+        return;
+    }
+    const vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, ctx->prefetch_semaphore.s, ctx->prefetch_semaphore.value};
+    VK_CHECK(ctx->device->device.waitSemaphores(swi, UINT64_MAX), "prefetch wait", ctx->device);
+    // the command buffer of the batch is done, it can go back to the pool
+    if (ctx->prefetch_cmd_buffer != nullptr) {
+        ctx->prefetch_cmd_buffer->in_use = false;
+        ctx->prefetch_cmd_buffer->buf.reset();
+        ctx->prefetch_cmd_buffer = nullptr;
+    }
+    // the next compute submission waits on the already signaled value: no stall, but it makes the
+    // transfer writes visible to the shaders that read the layer
+    ctx->prefetch_wait = ctx->prefetch_semaphore;
+    ctx->prefetch_wait_pending = true;
 }
 
 static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
@@ -16436,11 +16528,31 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+
+    // [MoE prefetch] optional API, resolved by the model runtime through the backend registry
+    static const struct {
+        const char * name;
+        void * fn;
+    } prefetch_api[] = {
+        { "ggml_backend_vk_prefetch_tensor", (void *) ggml_backend_vk_prefetch_tensor },
+        { "ggml_backend_vk_prefetch_submit", (void *) ggml_backend_vk_prefetch_submit },
+        { "ggml_backend_vk_prefetch_wait",   (void *) ggml_backend_vk_prefetch_wait   },
+    };
+    for (const auto & entry : prefetch_api) {
+        if (strcmp(name, entry.name) == 0) {
+            return entry.fn;
+        }
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

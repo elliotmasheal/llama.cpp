@@ -2648,6 +2648,9 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         return nullptr;
     }
 
+    // the selected experts are 3D [n_expert_used, 1, n_tokens] for some architectures, the token count
+    // must come from the element count so that the prefetch path sees the real ubatch size
+    moe_cache->set_batch_tokens(ggml_nelements(selected_experts) / selected_experts->ne[0]);
     ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
     if (slot_map == nullptr) {
         return nullptr;

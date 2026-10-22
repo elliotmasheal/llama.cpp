@@ -24,6 +24,12 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
+// [MoE prefetch] whole-layer expert upload on the transfer queue, overlapped with the compute of the previous layer.
+// The functions are resolved through ggml_backend_reg_get_proc_address, see ggml_backend_vk_reg_get_proc_address.
+GGML_BACKEND_API bool ggml_backend_vk_prefetch_tensor(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+GGML_BACKEND_API void ggml_backend_vk_prefetch_submit(ggml_backend_t backend);
+GGML_BACKEND_API void ggml_backend_vk_prefetch_wait(ggml_backend_t backend);
+
 #ifdef  __cplusplus
 }
 #endif

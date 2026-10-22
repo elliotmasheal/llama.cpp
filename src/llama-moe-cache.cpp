@@ -6,8 +6,11 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -50,6 +53,25 @@ struct moe_cache_slru {
         tail[0] = n_slots - 1;
         is_protected.assign(n_slots, false);
         seen.assign(n_expert, 0);
+    }
+
+    // drop the residency map: the whole-layer prefetch writes into the slots of the pool, so nothing is cached
+    void invalidate() {
+        for (int32_t * map : slot_map) {
+            if (map != nullptr) {
+                std::fill(map, map + n_expert, -1);
+            }
+        }
+        std::fill(key_of.begin(), key_of.end(), -1);
+        for (int32_t s = 0; s < n_slots; ++s) {
+            prev[s] = s - 1;
+            next[s] = s + 1 < n_slots ? s + 1 : -1;
+        }
+        head[0] = n_slots > 0 ? 0 : -1;
+        tail[0] = n_slots - 1;
+        head[1] = tail[1] = -1;
+        is_protected.assign(n_slots, false);
+        n_protected = 0;
     }
 
     // move slot s to the most recently used end of a segment
@@ -210,6 +232,7 @@ struct llama_moe_cache::impl {
         size_t host_bytes = 0;
         int32_t n_slots = 0;              // total hub slots, zero slot included at the end only when hybrid
         int32_t n_full  = 0;              // first n_full layers keep every expert in the bank
+        bool pf_dirty = false;            // the prefetch rings overwrote the SLRU slots of this group
         moe_cache_slru slru;
     };
 
@@ -262,12 +285,51 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
 
+    // [LLAMA_MOE_TRACE] appends the selected experts of every MoE-cache lookup for offline analysis
+    FILE *   trace_file    = nullptr;
+    uint64_t trace_records = 0;
+
+    // [LLAMA_MOE_STATS] persistent, decayed per-expert selection weights; read by the repack tool
+    std::string        stats_path;
+    std::vector<float> stats_w; // [n_layer*n_expert]
+    int32_t            stats_last_il = -1;
+    float              stats_decay   = 0.999f;
+    uint64_t           stats_tokens  = 0;
+    uint64_t           stats_since_save = 0;
+    bool               stats_dirty   = false;
+
     // [LLAMA_MOE_DEFER_UPLOAD] last expert tensor of a layer uploaded as a deferred batch
     const ggml_tensor * deferred_bank = nullptr;
     ggml_backend_t deferred_backend = nullptr;
     size_t n_deferred_bytes  = 0;
     size_t n_deferred_waits  = 0;
     size_t n_deferred_missed = 0;
+
+    // [LLAMA_MOE_PREFETCH] whole-layer expert prefetch for large ubatches, overlapped with the compute of
+    // the previous layer. The layers stream through two ring buffers taken from the LRU pool.
+    struct prefetch_api {
+        bool (*tensor)(ggml_backend_t, ggml_tensor *, const void *, size_t, size_t) = nullptr;
+        void (*submit)(ggml_backend_t) = nullptr;
+        void (*wait)(ggml_backend_t) = nullptr;
+
+        bool ok() const { return tensor != nullptr && submit != nullptr && wait != nullptr; }
+    };
+
+    bool pf_enabled = false;
+    bool pf_requested = false;             // LLAMA_MOE_PREFETCH, also reserves the rings from the LRU pool
+    int32_t pf_max_full = 4;               // static whole layers per group kept for decode when prefetch is on
+    int64_t pf_min_tokens = 512;           // below this the whole-layer bytes cost more than the gather saves
+    bool pf_batch = false;                 // the graph being built uses the prefetch path
+    bool pf_pass_dirty = false;            // a prefetch pass overwrote the LRU pools, rebuild them before a small batch
+    std::vector<int32_t> pf_order;         // prefetched layers in execution order
+    std::vector<int32_t> pf_pos;           // [n_layer] position in pf_order, -1 if not prefetched
+    prefetch_api pf;
+    size_t pf_bytes   = 0;
+    size_t pf_layers  = 0;
+    size_t pf_waits   = 0;
+    size_t pf_fallbacks = 0;
+    int64_t pf_wait_us  = 0;              // [LLAMA_MOE_PREFETCH_TIME] host time spent waiting for the prefetch
+    int64_t pf_copy_us  = 0;              // [LLAMA_MOE_PREFETCH_TIME] host time spent in the prefetch callback
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -280,6 +342,15 @@ struct llama_moe_cache::impl {
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool hybrid) :
             hybrid_mode(hybrid), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         n_expert = model.hparams.n_expert;
+        // whole-layer prefetch is on by default, LLAMA_MOE_PREFETCH=0 disables it
+        const char * env_pf = getenv("LLAMA_MOE_PREFETCH");
+        pf_requested = env_pf == nullptr || atoi(env_pf) != 0;
+        if (pf_requested) {
+            const char * env_max_full = getenv("LLAMA_MOE_PREFETCH_MAX_FULL");
+            if (env_max_full != nullptr) {
+                pf_max_full = std::max(0, atoi(env_max_full));
+            }
+        }
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -373,6 +444,8 @@ struct llama_moe_cache::impl {
         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
+
+        // pass 1: the slot count of each group, it does not depend on the residency split
         for (group & g : groups) {
             const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
@@ -384,11 +457,36 @@ struct llama_moe_cache::impl {
             if (g.n_slots < n_expert_used) {
                 LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
                 g.n_slots = 0;
+            }
+        }
+
+        // the prefetch rings take two whole layers of slots from each group, otherwise the plain cache is kept
+        if (pf_requested) {
+            init_prefetch_api(model);
+            for (const group & g : groups) {
+                if (g.n_slots != 0 && g.n_slots < 2*g.ref[0]->ne[2]) {
+                    LLAMA_LOG_WARN("%s: prefetch needs %d slots per group, group %td has %d, disabled\n",
+                            __func__, 2*g.ref[0]->ne[2], &g - groups.data(), g.n_slots);
+                    pf_requested = false;
+                }
+            }
+        }
+
+        // pass 2: the residency split, the static whole layers and the LRU pool of the rest
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
                 continue;
             }
+            const int32_t n_expert = g.ref[0]->ne[2];
             // whole layers never copy host experts during prefill, at most 5 per group so the LRU pool still helps decode
+            // the prefetch rings take two whole layers of slots, the rest of the static whole layers are
+            // kept for decode, LLAMA_MOE_PREFETCH_MAX_FULL sets how many per group
             constexpr int32_t max_full = 5;
             int32_t n_full = std::min(max_full, g.n_slots / n_expert);
+            if (pf_requested) {
+                n_full = std::min(n_full, std::max(0, (g.n_slots - 2*n_expert) / n_expert));
+                n_full = std::min(n_full, pf_max_full);
+            }
             n_full = std::min(n_full, (int32_t) g.layers.size() - 1);
             // do not starve the LRU pool: a bank that is mostly whole layers is worse than the plain static placement
             while (n_full > 0 && g.n_slots - n_full*n_expert < g.n_slots/5) {
@@ -425,7 +523,15 @@ struct llama_moe_cache::impl {
         ctx_host  = init_ctx(n_tensors_host);
         ctx_views = init_ctx(2);
 
+        // the slot maps are written by the host and copied before every split, a pinned host buffer
+        // makes that copy a direct transfer instead of a staging copy followed by a device drain
         ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
+        if (devices.size() == 1) {
+            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(devices[0].backend));
+            if (host_buft != nullptr) {
+                buft_host = host_buft;
+            }
+        }
         const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
 
         for (size_t ig = 0; ig < groups.size(); ++ig) {
@@ -543,6 +649,8 @@ struct llama_moe_cache::impl {
             prepopulate();
         }
 
+        init_prefetch(model);
+
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
         for (device & d : devices) {
             if (d.buf) {
@@ -569,6 +677,31 @@ struct llama_moe_cache::impl {
         for (const layer & l : layers) {
             n_cached_layers += l.ig >= 0;
         }
+
+        const char * trace_path = getenv("LLAMA_MOE_TRACE");
+        if (trace_path != nullptr && trace_path[0] != '\0') {
+            trace_file = fopen(trace_path, "ab");
+            if (trace_file == nullptr) {
+                LLAMA_LOG_WARN("%s: cannot open the MoE trace file %s, tracing disabled\n", __func__, trace_path);
+            } else {
+                LLAMA_LOG_INFO("%s: MoE trace enabled, appending records to %s\n", __func__, trace_path);
+            }
+        }
+
+        const char * stats_env = getenv("LLAMA_MOE_STATS");
+        if (stats_env != nullptr && stats_env[0] != '\0') {
+            stats_path = stats_env;
+            const char * decay_env = getenv("LLAMA_MOE_STATS_DECAY");
+            if (decay_env != nullptr) {
+                const float d = (float) atof(decay_env);
+                if (d > 0.0f && d <= 1.0f) {
+                    stats_decay = d;
+                }
+            }
+            stats_w.assign(model.layers.size()*n_expert, 0.0f);
+            load_stats();
+            LLAMA_LOG_INFO("%s: MoE stats enabled, decay %.4f, file %s\n", __func__, stats_decay, stats_path.c_str());
+        }
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -576,10 +709,107 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        // only a context that routed tokens owns the stats file; load-time probe contexts must not clobber it
+        if (stats_dirty) {
+            save_stats();
+            LLAMA_LOG_INFO("%s: MoE stats: %llu tokens recorded, file %s\n", __func__,
+                    (unsigned long long) stats_tokens, stats_path.c_str());
+        }
+        if (trace_file != nullptr) {
+            fclose(trace_file);
+            trace_file = nullptr;
+            LLAMA_LOG_INFO("%s: MoE trace records = %llu\n", __func__, (unsigned long long) trace_records);
+        }
         log_stats();
     }
 
-    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+    void load_stats() {
+        FILE * f = fopen(stats_path.c_str(), "rb");
+        if (f == nullptr) {
+            return;
+        }
+        uint32_t hdr[4] = { 0, 0, 0, 0 };
+        const bool hdr_ok = fread(hdr, sizeof(uint32_t), 4, f) == 4 &&
+            hdr[0] == 0x53454f4d && hdr[1] == 1 &&
+            hdr[2] == (uint32_t) layers.size() && hdr[3] == (uint32_t) n_expert;
+        std::vector<float> tmp(stats_w.size());
+        const bool ok = hdr_ok && fread(tmp.data(), sizeof(float), tmp.size(), f) == tmp.size();
+        fclose(f);
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: MoE stats file %s does not match this model, starting empty\n", __func__, stats_path.c_str());
+            return;
+        }
+        stats_w.swap(tmp);
+        LLAMA_LOG_INFO("%s: MoE stats loaded from %s\n", __func__, stats_path.c_str());
+    }
+
+    void save_stats() {
+        if (stats_w.empty()) {
+            return;
+        }
+        const std::string tmp = stats_path + ".tmp";
+        FILE * f = fopen(tmp.c_str(), "wb");
+        if (f == nullptr) {
+            LLAMA_LOG_WARN("%s: cannot open %s for writing\n", __func__, tmp.c_str());
+            return;
+        }
+        const uint32_t hdr[4] = { 0x53454f4d, 1, (uint32_t) layers.size(), (uint32_t) n_expert };
+        const bool ok = fwrite(hdr, sizeof(uint32_t), 4, f) == 4 &&
+            fwrite(stats_w.data(), sizeof(float), stats_w.size(), f) == stats_w.size();
+        fclose(f);
+        // std::rename does not replace an existing file on Windows
+        remove(stats_path.c_str());
+        if (!ok || std::rename(tmp.c_str(), stats_path.c_str()) != 0) {
+            LLAMA_LOG_WARN("%s: cannot write the MoE stats file %s\n", __func__, stats_path.c_str());
+            remove(tmp.c_str());
+            return;
+        }
+        stats_since_save = 0;
+    }
+
+    // decay once per token (a layer-id wrap marks a token boundary), then count the selected experts
+    void observe_ids(int32_t il, const std::vector<int32_t> & ids) {
+        if (stats_w.empty()) {
+            return;
+        }
+        if (stats_last_il >= 0 && il <= stats_last_il) {
+            for (float & v : stats_w) {
+                v *= stats_decay;
+            }
+            stats_tokens++;
+            if (++stats_since_save >= 512) {
+                save_stats();
+            }
+        }
+        stats_last_il = il;
+        stats_dirty = true;
+        float * row = stats_w.data() + (size_t) il*n_expert;
+        for (int32_t e : ids) {
+            if (e >= 0 && e < n_expert) {
+                row[e] += 1.0f;
+            }
+        }
+    }
+
+    // record = int32 layer, int32 count, count x int32 expert id; one record per traced layer lookup
+    void trace_ids(int32_t il, const std::vector<int32_t> & ids) {
+        if (trace_file == nullptr) {
+            return;
+        }
+        const int32_t n = (int32_t) ids.size();
+        const bool ok = fwrite(&il, sizeof(il), 1, trace_file) == 1 &&
+            fwrite(&n, sizeof(n), 1, trace_file) == 1 &&
+            (n == 0 || fwrite(ids.data(), sizeof(int32_t), (size_t) n, trace_file) == (size_t) n);
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: failed to write the MoE trace, tracing disabled\n", __func__);
+            fclose(trace_file);
+            trace_file = nullptr;
+            return;
+        }
+        trace_records++;
+    }
+
+    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
         }
@@ -589,6 +819,11 @@ struct llama_moe_cache::impl {
         // a whole layer reads the bank through a static view, it needs no slot map
         if (l.full) {
             return nullptr;
+        }
+
+        // the prefetch path maps every expert to a ring slot, the map is written by the copy callback
+        if (pf_batch) {
+            return l.slot_map;
         }
 
         // in hybrid mode the misses are computed on the CPU, so the residency map is always used for small batches
@@ -802,6 +1037,170 @@ struct llama_moe_cache::impl {
             __func__, (long long) n_uploaded_total, stats_hybrid.bytes/1024.0/1024.0);
     }
 
+    // [LLAMA_MOE_PREFETCH] resolve the optional backend API and check the preconditions of the whole-layer
+    // prefetch, called before the residency split so that an unusable prefetch leaves the plain cache unchanged
+    void init_prefetch_api(const llama_model & model) {
+        if (model.hparams.no_alloc || hybrid_mode) {
+            pf_requested = false;
+            return;
+        }
+        const char * env_min = getenv("LLAMA_MOE_PREFETCH_MIN_TOKENS");
+        if (env_min != nullptr) {
+            pf_min_tokens = atoll(env_min);
+        }
+        if (devices.size() != 1) {
+            LLAMA_LOG_WARN("%s: prefetch needs a single device, disabled\n", __func__);
+            pf_requested = false;
+            return;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(devices[0].backend);
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+        for (const group & g : groups) {
+            if (host_buft == nullptr || g.ref.empty() || ggml_backend_buffer_get_type(g.ref[0]->buffer) != host_buft) {
+                LLAMA_LOG_WARN("%s: prefetch needs pinned host experts, a group is not pinned, disabled\n", __func__);
+                pf_requested = false;
+                return;
+            }
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        pf.tensor = (decltype(pf.tensor)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_prefetch_tensor");
+        pf.submit = (decltype(pf.submit)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_prefetch_submit");
+        pf.wait   = (decltype(pf.wait))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_prefetch_wait");
+        if (!pf.ok()) {
+            LLAMA_LOG_WARN("%s: the backend does not provide the prefetch API, disabled\n", __func__);
+            pf_requested = false;
+        }
+    }
+
+    // [LLAMA_MOE_PREFETCH] the layers stream through the rings in execution order, the whole layers keep their static views
+    void init_prefetch(const llama_model & model) {
+        if (!pf_requested) {
+            return;
+        }
+        pf_pos.assign(layers.size(), -1);
+        for (group & g : groups) {
+            for (int32_t il : g.layers) {
+                if (il >= (int32_t) model.hparams.n_layer() || layers[il].full) {
+                    continue;
+                }
+                pf_order.push_back(il);
+            }
+        }
+        std::sort(pf_order.begin(), pf_order.end());
+        for (size_t i = 0; i < pf_order.size(); ++i) {
+            pf_pos[pf_order[i]] = (int32_t) i;
+        }
+        if (pf_order.empty()) {
+            pf_requested = false;
+            return;
+        }
+        pf_enabled = true;
+        size_t ring_bytes = 0;
+        for (const group & g : groups) {
+            ring_bytes += 2*n_expert*g.banks[0]->nb[2]*g.banks.size();
+        }
+        LLAMA_LOG_INFO("%s: prefetch: %zu layers stream through 2 rings (%.1f MiB), min ubatch tokens %lld\n",
+                __func__, pf_order.size(), ring_bytes/1024.0/1024.0, (long long) pf_min_tokens);
+    }
+
+    // large ubatches take the prefetch path, the residency map of the LRU pool is stale after it
+    void update_prefetch(int64_t n_tokens) {
+        if (!pf_enabled) {
+            return;
+        }
+        const bool batch = n_tokens >= pf_min_tokens;
+        if (!batch) {
+            for (group & g : groups) {
+                if (g.pf_dirty) {
+                    g.slru.invalidate();
+                    g.pf_dirty = false;
+                }
+            }
+        }
+        pf_batch = batch;
+        static const bool dbg = getenv("LLAMA_MOE_PREFETCH_DEBUG") != nullptr;
+        if (dbg) {
+            LLAMA_LOG_INFO("%s: n_tokens = %lld, batch = %d\n", __func__, (long long) n_tokens, (int) batch);
+        }
+    }
+
+    // upload the experts of one layer into its ring slot range, the copies are not waited by the compute queue
+    bool prefetch_layer(ggml_backend_t backend, int32_t pos) {
+        const layer & l = layers[pf_order[pos]];
+        group & g = groups[l.ig];
+        const int32_t ring = g.n_full*n_expert + (pos % 2) * n_expert;
+        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+            const ggml_tensor * w = l.experts[ip];
+            const size_t size = (size_t) n_expert * w->nb[2];
+            if (!pf.tensor(backend, g.banks[ip], w->data, (size_t) ring * w->nb[2], size)) {
+                if (pf_fallbacks++ == 0) {
+                    LLAMA_LOG_WARN("%s: prefetch of layer %d failed, is the transfer queue available and the source pinned?\n", __func__, pf_order[pos]);
+                }
+                return false;
+            }
+            pf_bytes += size;
+        }
+        pf_layers++;
+        return true;
+    }
+
+    // [LLAMA_MOE_PREFETCH] whole-layer slot map, the compute reads the bank through the ring slots
+    bool copy_prefetch(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, int32_t il) {
+        const int32_t pos = pf_pos[il];
+        if (pos < 0) {
+            return false;
+        }
+        layer & l = layers[il];
+        group & g = groups[l.ig];
+        GGML_ASSERT(backend == devices[g.id].backend);
+        GGML_ASSERT(src == l.slot_map);
+
+        static const bool time_it = getenv("LLAMA_MOE_PREFETCH_TIME") != nullptr;
+        const int64_t t0 = time_it ? ggml_time_us() : 0;
+
+        if (pos == 0) {
+            // the first layer cannot be hidden, the compute of the previous layer is done at this point
+            if (!prefetch_layer(backend, 0)) {
+                return false;
+            }
+            pf.submit(backend);
+            const int64_t tw = time_it ? ggml_time_us() : 0;
+            pf.wait(backend);
+            pf_waits++;
+            pf_wait_us += time_it ? ggml_time_us() - tw : 0;
+            if (time_it) {
+                fprintf(stderr, "moe_prefetch_first: first layer upload %.3f ms\n", (ggml_time_us() - tw)/1000.0);
+            }
+        } else {
+            // issued when the previous layer was set up, normally complete because it overlapped that layer's compute
+            const int64_t tw = time_it ? ggml_time_us() : 0;
+            pf.wait(backend);
+            pf_waits++;
+            pf_wait_us += time_it ? ggml_time_us() - tw : 0;
+        }
+
+        // the experts of the layer are read from the ring, the ids index it through this map
+        const int32_t ring = g.n_full*n_expert + (pos % 2) * n_expert;
+        int32_t * map = g.slru.slot_map[il];
+        for (int32_t e = 0; e < n_expert; ++e) {
+            map[e] = ring + e;
+        }
+
+        // the small copy that the compute of this layer waits on, it is submitted before the next prefetch
+        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+
+        if (pos + 1 < (int32_t) pf_order.size() && !prefetch_layer(backend, pos + 1)) {
+            return false;
+        }
+        pf.submit(backend);
+        pf_copy_us += time_it ? ggml_time_us() - t0 : 0;
+        if (time_it && pf_layers % 40 == 0) {
+            fprintf(stderr, "moe_prefetch_timing: layers %zu, wait %.3f ms/layer, callback %.3f ms/layer\n",
+                    pf_layers, pf_wait_us/1000.0/pf_waits, pf_copy_us/1000.0/pf_waits);
+        }
+        return true;
+    }
+
     bool wait_deferred(ggml_backend_t backend, ggml_cgraph * graph) {
         if (deferred_bank == nullptr || deferred_backend != backend) {
             return false;
@@ -874,6 +1273,46 @@ struct llama_moe_cache::impl {
 
         GGML_ASSERT(backend == devices[g.id].backend);
 
+        // [LLAMA_MOE_PREFETCH] the graph is reused between evals, so the ubatch size is taken from the
+        // lookup of the slot map instead of the token count seen when the graph was built
+        const ggml_tensor * lookup = nullptr;
+        {
+            const int n_nodes = ggml_graph_n_nodes(graph);
+            for (int i = 0; i < n_nodes && lookup == nullptr; ++i) {
+                const ggml_tensor * node = ggml_graph_node(graph, i);
+                if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
+                    lookup = node;
+                }
+            }
+        }
+        const int64_t n_tokens = lookup != nullptr ? ggml_nelements(lookup->src[1]) / n_expert_used : 0;
+        const bool pf = pf_enabled && pf_pos[il] >= 0 && n_tokens >= pf_min_tokens;
+        if (pf) {
+            if (pf_pos[il] == 0) {
+                // the rings overwrite the slots of the LRU pool, rebuild the residency map before a
+                // small batch reuses it, the rings of this pass start from empty
+                for (group & gg : groups) {
+                    gg.slru.invalidate();
+                    gg.pf_dirty = true;
+                }
+                pf_pass_dirty = true;
+            }
+            if (getenv("LLAMA_MOE_PREFETCH_DEBUG") != nullptr) {
+                LLAMA_LOG_INFO("%s: layer %d prefetch path, tokens %lld\n", __func__, il, (long long) n_tokens);
+            }
+            return copy_prefetch(backend, src, dst, il);
+        }
+        if (pf_pass_dirty) {
+            // the small batch after a prefetch pass rebuilds the residency map from scratch
+            for (group & gg : groups) {
+                if (gg.pf_dirty) {
+                    gg.slru.invalidate();
+                    gg.pf_dirty = false;
+                }
+            }
+            pf_pass_dirty = false;
+        }
+
         // a whole layer is resident, its slot map is static: no selected experts to read back
         if (l.full) {
             ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
@@ -882,13 +1321,6 @@ struct llama_moe_cache::impl {
 
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
-        const ggml_tensor * lookup = nullptr;
-        for (int i = 0; i < n_nodes && lookup == nullptr; ++i) {
-            const ggml_tensor * node = ggml_graph_node(graph, i);
-            if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
-                lookup = node;
-            }
-        }
         GGML_ASSERT(lookup != nullptr);
 
         // the selected experts must be computed in an earlier split
@@ -905,6 +1337,9 @@ struct llama_moe_cache::impl {
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+
+        trace_ids(il, ids);
+        observe_ids(il, ids);
 
         if (hybrid_mode) {
             if (!resident) {
@@ -1014,6 +1449,14 @@ struct llama_moe_cache::impl {
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
+        if (pf_layers > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: prefetch: %zu layers, %.2f MiB uploaded, %zu host waits, %zu fallbacks\n",
+                    pf_layers, pf_bytes/1024.0/1024.0, pf_waits, pf_fallbacks);
+            if (pf_waits > 0 && getenv("LLAMA_MOE_PREFETCH_TIME") != nullptr) {
+                fprintf(stderr, "moe_prefetch_timing: layers %zu, wait %.3f ms/layer, callback %.3f ms/layer\n",
+                        pf_layers, pf_wait_us/1000.0/pf_waits, pf_copy_us/1000.0/pf_waits);
+            }
+        }
     }
 };
 
@@ -1049,6 +1492,10 @@ ggml_tensor * llama_moe_cache::get_miss_mask(int32_t il, int64_t n_tokens, int64
 
 void llama_moe_cache::count_usage(const ggml_tensor * w, const ggml_tensor * ids, const std::vector<int32_t> & ids_data) {
     pimpl->count_usage(w, ids, ids_data);
+}
+
+void llama_moe_cache::set_batch_tokens(int64_t n_tokens) const {
+    pimpl->update_prefetch(n_tokens);
 }
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
