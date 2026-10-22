@@ -1,0 +1,8 @@
+=== overlap 400 MiB, compute target 100 ms ===
+timelineSemaphore=1
+compute arm: reps=63 (15.8 GiB read) -> 42.2 ms (373.2 GB/s)
+transfer arm: 400 MiB (0.4 GiB) -> 31.3 ms (12.5 GB/s)
+same-queue serial: 73.4 ms (t_c+t_t=73.5)
+two queues, both submitted before waiting: 49.1 ms (t_c+t_t=73.5)
+overlap hidden: 24.4 ms = 78.0% of min(t_c,t_t)=31.3 ms
+VERDICT: transfer and compute DO overlap

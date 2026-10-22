@@ -1,0 +1,28 @@
+device AMD Radeon RX 6700S  maxWgCount=4294967295 65535 65535  maxInvocations=1024
+
+=== SDMA reference (vkCmdCopyBuffer, single bulk submit) ===
+  H2D wc->dev          13.89 GB/s
+  H2D cached->dev      14.15 GB/s
+  D2H dev->wc          13.68 GB/s
+  D2D dev->dev         68.12 GB/s
+
+=== GPU-driven copy kernel (compute shader reads/writes across PCIe) ===
+leg                    workgroups       GB/s
+  H2D wc->dev          16            14.14
+  H2D wc->dev          64            14.19
+  H2D wc->dev          256           14.18
+  H2D wc->dev          1024          14.14
+  H2D wc->dev          4096          14.13
+  H2D cached->dev      256           14.20
+  D2H dev->wc          256           13.79
+  D2D dev->dev (kern)  256           72.00
+  H2D cached->dev      1024          14.18
+  D2H dev->wc          1024          13.83
+  D2D dev->dev (kern)  1024          68.84
+  H2D cached->dev      4096          14.21
+  D2H dev->wc          4096          13.80
+  D2D dev->dev (kern)  4096          72.33
+
+=== kernel + SDMA concurrently (same direction, then full duplex) ===
+  2x H2D (kernel+sdma)  agg  13.91 GB/s   (10.71 + 7.15)
+  full duplex (kernel H2D + sdma D2H)  agg  21.15 GB/s   (12.67 out + 10.78 in)

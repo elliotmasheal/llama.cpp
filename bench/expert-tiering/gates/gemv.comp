@@ -1,0 +1,24 @@
+#version 450
+// Memory-bound streaming read used as stand-in for one layer's expert GEMV.
+// Reads src.v[0 .. pc.n) pc.reps times and writes one partial per invocation.
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer Src { float v[]; } src;
+layout(binding = 1) writeonly buffer Dst { float v[]; } dst;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint reps;
+} pc;
+
+void main() {
+    uint gid    = gl_GlobalInvocationID.x;
+    uint stride = gl_WorkGroupSize.x * gl_NumWorkGroups.x;
+    float acc = 0.0;
+    for (uint r = 0; r < pc.reps; ++r) {
+        for (uint i = gid; i < pc.n; i += stride) {
+            acc += src.v[i];
+        }
+    }
+    dst.v[gid % 4096u] = acc;
+}

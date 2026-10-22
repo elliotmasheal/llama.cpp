@@ -1,0 +1,10 @@
+#version 450
+// Writes a 128-byte router result (32 ids) that the host must read back once per layer.
+layout(local_size_x = 32) in;
+
+layout(binding = 1) writeonly buffer Dst { uint v[]; } dst;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    dst.v[gid] = gid * 7u + 1u;
+}

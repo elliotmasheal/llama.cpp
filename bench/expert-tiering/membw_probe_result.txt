@@ -1,0 +1,7 @@
+buffer per run = 512 MiB (float32), best of 3
+threads  read_GB/s  copy_GB/s(read+write)
+      1       22.1       28.7
+      2       36.7       38.6
+      4       39.7       39.7
+      8       37.8       36.7
+     16       30.3       32.7

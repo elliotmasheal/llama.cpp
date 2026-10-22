@@ -1,0 +1,16 @@
+== Ornith-1.5-35B-Q4_K_M.gguf arch=qwen35moe
+  block_count=41 nextn=1 moe_layers_in_file=41 expert_count=256 top_k=8 n_embd=2048 expert_ff=512
+  expert bytes total = 18.650 GiB
+  per expert-layer (gate+up+down) = 1.820 MiB
+  expert bytes read per token (top_k x 40 layers) = 582.3 MiB
+  dense non-expert bytes (incl. output head, excl. token_embd) = 1.295 GiB
+  token_embd bytes = 0.266 GiB
+  dense read floor at 217 GB/s = 6.41 ms/token
+== LFM2.5-24B-A2B-UD-Q4_K_XL.gguf arch=lfm2moe
+  block_count=40 nextn=0 moe_layers_in_file=38 expert_count=64 top_k=4 n_embd=2048 expert_ff=1536
+  expert bytes total = 13.058 GiB
+  per expert-layer (gate+up+down) = 5.498 MiB
+  expert bytes read per token (top_k x 38 layers) = 835.7 MiB
+  dense non-expert bytes (incl. output head, excl. token_embd) = 0.530 GiB
+  token_embd bytes = 0.259 GiB
+  dense read floor at 217 GB/s = 2.62 ms/token

@@ -1,0 +1,7 @@
+=== boundary 500 ===
+timelineSemaphore=1
+recorded GPU work per layer: 0.206 ms (gemv n=3670016 reps=4 + ids + 128 B copy)
+A alloc+record+fence (scheduler-like)       0.209 ms/layer  overhead=+0.004 ms/layer
+B prerecorded+fence                         0.194 ms/layer  overhead=-0.012 ms/layer
+C prerecorded+timeline                      0.191 ms/layer  overhead=-0.015 ms/layer
+D pipelined depth2+timeline                 0.115 ms/layer  overhead=-0.090 ms/layer
