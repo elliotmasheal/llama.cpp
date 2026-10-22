@@ -192,9 +192,6 @@ option(GGML_VULKAN_RUN_TESTS                "ggml: run Vulkan tests"            
 set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
 
 # extra artifacts
-option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
-option(GGML_BUILD_EXAMPLES "ggml: build examples" ${GGML_STANDALONE})
-
 #
 # dependencies
 #
@@ -216,19 +213,6 @@ include(GNUInstallDirs)
 #
 
 add_subdirectory(src)
-
-#
-# tests and examples
-#
-
-if (GGML_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(tests)
-endif ()
-
-if (GGML_BUILD_EXAMPLES)
-    add_subdirectory(examples)
-endif ()
 
 #
 # install
@@ -360,46 +344,4 @@ if (MSVC)
     configure_msvc_target(ggml-cpu-alderlake)
     # MSVC doesn't support AMX
     # skipping            ggml-cpu-sapphirerapids
-
-    if (GGML_BUILD_EXAMPLES)
-        configure_msvc_target(common-ggml)
-        configure_msvc_target(common)
-
-        configure_msvc_target(mnist-common)
-        configure_msvc_target(mnist-eval)
-        configure_msvc_target(mnist-train)
-
-        configure_msvc_target(gpt-2-ctx)
-        configure_msvc_target(gpt-2-alloc)
-        configure_msvc_target(gpt-2-backend)
-        configure_msvc_target(gpt-2-sched)
-        configure_msvc_target(gpt-2-quantize)
-        configure_msvc_target(gpt-2-batched)
-
-        configure_msvc_target(gpt-j)
-        configure_msvc_target(gpt-j-quantize)
-
-        configure_msvc_target(magika)
-        configure_msvc_target(yolov3-tiny)
-        configure_msvc_target(sam)
-
-        configure_msvc_target(simple-ctx)
-        configure_msvc_target(simple-backend)
-    endif()
-
-    if (GGML_BUILD_TESTS)
-        configure_msvc_target(test-mul-mat)
-        configure_msvc_target(test-arange)
-        configure_msvc_target(test-backend-ops)
-        configure_msvc_target(test-cont)
-        configure_msvc_target(test-conv-transpose)
-        configure_msvc_target(test-conv-transpose-1d)
-        configure_msvc_target(test-conv1d)
-        configure_msvc_target(test-conv2d)
-        configure_msvc_target(test-conv2d-dw)
-        configure_msvc_target(test-customop)
-        configure_msvc_target(test-dup)
-        configure_msvc_target(test-opt)
-        configure_msvc_target(test-pool)
-    endif ()
 endif()

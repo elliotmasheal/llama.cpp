@@ -12,10 +12,28 @@
 
 以Qwen3.6 35B A3B Q4量化为测试模型(F盘LLM目录下：Ornith-1.5-35B-Q4_K_M.gguf)，VULKAN Backend下在8G RX 6700S显卡硬件基础上实现PP1000+/TG200+的第一阶段目标(这是一个肯定可以且必须达到的目标，但是需要你综合多方面知识并不断深入技术底层，因此需要你不畏艰难、不断探索，基于实际PP和TG过程在不同阶段的时间消耗现状，逐项优化甚至是打破传统，另辟蹊径，最终完成第一阶段的优化目标)。
 
+## 仓库裁剪范围
+
+本 fork 已物理裁剪（`trim-vulkan-cpu-qwen35moe` 分支），不要去找不存在的东西：
+
+- backend 只有 **CPU 与 Vulkan**；CUDA/Metal/SYCL/OpenCL/MUSA/CANN/… 的源码、CI、文档、fixture 全部删除。
+- 模型只支持 **qwen35moe**（`src/models/qwen35moe.cpp` + 依赖的 `delta-net-base.cpp`）；
+  `llama_model_mapping()` 只有这一个 case，其他 arch 直接抛 `unsupported model architecture`。
+- tools 只有 **cli、server、llama-bench、mtmd**（外加 server 依赖的 `tools/ui`）；
+  `quantize`、`perplexity`、`completion`、`batched-bench`、`fit-params`、`gguf-split`、`imatrix`、
+  `tokenize`、`tts`、`cvector-generator`、`export-lora`、`results`、`connect`、`examples/`、`pocs/` 已删除。
+  统一入口 `llama` 只分发 `serve`/`cli`/`bench`/`download`。
+- tests 只剩 32 个可跑的用例；`test-tokenizer-0` 与 `models/ggml-vocab-*.gguf` 已删除
+  （加载 vocab 也要走模型工厂，其他 arch 加载不了）。`models/templates/` 保留，chat 模板测试与 server 会用。
+- CI 只留 `build-vulkan.yml` + `code-style.yml`；`.devops` 只留 `vulkan.Dockerfile` + `tools.sh`。
+- 仍保留的 Python 侧：`convert_hf_to_gguf.py` + `conversion/` + `gguf-py/` + `requirements/`（本项目需要能自己造 GGUF）。
+
 ## 当前最优配置与实测基线
 
 本机：RX 6700S 8 GiB（`-dev Vulkan1`），Ryzen 7 7735HS，39.2 GiB RAM。默认加载模式在 Windows 上是
-AUTO -> resident（整模型读入内存；如需 mmap 设 `LLAMA_AUTO_RESIDENT=0`）。以下为 merge 后的 master 实测
+AUTO -> resident（整模型读入内存；如需 mmap 设 `LLAMA_AUTO_RESIDENT=0`）。注意 resident 的门槛是
+`n_bytes x 1.25 + 1 GiB`，20.2 GiB 的模型需要约 26.3 GiB 空闲内存；内存不够时 AUTO 会退回 mmap，
+pp512 直接腰斩（180 vs 373），所以基准测试要显式加 `-lm none` 强制 resident。以下为 merge 后的 master 实测
 （llama-bench，`-fa on -t 5`，交叉 r=3）：
 
 | 配置 | 命令要点 | pp512 | tg32 | pp2048 ub2048 |
@@ -40,25 +58,34 @@ AUTO -> resident（整模型读入内存；如需 mmap 设 `LLAMA_AUTO_RESIDENT=
 ## 现成基础设施（不要重复造）
 
 - MoE 专家 GPU cache：`src/llama-moe-cache.{h,cpp}`；开关 `--moe-cache-mib N`（`cparams.moe_cache_size`）。图接线：`build_moe_cache_slots()` 与 `src/llama-graph.{h,cpp}` 里的 `moe_cache` 字段。
-- 专家分层/放置：`--cpu-moe`、`--n-cpu-moe`、`-ot`/`--override-tensor`（`common/arg.cpp`）；自动放置见 `common/fit.cpp`（`llama-fit-params`）。
-- MoE 算子：`GGML_OP_MUL_MAT_ID`，kernel 在各 backend `ggml/src/ggml-*`。
+- 专家分层/放置：`--cpu-moe`、`--n-cpu-moe`、`-ot`/`--override-tensor`（`common/arg.cpp`）；自动放置见 `common/fit.cpp`（`llama-fit-params` 工具已删除，只用库函数）。
+- MoE 算子：`GGML_OP_MUL_MAT_ID`（还有本 fork 的 `GGML_OP_MUL_MAT_ID_MASK`），kernel 在 `ggml/src/ggml-cpu` 与 `ggml/src/ggml-vulkan`。
 - MTP / 投机解码：`--spec-type draft-mtp`；MTP "nextn" 头为 `LLM_TENSOR_NEXTN_*`（`src/llama-arch.cpp`）；draft 循环在 `common/speculative.cpp`；见 `docs/speculative.md`。
 
 ## 代码地图
 
 - `src/` 核心库 libllama：加载 `llama-model.cpp`/`llama-model-loader.cpp`/`llama-mmap.cpp`；图 `llama-graph.cpp`；KV/内存 `llama-memory*.cpp`、`llama-kv-cache*.cpp`；采样 `llama-sampler.cpp`；C API `include/llama.h`。
-- `ggml/` 张量库 + backend（`ggml/src/ggml-cpu`、`-cuda`、`-vulkan`、`-sycl` 等）。
+- `ggml/` 张量库 + backend（只有 `ggml/src/ggml-cpu` 与 `ggml/src/ggml-vulkan`）。
 - `common/` 参数/CLI（`arg.cpp`、`common.cpp`）、chat/解析（`chat.cpp`、`jinja/`、`parsers/`）、`speculative.cpp`。
-- `tools/` 命令行工具（`cli`、`server`、`quantize`、`llama-bench` 等）；`app/` 统一 `llama` 入口，经 `LLAMA_APP_CMD` 分发 `serve`/`cli`/`download` 等。
-- `tests/` CTest；`conversion/` + `convert_hf_to_gguf.py` GGUF 转换；`pocs/` 微基准。
+- `tools/` 命令行工具（`cli`、`server`、`llama-bench`、`mtmd`、`ui`）；`app/` 统一 `llama` 入口，经 `LLAMA_APP_CMD` 分发 `serve`/`cli`/`bench`/`download`。
+- `tests/` CTest（32 个用例）；`conversion/` + `convert_hf_to_gguf.py` GGUF 转换；`bench/moe-baseline/` 是本 fork 的实测记录。
 
 ## 构建与测试
 
-- Windows MSVC/Ninja：`cmake --preset x64-windows-msvc-release`，然后 `cmake --build build-x64-windows-msvc-release`。
-- Linux/WSL：`cmake -B build -DCMAKE_BUILD_TYPE=Release`（CUDA 加 `-DGGML_CUDA=ON`），`cmake --build build --config Release -j`。
+- 本机实际在用的是 MinGW + Ninja（不是 MSVC preset）：
+
+  ```
+  cmake -B build-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF \
+    -DCMAKE_C_COMPILER=D:/Scoop/apps/mingw/current/bin/gcc.exe \
+    -DCMAKE_CXX_COMPILER=D:/Scoop/apps/mingw/current/bin/g++.exe
+  cmake --build build-vulkan -j 8
+  ```
+
+- Git Bash 里跑 `build-vulkan/bin/*.exe` 前要 `export PATH="/d/Scoop/apps/mingw/current/bin:$PATH"`，否则找不到 libstdc++/libgcc DLL，直接 exit 127。
+- Linux/WSL：`cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON`，`cmake --build build -j`。
 - 性能相关一律用 Release/RelWithDebInfo；Debug 推理慢到不可用。
-- 测试：`ctest --test-dir <build-dir> --output-on-failure -C Release`。
-- 改 ggml 算子/kernel 先跑：`build/bin/test-backend-ops -o MUL_MAT_ID`（`-b <backend>` 过滤 backend）。
+- 测试：`ctest --test-dir build-vulkan --output-on-failure -C Release`（`test-backend-ops` 单跑太慢，已用 `-o` 门禁代替）。
+- 改 ggml 算子/kernel 先跑：`build-vulkan/bin/test-backend-ops -o MUL_MAT_ID`（`-b <backend>` 过滤 backend）。
 
 ## 代码与提交规范
 
