@@ -335,6 +335,7 @@ struct llama_moe_cache::impl {
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
     size_t buf_host_size = 0;
+    ggml_tensor * ids_host = nullptr; // pinned destination of the selected-expert readback
 
     // views used by copy_experts
     ggml_context_ptr ctx_views;
@@ -520,7 +521,7 @@ struct llama_moe_cache::impl {
                 devices[id].ctx = init_ctx(n_tensors[id]);
             }
         }
-        ctx_host  = init_ctx(n_tensors_host);
+        ctx_host  = init_ctx(n_tensors_host + 1);
         ctx_views = init_ctx(2);
 
         // the slot maps are written by the host and copied before every split, a pinned host buffer
@@ -533,6 +534,12 @@ struct llama_moe_cache::impl {
             }
         }
         const size_t alignment_host = ggml_backend_buft_get_alignment(buft_host);
+
+        // the ids are read back into pinned host memory: a pageable destination would take the
+        // staging path with its extra device drain
+        ids_host = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_I32, (int64_t) n_expert_used * max_batch);
+        ggml_format_name(ids_host, "moe_cache.ids_host");
+        buf_host_size += GGML_PAD(ggml_nbytes(ids_host), alignment_host);
 
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             group & g = groups[ig];
@@ -1335,8 +1342,16 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(ggml_is_contiguous(sel));
 
         ids.resize(ggml_nelements(sel));
-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+        const size_t ids_bytes = ggml_nbytes(sel);
+        int32_t * ids_dst = ids.data();
+        if (ids_host != nullptr && ids_host->data != nullptr && ids_bytes <= ggml_nbytes(ids_host)) {
+            ids_dst = (int32_t *) ids_host->data;
+        }
+        ggml_backend_tensor_get_async(backend, sel, ids_dst, 0, ids_bytes);
         ggml_backend_synchronize(backend);
+        if (ids_dst != ids.data()) {
+            memcpy(ids.data(), ids_dst, ids_bytes);
+        }
 
         trace_ids(il, ids);
         observe_ids(il, ids);
