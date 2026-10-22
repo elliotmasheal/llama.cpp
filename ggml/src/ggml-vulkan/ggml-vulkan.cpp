@@ -1481,6 +1481,15 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     return supported;
 }
 
+// Four k-blocks per iteration amortize the k-block barriers of the id GEMM but need 4x the LDS.
+// On this 32 KB-LDS device the m/l tiles lose occupancy and run ~2% slower, so only the s tile
+// uses that variant. GGML_VK_ID_BK4=1 puts every id tile on it for hardware with more LDS.
+// See bench/moe-baseline/P11-ID-BK4-ML.md.
+static bool ggml_vk_id_bk4_all(const vk_device& device) {
+    static const bool enable = getenv("GGML_VK_ID_BK4") != nullptr;
+    return enable && device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN;
+}
+
 static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type, uint32_t bk_step = 0) {
 
     // FLOAT_TYPE in the shader is float16_t with fp16 support, otherwise float.
@@ -1942,8 +1951,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 return use_cm1_int ? ggml_vk_matmul_cm1_int_shmem_support(device, wt, id, t)
                                    : ggml_vk_matmul_int_shmem_support(device, wt, id, t, bk_step);
             };
-            // The AMD s-tile id GEMM runs from the BK_STEP=4 shader, i.e. 4x the load buffers.
+            // The AMD id s tile runs from the BK_STEP=4 shader, i.e. 4x the load buffers.
             const bool id_s_bk4 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN;
+            const uint32_t id_ml_bk = ggml_vk_id_bk4_all(device) ? 4u : 0u;
 
             if (!int_shmem_support(s_int, false)) {
                 device->mul_mat_s_int[i] = false;
@@ -1960,10 +1970,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->mul_mat_id_s_int[i] = false;
                 device->mul_mat_id_m_int[i] = false;
                 device->mul_mat_id_l_int[i] = false;
-            } else if (!int_shmem_support(m_intid, true)) {
+            } else if (!int_shmem_support(m_intid, true, id_ml_bk)) {
                 device->mul_mat_id_m_int[i] = false;
                 device->mul_mat_id_l_int[i] = false;
-            } else if (!int_shmem_support(l_intid, true)) {
+            } else if (!int_shmem_support(l_intid, true, id_ml_bk)) {
                 device->mul_mat_id_l_int[i] = false;
             }
         }
@@ -2611,7 +2621,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 create_mm_pipelines(key, tc, name, len, data, pc_size, pc, identity, false, rsgs > 0, rsgs, false);
             }
         };
-        // AMD id path: the s tile runs the BK_STEP=4 shader, the m/l tiles keep BK_STEP=1.
+        // AMD id path: the s tile runs the BK_STEP=4 shader, the m/l tiles keep BK_STEP=1 unless
+        // GGML_VK_ID_BK4 puts them on the same variant.
         auto sg_create_mmq_bk4 = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                                      const std::string& name, size_t len, const void* data,
                                      size_t bk4_len, const void* bk4_data, uint32_t pc_size, uint32_t pc,
@@ -2626,6 +2637,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 return;
             }
             spec_fn_t identity = [](const std::vector<uint32_t>& wt, bool) { return wt; };
+            if (ggml_vk_id_bk4_all(device)) {
+                create_mm_pipelines(key, tc, name, bk4_len, bk4_data, pc_size, pc, identity, false, rsgs > 0, rsgs, false, false, 0);
+                return;
+            }
             const std::vector<vk_tile_config> tc_s = { tc[0] };
             create_mm_pipelines(key, tc_s, name, bk4_len, bk4_data, pc_size, pc, identity, false, rsgs > 0, rsgs, false, false, 0);
             if (tc.size() > 1) {
