@@ -408,6 +408,11 @@ extern "C" {
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits, except for a pooling type other than NONE)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
+
+        // cells allocated up front for the attention K/V cache:
+        //   -1 = auto (working set, grows on demand up to n_ctx), 0 = allocate n_ctx up front, > 0 = initial cells
+        // the allocation falls back to host memory when the device is full
+        int32_t kv_grow_initial;
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device
         bool swa_full;    // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)

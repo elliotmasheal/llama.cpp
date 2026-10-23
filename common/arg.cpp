@@ -2423,6 +2423,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"-kvg", "--kv-grow"}, "N",
+        "cells allocated up front for the K/V cache: -1 = grow on demand from the working set (default), 0 = allocate n_ctx up front",
+        [](common_params & params, int value) {
+            params.kv_grow_initial = value;
+        }
+    ).set_env("LLAMA_ARG_KV_GROW"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

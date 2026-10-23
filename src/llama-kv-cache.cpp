@@ -79,12 +79,15 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                 uint32_t   kv_size_init) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
+
+    this->offload = offload;
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -95,6 +98,16 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_WARN("%s: kv_size = %u overridden to %u to match the shared source cache\n", __func__, kv_size, size_other);
             kv_size = size_other;
         }
+        kv_size_init = 0;
+    }
+
+    kv_size_max = kv_size;
+
+    // allocate only the working set up front, the rest is grown on demand (ensure_capacity)
+    if (kv_size_init > 0 && kv_size_init < kv_size) {
+        kv_size = std::max<uint32_t>(kv_size_init, n_pad*64);
+        kv_size = (kv_size + n_pad - 1)/n_pad*n_pad;
+        kv_size = std::min(kv_size, kv_size_max);
     }
 
     GGML_ASSERT(kv_size % n_pad == 0);
@@ -1225,6 +1238,202 @@ uint32_t llama_kv_cache::get_size() const {
     const auto & cells = v_cells[seq_to_stream[0]];
 
     return cells.size();
+}
+
+uint32_t llama_kv_cache::used_max() const {
+    uint32_t res = 0;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        res = std::max(res, v_cells[s].used_max_p1());
+    }
+
+    return res;
+}
+
+bool llama_kv_cache::ensure_capacity(uint32_t n_extra) {
+    if (hparams.no_alloc || other != nullptr) {
+        return false;
+    }
+
+    // tensor sharing (the layer_share callback) is not supported by the rebuild below
+    for (size_t i = 1; i < layers.size(); ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            if (layers[i].k != nullptr && layers[i].k == layers[j].k) {
+                return false;
+            }
+        }
+    }
+
+    const uint32_t cur  = get_size();
+    const uint32_t need = used_max() + n_extra;
+    if (need <= cur || cur >= kv_size_max) {
+        return false;
+    }
+
+    uint32_t next = std::max<uint32_t>(need, cur*2);
+    next = (next + n_pad - 1)/n_pad*n_pad;
+    next = std::min(next, kv_size_max);
+
+    if (!host_fallback && realloc_cache(next, false)) {
+        LLAMA_LOG_INFO("%s: K/V grown to %u cells (%.2f MiB)\n", __func__, next, (double) total_size()/1024.0/1024.0);
+        return true;
+    }
+
+    // capacity must degrade, not abort: retry on host memory and stay there
+    if (offload && !host_fallback && realloc_cache(next, true)) {
+        host_fallback = true;
+        LLAMA_LOG_WARN("%s: K/V grown to %u cells on host after a device allocation failure\n", __func__, next);
+        return true;
+    }
+
+    if (host_fallback && realloc_cache(next, true)) {
+        LLAMA_LOG_INFO("%s: K/V grown to %u cells on host\n", __func__, next);
+        return true;
+    }
+
+    LLAMA_LOG_WARN("%s: failed to grow K/V to %u cells, keeping %u\n", __func__, next, cur);
+
+    return false;
+}
+
+bool llama_kv_cache::realloc_cache(uint32_t new_size, bool use_host) {
+    if (new_size < get_size()) {
+        return false;
+    }
+
+    const uint32_t n_layer = hparams.n_layer_all;
+
+    struct ggml_backend_buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                return nullptr;
+            }
+
+            ctx_map.emplace(buft, ctx);
+
+            return ctx;
+        }
+
+        return it->second.get();
+    };
+
+    const bool is_mla = hparams.is_mla();
+
+    std::vector<kv_layer> new_layers;
+    new_layers.reserve(layers.size());
+
+    for (const auto & l : layers) {
+        const uint32_t il = l.il;
+
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        if (offload && !use_host) {
+            buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
+        }
+
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            return false;
+        }
+
+        const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
+        const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+
+        const bool has_v = !is_mla;
+
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_k(), n_embd_k_gqa, new_size, n_stream);
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v(), n_embd_v_gqa, new_size, n_stream) : nullptr;
+
+        has_v && ggml_format_name(v, "%s (realloc)", l.v->name);
+        ggml_format_name(k, "%s (realloc)", l.k->name);
+
+        std::vector<ggml_tensor *> k_stream;
+        std::vector<ggml_tensor *> v_stream;
+
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            k_stream.push_back(ggml_view_2d(ctx, k, n_embd_k_gqa, new_size, k->nb[1], s*k->nb[2]));
+            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, new_size, v->nb[1], s*v->nb[2]) : nullptr);
+        }
+
+        new_layers.push_back({ il, k, v, k_stream, v_stream });
+    }
+
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> new_ctxs_bufs;
+
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: failed to allocate %u cells on %s\n", __func__, new_size, ggml_backend_buft_name(buft));
+            return false;
+        }
+
+        ggml_backend_buffer_clear(buf, 0);
+        new_ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // copy the used prefix, then swap. the per-stream block is contiguous
+    {
+        const uint32_t n_copy = std::min<uint32_t>(used_max(), get_size());
+
+        ggml_init_params gp = {
+            /*.mem_size   =*/ 4u*(1 + n_stream)*n_layer*ggml_tensor_overhead() + (1u << 20),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * gctx = ggml_init(gp);
+        if (!gctx) {
+            return false;
+        }
+
+        for (size_t i = 0; i < layers.size() && n_copy > 0; ++i) {
+            const auto & lo = layers[i];
+            const auto & ln = new_layers[i];
+
+            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(lo.il);
+            const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(lo.il) : hparams.n_embd_v_gqa_max();
+
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                ggml_tensor * ks = ggml_view_2d(gctx, lo.k, n_embd_k_gqa, n_copy, lo.k->nb[1], s*lo.k->nb[2]);
+                ggml_tensor * kd = ggml_view_2d(gctx, ln.k, n_embd_k_gqa, n_copy, ln.k->nb[1], s*ln.k->nb[2]);
+                ggml_backend_view_init(ks);
+                ggml_backend_view_init(kd);
+                ggml_backend_tensor_copy(ks, kd);
+
+                if (lo.v != nullptr && ln.v != nullptr) {
+                    ggml_tensor * vs = ggml_view_2d(gctx, lo.v, n_embd_v_gqa, n_copy, lo.v->nb[1], s*lo.v->nb[2]);
+                    ggml_tensor * vd = ggml_view_2d(gctx, ln.v, n_embd_v_gqa, n_copy, ln.v->nb[1], s*ln.v->nb[2]);
+                    ggml_backend_view_init(vs);
+                    ggml_backend_view_init(vd);
+                    ggml_backend_tensor_copy(vs, vd);
+                }
+            }
+        }
+
+        ggml_free(gctx);
+    }
+
+    ctxs_bufs = std::move(new_ctxs_bufs);
+    layers    = std::move(new_layers);
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_cells[s].grow(new_size);
+    }
+
+    return true;
 }
 
 uint32_t llama_kv_cache::get_n_seq_max() const {

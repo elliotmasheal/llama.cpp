@@ -75,6 +75,18 @@ public:
         reset();
     }
 
+    // append cells [size(), n) without touching the existing ones
+    void grow(uint32_t n) {
+        if (n <= pos.size()) {
+            return;
+        }
+
+        pos.resize(n, -1);
+        ext.resize(n);
+        shift.resize(n, 0);
+        seq.resize(n);
+    }
+
     bool is_empty(uint32_t i) const {
         assert(i < pos.size());
         assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);

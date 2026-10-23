@@ -29,7 +29,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                 uint32_t   kv_size_init) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -49,7 +50,9 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        "",
+        kv_size_init
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -179,8 +182,11 @@ llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
 }
 
-std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown() const {
-    std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
+bool llama_memory_hybrid::ensure_capacity(uint32_t n_extra) {
+    return mem_attn->ensure_capacity(n_extra);
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown() const {    std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
     for (const auto & buft_size : mem_recr->memory_breakdown()) {
         mb[buft_size.first] += buft_size.second;
     }

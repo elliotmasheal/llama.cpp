@@ -278,6 +278,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.kv_grow_initial         = params.kv_grow_initial;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -2033,6 +2034,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
+
+    // grow the K/V allocation to the working set before the compute buffers are reserved
+    if (memory && memory->ensure_capacity(cparams.n_ubatch)) {
+        sched_need_reserve = true;
+    }
 
     sched_reserve();
 
@@ -4175,6 +4181,7 @@ llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
+        /*.kv_grow_initial             =*/ -1,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,

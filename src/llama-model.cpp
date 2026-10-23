@@ -2816,6 +2816,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_rs_seq,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
+                    // the K/V allocation starts at the working set and grows on demand (see llama_kv_cache::ensure_capacity)
+                    uint32_t kv_size_init = 0; // 0 = allocate n_ctx up front
+                    if (cparams.kv_grow_initial < 0) {
+                        kv_size_init = std::min(cparams.n_ctx_seq, std::max<uint32_t>(2048, 4*cparams.n_ubatch));
+                    } else if (cparams.kv_grow_initial > 0) {
+                        kv_size_init = (uint32_t) cparams.kv_grow_initial;
+                    }
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
@@ -2918,7 +2925,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* kv_size_init      */ kv_size_init);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;

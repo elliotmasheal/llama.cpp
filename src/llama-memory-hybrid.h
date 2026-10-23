@@ -39,7 +39,9 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* cells allocated up front, 0 = kv_size */
+                 uint32_t   kv_size_init = 0);
 
     ~llama_memory_hybrid() = default;
 
@@ -70,6 +72,9 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+
+    // grow the attention half, the recurrent state has a fixed size
+    bool ensure_capacity(uint32_t n_extra) override;
 
     // state write/load
 

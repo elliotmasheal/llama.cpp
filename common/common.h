@@ -583,6 +583,7 @@ struct common_params {
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
+    int32_t kv_grow_initial = -1;   // cells up front for K/V: -1 auto, 0 = n_ctx, > 0 explicit
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

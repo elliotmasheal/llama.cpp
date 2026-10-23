@@ -114,7 +114,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // cells to allocate up front; 0 = allocate the full kv_size
+                     uint32_t   kv_size_init = 0);
 
     ~llama_kv_cache() = default;
 
@@ -132,6 +134,9 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+
+    // grow the K/V allocation so that used_max + n_extra cells fit; falls back to host on allocation failure
+    bool ensure_capacity(uint32_t n_extra) override;
 
     void clear(bool data) override;
 
@@ -268,6 +273,15 @@ private:
 
     bool v_trans = true;  // the value tensor is transposed
 
+    // hard upper bound for the K/V allocation (cells)
+    uint32_t kv_size_max = 0;
+
+    // whether the tensors were requested on the device
+    bool offload = false;
+
+    // set once a device allocation failed, later growth stays on the host
+    bool host_fallback = false;
+
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
 
@@ -321,6 +335,12 @@ private:
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
     size_t total_size() const;
+
+    // highest used cell + 1, over all streams
+    uint32_t used_max() const;
+
+    // re-create the K/V tensors with new_size cells and copy the used prefix; use_host forces host buffers
+    bool realloc_cache(uint32_t new_size, bool use_host);
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;

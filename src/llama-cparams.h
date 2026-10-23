@@ -37,6 +37,7 @@ struct llama_cparams {
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
     bool offload_kqv;
+    int32_t kv_grow_initial;  // -1 auto, 0 = allocate n_ctx up front, > 0 initial cells
     bool flash_attn;
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
