@@ -44,7 +44,8 @@
 - 限制：真把 256K 填满时会增长回 5120 MiB，重新撞 `RESULTS.md` 0.2 表 B 的容量悬崖；这是预期行为。
   要覆盖"真长上下文 + 小显存"仍需 F1 + 分段（原第二阶段）。
 - 第二阶段（只有第一阶段证明不够才做）：按 cell 块分段，前段设备、尾段 host，用 LSE 合并两段注意力。
-  这要动 FA/matmul 注意力路径，风险大，先不做。
+  这要动 FA/matmul 注意力路径，风险大，先不做。**2026-10-23 更新：该方向由 F10（分块 KV + 块表间接寻址）取代，
+  不再用 LSE 合并两段，改为所有块在同一注意力内统一寻址。**
 - 验收：256K + 10K prompt、8176/6144/4096 三档全部 `status = ok`，KV 驻设备部分约 205 MiB，
   splits 从 291 降到 40-121（取决于 bank，bank 0 时 121）；PP、TG 相对同 n_kv 的 32K + KV-on-GPU 对照在 r=2 噪声内持平。
   **已达成**（`RESULTS.md` 0.3）：KV 驻 320 MiB，PP 447-478（对照 32K + KV-on-GPU 的 472.3），TG 12-14（对照 12.9-15.4）。
@@ -337,6 +338,329 @@ PP 与 TG 都有 r=2 可复现的差值，并同表记录 splits、`used`、`RS 
 (b) decode 关键路径 pread 次数 = 0（`GGML_SCHED_TRACE` 证明）、(c) pp2048 >= 同配置 resident 的 70%、(d) `ctest` 32/32。
 混合精度那条腿（热 Q4_K + 冷 IQ2/IQ3）仍先受 F6 与 repack KLD 的门禁。
 
+### F10 分块（paged）KV：块表间接寻址，原地扩展（**新增，容量路线，取代 A 第二阶段的 LSE 分段**）
+
+#### 0. 结论先行
+
+- 原地扩展**可以实现**，但不是"在原 buffer 后面接着长"（Vulkan 不能 realloc，且 tensor stride 固定），
+  而是把 KV 从"一张 `[n_embd, n_ctx]` 大张量"改成"固定大小的块 + 块表"，即 vLLM PagedAttention 的同一思路：
+  - 逻辑 cell 下标不变（`find_slot`、`k_idxs`、kq_mask、`get_n_kv` 全部照旧），只把 `cell -> 物理地址` 交给一张小表；
+  - 扩容 = 分配一个新块（BS=2048 时 40 MiB）并追加表项，**不拷贝、不重建已有张量、不重新预留图**；
+  - 峰值从 `cur + next`（约 1.5 x 新尺寸）降到 `cur + 1 块`。
+- Vulkan 侧的支撑已在树里：所有 storage buffer 在设备支持时带 `eShaderDeviceAddress`（`ggml-vulkan-buffers.cpp:64-69`），
+  `bda_addr` 已记录（`:199`）；cm2 FA 已用 `buffer_reference` 解引用 K/V（`flash_attn_cm2.comp:21,44-47`）。
+  块表存 64 位设备地址，shader 直接访问，**不需要把各块合并成一张大 buffer**。
+- **它解决的是容量，不是 decode 速度**。full attention 每个 token 都读全部历史 cell，没有"热冷"局部性；
+  落在 host 的块每 token 多付一次 PCIe（实测 H2D 14.3 GB/s，第 1 节）。成本模型见第 9 节。SSD 仍不进 decode。
+- 推荐顺序：M0 spike（确认 BDA、FA 实际路径、表读取开销）-> M1 CPU 参考 -> M2a B-lite 验证 -> M2b 融合 FA。
+  M0-M2b 只改寻址、不改 FA 数学，数值应当**逐位相同**，这是最硬的验收手段，**不依赖 F6**。
+
+#### 1. 问题与动机
+
+A 第一阶段有三个结构性问题，它们都来自"一张连续大张量"：
+
+- 扩容是整块重分配：`realloc_cache` 先为所有层分配新 buffer（`src/llama-kv-cache.cpp:1377-1386`），
+  旧 buffer 直到 `:1429` 才释放，峰值是 `cur + next`。
+- 失败是整棵 cache 粘住 host：`host_fallback` 是 cache 级标志（`src/llama-kv-cache.h:283`），
+  一次设备分配失败后整棵 KV 都在 host（`src/llama-kv-cache.cpp:1283-1291`）。
+- state 恢复不扩容：`state_read_meta` 在 `cell_count > cells.size()` 时直接失败（`src/llama-kv-cache.cpp:2575-2577`），
+  这是 `DECISIONS.md` 第 6 节未列的缺口，也是 server 的 "No available space in KV cache" 的潜在来源。
+
+分块后三者同时消失（M3 验收）。
+
+#### 2. 目标 / 非目标 / 不变量
+
+目标：
+
+1. 扩容零拷贝，峰值 = 1 块；
+2. 放置粒度 = 块（device-local / host-visible），一次设备分配失败只影响那一块；
+3. 缩容可行（clear 或显式回收尾块）；
+4. 第一版数值逐位等于现有路径。
+
+非目标（第一版）：
+
+- 量化 K/V 的分页（q8_0 等）-> M5；
+- 块级前缀共享 / copy-on-write（vLLM prefix caching）-> M5，与 `THREE-TIER.md` C 的检查点合并考虑；
+- SSD 块作为 decode 访问层：永久禁止（红线）。
+
+不变量（实现时必须保持）：
+
+- 逻辑 cell 下标语义不变；`llama_kv_cells::grow`（`src/llama-kv-cells.h:79`）原样复用；
+- `get_n_kv()` 只看 `used_max`（`src/llama-kv-cache.cpp:1494-1508`），与分配量无关，图拓扑不因分配而变；
+- 块表长度固定为 `n_ctx / BS` 项（256K / 2048 = 128 项，1 KiB），图输入尺寸不变，图复用不被打断；
+- 容量不足 = 退化而非 abort（红线）。
+
+#### 3. 数据结构
+
+- **块 `kv_block`**：BS 个 cell 的全部注意力层 K/V，是一个 ggml backend buffer（默认 device-local，可选 host-visible）。
+  块内布局 `[layer][K|V][cell][row]`，同一层在块内是连续的 `BS x row` 矩阵，FA tile 的局部性不变。
+  每 cell 20 KiB（10 层 x K/V x f16，与 `RESULTS.md` 0.3 的 160 MiB / 8192 cells 一致），BS=2048 时块为 40 MiB。
+- **块表 `kv_block_table`**：每 stream 一张，`uint64 addr[n_ctx / BS]`，Vulkan 时放在设备 SSBO，CPU 时放在主机数组。
+  `addr[b]` 为块 b 的基址（Vulkan 为 BDA，CPU 为指针），层内偏移为 `layer_idx * layer_stride + kv_off`，由 shader 计算。
+- **锚张量 `anchor`**：一个不分配数据的 f16 ggml 张量，`ne = [n_embd_k_gqa, n_ctx, n_stream]`，挂在设备 buffer 上，
+  只用来让调度器把依赖它的 FA/SET_ROWS 放到正确 backend。`get_k/get_v` 继续返回对锚的 `ggml_view_4d`，
+  `ne/nb` 与现在一致，`src/llama-kv-cache.cpp:1510-1550` 的视图代码基本不动。
+  待 M0 确认：调度器对"无真实数据的 view"按 `view_src` 的 buffer 分配 backend（读 `ggml-backend.cpp` 的 split 逻辑）。
+- **分配器**：空闲链表 + 每块状态 `{addr, placement(dev|host), refcount(M5 预留)}`。
+  `ensure_blocks(n_extra)` 取代 `ensure_capacity`：`need = used_max + n_extra`，`while cap < need: alloc_block()`。
+
+#### 3.1 块大小（BS）选型：容量粒度参数，不是性能参数
+
+BS 只影响以下四项，其中没有一项直接作用在 PP/TG 的算子上：
+
+| 影响面 | BS=2048（40 MiB/块） | BS=8192（160 MiB/块） | 对 PP/TG 的量级 |
+|---|---|---|---|
+| 增长粒度与最坏浪费 | <= 40 MiB | <= 160 MiB | 噪声内。实测 160 对 320 MiB 的 KV 无差（都 477），320 MiB 对 5120 MiB 才有差（477 对 239，`RESULTS.md` 0.2 表 B） |
+| host/device 边界粒度 | 剩余 40 MiB 即可多留一块 | 剩余 160 MiB 才多留一块 | 唯一真实影响：边界上最多差 160 MiB 的 host 流量（约 11 ms/token，见 9 节） |
+| 表项数 | 128 项 / 1 KiB（256K） | 32 项 / 256 B | 无 |
+| FA 表查询次数 | 按 K/V tile 计数，与 BS 无关（BS 只需 >= tile 且为其倍数） | 同 | 无 |
+| B-lite gather 的 dispatch 数与 scratch | 更少 / 更小 | 更多 / 更大 | 只影响验证路径（M2a）的 PP |
+
+结论：默认 2048，理由是边界粒度细、浪费小，不是因为更快。8192 只在 M2b 实测证明 dispatch 或表查询开销不可忽略时才启用。
+
+#### 4. ggml 与图层接口
+
+- **SET_ROWS**（`GGML_OP_SET_ROWS`，`ggml/include/ggml.h:538`）：dst 为分页锚时，目标地址 =
+  `addr[idx / BS] + layer_off + (idx % BS) * row_bytes`。在 op 参数里置分页标志，表作为额外输入。
+- **FLASH_ATTN_EXT**（`ggml/include/ggml.h:2503`）：K/V 为分页锚视图时，每个 K/V tile 的地址由表查出。表的挂法有两个候选：
+  (a) 新增一个 `src` 槽（需核对 `ggml_flash_attn_ext_add_sinks` 占用的槽位）；
+  (b) 在锚上挂一个分页元数据字段，不占 `src`。优先 (b)：改动小，不影响其他 op。M0 决定。
+- 复用：不新增 op，不新增并行子系统（符合 AGENTS "复用现有基础设施"）。
+
+#### 5. Vulkan 专项
+
+5.1 BDA 基础设施（已具备，只需小改）
+
+- `device->buffer_device_address` 为真时（`ggml/src/ggml-vulkan/ggml-vulkan.cpp:4589`）
+  storage buffer 带 `eShaderDeviceAddress`（`ggml-vulkan-buffers.cpp:64-69`）。
+  需新增访问器 `ggml_backend_vk_buffer_get_device_address(buffer)`，放进 `ggml/include/ggml-vulkan.h`，风格与 `ggml_backend_vk_prefetch_tensor` 一致。
+- 扩展已在用：`GL_EXT_buffer_reference2`（`flash_attn_cm2.comp:21`）、`GL_EXT_buffer_reference`（`mul_mm_cm2.comp:17`）；
+  `uint64` 表依赖 `device->shader_int64`（`ggml-vulkan.cpp:4588`），需 M0 确认在目标设备上为真。
+
+5.2 FA shader 改点（FA_SCALAR 路径）
+
+- 路径选择（`ggml-vulkan.cpp:1346-1347`）：`coopmat2` 与 `coopmat1_fa_support` 都要求 coopmat。RDNA2 预期两者皆假，走 `FA_SCALAR`，
+  f16 K/V 的 pipeline 来自 `flash_attn.comp`（`flash_attn_f32_f16*`）。M0 用日志确认，不靠推断。
+- 需改的 f16 读取点：`flash_attn.comp:266, 322, 347`（`data_kv4[k_offset/4 + kcol*k_stride/4 + ...]`）及 V 侧对应读取；
+  `k_offset` 在 `:182`，`k_stride` 在 `flash_attn_base.glsl:208`。改成按 tile 解析块：`blk = kcol / BS`，`row = kcol % BS`，
+  地址 = `addr[blk] + layer_off + row * row_bytes + d`。
+- `vulkan-shaders/` 下另有 `flash_attn_decode_phase_1.comp` / `flash_attn_decode_phase_2.comp`：M0 确认 TG 实际走哪一条，生效的那条同样要改。
+- 量化 K/V（`dequantize4`、`get_k_qs`，`flash_attn.comp:400-413`，mmq 变体）第一版**不支持**：分页要求 F16 K/V，其他类型退回连续路径并记录原因。
+
+5.3 tile 对齐（硬约束）
+
+- 每个 K tile（`BLOCK_SIZE_K` 或 Bc，M0 查清具体值）必须落在单个块内：`BS % BLOCK_SIZE_K == 0`，且 `BS % 256 == 0`
+  （与 `get_n_kv` 的 padding 粒度一致，`src/llama-kv-cache.cpp:1499`）。
+- BS 候选 1024 / 2048 / 4096 / 8192，默认 2048。满足约束后，shader 每个 tile 只查一次表，内层循环不做除法。
+
+5.4 表更新与同步
+
+- 追加块是 host 写表（`ggml_backend_tensor_set`，8 字节项）。必须在上一张图完成之后做：入口处 `llama_synchronize(lctx)`，
+  照 `update()` 的做法（`src/llama-kv-cache.cpp:863`）。释放块同样只在同步点发生，走延迟释放列表。
+- 表项为 0 时 shader 不得解引用：host 侧保证 `need <= cap`。调试开关下 shader 对 `addr == 0` 写 sentinel 并计数，避免 GPU fault 导致 device lost。
+
+5.5 放置与显存限额
+
+- `GGML_VK_VRAM_LIMIT_MIB`（F0）经 hold-back 让新块分配失败。失败时**只把这一块放到 host-visible 内存**，
+  而不是整棵 cache 粘住。这是相对现状最大的改进。
+- host-visible 块：BDA 同样可用，FA 直接经 PCIe 读。它的作用是容量，不是 TG 加速。
+
+5.6 分配失败的退化路径（已具备）
+
+- `ggml_backend_vk_buffer_type_alloc_buffer` 捕获 `vk::SystemError` 并返回 nullptr（`ggml-vulkan.cpp:13315-13317`），
+  不 abort，可直接用作逐块降级的判据。
+
+5.7 性能假设（M0 必测）
+
+- 标量 FA 在 tile 边界查表后，预期每 tile 增加 1 次表读 + 1 次 64 位加法，开销 < 1%。测 n_kv = 10K 与 128K 两点。
+
+#### 6. CPU 参考实现（M1）
+
+- `ggml-cpu` 的 FLASH_ATTN_EXT 与 SET_ROWS 按同一张表求地址（指针算术）。它是 M1 的正确性基准，也是 test-backend-ops 的参考实现。
+- CPU 块用对齐的 host 内存分配，沿用 `ggml_backend_cpu_buffer_type`。
+
+#### 7. 与现有行为的对接
+
+| 位置 | 现状 | F10 后 |
+|---|---|---|
+| `src/llama-kv-cache.cpp:1253` `ensure_capacity` | 整块重分配 | `ensure_blocks`，追加块，不拷贝 |
+| `src/llama-kv-cache.cpp:1299` `realloc_cache` | 全量重建 | 分页模式下删除该路径 |
+| `:1510` / `:1530` get_k / get_v | 对大张量取视图 | 对锚取视图（ne/nb 不变） |
+| `:1594` / `:1629` / `:1650` cpy_k / cpy_v | SET_ROWS 写大张量 | SET_ROWS 写锚（分页变体） |
+| `:2233` build_graph_shift | 对整张量做 RoPE | 逐块 `ggml_view_2d` 做 RoPE（块内连续） |
+| `:2468` state_write_data / `:2747` state_read_data | 按 cell range 读写大张量 | 按块拆分 range，每块一次 `ggml_backend_tensor_get/set` |
+| `:2569` state_read_meta | cell 超出即失败 | 先 `ensure_blocks(cell_count)` 再读，修掉 "not enough cells" |
+| `src/llama-context.cpp:2043` | 增长后置 `sched_need_reserve` | 分页模式下 n_kv 不变，不再重预留（顺带收掉 `DECISIONS.md` 第 6 节第 11 条的 (b)） |
+| `src/llama-memory-hybrid.cpp:35` | 只挂 `llama_kv_cache` | 不变，recurrent 不参与 |
+
+自动退回条件（任一成立就走连续路径，计数告警，不 abort）：`flash_attn` 关闭、K/V 非 F16、`v_trans`、
+`other != nullptr`（共享 cells，MTP / qwen4exp）、`layer_share` 复用张量、`hparams.no_alloc`。
+与 `ensure_capacity` 现有守卫一一对应（`src/llama-kv-cache.cpp:1254-1265`）。
+
+#### 8. 开关与默认
+
+- `--kv-page auto|on|off`（env `LLAMA_ARG_KV_PAGE`）、`--kv-block N`（默认 2048，必须是 256 的倍数）。
+- 默认值：M2b 之前为 off；M2b 过门禁并在目标口径 256K + 10K 三档 r=2 上 PP/TG 不退步后，改 auto，并登记进 `DECISIONS.md` 第 4 节。
+- 每次退回都打印一次原因（`kv-page disabled: <reason>`）。
+
+#### 9. 成本模型（M0/M2 实测前的估算基线）
+
+9.0 先纠正一个容易误读的前提
+
+**分页本身不产生 PCIe 流量。** 全部块在 VRAM 时每 token 的 PCIe = 0，与 KV 全驻设备相同；
+M2a 的 gather 是显存内 D2D，走显存带宽而不是 PCIe。**只有块落在 host 时才有 PCIe**，
+那是"容量装不下"的固有代价，不是分页引入的代价。相对现状 `-nkvo`（100% host，每 token 全量上传）
+分页只会减少 PCIe；相对 KV 全驻 VRAM 则是中立的。
+唯一必须守住的一条：**块表必须驻设备**（256K 时 1 KiB）。表在 host 会被每个 tile 读一次，那才是真正的灾难。
+
+9.1 TG（单一 token 查询，无内容可重叠，损失是直接的）
+
+口径：20 KiB/cell、256K 满填 = 5120 MiB、PCIe 14.3 GB/s（第 1 节实测）、基线 73 ms/token（13.7 t/s）。
+
+| host 块占比 | 每 token 字节 | PCIe 时间 | 结论 |
+|---|---:|---:|---|
+| 0（全 VRAM） | 0 | 0 | 基线 |
+| 5%（0.25 GiB） | 256 MiB | 18 ms | 可被流水预取隐藏 |
+| 10%（0.5 GiB） | 512 MiB | 36 ms | 可被流水预取隐藏 |
+| **20%（1 GiB）** | 1 GiB | **72 ms** | **临界：约等于一次完整的单 token 计算预算** |
+| 40%（2 GiB） | 2 GiB | 143 ms | 不可隐藏，TG 约 4.7 t/s |
+| 100%（现状 `-nkvo`） | 5 GiB | 359 ms | 约 2.3 t/s，且注意力可能被拖到 CPU，实际更差 |
+
+注意上表的基线是 10K 口径。256K 满填时基线本身也会变慢（仅从 VRAM 读 5 GiB KV 就要约 17 ms），
+所以表里的 TG 是上限估计，不是预测值。
+
+9.2 PP（可重叠，且摊在整段 prefill 上）
+
+每个 ubatch 都要从 host 读一次当前历史范围内的全部 host 块：
+
+```
+host 字节总量 ~= f_host x 20 KiB x N^2 / (2 x n_ubatch)
+```
+
+N = 262144、`-ub 2048` 时：f_host = 1 约 320 GiB -> 22 s，占 256K prefill（约 870 s 量级）的 2-3%；
+f_host = 0.2 约 4.5 s -> 约 0.5%，且 H2D 与 shader 可并行。
+**PP 不是这个方案的问题，TG 才是。**
+
+9.3 缓解梯度（按性价比，全部需要实测）
+
+1. 流水预取（无质量风险，优先做）：host 块按层预取，复用 MoE 的 2 槽环机制（`LLAMA_MOE_PREFETCH`），
+   让第 L 层的 H2D 与第 L-1 层的计算重叠。隐藏上限就是 9.1 的临界值：**host 侧 1 GiB 以内基本免费**，
+   1-2 GiB 部分隐藏，超过 2 GiB 按字节线性付费。
+2. 冷块降精度：host 块按 q8_0 存（10 KiB/cell），读入后反量化到 scratch，PCIe 减半，
+   代价是一遍显存内反量化（host 字节的 2 倍，约 14 ms/GiB）。改数值，受 F6 门禁。
+3. 减少 n_kv：见 9.4，是唯一从根上把 decode 变便宜的路径。
+4. 减少每 cell 字节：`-ctk/-ctv q8_0`（5120 -> 2660 MiB），与 bank 空间互挤，受 F6 门禁。
+
+9.4 显存侧的两个对照量（说明分页把成本从显存挪到了 PCIe，而不是凭空增加）
+
+- 全驻 VRAM 时每 token 的 KV 读取本身有下限：256K 满填 5 GiB / 300 GB/s 约 17 ms。
+  即 PCIe 为 0 时，256K 满上下文的 KV 读也要约 17 ms。这是显存带宽的地板，不是分页的成本。
+- B-lite（M2a）的 gather 是显存内 D2D，额外约 2 x n_kv x 20 KiB：10K 约 1.4 ms/token（约占 2%）、
+  128K 约 18 ms、256K 约 36 ms。**只用于验证，长上下文下不可作为默认。**
+
+9.5 上下文压缩与前缀缓存（agent / 多轮场景的硬约束）
+
+压缩必须做在 KV 层，不能做在 token 层。server 的复用判定只看 token 列表：
+`n_past = slot.prompt.tokens.get_common_prefix(input_tokens)`（`tools/server/server-context.cpp:3972`），
+slot 选择也基于 LCP（`:1812`）。所以"改写 / 摘要 prompt 文本"会让前缀缓存全废、每轮全量重算；
+而"只丢 KV cell、token 原文逐字不变"则照常命中，PP 只算新增。
+
+三条代码级约束（实现前必须满足）：
+
+1. **现有 API 删不了头部**。`llama_memory_hybrid::seq_rm` 先问 recurrent（`src/llama-memory-hybrid.cpp:146-153`），
+   而 `llama_memory_recurrent::seq_rm` 只支持全删与尾回滚（`n_rs_seq`），删头部直接返回 false
+   （`src/llama-memory-recurrent.cpp:184-232`）。所以要新增一个只动 attention 段的压缩操作；
+   语义成立，因为 30 层 GDN 的 RS 已经把被丢的那段总结进去了。
+2. **命中判定不看 `seq_pos_min`**。压缩后若新请求只匹配被丢掉的前段，LCP 给出很大的 `n_past`，
+   但那些 cell 已不存在，会静默漏掉历史。恢复前必须校验 `n_past >= seq_pos_min`，否则重算。
+3. **只留洞不省时间**。`get_n_kv()` 取 `used_max`（`src/llama-kv-cache.cpp:1494-1508`），低地址留洞不降 `n_kv`，
+   FA 仍遍历整段：只省显存，不省 PP/TG。必须压缩 cell 编号。
+   分页让这一步免费：重排 = 改块表顺序，不搬数据；无分页则要 defrag 搬 cell。
+
+策略要求：保留边界必须是"位置 / 固定窗口"的确定性函数，**不得由当前剩余显存决定**，
+否则同一 prompt 在不同时刻得到不同状态，缓存不可复用、输出不可复现。逻辑保留集合与物理放置解耦（M4）。
+压缩后的状态要能作为缓存对象保存与装载（内存 prompt cache、SSD 检查点，与 C 合并），
+键 = 完整 token 前缀哈希 + 压缩策略版本；装载前 `ensure_blocks`（M3）。
+
+PP 成本分三层（256K 口径）：
+
+| 场景 | PP 成本 | 依据 |
+|---|---|---|
+| 无前缀缓存，每轮全量重算 | 约 550 s/轮 | 10K 实测 22 s、PP 478（`RESULTS.md` 0.3）线性外推，是下界 |
+| 有前缀缓存，每轮只算新增 | 每轮几十秒（估算，未实测） | 新增 token 仍 attend 全部历史，成本随 `n_kv` 线性 |
+| 有前缀缓存 + 压缩到 N' | 按 `N' / n_kv` 线性下降 | 注意力部分随 `n_kv` 走 |
+
+第二行估算区间：每 token = 专家（常数）+ 注意力（随 `n_kv`）。10K 时 2.09 ms/token，
+256K 时注意力放大 26 倍；若注意力在 10K 占 20-40%，每 token 约 13-23 ms，新增 2K token 的一轮约 25-46 s。
+**未实测，M4 的 256K 满填臂就是为了量它，不得当结论引用。**
+
+质量保护（压缩一旦启用）：system prompt / 工具定义 / 最近 N 轮钉住不压，只压中间最老的部分，
+优先"冷块降精度"（q8_0 存 host、读入反量化），最后才整块丢弃。压缩改数值，必须过质量门
+（F6 已落地，`bash bench/tools/quality-gate.sh`，门槛 |mean KLD| <= 1e-4 且 same top p >= 99.5%）。
+
+与压缩正交的 PP 手段：F8/B2 的按 query 分块、更大的 `-ub`、C 的 SSD 前缀检查点。不改变上下文语义，可独立推进。
+
+
+#### 10. 里程碑与验收
+
+M0 spike（前置，不改主线）
+
+- 0a. ~~补完 `FLASH_ATTN_EXT -b Vulkan1` 的约 22 例~~ **已解除**（2026-10-23：5332/5332 已补齐，`DECISIONS.md` 第 6 节）。
+- 0b. 用日志确认 RX 6700S 上 PP、TG 实际走的 FA 路径（FA_SCALAR？split-k？decode phase？）。
+- 0c. 独立 Vulkan 小测试：两个 buffer，块表（uint64）经 BDA 访问，表内块不连续时结果正确。
+- 0d. 手写一个"读表版"标量 FA 微基准，测 10K 与 128K 耗时，验证第 5.7 节的 < 1% 假设。
+- 验收：0b 结论落地；0c 通过；0d 开销 < 1%，否则给出替代方案。
+
+M1 CPU 参考 + 分配器（默认 off）
+
+- 块分配器、块表、锚、`ensure_blocks`，SET_ROWS / FA 的 CPU 分页实现，get_k/get_v 的锚视图。
+- 验收：CPU 上 `--kv-page on` 与 `off` 的第一步 logits 逐位相同（8K、16K 两点）；test-backend-ops 新增分页用例（块序随机打乱以捕捉表错误）全绿；`ctest` 32/32。
+
+M2a B-lite（验证，不改 FA shader）
+
+- 每层每块 `ggml_cpy` 把块内连续行拷进 scratch，FA 走原连续路径。只用于验证 M1 的表与块语义，性能不作目标。
+- 验收：Vulkan 上 `--kv-page on`（B-lite）与 `off` 的生成文本在 temp 0 下逐字相同，10K 与 40K 两个 prompt。
+
+M2b 融合 FA（Vulkan）
+
+- 分页 SET_ROWS 变体；`flash_attn.comp` 的 f16 读取改表（5.2）；分页模式强制 FA_SCALAR（RDNA2 本来就走它）。
+- 门禁（AGENTS 第 3 节）：`MUL_MAT_ID` CPU 945/945、`MUL_MAT_ID_MASK` CPU 4/4、`MUL_MAT_ID` Vulkan 939/939、
+  `MUL_MAT` Vulkan 2275/2275、`FLASH_ATTN_EXT` Vulkan 5332/5332、`ctest` 32/32。
+- 验收：256K + 10K 三档 `status = ok`；逐位相同；PP/TG 与 `off` 在 r=2 噪声内持平；`reallocs` 列为 0（扩容不再触发重分配）。
+
+M3 状态与清理
+
+- state_write / state_read 按块；`state_read` 前调用 `ensure_blocks`；K-shift 逐块；clear 时回收块。
+- 验收：server 的 slot save/restore 在"快照 token 数 > 当前容量"时通过；上下文平移（K-shift）测试通过。
+
+M4 放置与三层
+
+- 块级 device/host 放置，显存限额失败时逐块降级；`used`、`held`、host 块数进矩阵。
+  回归确认 F1 的触发条件（`-nkvo` + 非零 bank）没有被 host 块误触发。
+- 验收：`RESULTS.md` 第 0 节新增"256K 满填"臂（真正填到 262144 cells，而不是 10K），8176 / 6144 / 4096 三档全部 `status = ok`，
+  报告 host 块字节数与 decode 额外时间，与第 9 节模型对照。
+
+M5（可选）：量化 K/V 分页；块级前缀共享（seq_cp 的 copy-on-write，与 C 的检查点合并）。
+
+#### 11. 风险
+
+| 风险 | 影响 | 缓解 |
+|---|---|---|
+| 表项错误或越界 -> GPU fault / device lost | 需重启整机 | host 侧表校验；调试开关；M0c 专测；随机块序测试 |
+| 调度器对无数据锚的 split 判断与预期不同 | split 数增加、性能下降 | M1 用 `GGML_SCHED_TRACE` 对照 splits 基线（prefill 291、decode 282） |
+| 标量 FA 内循环地址计算拖慢 PP | PP 下降 | M0d 测量；必要时 tile 级预计算表指针 |
+| 图复用被打断 | PP/TG 下降 | 锚与表尺寸固定；只有 n_kv 变化才重建图（现状已如此） |
+| 块对齐与 FA tile 不匹配 | 数值错误或性能下降 | BS 约束 + M0 确认 `BLOCK_SIZE_K` |
+| 与 `-nkvo` / F1 交互 | 复现 abort | M4 专门回归 |
+| 守卫分支组合爆炸 | 维护成本 | 只支持 F16 + FA + 非共享 + 非 transposed，其余显式退回 |
+
+#### 12. 需要用户确认的决定（按 AGENTS 要求，动手前先停）
+
+1. 是否批准启动 M0（0b/0c/0d 需要 GPU 时间；0a 的 FA 5332 已补齐）。
+2. 块大小默认 2048 还是 8192：前者增长粒度细、峰值低；后者表更小，与现有 160 MiB 增长步一致。
+3. 是否先做 M2a（B-lite）再做 M2b（融合 FA）。建议先做：它不碰 FA 就能验证整套表与块语义，长上下文成本也已估出。
+4. M4 是否接受 host 块作为"能跑但慢"的容量档（见第 9 节的 decode 代价）。
+
 ## 4. 建议顺序
 
 以第 0 节为最高优先级，本节保留原有的分级依据。
@@ -350,5 +674,10 @@ P1 同配置最优：F8 的实现（预算归属 + 按 query 分块）-> F2 的�
 
 P2 跑更大模型：F9 有界 pinned 窗口 -> F5 SSD 冷层 -> F4 Vulkan `MUL_MAT_ID_MASK`（CPU 就地算冷专家的前置）。
 F6 是 P2 与 F8 分块改动的验收前提，不是可以并行推的独立任务。
+
+容量路线 F10（分块 KV）：与 P0 的 F1 无依赖，可在 P0 之后独立推进。M0-M2b 只改寻址，数值逐位相同，
+因此**不依赖 F6**；只有将来在分页上叠加量化或分块 softmax 时才需要 F6。
+F6 已于 2026-10-23 落地（`bash bench/tools/quality-gate.sh`），所以 9.5 的上下文压缩一旦启用，
+质量门可以直接用，不再是阻塞项。
 
 混合精度分层仍是唯一能改变 TG 屋顶线的选项（屋顶线见 `RESULTS.md` 第 5 节），但它的前提是 F6 + repack KLD = 0。
