@@ -418,6 +418,15 @@ struct llama_moe_cache::impl {
             return res;
         };
 
+        // a bank is one tensor, so it must fit in one allocation of the device
+        auto largest_bank = [](const group & g, int32_t n_slots) {
+            size_t res = 0;
+            for (const ggml_tensor * t : g.ref) {
+                res = std::max(res, (size_t) t->nb[2]*(n_slots + 1));
+            }
+            return res;
+        };
+
         // the budget is split among the devices with host experts like the layers, by the tensor split or by default by free memory
         const float * tensor_split = model.tensor_split();
         const bool split_by_free = tensor_split == nullptr ||
@@ -452,17 +461,68 @@ struct llama_moe_cache::impl {
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
 
+        auto group_budget = [&](const group & g) {
+            const device & d = devices[g.id];
+            return (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
+        };
+
+        // a bank that does not fit in one buffer cannot be allocated, split the group by layers.
+        // All layers of a group share the layout, so each chunk keeps its share of the budget and slots.
+        // The split limit comes from the backend, not from a device specific constant.
+        {
+            std::vector<group> chunks;
+            chunks.reserve(groups.size());
+            for (group & g : groups) {
+                const size_t limit    = ggml_backend_buft_get_max_alloc_size(devices[g.id].buft);
+                const int32_t n_layers = (int32_t) g.layers.size();
+                size_t per_slot = 0;
+                for (const ggml_tensor * t : g.ref) {
+                    per_slot = std::max(per_slot, (size_t) t->nb[2]);
+                }
+                int32_t n_slots = 0;
+                while (n_slots < n_layers*g.ref[0]->ne[2] && alloc_size(g, n_slots + 1) <= group_budget(g)) {
+                    n_slots++;
+                }
+                const size_t bank = per_slot*(n_slots + 1);
+
+                int32_t n_chunks = 1;
+                if (bank > limit && n_layers > 1) {
+                    if (limit <= per_slot) {
+                        n_chunks = n_layers;
+                    } else {
+                        n_chunks = (int32_t) ((bank - per_slot + limit - per_slot - 1)/(limit - per_slot));
+                        n_chunks = std::max(2, std::min(n_chunks, n_layers));
+                    }
+                    LLAMA_LOG_INFO("%s: %d layers share a bank of %.1f MiB, split into %d groups to fit the device buffer\n",
+                            __func__, n_layers, bank/1024.0/1024.0, n_chunks);
+                }
+                for (int32_t ic = 0; ic < n_chunks; ++ic) {
+                    group & dst = chunks.emplace_back();
+                    dst.id   = g.id;
+                    dst.ref  = g.ref;
+                    const int32_t first = n_layers*ic/n_chunks;
+                    const int32_t last  = n_layers*(ic + 1)/n_chunks;
+                    dst.layers.assign(g.layers.begin() + first, g.layers.begin() + last);
+                    dst.host_bytes = g.host_bytes*(last - first)/n_layers;
+                }
+            }
+            groups = std::move(chunks);
+        }
+
         // pass 1: the slot count of each group, it does not depend on the residency split
         for (group & g : groups) {
             const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
-            const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
+            const size_t  budget    = group_budget(g);
+            const size_t  limit     = ggml_backend_buft_get_max_alloc_size(d.buft);
             const int32_t max_slots = g.layers.size()*n_expert;
-            while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
+            while (g.n_slots < max_slots &&
+                   alloc_size(g, g.n_slots + 1) <= budget &&
+                   largest_bank(g, g.n_slots + 1) <= limit) {
                 g.n_slots++;
             }
             if (g.n_slots < n_expert_used) {
-                LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
+                LLAMA_LOG_WARN("%s: MoE cache budget or device buffer limit is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
                 g.n_slots = 0;
             }
         }
