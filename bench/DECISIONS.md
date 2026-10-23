@@ -69,6 +69,18 @@
     增长后 reserve 的 mask 自动按当前 `n_kv` 变小（设备 compute 1490 -> 708 MiB），planner 首次在 256K 给出 bank 1481 MiB。
     所以 `-nkvo` 不再是 256K 的必需项，`:1910` 那条 abort 也被绕开（KV 留在设备上）。
     限制：真把 256K 填满时会增长回 5120 MiB 并重新撞容量悬崖，这是预期行为。
+18. **长跨距 score 缓冲按 query 分块是 8G 档 PP 的最大单项杠杆**（2026-10-23 落地并实测，`RESULTS.md` 0.4）：
+    把一次 1280 MiB 的 score 换成若干 256 MiB 的块后，8176 档 bank 1481 -> 2879 MiB、每组 slots 406 -> 791，
+    真正跨过"双环 512 slots/组"的门槛，splits 114 -> 40、hit 6.3% -> 57.6%，PP 478 -> 680、TG 13.7 -> 20.4。
+    6144 档 bank 246 -> 1644（451 slots），仍差 61 slots 没进预取，PP 只 +8.6%。
+    4096 档 score 从 1536 降到 256 仍不够，planner 继续判 bank 0，这一档与 score 无关。
+    数值等价：KLD -0.000000、same top p 100%（`RESULTS.md` 7.1）。
+    **cap 不是越小越好**：64 MiB 时 bank 最大（3969 MiB）但块数 32 抵消收益，PP 比 256 低 20 t/s。
+19. **规划器的 "prefetch available" 不等于 cache 真的开了预取**（2026-10-23 两批日志对照）：
+    规划器只比较总 bank 与 930 MiB 双环，cache 侧却按 group（q6_K / q4_K 各 20 层）要求每组 `2 x n_expert = 512` slots。
+    0.3 的 8176 臂 bank 1481 MiB = 406 slots/组，实际是关的（`prefetch needs 512 slots per group`），
+    当时文档写"预取打开"作废；0.4 的 cap 256 之后才是 791 slots/组、真的打开。
+    以后引用预取状态必须以 cache 的 `prefetch needs ...` 行与 `splits` 为准，不读规划器那一句。
 
 ## 3. 已证伪清单（勿重做）
 
@@ -128,6 +140,8 @@
 | `LLAMA_MOE_PLAN` | 开 | 0 = 不由规划器决定 bank | - |
 | `GGML_VK_VRAM_LIMIT_MIB` | 未设 | **显存档位模拟**，见 `README.md` 第 2 节 | 2026-10-23 报告值已验证；各档性能未测 |
 | `-kvg` / `--kv-grow` | **-1（auto）** | K/V 初始 cells：-1 = 按工作集增长（上限 `n_ctx`，设备失败回退 host）、0 = 一次分配 `n_ctx`、>0 = 指定初始 cells | 256K+10K：PP 178.5 -> 477、TG 6.4 -> 13.8、RAM 峰值 -7.2 GiB；`0` 时 PP 239.4（`RESULTS.md` 0.3） |
+| `-fac` / `--fa-chunk-mib` | **256** | 长跨距 prefill 注意力每块 score 的上限；query 维按预算切块，0 = 整段一块（旧行为）。规划器的 score 预留同步取这个值 | 8176 档：0 -> PP 458、64 -> 657、128 -> 673、**256 -> 680**、512 -> 627（`RESULTS.md` 0.4） |
+| `--kv-page` / `--kv-block`（**规划中，未在树里**，见 `THREE-TIER.md` F10） | off（M2b 前）；`--kv-block` 2048 | K/V 改为固定大小块 + 块表：扩容零拷贝、峰值 = 1 块、块级设备/host 放置 | 待 M1-M2b 实测，默认值由目标口径决定 |
 | `GGML_SCHED_TRACE` / `GGML_MOE_COPY_TRACE` / `GGML_VK_TIME_COPIES` / `GGML_VK_MEMORY_LOGGER` / `GGML_VK_PERF_LOGGER` | 关 | 诊断；PERF_LOGGER 拖慢 decode 2.6x | 只看占比 |
 | `GGML_SCHED_HW_SIGNAL` / `_HW_PIPELINE` / `_HW_NOWAIT`、`GGML_MOE_CACHE_MAX_FULL` / `_LRU_DIV`、`LLAMA_ROUTING_DIAG` | 已回退，不在树里 | 见第 3 节 | - |
 
@@ -184,17 +198,24 @@
    不是 KV 本身，且比先前假设的"约 940 MiB"更大。修法是按 `n_kv` 工作集而不是 `n_ctx` 建 reserve 图（或按 query 分块），
    归属与量级都已确认，**已由 A 落地**（`RESULTS.md` 0.3：device compute 1490.02 -> 708.02 MiB，planner 在 256K 给出 bank 1481 MiB）。
    另一条腿是按 query 分块（保持 `-ub 2048` 与完整历史范围），将 KV 驻 GPU 口径的 bank 从 3584 用回 4096；它改变数值结果，等 F6。
+    **2026-10-23 已落地并验收**（判决 18、`RESULTS.md` 0.4）：F6 先行，分块数值等价（KLD 0），
+    8176 档 bank 2879 MiB、预取真开、PP 680 / TG 20.4；6144 档 451 slots/组差 61 开不了预取（F3）；
+    4096 档 bank 仍 0，与本条"这一档缺的不是 score"的结论一致。
 4. **P1**：目标口径矩阵的 r=2 方差已补（`RESULTS.md` 0.3，三档各 2 次）；
    旧的 256K bank 阶梯（3072/2048/1024，为了绕 `:1910`）**已作废**，现在 planner 直接给 1481 MiB 且不 abort。
    `-ctk/-ctv q8_0` 对搬运税的实测也降级：prefill 不搬 KV，只剩 decode 的 205.7 MiB/token。
    FA hunk 的二分**取消**，没有引擎回归（判决 13）。
 5. **P2，F9**：RAM 侧是全有或全无（`common/fit.cpp:987-995` + `src/llama-moe-cache.cpp:208-213`），
    跑更大模型要换成有界 pinned 窗口 + 批量填充；SSD 仍是冷层，且**不得**把 85% 命中率当成 decode 不等盘的保证。
-6. `FLASH_ATTN_EXT -b Vulkan1` 5332 例只跑完 5310（0 FAIL），剩约 22 例未补；动 FA 之前先补完。
+6. `FLASH_ATTN_EXT -b Vulkan1` **5332/5332 已补齐**（2026-10-23，B2 落地那轮，0 FAIL）；`MUL_MAT` 2275/2275、
+   `MUL_MAT_ID` Vulkan1 939/939 / CPU 945/945、`MUL_MAT_ID_MASK` CPU 4/4（Vulkan 0/0）、`ctest` 32/32。
+   这条门禁关闭。
 7. repack 的 KLD != 0 未修，这是混合精度分层路线（唯一能改 TG 屋顶线的选项）的前置门。
 8. 独立小 draft 模型（需要同 tokenizer/vocab 且受 arch 裁剪限制）与 ReBAR/SAM 两项可行性筛查至今没做。
 9. q6_K dense 的真实缺口（1.4x）还没定位到 MMQ 的哪一段；GEMV 向量化已被判无空间。
-10. 本树没有可重建的 PPL/KLD 通道，任何质量结论都必须先恢复一个测量工具再谈（F6）。
+10. **F6 已关闭**（2026-10-23）：`tools/perplexity/` 从 git 历史恢复，`bench/tools/quality-gate.sh` 一条命令给出
+    PPL 与 KLD（基线 PPL 5.798313、logits 基线 2.0 GB 在 `F:/LLM/kld/`），B2 用它验收过（`RESULTS.md` 7.1）。
+    限制：10K 文本最多 `-c 4096`（要求 >= 2 x n_ctx tokens），质量门验证算法等价，不是 256K 数值。
 11. **A 第一阶段的遗留**（`RESULTS.md` 0.3）：增长是按 2 倍翻，`reallocs` 3 次；长 prefill 时会多一次重预留。
     要收掉这两项需要 (a) 按 `n_ubatch` 预增长而不是越界才长，(b) 增长后跳过当前 eval 的重预留、推迟到下一个 eval。
     两者都只影响常数，不影响正确性，属于下一轮的小优化。
@@ -209,6 +230,15 @@
     （`tools/server/server-context.cpp:3972`），压缩后必须补校验，否则静默漏历史；
     (c) 只留洞不降 `n_kv`（`src/llama-kv-cache.cpp:1494-1508`），必须借块表压缩 cell 编号，否则 PP/TG 都不省。
     压缩改数值，验收走已落地的 F6 质量门。
+14. **P1，F3 现在是 6144 档的钥匙**：B2 之后这一档 bank 1644 MiB = 451 slots/组，双环要 512，
+    差 61 slots（约 220 MiB）。两条候选：规划器在决定 bank 时先把双环预留算进去（优先保预取，牺牲 LRU slots），
+    或者把"每组 2 x n_expert"的门槛改成分块层预取 / 允许 1 环 + 同步上传。
+    **已量化收益**（`RESULTS.md` 0.4 读数 5）：同档强给 `--moe-cache-mib 1920` -> PP 490 -> 678（+38%）、
+    TG 14.5 -> 19.2、hit 14.6% -> 55.2%、splits 114 -> 42、used 5161 MiB（余约 1 GiB），`status = ok`。
+    所以这条不是"要不要"，而是"怎么让规划器自己给出 1920"。
+15. **P1，4096 档 bank 仍是 0**：`-fac 256` 之后 score 预留只有 256 MiB，surplus 仍然不够（`RESULTS.md` 0.4 读数 6）。
+    这一档要么论证"0 就是最优"，要么继续查设备 compute 的其它归属（0.2 表 A 的 +1134 MiB 已在 A 里按工作集收掉，
+    剩下的固定项还没拆）。
 
 新增行为（F7 的 offload 开关、F8 的分块开关）落地时必须进第 4 节开关表，默认值由目标口径实测决定；
 `-kvg/--kv-grow` 已按此规则登记（默认 -1，实测见 `RESULTS.md` 0.3）。

@@ -28,6 +28,8 @@ llama-cli -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on \
   所以本口径**不再加 `-nkvo`**；`-nkvo` 只用于"工作集超过显存"的对照臂，且它和 `--moe-cache-mib` 非零同时出现会触发
   `llama-moe-cache.cpp:1910`（F1 未修）。要复现旧行为用 `-kvg 0`（一次分配 `n_ctx`，256K 下 5120 MiB）。
 - `used` 里的 KV 只算当前分配，不再等于 `n_ctx x 20 KiB`；比较不同臂时先看日志的 `K/V grown to N cells`。
+- 长跨距注意力的 score 缓冲由 `-fac/--fa-chunk-mib`（默认 256）封顶，query 维按预算切块；`-fac 0` 是旧行为
+  （整段一块，`RESULTS.md` 0.4 有五个 cap 的消融）。改这个值要同时看 bank 与 `reallocs`。
 - 不加 `--moe-cache-mib` 时由内存规划器（`common_moe_plan_get()`）自己算 bank，这就是"自适应 RAM 条件"。
 - 显存档位用 `GGML_VK_VRAM_LIMIT_MIB` 实现，见第 2 节。
 - 电源：「平衡」方案 + AC 供电（`bench/env/power.txt` 记 GUID），dGPU 上不得有其它推理进程。
@@ -62,6 +64,8 @@ Vulkan0（680M，UMA）两次都是 22842.2 MiB，不受影响。
   所以真实足迹看 `used = peak - held`。设定值高于当时空闲时不会 hold back
   （本机当时空闲 7378.8 MiB，所以 `8176` 档等价于"不限"）。
 - `status` 必须是 `ok`。出现 `abort` / `vram-oom` 是缺陷，不是"配置不对"，要当成待修项记进 `DECISIONS.md`。
+- 改了注意力图、分块、KV 或任何数值路径的轮次，必须附质量门的读数（`bash bench/tools/quality-gate.sh`，
+  输出 `PPL | mean KLD | same top p | PASS/FAIL`）。它不在矩阵脚本里，因为要读 2 GB 的 logits 基线。
 - 同档同配置的臂之间比收益；跨档、跨电源态的数字不可直接比。
 - `THREE-TIER.md` 第 4 节的 P0 归因（F7 / F8）除上表外还要报四项，它们不在现成的矩阵列里：
   每 eval 的 `splits`（`GGML_SCHED_TRACE=1`）、日志里的 `RS buffer size`、
@@ -95,6 +99,12 @@ Vulkan0（680M，UMA）两次都是 22842.2 MiB，不受影响。
     任何"引擎回归"的结论，都要先用另一种启动方式复现一次再说。
 14. 不带 `-v` 时这个 fork 的 INFO 日志（`common_moe_plan_impl`、`sched_graph_realloc`、`hit rate`、`VRAM limited`）
     一条都不出，所以 `held`/`reallocs`/`hit` 这几列必须有 `-v`。
+15. **`bash` 必须是 Git Bash，不能是 WSL 的 `/usr/bin/bash`**。2026-10-23 用 WSL bash 跑 `run-matrix.sh` 时：
+    `GGML_VK_VRAM_LIMIT_MIB` 没有传给 interop 起来的 `.exe`（日志里没有 `VRAM limited`，三档 bank 完全一样），
+    用 Windows pid 采显存的采样也全为 0（`peak`/`used`/`RAM` 列都是 0），只有 PP/TG 是"不限档"的真实读数。
+    判据：日志里必须出现 `VRAM limited to ...`，否则整批 `tier` 列作废。用
+    `"C:\Program Files\Git\bin\bash.exe" -c ...` 启动；Git Bash 的 `PATH` 以 `/mingw64/bin` 开头且没有 `/mnt/`，
+    WSL 的 `PATH` 以 `/usr/local/sbin` 开头并带 `/mnt/c/...`，一眼可辨。
 
 ## 5. 目录里还留着什么
 
@@ -102,7 +112,8 @@ Vulkan0（680M，UMA）两次都是 22842.2 MiB，不受影响。
 bench/README.md  RESULTS.md  DECISIONS.md  THREE-TIER.md   四份文档
 bench/prompts/   prompt10k.txt (10428 tok)  prompt20k.txt (19758 tok)
 bench/env/       power.txt  machine.txt                      口径依赖的机器事实
-bench/tools/     run-matrix.sh（矩阵） monitor.ps1  run-case.ps1  bench10k.ps1  matrix.ps1
+bench/tools/     run-matrix.sh（矩阵） quality-gate.sh（PPL + KLD 门禁）
+                 monitor.ps1  run-case.ps1  bench10k.ps1  matrix.ps1
                  ssd_probe.py  membw_probe.py  gguf_dims.py  read_trace.py
                  summarize_perf.py  vkgate.cpp               可复用探针与门禁
 bench/raw/       每次跑的 .out/.err/.csv 产物（不入库）

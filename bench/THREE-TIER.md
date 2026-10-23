@@ -55,7 +55,11 @@
 ### B（P0）：注意力按 query 分块 + 预留随块大小，不随 n_ctx（即 `THREE-TIER.md` F8 的实现形态）
 
 **B1（预留随工作集）已由 A 自动达成**：`RESULTS.md` 0.3 的 1490.02 -> 708.02 MiB 就是它，不需要单独改代码。
-下面只剩 B2（按 query 分块），它改变数值结果，等 F6 或 top-1 一致性对比再动。
+
+**B2（按 query 分块）已落地并验收**（`RESULTS.md` 0.4）：开关 `-fac/--fa-chunk-mib`（默认 256 MiB），
+分块不改变数学（质量门 KLD -0.000000、top-p 100%，见 `RESULTS.md` 7.1）。8176 档 bank 1481 -> 2879 MiB、
+每组 slots 406 -> 791（真的跨过双环门槛）、splits 114 -> 40、PP 478 -> 680、TG 13.7 -> 20.4；
+6144 档仍差 61 slots/组（F3），4096 档 bank 仍是 0（与 score 无关）。下面保留当时的设计依据。
 
 - 证据一：matmul 注意力的 score 缓冲在 10K 时 +1276.7 MiB（`RESULTS.md` 2.2），由设备 surplus 里固定扣 `LLAMA_FA_LONG_KV_MIB=1536`（`common/fit.cpp:954-960`），挤掉 bank。
 - 证据二（2026-10-23 新增，`RESULTS.md` 0.2 表 A）：reserve 图里 `attn_inp_kq_mask` 的 ne 就是 `n_ctx`（16K 时是 16384），
@@ -67,7 +71,8 @@
   外层 `-ub 2048` 与完整历史注意力范围不变（`THREE-TIER.md` F8 第 2 条的约束继续有效）。
 - 连带收益（待测）：score 与 ubatch 解耦后，8 GiB 档可以用 `-ub 4096`。`RESULTS.md` 2.3 的 10k 读数 ub4096/4608 PP 437.8 对 ub2048/5120 的 398-407，
   并且上传从 71278 MiB 降到 40765 MiB（-43%）。这是 PP 的第二个主要杠杆，和 A 独立叠加。
-- 代价：分块后 dispatch 变多，分块 softmax 与整段路径不逐位一致。先有 F6 或至少 top-1 一致性对比，再验收。
+- 代价：分块后 dispatch 变多。**实测分块与整段逐位一致**（`RESULTS.md` 7.1 的 KLD -0.000000、top-p 100%），
+  因为 softmax 的归约范围本来就是每条 query 自己那一行，切分不改变它。
 - 门禁：改 FA/graph 后必跑 `-o FLASH_ATTN_EXT -b Vulkan1`（5332，需先补完 5310 之后的约 22 例）与 `-o MUL_MAT -b Vulkan1`（2275/2275）。
 - 验收：8176 档 planner bank 达到约 3084 MiB（6 层）且预取开；4096 档 `-ub 4096` 不溢出；`reallocs`、`hit %` 进表。
 
@@ -99,7 +104,8 @@
 ### F（P2，门禁）：KV 量化作为容量杠杆，不是速度杠杆
 
 - `-ctk/-ctv q8_0` 把 256K KV 从 5 GiB 降到约 2.66 GiB，q4 约 1.4 GiB。A 完成后它能让 6G 档把整个 256K 放进设备。
-- 10K 口径下 q8_0 与 f16 的 PP 平价已测（`DECISIONS.md` 第 3 节），但**质量未测**。没有 F6 的 PPL/KLD 通道前不得作为默认。
+- 10K 口径下 q8_0 与 f16 的 PP 平价已测（`DECISIONS.md` 第 3 节），但**质量还没测**。
+  F6 的通道已就位（`bash bench/tools/quality-gate.sh`），把它当默认之前先补 q8 的 KLD 读数。
 
 ### G（P2，门禁）：大模型路径 = 有界 pinned 窗口（F9）+ 冷专家降精度（F5/F6）
 
@@ -123,7 +129,9 @@
    (a) splits 构成：prefill 291、decode 282；prefill 期间 KV 跨总线仅约 210 MiB（全程），`conv_state_last` 1.92 GiB/ubatch，专家 18.1 GiB/ubatch。
    (b) 同一 `-nkvo` 下 16K-256K 的 `sched_reserve`：设备 compute 578.02 -> 1712.02（+1134.0 MiB），host compute = `96.18 + 0.2 x KV`。
 2. **A + B1 已落地并验收**（`RESULTS.md` 0.3）：PP x2.67、TG x2.16、三档 ok、rm 峰值 -7.2 GiB。
-   下一步是 C（前缀检查点）与 D（预算式一体化）；B2（按 query 分块）等 F6。
+   **B2 随后落地并验收**（`RESULTS.md` 0.4，F6 先行）：8176 档 PP 478 -> 680、TG 13.7 -> 20.4，三档 ok。
+   下一步按收益排：F3（6144 差 61 slots/组就能开预取）-> E（`ub 2048/3072/4096` 联合调参，B2 已解锁）
+   -> C（前缀检查点）与 D（预算式一体化）。
 2. A + B 同一轮实现。只做 A 看不到 compute 预留的收益。
 3. C 紧随 A（依赖 KV 变小）。
 4. D 收尾统一规划器；E 跟 B 一起调参。
@@ -252,11 +260,15 @@ Vulkan 补 `MUL_MAT_ID_MASK`（或把 mask 变成 `MUL_MAT_ID` 的 `src[3]`，�
 验收：RAM 受限 profile 的 pp2048 >= resident 的 70%；稳态磁盘读为 0；`ctest` 32/32；
 decode 关键路径上pread 次数为 0（用 `GGML_SCHED_TRACE` 证明）。
 
-### F6 质量门
+### F6 质量门（**已落地，2026-10-23**）
 
-恢复一个可重建的 PPL/KLD 通道（本树已删 `llama-perplexity`），
-否则 F4/F5 的降精度与 CPU 分支改动无法判断是否伤输出。
-验收：一条命令能在 10k 文本上给出 PPL 与 logit KL，并进入每轮的报告。
+`tools/perplexity/` 已从 git 历史恢复，一条命令是 `bash bench/tools/quality-gate.sh`
+（`-R` 重录基线 `F:/LLM/kld/qwen35moe-10k-c4096.kld`，2.0 GB，不进 git）。
+口径：`prompt10k.txt`、`-c 4096 --chunks 2`、`-ncmoe 41`、`-lm none`、`-fa on`，覆盖长跨距 matmul 路径。
+基线 PPL 5.798313 ± 0.237848；门槛是 |mean KLD| <= 1e-4 且 same top p >= 99.5%（脚本自己判）。
+B2 用它验收过（KLD -0.000000、top-p 100%，`RESULTS.md` 7.1）。
+剩下的局限：10K 文本只能跑 `-c <= 5214`，所以质量门不是 256K 口径；它验证的是算法等价，不是长上下文数值。
+F5/G 的降精度仍需这个门。
 
 ### F7 状态放置与 KV 放置解耦（**新增，P0，TG/PP 双向**）
 
@@ -303,7 +315,7 @@ PP 与 TG 都有 r=2 可复现的差值，并同表记录 splits、`used`、`RS 
    10k 时实测 +1276.7 MiB（`RESULTS.md` 2.2），所以在 KV 驻 GPU 的短 ctx 口径上它确实挤 bank（4096 被迫降到 3584）。
    正解是按 query 分块跑 KQ/softmax/KV（例如每块 1024 token），
    **保持外层 `-ub 2048` 与完整历史注意力范围不变**，不要靠缩小整个 ubatch 省这块（ubatch 级方案已被第 3 节证伪）。
-   代价是 dispatch 变多，要用 PP 实测抵掉；分块 softmax 与整段路径不逐位一致，验收前先有 F6。
+   代价是 dispatch 变多，要用 PP 实测抵掉；分块与整段实测逐位一致（KLD 0）。
 3. **设备 compute 本身没查过归属**：`sched_reserve` 报的设备 compute 是 **1712.02 MiB**，三档完全一致，
    而 32K ctx 那批只有 772.0 MiB。这两个读数同时变了两个变量（`n_ctx` 与 KV 放置），所以"约 940 MiB 随 `n_ctx` 走"目前只是假设，
    要补的是同一 `-nkvo` 放置下 32K/64K/256K 的 `sched_reserve` 设备 compute 对照。
@@ -313,9 +325,13 @@ PP 与 TG 都有 r=2 可复现的差值，并同表记录 splits、`used`、`RS 
    同批 4096 档的 teardown warning 同向：host compute 从 1120.18 涨到 1446.35 MiB。
    这就是 4 GiB 档的钥匙：reserve 图要按 `n_kv` 工作集建，而不是按 `n_ctx`。
 
-验收：`-nkvo` + 256K + 10k 下，6144 与 8176 两档的 planner bank 达到上面反解出的量级（约 1848 / 3084 MiB）且预取打开，
-4096 档则要求第 3 条的归因结论（要么论证设备 compute 里可摘出 >= 1 GiB，要么明确论证这一档 bank 0 最优）；
-且在 32K ctx + KV 在 GPU 上，分块后的 bank 能安全用回 4096（`used`、`reallocs`、`hit %` 进表）。
+**2026-10-23 落地结果（B2，`RESULTS.md` 0.4）**：第 2 条改成按预算分块，预算由 `-fac/--fa-chunk-mib` 给（默认 256 MiB），
+`src/llama-graph.cpp` 的 matmul 注意力按 query 维切块、mask 同步切片、输出沿 query 维 concat；
+规划器的 score 预留改读同一个上限（`llama_fa_long_kv_reserve_bytes(..., fa_chunk_mib)`）。
+8176 档 bank 2879 MiB（>= 反解值 3084 的大半）、预取真的打开（791 slots/组）、splits 40、PP 680、TG 20.4。
+6144 档 bank 1644 MiB（451 slots/组），**还差 61 slots** 才开预取 -> 归到 F3。
+4096 档第 3 条的结论仍然成立：score 从 1536 降到 256 之后 bank 还是 0，这一档缺的是别的归属。
+第 1 条的"host 归属"只在 `-nkvo` 臂上还有意义，目标口径已不需要 `-nkvo`（KV 在设备）。
 
 ### F9 RAM 侧改成有界热专家窗口（**新增，P2，但它是"跑更大模型"的唯一路径**）
 

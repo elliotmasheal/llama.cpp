@@ -54,15 +54,17 @@ bash bench/tools/run-matrix.sh -T 8176,6144,4096 -r 2
 - 数字必须带口径（日期、分支/提交、电源态、bank、显存档）；跨口径比较一律视为错误，
   换算陷阱清单在 `bench/README.md` 第 4 节。
 - 结论只写进 `bench/` 的那四份文档，**不新增第五份 md**；原始产物写进 `bench/raw/`（不进 git）。
-- 本树已删 `llama-perplexity`，**没有任何可重建的 PPL/KLD 通道**。任何降精度、混合精度或 CPU 分支改动，
-  都要先恢复质量门（`THREE-TIER.md` F6），否则不予验收。
+- 质量门已恢复（`THREE-TIER.md` F6）：`bash bench/tools/quality-gate.sh` 给出 PPL 与 logit KL，
+  基线 logits 在 `F:/LLM/kld/`（2.0 GB，不进 git）。任何降精度、混合精度、CPU 分支或注意力数值路径的改动，
+  都要贴这条命令的读数（PPL | mean KLD | same top p），否则不予验收。
 
 ### 3. 回归门禁（改 Vulkan / 调度 / GEMM 后必跑，命令在 `build-vulkan/bin/` 下）
 
 `test-backend-ops -o MUL_MAT_ID -b CPU` = 945/945、`-o MUL_MAT_ID_MASK -b CPU` = 4/4、
 `-o MUL_MAT_ID -b Vulkan1` = 939/939、`-o MUL_MAT -b Vulkan1` = 2275/2275、
-`-o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332（只跑完 5310，补完后才允许动 FA）、
+`-o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332（2026-10-23 已补齐）、
 `ctest --test-dir build-vulkan` = 32/32。`-o MUL_MAT_ID_MASK -b Vulkan1` = 0/0，因为 Vulkan 侧还没有这个 op。
+动注意力数值（含 `-fac` 分块）再加一条：`bash bench/tools/quality-gate.sh` 必须 `GATE PASS`。
 
 ## 仓库裁剪范围
 
@@ -71,11 +73,11 @@ bash bench/tools/run-matrix.sh -T 8176,6144,4096 -r 2
 - backend 只有 **CPU 与 Vulkan**；CUDA/Metal/SYCL/OpenCL/MUSA/CANN/... 的源码、CI、文档、fixture 全部删除。
 - 模型只支持 **qwen35moe**（`src/models/qwen35moe.cpp` + 依赖的 `delta-net-base.cpp`）；
   `llama_model_mapping()` 只有这一个 case，其他 arch 直接抛 `unsupported model architecture`。
-- tools 只有 **cli、server、llama-bench、mtmd**（外加 server 依赖的 `tools/ui`）；
-  `quantize`、`perplexity`、`completion`、`batched-bench`、`fit-params`、`gguf-split`、`imatrix`、
+- tools 只有 **cli、server、llama-bench、mtmd、perplexity**（外加 server 依赖的 `tools/ui`）；
+  `perplexity` 是 2026-10-23 为质量门从 git 历史恢复的（`THREE-TIER.md` F6）；
+  `quantize`、`completion`、`batched-bench`、`fit-params`、`gguf-split`、`imatrix`、
   `tokenize`、`tts`、`cvector-generator`、`export-lora`、`results`、`connect`、`examples/`、`pocs/` 已删除。
-  统一入口 `llama` 只分发 `serve`/`cli`/`bench`/`download`。
-  注意 `common/arg.cpp` 里 `--ppl`、`--kl-divergence`、imatrix 家族参数仍在解析，但已经没有对应的工具。
+  统一入口 `llama` 只分发 `serve`/`cli`/`bench`/`download`，`llama-perplexity` 是独立二进制。
 - tests 只剩 32 个可跑的用例；`test-tokenizer-0` 与 `models/ggml-vocab-*.gguf` 已删除
   （加载 vocab 也要走模型工厂，其他 arch 加载不了）。`models/templates/` 保留。
 - CI 只留 `build-vulkan.yml` + `code-style.yml`；`.devops` 只留 `vulkan.Dockerfile` + `tools.sh`。
@@ -110,14 +112,15 @@ AGENTS.md                     本文件：目标、期望约束、门禁、索�
 bench/README.md               测试口径、显存/内存档位实现、必报列、测量陷阱、目录说明
 bench/RESULTS.md              数字的唯一来源（含尚未开测的目标矩阵）
 bench/DECISIONS.md            可达性判决、已证伪清单、开关表、代码级硬约束、未结项
-bench/THREE-TIER.md           三层协同的现状判定、缺口 F0-F6 与顺序
+bench/THREE-TIER.md           三层协同的现状判定、缺口 F0-F10 与顺序
 bench/prompts/                prompt10k.txt(10428 tok) prompt20k.txt(19758 tok) + d3 的两份
 bench/env/                    power.txt（电源方案 GUID）、machine.txt（采集的硬件事实）
-bench/tools/                  run-matrix.sh（矩阵，bash） bench10k.ps1 matrix.ps1 run-case.ps1 monitor.ps1
+bench/tools/                  run-matrix.sh（矩阵，bash） quality-gate.sh（PPL+KLD，bash）
+                              bench10k.ps1 matrix.ps1 run-case.ps1 monitor.ps1
                               ssd_probe.py membw_probe.py gguf_dims.py read_trace.py summarize_perf.py
                               vkgate.cpp deferred-copy.cpp vklimit-probe.cpp（显存档位自检）
 bench/raw/                    历史原始日志与 CSV，不进 git，只用于复核数字出处
-tools/expert-repack/          GGUF 专家重排脚本（质量门缺失，暂不可验收）
+tools/expert-repack/          GGUF 专家重排脚本（质量门已就位，但 repack 的 KLD != 0 未修）
 skills/code-review/SKILL.md   写代码/加注释前读
 ```
 
@@ -128,7 +131,7 @@ skills/code-review/SKILL.md   写代码/加注释前读
   采样 `llama-sampler.cpp`；C API `include/llama.h`，私有扩展 `src/llama-ext.h`。
 - `ggml/` 张量库 + backend（只有 `ggml/src/ggml-cpu` 与 `ggml/src/ggml-vulkan`）；调度器在 `ggml/src/ggml-backend.cpp`。
 - `common/` 参数/CLI（`arg.cpp`、`common.cpp`）、放置与规划（`fit.cpp`、`fit.h`）、chat/解析（`chat.cpp`、`jinja/`、`parsers/`）、`speculative.cpp`。
-- `tools/` `cli`、`server`、`llama-bench`、`mtmd`、`ui`；`app/` 统一 `llama` 入口，经 `LLAMA_APP_CMD` 分发。
+- `tools/` `cli`、`server`、`llama-bench`、`mtmd`、`perplexity`、`ui`；`app/` 统一 `llama` 入口，经 `LLAMA_APP_CMD` 分发。
 - `tests/` CTest（32 个用例）+ `test-backend-ops.cpp`（不进 CTest，要手跑）。
 
 ## 构建与测试
