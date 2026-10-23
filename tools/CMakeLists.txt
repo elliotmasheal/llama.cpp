@@ -21,4 +21,6 @@ else()
     endif()
     add_subdirectory(llama-bench)
     add_subdirectory(mtmd)
+    # the quality gate, see bench/THREE-TIER.md F6
+    add_subdirectory(perplexity)
 endif()
