@@ -89,6 +89,20 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
+// expert tensor geometry, used by the host/device memory planner
+struct llama_moe_geometry {
+    int32_t n_expert       = 0;
+    int32_t n_expert_used  = 0;
+    int32_t n_layer_expert = 0;        // number of layers with expert tensors
+    std::vector<int64_t> expert_bytes; // [n_layer] bytes of the expert tensors of each layer, 0 if none
+};
+
+LLAMA_API llama_moe_geometry llama_model_get_moe_geometry(const struct llama_model * model);
+
+// device bytes that the long cross-chunk prefill path of flash attention may need for its score buffer
+// at this configuration, 0 when the path cannot fire; the memory planner keeps this much out of the MoE bank
+LLAMA_API int64_t llama_fa_long_kv_reserve_bytes(int32_t n_head, uint32_t n_ubatch, uint32_t n_ctx);
+
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
 // the backend buffers that a state write of this memory would touch - empty caches report none

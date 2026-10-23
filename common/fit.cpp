@@ -27,6 +27,14 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// extra data from one measurement, used by the MoE memory plan
+struct common_moe_measurement {
+    llama_moe_geometry geo;
+    uint32_t n_ctx    = 0;
+    uint32_t n_ubatch = 0;
+    int32_t  n_head   = 0;
+};
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -35,7 +43,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        common_moe_measurement * moe = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -68,6 +77,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
+    }
+
+    if (moe != nullptr) {
+        moe->geo      = llama_model_get_moe_geometry(model);
+        moe->n_ctx    = llama_n_ctx(ctx);
+        moe->n_ubatch = llama_n_ubatch(ctx);
+        moe->n_head   = llama_model_n_head(model);
     }
 
     const size_t nd = llama_model_n_devices(model);
@@ -874,6 +890,162 @@ static void common_params_fit_impl(
     }
 
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+}
+
+// advisory only: prints how to split the free device memory between the MoE cache and the rest
+// the parameters are not modified, see bench/THREE-TIER.md
+static bool common_moe_plan_impl(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const size_t * margins_s,
+        common_moe_plan * out,
+        ggml_log_level log_level) {
+    constexpr int64_t MiB = 1024*1024;
+    constexpr int64_t GiB = 1024*MiB;
+
+    *out = common_moe_plan{};
+
+    llama_context_params cparams_plan = *cparams;
+    // the plan is the budget that a cache would get, so measure without one
+    cparams_plan.moe_cache_size = 0;
+    cparams_plan.moe_hybrid     = false;
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
+
+    common_moe_measurement meas;
+    std::vector<llama_device_memory_data> dmds;
+    try {
+        dmds = common_get_device_memory_data_impl(path_model, mparams, &cparams_plan, devs, hp_ngl, hp_nct, hp_nex, log_level, &meas);
+    } catch (const std::runtime_error & e) {
+        LOG_TRC("%s: cannot measure the model, no MoE plan: %s\n", __func__, e.what());
+        return false;
+    }
+
+    const llama_moe_geometry & geo = meas.geo;
+    if (geo.n_expert <= 0 || geo.n_layer_expert <= 0) {
+        LOG_TRC("%s: not a MoE model, no plan\n", __func__);
+        return false;
+    }
+
+    const size_t nd = devs.size();
+    if (nd == 0) {
+        LOG_INF("%s: no GPU, the %d expert layers stay on the host\n", __func__, geo.n_layer_expert);
+        return true;
+    }
+
+    int64_t kv_bytes    = 0;
+    int64_t compute     = 0;
+    int64_t model_bytes = (int64_t) dmds.back().mb.model;
+    int64_t surplus     = 0;
+    for (size_t id = 0; id < nd; id++) {
+        kv_bytes    += (int64_t) dmds[id].mb.context;
+        compute     += (int64_t) dmds[id].mb.compute;
+        model_bytes += (int64_t) dmds[id].mb.model;
+        surplus     += (int64_t) dmds[id].free - (int64_t) dmds[id].mb.total() - (int64_t) margins_s[id];
+    }
+
+    int64_t expert_total = 0;
+    int64_t layer_bytes  = 0;
+
+    // the long cross-chunk prefill path materialises its score buffer at runtime, not at sched_reserve:
+    // at n_kv = n_ctx the criterion declines it, so the compute size measured above is short by that much.
+    // Keep it out of the bank, otherwise the device spills in the middle of a long prompt
+    // (bench/RESULTS.md 2.2: +1276.7 MiB measured, nothing reserved).
+    const int64_t fa_score = cparams_plan.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ? 0 :
+        llama_fa_long_kv_reserve_bytes(meas.n_head, meas.n_ubatch, meas.n_ctx);
+    surplus -= fa_score;
+    for (const int64_t b : geo.expert_bytes) {
+        expert_total += b;
+        layer_bytes   = std::max(layer_bytes, b);
+    }
+    const int64_t n_slots_all = (int64_t) geo.n_layer_expert*geo.n_expert;
+    const int64_t per_expert  = n_slots_all > 0 ? expert_total/n_slots_all : 0;
+    if (per_expert <= 0) {
+        LOG_TRC("%s: no expert bytes, no plan\n", __func__);
+        return false;
+    }
+
+    // the fit margin is already subtracted from the surplus, this only covers the allocation slack
+    const int64_t slack = std::min<int64_t>(std::max<int64_t>(surplus, 0), 256*MiB);
+    int64_t bank = std::max<int64_t>(surplus - slack, 0);
+    bank = std::min(bank, expert_total);
+    if (bank < per_expert*geo.n_expert_used) {
+        bank = 0;
+    }
+
+    const int64_t slots  = bank/per_expert;
+    const int64_t ring   = 2*(int64_t) geo.n_expert*per_expert;
+    const int64_t n_full = layer_bytes > 0 ? bank/layer_bytes : 0;
+
+    const int64_t host_free     = (int64_t) dmds.back().free;
+    const int64_t resident_need = model_bytes + model_bytes/4 + 1*GiB;
+    const bool    host_fits     = host_free > resident_need;
+    // only pinned host experts are worth caching: copies from pageable mmap memory are many times slower
+    const bool mmap_load = mparams->load_mode == LLAMA_LOAD_MODE_MMAP ||
+                           mparams->load_mode == LLAMA_LOAD_MODE_MLOCK ||
+                           mparams->load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ||
+                           mparams->load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    const bool pinned = host_fits && !mmap_load;
+
+    bank = pinned ? bank : 0;
+    const bool prefetch = nd == 1 && pinned && bank >= ring;
+
+    out->cache_bytes = (size_t) bank;
+    out->slots       = pinned ? slots : 0;
+    out->n_slots_all = n_slots_all;
+    out->n_full      = pinned ? n_full : 0;
+    out->ring_bytes  = ring;
+    out->prefetch    = prefetch;
+    out->resident    = pinned;
+
+    LOG_INF("%s: %d expert layers, %d experts (top %d), %.1f MiB of experts per layer, %.1f GiB in total\n",
+            __func__, geo.n_layer_expert, geo.n_expert, geo.n_expert_used,
+            (double) layer_bytes/MiB, (double) expert_total/GiB);
+    LOG_INF("%s: model weights %.1f GiB (host + device), KV %.1f GiB at n_ctx %u, compute %.1f MiB at ubatch %u; %s %.1f MiB on %zu device(s) after margins\n",
+            __func__, (double) model_bytes/GiB, (double) kv_bytes/GiB, meas.n_ctx,
+            (double) compute/MiB, meas.n_ubatch,
+            surplus >= 0 ? "surplus" : "deficit", (double) (surplus >= 0 ? surplus : -surplus)/MiB, nd);
+    if (fa_score > 0) {
+        LOG_INF("%s: long cross-chunk prefill keeps %.1f MiB of the surplus for its score buffer (n_head %d, ubatch %u)\n",
+                __func__, (double) fa_score/MiB, meas.n_head, meas.n_ubatch);
+    }
+
+    if (bank > 0) {
+        LOG_INF("%s: recommend --moe-cache-mib %" PRId64 " -> %.1f%% of the experts (%" PRId64 " slots), or %" PRId64 " whole layers static\n",
+                __func__, bank/MiB, 100.0*(double) slots/(double) n_slots_all, slots, n_full);
+    } else if (!pinned) {
+        LOG_WRN("%s: host experts are pageable (mmap or not resident), no cache: per-expert copies from mmap are ~3x slower\n", __func__);
+    } else {
+        LOG_INF("%s: no device memory for a cache, keep the experts on the host\n", __func__);
+    }
+    LOG_INF("%s: whole-layer prefetch %s (two rings need %.1f MiB, needs one device and pinned host experts)\n",
+            __func__, prefetch ? "available" : "not available", (double) ring/MiB);
+
+    if (pinned) {
+        LOG_INF("%s: host RAM %.1f GiB free, a resident load needs %.1f GiB: host experts can be pinned\n",
+                __func__, (double) host_free/GiB, (double) resident_need/GiB);
+    } else if (!host_fits) {
+        LOG_WRN("%s: host RAM %.1f GiB free < %.1f GiB for a resident load: mmap, pageable experts, prefetch off\n",
+                __func__, (double) host_free/GiB, (double) resident_need/GiB);
+    } else {
+        LOG_WRN("%s: mmap load forced, host experts are pageable: prefetch off\n", __func__);
+    }
+
+    return true;
+}
+
+bool common_moe_plan_get(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const size_t * margins,
+        common_moe_plan * out,
+        ggml_log_level log_level) {
+    return common_moe_plan_impl(path_model, mparams, cparams, margins, out, log_level);
 }
 
 enum common_params_fit_status common_fit_params(

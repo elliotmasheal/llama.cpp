@@ -113,6 +113,29 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// the device-memory ceiling of the score buffer that the long cross-chunk prefill path may materialise;
+// LLAMA_FA_LONG_KV_MIB=0 disables that path. build_attn_mha and the memory planner both read this.
+static int64_t llama_fa_long_kv_score_max_bytes(void) {
+    static const int64_t bytes = [] {
+        const char * env = getenv("LLAMA_FA_LONG_KV_MIB");
+        return env != nullptr ? atoll(env) << 20 : (int64_t) 1536 << 20;
+    }();
+    return bytes;
+}
+
+// the largest score buffer the path can ask for at this configuration, 0 when it cannot fire.
+// sched_reserve builds the graph with n_kv = n_ctx, where the criterion declines, so nothing else sees it.
+int64_t llama_fa_long_kv_reserve_bytes(int32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
+    const int64_t max = llama_fa_long_kv_score_max_bytes();
+    if (max <= 0 || n_head <= 0 || n_ubatch < 512) {
+        return 0;
+    }
+    if ((int64_t) n_ctx <= (int64_t) n_ubatch + n_ubatch / 2) {
+        return 0;
+    }
+    return std::min(max, (int64_t) n_ctx * n_ubatch * n_head * (int64_t) sizeof(float));
+}
+
 // number of token rows of the mixed path, a non-mixed ubatch is sized for the worst case
 static int64_t llm_graph_n_tok_rows(const llama_ubatch & ubatch) {
     if (!ubatch.is_mixed()) {

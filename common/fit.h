@@ -21,6 +21,27 @@ struct common_fit_extra_model {
     bool shares_model;
 };
 
+// device memory budget for the MoE cache, see bench/THREE-TIER.md
+struct common_moe_plan {
+    size_t  cache_bytes = 0;    // recommended cache size, 0 = keep all experts on the host
+    int64_t slots       = 0;    // expert slots the cache would hold
+    int64_t n_slots_all = 0;    // expert slots of all layers with experts
+    int64_t n_full      = 0;    // whole expert layers that fit instead of a cache
+    int64_t ring_bytes  = 0;    // bytes of the two whole-layer prefetch rings
+    bool    prefetch    = false;
+    bool    resident    = false;
+};
+
+// measures the model once and fills the plan, returns false if the model is not a MoE model
+// the plan is advisory: this function does not modify the parameters
+bool common_moe_plan_get(
+                const char * path_model,
+      const llama_model_params * mparams,
+     const llama_context_params * cparams,
+                    const size_t * margins,      // margins of memory to leave per device in bytes
+              common_moe_plan * out,
+                ggml_log_level log_level);       // minimum log level to print during the measurement
+
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 //   - returns true if the parameters could be successfully modified to fit device memory
 //   - this function is NOT thread safe because it modifies the global llama logger state

@@ -1280,6 +1280,23 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    if (!model_only && !params.moe_cache_size_set) {
+        // the MoE cache is sized by the memory plan unless the user set --moe-cache-mib
+        const char * env_plan = getenv("LLAMA_MOE_PLAN");
+        if (env_plan == nullptr || atoi(env_plan) != 0) {
+            common_moe_plan plan;
+            const bool planned = common_moe_plan_get(params.model.path.c_str(), &mparams, &cparams,
+                    params.fit_params_target.data(), &plan,
+                    params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            if (planned && plan.cache_bytes > 0) {
+                params.moe_cache_size = plan.cache_bytes;
+                cparams.moe_cache_size = plan.cache_bytes;
+                LOG_INF("MoE cache: %.1f MiB from the memory plan (%s)\n", plan.cache_bytes/1024.0/1024.0,
+                        plan.prefetch ? "whole-layer prefetch available" : "no prefetch");
+            }
+        }
+    }
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;

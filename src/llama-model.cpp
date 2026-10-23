@@ -3536,6 +3536,26 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
     return model->devices[i].dev;
 }
 
+llama_moe_geometry llama_model_get_moe_geometry(const struct llama_model * model) {
+    llama_moe_geometry res;
+    res.n_expert       = model->hparams.n_expert;
+    res.n_expert_used  = model->hparams.n_expert_used_max();
+    res.expert_bytes.assign(model->layers.size(), 0);
+
+    for (size_t il = 0; il < model->layers.size(); ++il) {
+        const llama_layer & layer = model->layers[il];
+        for (const ggml_tensor * t : {layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps}) {
+            if (t != nullptr) {
+                res.expert_bytes[il] += (int64_t) ggml_nbytes(t);
+            }
+        }
+        if (res.expert_bytes[il] > 0) {
+            res.n_layer_expert++;
+        }
+    }
+    return res;
+}
+
 void llama_model_set_attn_rot(struct llama_model * model, bool value) {
     model->attn_rot = value;
 }
