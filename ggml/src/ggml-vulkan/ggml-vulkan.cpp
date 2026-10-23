@@ -4060,6 +4060,8 @@ static bool ggml_vk_host_buffer_import_usable(uint32_t vendor_id) {
     return vendor_id != VK_VENDOR_ID_AMD;
 }
 
+static void ggml_vk_reserve_vram_limit(vk_device& device, size_t idx);
+
 vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -4990,6 +4992,8 @@ vk_device ggml_vk_get_device(size_t idx) {
         } else if (getenv("GGML_VK_FORCE_MMVQ")) {
             device->mmvq_mode = 1;
         }
+
+        ggml_vk_reserve_vram_limit(device, idx);
 
         // publish the device only when it is fully built
         vk_instance.devices[idx] = device;
@@ -15607,6 +15611,72 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
     }
 }
 
+// Hold back the difference between the device-local budget and GGML_VK_VRAM_LIMIT_MIB at init.
+// The budget query counts this process, so fit-params and the MoE planner see a small card.
+static void ggml_vk_reserve_vram_limit(vk_device& device, size_t idx) {
+    const char * env = getenv("GGML_VK_VRAM_LIMIT_MIB");
+    if (env == nullptr || device->uma) {
+        return;
+    }
+
+    const uint64_t limit = std::strtoull(env, nullptr, 10) << 20;
+    if (limit == 0) {
+        return;
+    }
+
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    ggml_backend_vk_get_device_memory((int) idx, &free_mem, &total_mem);
+
+    if (free_mem <= limit) {
+        GGML_LOG_INFO("ggml_vulkan: %s: %.1f MiB available is already under the %.1f MiB limit, nothing reserved\n",
+                      device->name.c_str(), free_mem / 1024.0 / 1024.0, limit / 1024.0 / 1024.0);
+        return;
+    }
+
+    const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+
+    int32_t type_idx = -1;
+    uint64_t heap_size_max = 0;
+    for (uint32_t t = 0; t < mem_props.memoryTypeCount; t++) {
+        const vk::MemoryPropertyFlags flags = mem_props.memoryTypes[t].propertyFlags;
+        if ((flags & vk::MemoryPropertyFlagBits::eDeviceLocal) != vk::MemoryPropertyFlagBits() &&
+            (flags & vk::MemoryPropertyFlagBits::eLazilyAllocated) == vk::MemoryPropertyFlagBits()) {
+            const uint64_t heap_size = mem_props.memoryHeaps[mem_props.memoryTypes[t].heapIndex].size;
+            if (heap_size > heap_size_max) {
+                heap_size_max = heap_size;
+                type_idx = (int32_t) t;
+            }
+        }
+    }
+
+    if (type_idx < 0) {
+        GGML_LOG_WARN("ggml_vulkan: %s: no device-local memory type, GGML_VK_VRAM_LIMIT_MIB ignored\n",
+                      device->name.c_str());
+        return;
+    }
+
+    const uint64_t reserve = free_mem - limit;
+    const uint64_t chunk_max = std::max<uint64_t>(device->max_memory_allocation_size, 1ull << 20);
+
+    uint64_t held = 0;
+    while (held < reserve) {
+        const uint64_t size = std::min(chunk_max, reserve - held);
+        try {
+            device->vram_limit_reservations.push_back(device->device.allocateMemory({ size, (uint32_t) type_idx }));
+            held += size;
+        } catch (const vk::SystemError& e) {
+            GGML_LOG_WARN("ggml_vulkan: %s: held back only %.1f of %.1f MiB (%s)\n", device->name.c_str(),
+                          held / 1024.0 / 1024.0, reserve / 1024.0 / 1024.0, e.what());
+            break;
+        }
+    }
+
+    GGML_LOG_INFO("ggml_vulkan: %s: VRAM limited to %.1f MiB, %.1f MiB of %.1f MiB held back\n",
+                  device->name.c_str(), (free_mem - held) / 1024.0 / 1024.0,
+                  held / 1024.0 / 1024.0, free_mem / 1024.0 / 1024.0);
+}
+
 static vk::PhysicalDeviceType ggml_backend_vk_get_device_type(int device_idx) {
     GGML_ASSERT(device_idx >= 0 && device_idx < (int) vk_instance.device_indices.size());
 
@@ -16820,6 +16890,13 @@ vk_device_struct::~vk_device_struct() {
     all_pipelines.clear();
 
     device.destroyDescriptorSetLayout(dsl);
+
+    for (const vk::DeviceMemory & memory : vram_limit_reservations) {
+        if (memory != VK_NULL_HANDLE) {
+            device.freeMemory(memory);
+        }
+    }
+    vram_limit_reservations.clear();
 
     device.destroy();
 }

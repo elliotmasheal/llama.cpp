@@ -682,6 +682,9 @@ struct vk_device_struct {
     bool pipeline_robustness;
     bool memory_priority;
     vk::Device device;
+    // GGML_VK_VRAM_LIMIT_MIB holds these allocations back so a big card reports and
+    // behaves like a small one. They are released with the device.
+    std::vector<vk::DeviceMemory> vram_limit_reservations;
     uint32_t vendor_id;
     vk::DriverId driver_id;
     vk_device_architecture architecture;
