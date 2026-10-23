@@ -1,4 +1,0 @@
-# Cold-start decode (r=1) to compare with the llama-server path (no cross-rep cache warming).
-c1_fork_mixed_512_128 |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 512 -n 128
-c1_fork_static_512_128 |-ngl 99 -ncmoe 22 -fa on -t 6 -ub 2048 -p 512 -n 128
-c1_fork_mixed_1203_128 |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 1203 -n 128

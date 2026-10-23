@@ -1,4 +1,0 @@
-t_ms,cpu_pct,mem_avail_mb,mem_used_mb,disk_read_mbs,disk_write_mbs,gpu_util_pct,gpu_ded_mb,gpu_shared_mb,proc_cpu_pct,proc_ws_mb
-5976,21.5,18134,22038,0.0,0.0,14.5,399,13139,365.1,6899.3
-11994,13.6,12909,27263,0.0,0.0,5.8,409,18853,-357.6,11625.6
-17830,17.8,18059,22113,0.0,0.0,4.5,382,13221,370.3,6899.3

@@ -1,9 +1,0 @@
-# Official llama.cpp - refine best static config + long prefill + load mode.
-o2_ncmoe20_t6 |-ngl 99 -ncmoe 20 -fa on -t 6 -p 512 -n 32
-o2_ncmoe20_t5 |-ngl 99 -ncmoe 20 -fa on -t 5 -p 512 -n 32
-o2_ncmoe20_ub2048_pp2048 |-ngl 99 -ncmoe 20 -fa on -t 6 -ub 2048 -p 2048 -n 0
-o2_ncmoe22_ub2048_pp2048 |-ngl 99 -ncmoe 22 -fa on -t 6 -ub 2048 -p 2048 -n 0
-o2_ncmoe24_ub2048_pp2048 |-ngl 99 -ncmoe 24 -fa on -t 6 -ub 2048 -p 2048 -n 0
-o2_ncmoe22_ub512_pp2048 |-ngl 99 -ncmoe 22 -fa on -t 6 -ub 512 -p 2048 -n 0
-o2_ncmoe22_lm_none |-ngl 99 -ncmoe 22 -fa on -t 6 -lm none -p 512 -n 32
-o2_ncmoe22_lm_mmap |-ngl 99 -ncmoe 22 -fa on -t 6 -lm mmap -p 512 -n 32

@@ -162,6 +162,6 @@ AGENTS.local.md
 /pocs/
 *.err
 *.spv
-/bench/expert-tiering/acl-recovery/
-/bench/expert-tiering/stats/
+/bench/raw/
+/bench/longctx/
 

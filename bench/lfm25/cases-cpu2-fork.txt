@@ -1,4 +1,0 @@
-# Isolate CPU decode path: load-mode and thread-count controls (fork).
-cpu_fork_t8        |-ngl 0 -ncmoe 0 -fa on -t 8 -p 512 -n 128
-cpu_fork_none_t6   |-ngl 0 -ncmoe 0 -fa on -t 6 -lm none -p 512 -n 128
-fork_static_t8     |-ngl 99 -ncmoe 22 -fa on -t 8 -p 512 -n 128

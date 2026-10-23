@@ -1,7 +1,0 @@
-# Round 4b: long-prefill scaling at the mixed winner (t=6).
-r4b_pp2048_c36m5120_ub2048 |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 2048 -n 0
-r4b_pp2048_c36m5120_ub1024 |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -ub 1024 -p 2048 -n 0
-r4b_pp4096_c36m5120_ub2048 |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 4096 -n 0
-r4b_pp4096_c36m5120_ub4096 |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -b 4096 -ub 4096 -p 4096 -n 0
-r4b_pp2048_c40m5120_ub2048 |-ngl 99 -ncmoe 40 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 2048 -n 0
-r4b_pp8192_c36m5120_ub2048 |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 8192 -n 0

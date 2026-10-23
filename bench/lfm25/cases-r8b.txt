@@ -1,2 +1,0 @@
-# Round 8b: context-length effect on TG at the champion config.
-r8b_ctx2048_tg128 |-ngl 99 -ncmoe 36 --moe-cache-mib 5120 -fa on -t 6 -ub 2048 -p 2048 -n 128

@@ -1,7 +1,0 @@
-ggml_vulkan: 1 = AMD Radeon RX 6700S (AMD proprietary driver) | uma: 0 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 32768 | int dot: 1 | matrix cores: none
-cpu 4 experts:  0.575 ms
-gpu 4 experts:  0.330 ms
-serial sum:     0.905 ms
-concurrent:     0.639 ms
-hidden: 0.266 ms = 80.4% of min(cpu,gpu)=0.330 ms
-VERDICT: CPU and GPU run concurrently

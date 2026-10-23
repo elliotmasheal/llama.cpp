@@ -3,75 +3,133 @@
 **除关键术语等之外，尽可能用中文回复**
 
 > [!NOTE]
-> 本仓库是 `elliotmasheal/llama.cpp` fork，基于 ggml-org/llama.cpp 的上游 master。
-> `origin` 指向本 fork，未配置 `upstream` remote。
+> 本仓库是 `elliotmasheal/llama.cpp` fork，基线是 ggml-org/llama.cpp 的上游 master。
+> `origin` 指向本 fork，未配置 `upstream` remote。**本项目不考虑"能否上游化"，追求小VRAM设备下的指定模型的极致性能。**
 
-## 本 fork 目标
+## 目标（唯一）
 
-构建一个本地运行大型 MoE 模型的 runtime：GPU + RAM + SSD 三者协同（专家预取/缓存）、算子优化、MTP。变更要小而可上游化，复用现有基础设施，避免新增子系统。
+在 qwen35moe（测试模型 `F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf`，20.2 GiB，Vulkan backend）上，
+以 **256K ctx + 10K prompt** 为统一工况，追求 **PP 与 TG 最大化**，实现 **VRAM + RAM + SSD 三层协同**，
+其中 **显存与内存都不足时 SSD 必须能当临时缓冲**。
 
-以Qwen3.6 35B A3B Q4量化为测试模型(F盘LLM目录下：Ornith-1.5-35B-Q4_K_M.gguf)，VULKAN Backend下在8G RX 6700S显卡硬件基础上实现PP1000+/TG200+的第一阶段目标(这是一个肯定可以且必须达到的目标，但是需要你综合多方面知识并不断深入技术底层，因此需要你不畏艰难、不断探索，基于实际PP和TG过程在不同阶段的时间消耗现状，逐项优化甚至是打破传统，另辟蹊径，最终完成第一阶段的优化目标)。
+三层分工与硬约束写在 `bench/THREE-TIER.md`；工程红线写在下面，每次改动都要遵守。
+
+## 期望约束
+
+### 1. 每轮优化都在目标工况下测
+
+一轮 = 一个改动 + 一次矩阵跑 + 四份文档的更新。不允许"先在短上下文验证，之后再外推"。
+
+```
+# 统一工况（长上下文口径，必须用 llama-cli，llama-bench 会把 n_ctx 设成 p+n）
+# K/V 默认按工作集增长（-kvg -1），256K + 10K 只用 320 MiB 并驻设备，所以不再加 -nkvo
+llama-cli -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on `
+  -t 5 -b 2048 -ub 2048 -c 262144 -f bench\prompts\prompt10k.txt -n 64 `
+  --temp 0 --no-warmup --no-display-prompt -lm none -v
+
+# 一条命令跑完整矩阵（bash，子进程用普通重定向）
+bash bench/tools/run-matrix.sh -T 8176,6144,4096 -r 2
+```
+
+- 显存档位用 `GGML_VK_VRAM_LIMIT_MIB=<MiB>` 实现：设备初始化时 hold back 差额，
+  于是 `llama-fit-params`、MoE bank 规划器和每次分配看到的都是缩小后的预算。集显不生效。
+- RAM 条件用 `-lm none`（resident，模型全入内存）与 `-lm mmap`（内存不足档）两臂；
+  不加 `--moe-cache-mib` 时由 `common_moe_plan_get()` 自己算 bank，这就是"自适应"。
+- 电源：「平衡」方案 + AC 供电 + dGPU 上无其它推理进程（GUID 与机器事实见 `bench/env/`）。
+- 必报列：`tier | load | bank | ncmoe | -nkvo | PP | TG | VRAM peak | held | VRAM used | RAM peak | reallocs | hit % | status`。
+  `VRAM peak` 取**每进程独占**（`\GPU Process Memory(pid_<pid>*)\Dedicated Usage` 峰值），不要看设备总量；
+  真实足迹看 `used = peak - held`（`held` 是显存档自己 hold back 的部分，它也计入进程峰值）。
+- `status` 不是 `ok`（`abort` / `vram-oom`）算缺陷，要进 `bench/DECISIONS.md` 的未结项，不能当成"配置不对"忽略。
+
+### 2. 工程红线
+
+- **容量不足必须退化，不得 abort**。显存/内存/bank 不够时回退到慢但正确的路径并计数告警。
+  现在还有 5 处 `GGML_ABORT`（`src/llama-moe-cache.cpp` 的 :128、:1910、:2013、:2045、:1740），
+  其中 :1910 把正确性绑在调度器分片启发式上。这是 4G/6G 档的前置修复项（`THREE-TIER.md` F1）。
+- **SSD 只做容量层，绝不进 decode 单步关键路径**：随机 1.95 MiB 实测 0.81 GB/s，
+  206 MiB/token 要 258 ms。SSD 只允许出现在预取批次与 prefill，且服务命中率 >= 85% 的冷层。
+- 新行为一律带开关，默认值由**目标工况**的实测决定；开关同时登记进 `bench/DECISIONS.md` 的开关表。
+  只靠 env 而不上 CLI 的行为不得成为默认路径。
+- 复用现有基础设施（MoE cache、fit、graph、MUL_MAT_ID），避免新增平行子系统。
+- 数字必须带口径（日期、分支/提交、电源态、bank、显存档）；跨口径比较一律视为错误，
+  换算陷阱清单在 `bench/README.md` 第 4 节。
+- 结论只写进 `bench/` 的那四份文档，**不新增第五份 md**；原始产物写进 `bench/raw/`（不进 git）。
+- 本树已删 `llama-perplexity`，**没有任何可重建的 PPL/KLD 通道**。任何降精度、混合精度或 CPU 分支改动，
+  都要先恢复质量门（`THREE-TIER.md` F6），否则不予验收。
+
+### 3. 回归门禁（改 Vulkan / 调度 / GEMM 后必跑，命令在 `build-vulkan/bin/` 下）
+
+`test-backend-ops -o MUL_MAT_ID -b CPU` = 945/945、`-o MUL_MAT_ID_MASK -b CPU` = 4/4、
+`-o MUL_MAT_ID -b Vulkan1` = 939/939、`-o MUL_MAT -b Vulkan1` = 2275/2275、
+`-o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332（只跑完 5310，补完后才允许动 FA）、
+`ctest --test-dir build-vulkan` = 32/32。`-o MUL_MAT_ID_MASK -b Vulkan1` = 0/0，因为 Vulkan 侧还没有这个 op。
 
 ## 仓库裁剪范围
 
 本 fork 已物理裁剪（`trim-vulkan-cpu-qwen35moe` 分支），不要去找不存在的东西：
 
-- backend 只有 **CPU 与 Vulkan**；CUDA/Metal/SYCL/OpenCL/MUSA/CANN/… 的源码、CI、文档、fixture 全部删除。
+- backend 只有 **CPU 与 Vulkan**；CUDA/Metal/SYCL/OpenCL/MUSA/CANN/... 的源码、CI、文档、fixture 全部删除。
 - 模型只支持 **qwen35moe**（`src/models/qwen35moe.cpp` + 依赖的 `delta-net-base.cpp`）；
   `llama_model_mapping()` 只有这一个 case，其他 arch 直接抛 `unsupported model architecture`。
 - tools 只有 **cli、server、llama-bench、mtmd**（外加 server 依赖的 `tools/ui`）；
   `quantize`、`perplexity`、`completion`、`batched-bench`、`fit-params`、`gguf-split`、`imatrix`、
   `tokenize`、`tts`、`cvector-generator`、`export-lora`、`results`、`connect`、`examples/`、`pocs/` 已删除。
   统一入口 `llama` 只分发 `serve`/`cli`/`bench`/`download`。
+  注意 `common/arg.cpp` 里 `--ppl`、`--kl-divergence`、imatrix 家族参数仍在解析，但已经没有对应的工具。
 - tests 只剩 32 个可跑的用例；`test-tokenizer-0` 与 `models/ggml-vocab-*.gguf` 已删除
-  （加载 vocab 也要走模型工厂，其他 arch 加载不了）。`models/templates/` 保留，chat 模板测试与 server 会用。
+  （加载 vocab 也要走模型工厂，其他 arch 加载不了）。`models/templates/` 保留。
 - CI 只留 `build-vulkan.yml` + `code-style.yml`；`.devops` 只留 `vulkan.Dockerfile` + `tools.sh`。
-- 仍保留的 Python 侧：`convert_hf_to_gguf.py` + `conversion/` + `gguf-py/` + `requirements/`（本项目需要能自己造 GGUF）。
+- 仍保留的 Python 侧：`convert_hf_to_gguf.py` + `conversion/` + `gguf-py/` + `requirements/`。
 
-## 当前最优配置与实测基线
+## 机器事实
 
-本机：RX 6700S 8 GiB（`-dev Vulkan1`），Ryzen 7 7735HS，39.2 GiB RAM。默认加载模式在 Windows 上是
-AUTO -> resident（整模型读入内存；如需 mmap 设 `LLAMA_AUTO_RESIDENT=0`）。注意 resident 的门槛是
-`n_bytes x 1.25 + 1 GiB`，20.2 GiB 的模型需要约 26.3 GiB 空闲内存；内存不够时 AUTO 会退回 mmap，
-pp512 直接腰斩（180 vs 373），所以基准测试要显式加 `-lm none` 强制 resident。以下为 merge 后的 master 实测
-（llama-bench，`-fa on -t 5`，交叉 r=3）：
-
-| 配置 | 命令要点 | pp512 | tg32 | pp2048 ub2048 |
-|---|---|---:|---:|---:|
-| static（默认推荐，显存省） | `-ncmoe 27 -lm none` | 373-376 | 18.7 | 566 |
-| cache（TG 最优） | `-ncmoe 41 --moe-cache-mib 6144 -ub 2048 -lm none` | 405 | 26.2-26.5 | 582 |
-
-- 两条命令都加：`-m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on -t 5`；
-  benchmark 用 `-p 512 -n 32`（cache 再加 `-p 2048 -n 0 -ub 2048`）。
-- 上表是 merge 上游 113 个提交并裁剪到 Vulkan+CPU / qwen35moe 之后重测的（`trim-vulkan-cpu-qwen35moe` 分支，
-  2026-10-22，`-r 3`），比裁剪前略快：static pp512 359-363 -> 373-376，cache pp512 383-387 -> 405。
-- `--moe-cache-mib 6144` 是这张卡的上限（6400 起会崩到 ~57 t/s）；bank 峰值 device 8028 MiB / 总 8176 MiB。
-- 现状结论：PP 被 host->device 上传限制（10.4-8.0 GiB/eval，实测 H2D 天花板 13.9 GB/s，已用到 96%），
-  且 MoE 层间依赖链（routing 依赖上一层 MoE 输出）使调度层重叠无效；TG 由 decode 的 MoE cache 命中决定。
-  已达成 PP 405 / TG 26.2，PP1000/TG200 尚未达成；继续冲 PP 需要更大显存、MUL_MAT_ID GEMM 或换权重访问范式。
-- 证据与设计记录：`bench/moe-baseline/` 下的 `PROGRESS.md`、`BASELINE.md`、`PROFILE-*.md`、
-  `L4-HOST-WEIGHT-PIPELINE.md`、`L5-PREFILL-UPLOAD-FLOOR.md`、`L6-PREFILL-RESIDENT.md`、
-  `L8-H2D-AND-BANK-DIAGNOSIS.md`、`L9-OVERLAP-BLOCKED-BY-IDS-DRAIN.md`、`L10-DEPENDENCY-CHAIN-LIMIT.md`。
-- 回归基线（改 Vulkan/调度/GEMM 后必跑，命令在 `build-vulkan/bin/` 下）：`test-backend-ops -o MUL_MAT_ID -b CPU` = 945/945、
-  `-o MUL_MAT_ID_MASK -b CPU` = 4/4、`-o MUL_MAT_ID -b Vulkan1` = 939/939、
-  `-o MUL_MAT_ID_MASK -b Vulkan1` = 0/0（Vulkan 没有该 op 的用例）、`-o MUL_MAT -b Vulkan1` = 2275/2275、
-  `-o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332。`ctest --test-dir build-vulkan` = 32/32（不含 test-backend-ops）。
-
+RX 6700S 8 GiB（`-dev Vulkan1`），Ryzen 7 6800HS（以 `llama-bench` 的 `cpu_info` 为准），
+RAM 40172 MiB（采集值见 `bench/env/machine.txt`），电源「平衡」（`bench/env/power.txt`）。
+桌面已占显存 0.5-1.4 GiB；设备总量 8176 MiB。resident 门槛是 `n_bytes x 1.25 + 1 GiB`，
+20.2 GiB 模型要约 26.3 GiB 空闲内存；不足时 AUTO 退回 mmap，而 mmap 下 bank 与预取被守卫强制为 0，
+pp512 直接腰斩，所以基准测试要显式 `-lm none`。
 
 ## 现成基础设施（不要重复造）
 
-- MoE 专家 GPU cache：`src/llama-moe-cache.{h,cpp}`；开关 `--moe-cache-mib N`（`cparams.moe_cache_size`）。图接线：`build_moe_cache_slots()` 与 `src/llama-graph.{h,cpp}` 里的 `moe_cache` 字段。
-- 专家分层/放置：`--cpu-moe`、`--n-cpu-moe`、`-ot`/`--override-tensor`（`common/arg.cpp`）；自动放置见 `common/fit.cpp`（`llama-fit-params` 工具已删除，只用库函数）。
-- MoE 算子：`GGML_OP_MUL_MAT_ID`（还有本 fork 的 `GGML_OP_MUL_MAT_ID_MASK`），kernel 在 `ggml/src/ggml-cpu` 与 `ggml/src/ggml-vulkan`。
-- MTP / 投机解码：`--spec-type draft-mtp`；MTP "nextn" 头为 `LLM_TENSOR_NEXTN_*`（`src/llama-arch.cpp`）；draft 循环在 `common/speculative.cpp`；见 `docs/speculative.md`。
+- MoE 专家 GPU cache：`src/llama-moe-cache.{h,cpp}`；`--moe-cache-mib N`（`cparams.moe_cache_size`）；
+  图接线 `build_moe_cache_slots()` 与 `src/llama-graph.{h,cpp}` 的 `moe_cache` 字段；
+  SLRU + 整层静态驻留 + 2 槽预取环（`LLAMA_MOE_PREFETCH*`）。
+- 预算与放置：`common/fit.cpp` 的 `common_moe_plan_get()`（未指定 `--moe-cache-mib` 时给 CLI/server 默认值）、
+  `--cpu-moe`、`--n-cpu-moe`、`-ot`；`llama-fit-params` 工具已删除，只用库函数。
+- MoE 算子：`GGML_OP_MUL_MAT_ID`，加上本 fork 的 `GGML_OP_MUL_MAT_ID_MASK`（**只有 CPU 实现**，
+  要 "GPU 算命中 / CPU 算 miss" 必须先补 Vulkan，见 `THREE-TIER.md` F4）。
+- 调度器扩展点：`ggml_backend_sched_set_pre_split_callback()` / `_post_split_callback()`、
+  `ggml_backend_set_tensor_async_deferred()` / `wait_deferred()`、`ggml_backend_buft_get_max_alloc_size()`。
+- Vulkan 侧 API：`ggml_backend_vk_prefetch_tensor/submit/wait`（`ggml/include/ggml-vulkan.h`）。
+- MTP / 投机解码：`--spec-type draft-mtp`，`LLM_TENSOR_NEXTN_*`，draft 循环在 `common/speculative.cpp`。
+
+## 文件索引
+
+```
+AGENTS.md                     本文件：目标、期望约束、门禁、索引
+bench/README.md               测试口径、显存/内存档位实现、必报列、测量陷阱、目录说明
+bench/RESULTS.md              数字的唯一来源（含尚未开测的目标矩阵）
+bench/DECISIONS.md            可达性判决、已证伪清单、开关表、代码级硬约束、未结项
+bench/THREE-TIER.md           三层协同的现状判定、缺口 F0-F6 与顺序
+bench/prompts/                prompt10k.txt(10428 tok) prompt20k.txt(19758 tok) + d3 的两份
+bench/env/                    power.txt（电源方案 GUID）、machine.txt（采集的硬件事实）
+bench/tools/                  run-matrix.sh（矩阵，bash） bench10k.ps1 matrix.ps1 run-case.ps1 monitor.ps1
+                              ssd_probe.py membw_probe.py gguf_dims.py read_trace.py summarize_perf.py
+                              vkgate.cpp deferred-copy.cpp vklimit-probe.cpp（显存档位自检）
+bench/raw/                    历史原始日志与 CSV，不进 git，只用于复核数字出处
+tools/expert-repack/          GGUF 专家重排脚本（质量门缺失，暂不可验收）
+skills/code-review/SKILL.md   写代码/加注释前读
+```
 
 ## 代码地图
 
-- `src/` 核心库 libllama：加载 `llama-model.cpp`/`llama-model-loader.cpp`/`llama-mmap.cpp`；图 `llama-graph.cpp`；KV/内存 `llama-memory*.cpp`、`llama-kv-cache*.cpp`；采样 `llama-sampler.cpp`；C API `include/llama.h`。
-- `ggml/` 张量库 + backend（只有 `ggml/src/ggml-cpu` 与 `ggml/src/ggml-vulkan`）。
-- `common/` 参数/CLI（`arg.cpp`、`common.cpp`）、chat/解析（`chat.cpp`、`jinja/`、`parsers/`）、`speculative.cpp`。
-- `tools/` 命令行工具（`cli`、`server`、`llama-bench`、`mtmd`、`ui`）；`app/` 统一 `llama` 入口，经 `LLAMA_APP_CMD` 分发 `serve`/`cli`/`bench`/`download`。
-- `tests/` CTest（32 个用例）；`conversion/` + `convert_hf_to_gguf.py` GGUF 转换；`bench/moe-baseline/` 是本 fork 的实测记录。
+- `src/` 核心库 libllama：加载 `llama-model.cpp`/`llama-model-loader.cpp`/`llama-mmap.cpp`；图 `llama-graph.cpp`；
+  KV/内存 `llama-memory*.cpp`、`llama-kv-cache*.cpp`；MoE cache `llama-moe-cache.cpp`、执行器 `llama-moe-exec.cpp`；
+  采样 `llama-sampler.cpp`；C API `include/llama.h`，私有扩展 `src/llama-ext.h`。
+- `ggml/` 张量库 + backend（只有 `ggml/src/ggml-cpu` 与 `ggml/src/ggml-vulkan`）；调度器在 `ggml/src/ggml-backend.cpp`。
+- `common/` 参数/CLI（`arg.cpp`、`common.cpp`）、放置与规划（`fit.cpp`、`fit.h`）、chat/解析（`chat.cpp`、`jinja/`、`parsers/`）、`speculative.cpp`。
+- `tools/` `cli`、`server`、`llama-bench`、`mtmd`、`ui`；`app/` 统一 `llama` 入口，经 `LLAMA_APP_CMD` 分发。
+- `tests/` CTest（32 个用例）+ `test-backend-ops.cpp`（不进 CTest，要手跑）。
 
 ## 构建与测试
 
@@ -84,30 +142,31 @@ pp512 直接腰斩（180 vs 373），所以基准测试要显式加 `-lm none` �
   cmake --build build-vulkan -j 8
   ```
 
-- Git Bash 里跑 `build-vulkan/bin/*.exe` 前要 `export PATH="/d/Scoop/apps/mingw/current/bin:$PATH"`，否则找不到 libstdc++/libgcc DLL，直接 exit 127。
+- Git Bash 里跑 `build-vulkan/bin/*.exe` 前要 `export PATH="/d/Scoop/apps/mingw/current/bin:$PATH"`，
+  否则找不到 libstdc++/libgcc DLL，直接 exit 127。
 - Linux/WSL：`cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON`，`cmake --build build -j`。
+  注意 auto-resident 是 `_WIN32` 专属路径，跨平台的性能结论不可直接搬。
 - 性能相关一律用 Release/RelWithDebInfo；Debug 推理慢到不可用。
-- 测试：`ctest --test-dir build-vulkan --output-on-failure -C Release`（`test-backend-ops` 单跑太慢，已用 `-o` 门禁代替）。
-- 改 ggml 算子/kernel 先跑：`build-vulkan/bin/test-backend-ops -o MUL_MAT_ID`（`-b <backend>` 过滤 backend）。
+- 测试：`ctest --test-dir build-vulkan --output-on-failure -C Release`；改算子/kernel 先跑
+  `build-vulkan/bin/test-backend-ops -o MUL_MAT_ID -b <backend>`。
 
 ## 代码与提交规范
 
-- 只用 ASCII：不要 `—`、`→`、`×`、`…`；改用 `-`、`->`、`x`、`...`。
-- 注释 1-2 行，只写不显然的约定；不复述代码；不按固定列宽硬换行；用 ASD-STE100 简明英语。
-- 先写代码后写注释，只在确有必要处加。
-- 不要从句子中间断行，也不要为凑列宽拆行。
-- 复用现有基础设施，避免新增子系统或破坏现有行为。
-- 大改动或引入新模式前先读相关文件，**暂停并征求用户确认**。
-- 写代码/实现新功能前先读 `skills/code-review/SKILL.md`。
-- 常见错误：先写注释再写代码会堆出冗余注释；llama.cpp 不用 Minja，其 Jinja 引擎在 `common/jinja`。
+- 只用 ASCII：不要 `—`、`→`、`x` 写成 `×`、`...` 写成 `…`；改用 `-`、`->`、`x`、`...`。
+- 注释 1-2 行，只写不显然的约定；不复述代码；不按固定列宽硬换行；不要从句子中间断行。
+- 先写代码后写注释，只在确有必要处加；先写注释会堆出冗余注释。
+- llama.cpp 不用 Minja，其 Jinja 引擎在 `common/jinja`。
+- 提交要小而可回退；改 Vulkan/调度/GEMM 的提交必须写明跑了哪些门禁。
 
 ## 硬性禁止
 
-- 不确定时尽量少动手。
+- 不确定时尽量少动手；大改动或引入新模式前先读相关文件，**暂停并征求用户确认**。
+- 不得用 `GGML_ABORT` 处理容量不足、内存不足、路由过散这类运行期条件。
+- 不得把只在一个显存档、一个 bank、一个电源态下成立的结论写进文档。
+- 不得为了让数字好看而跳过 `-nkvo`、跳过小显存档或缩短 prompt。
 
 ## 参考
 
-- `CONTRIBUTING.md`；上游 issue/PR 先搜（`gh search issues`、`gh search prs`）。
 - 新增模型：`docs/development/HOWTO-add-model.md`。
 - 构建：`docs/build.md`；server：`tools/server/README.md`、`tools/server/README-dev.md`。
 - 解析/模板：`docs/development/parsing.md`、`docs/autoparser.md`、`common/jinja/README.md`。

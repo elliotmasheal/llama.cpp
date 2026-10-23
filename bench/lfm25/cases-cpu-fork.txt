@@ -1,2 +1,0 @@
-# Pure-CPU decode (no Vulkan offload) - isolates CPU backend / compiler / upstream version from the MoE placement logic.
-cpu_fork_ngl0 |-ngl 0 -ncmoe 0 -fa on -t 6 -p 512 -n 128

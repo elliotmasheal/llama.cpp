@@ -1,7 +1,0 @@
-Repeat exactly this line five times: alpha beta gamma delta.
-alpha beta gamma delta.
-alpha beta gamma delta.
-alpha beta gamma delta.
-alpha beta gamma delta.
-
-Now repeat: alpha beta gamma delta.
