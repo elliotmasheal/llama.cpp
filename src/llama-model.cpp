@@ -2926,7 +2926,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* kv_size_init      */ kv_size_init);
+                            /* kv_size_init      */ kv_size_init,
+                            /* kv_page           */ cparams.kv_page,
+                            /* kv_block          */ cparams.kv_block);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;

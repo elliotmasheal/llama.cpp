@@ -116,7 +116,10 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
         // cells to allocate up front; 0 = allocate the full kv_size
-                     uint32_t   kv_size_init = 0);
+                     uint32_t   kv_size_init = 0,
+        // paged K/V: fixed-size blocks addressed through a table (bench/THREE-TIER.md F10)
+                         bool   kv_page = false,
+                     uint32_t   kv_block = 2048);
 
     ~llama_kv_cache() = default;
 
@@ -171,6 +174,9 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+
+    // paged K/V: the two tables of one layer, false when the cache is contiguous
+    bool get_kv_page(int32_t il, uint64_t * k_table, uint64_t * v_table, int32_t * block_size) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -312,6 +318,14 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
+    // paged mode: anchors (virtual views), the address table and the block list
+    ggml_context_ptr        page_anchor_ctx;
+    ggml_backend_buffer_ptr page_anchor_buf;
+    ggml_context_ptr        page_table_ctx;
+    ggml_backend_buffer_ptr page_table_buf;
+    ggml_tensor *           page_table = nullptr;  // i64 [2 * n_layer_kv * n_blocks_max]
+    std::vector<uint64_t>   page_table_host;       // host mirror, written through on every block add
+
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
@@ -366,6 +380,38 @@ private:
         std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
     };
 
+    // one fixed-size block of cells: its own allocation, all layers, K and V
+    struct kv_block {
+        ggml_context_ptr         ctx;
+        ggml_backend_buffer_ptr  buf;
+        std::vector<ggml_tensor *> k;  // [layers.size()] [n_embd_k_gqa, block_size]
+        std::vector<ggml_tensor *> v;
+        bool host = false;
+    };
+
+    // paged mode is off unless the caller asked for it and every guard in the ctor holds
+    bool kv_page = false;
+    uint32_t kv_block_size = 0;
+    uint32_t kv_page_blocks = 0;             // blocks allocated so far
+    std::vector<kv_block> page_blocks;
+    ggml_backend_buffer_type_t page_buft = nullptr;   // buffer type of the anchors and of new blocks
+
+    // allocate the anchors, the address table and the first blocks; called from the ctor
+    void init_pages(uint32_t cells);
+
+    // address of the table slice of one (layer, K|V): the first block index and the count are fixed
+    uint64_t page_table_addr(int32_t ikv, bool is_v) const;
+
+    // grow the block list so that used_max + n_extra cells fit; returns true if it grew
+    bool ensure_blocks(uint32_t n_extra);
+
+    // allocate one block and write its addresses into the table; false if neither device nor host had room
+    bool add_block();
+
+    // write/read one cell run of one (layer, K|V) through the block table
+    void page_write_run(llama_io_write_i & io, int32_t ikv, bool is_v, uint32_t from, uint32_t to, size_t row_size) const;
+    void page_read_run (llama_io_read_i  & io, int32_t ikv, bool is_v, uint32_t from, uint32_t to, size_t row_size) const;
+
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
@@ -413,6 +459,9 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    // paged K/V: the two tables of one layer, false when the cache is contiguous
+    bool get_kv_page(int32_t il, uint64_t * k_table, uint64_t * v_table, int32_t * block_size) const override;
 
     //
     // llama_kv_cache_context specific API

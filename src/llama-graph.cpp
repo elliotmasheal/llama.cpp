@@ -3115,6 +3115,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
+        // paged KV: the kernel resolves every cell through this layer's block tables
+        {
+            uint64_t k_table = 0;
+            uint64_t v_table = 0;
+            int32_t  block_size = 0;
+
+            if (mctx && mctx->get_kv_page(il, &k_table, &v_table, &block_size)) {
+                ggml_flash_attn_ext_set_paged(cur, k_table, v_table, block_size);
+            }
+        }
+
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));

@@ -39,6 +39,8 @@ struct llama_cparams {
     bool offload_kqv;
     int32_t kv_grow_initial;  // -1 auto, 0 = allocate n_ctx up front, > 0 initial cells
     int32_t fa_chunk_mib;     // cap on the score buffer of the long prefill attention path, 0 = no chunking
+    bool kv_page;             // paged K/V: fixed-size blocks + a table of block addresses
+    uint32_t kv_block;        // cells per block in paged mode
     bool flash_attn;
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)

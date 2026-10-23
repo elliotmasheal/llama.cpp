@@ -41,7 +41,10 @@ public:
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
                             /* cells allocated up front, 0 = kv_size */
-                 uint32_t   kv_size_init = 0);
+                 uint32_t   kv_size_init = 0,
+                            /* paged attention K/V (bench/THREE-TIER.md F10) */
+                      bool   kv_page = false,
+                 uint32_t   kv_block = 2048);
 
     ~llama_memory_hybrid() = default;
 
@@ -124,6 +127,9 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    // paged K/V lives in the attention cache, the recurrent state is never paged
+    bool get_kv_page(int32_t il, uint64_t * k_table, uint64_t * v_table, int32_t * block_size) const override;
 
     //
     // llama_memory_hybrid_context

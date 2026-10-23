@@ -8394,6 +8394,33 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
 
+    // M0b of the paged-KV plan: one line per distinct shape, so the log shows which FA
+    // path the target workload really runs. Off by default.
+    static const bool fa_trace = getenv("GGML_VK_FA_TRACE") != nullptr;
+    if (fa_trace) {
+        static vk_fa_pipeline_state last_state{};
+        static uint32_t last_N = 0;
+        static uint32_t last_KV = 0;
+        if (fa_pipeline_state.path != last_state.path || fa_pipeline_state.Br != last_state.Br ||
+            fa_pipeline_state.Bc != last_state.Bc || fa_pipeline_state.D_split != last_state.D_split ||
+            fa_pipeline_state.row_split != last_state.row_split || fa_pipeline_state.aligned != last_state.aligned ||
+            fa_pipeline_state.f32acc != last_state.f32acc || fa_pipeline_state.flags != last_state.flags ||
+            N != last_N || KV != last_KV) {
+            last_state = fa_pipeline_state;
+            last_N = N;
+            last_KV = KV;
+            const char * path_name = fa_pipeline_state.path == FA_SCALAR ? "scalar" :
+                                     fa_pipeline_state.path == FA_COOPMAT1 ? "coopmat1" : "coopmat2";
+            GGML_LOG_INFO("ggml_vulkan: fa-trace path=%s N=%u KV=%u Br=%u Bc=%u D_split=%u row_split=%u "
+                          "sgs=%u wg=%u aligned=%d f32acc=%d flags=%u sparse=%d dequant_kv=%d mask=%d k=%s v=%s\n",
+                          path_name, N, KV, fa_pipeline_state.Br, fa_pipeline_state.Bc, fa_pipeline_state.D_split,
+                          fa_pipeline_state.row_split, fa_pipeline_state.subgroup_size, fa_pipeline_state.workgroup_size,
+                          (int) fa_pipeline_state.aligned, (int) fa_pipeline_state.f32acc, fa_pipeline_state.flags,
+                          (int) use_sparse, (int) use_dequant_kv, (int) (mask != nullptr),
+                          ggml_type_name(fa_pipeline_state.k_type), ggml_type_name(fa_pipeline_state.v_type));
+        }
+    }
+
     vk_pipeline pipeline = nullptr;
 
     bool xe_fa_opt = false;
@@ -13631,6 +13658,21 @@ void ggml_backend_vk_prefetch_wait(ggml_backend_t backend) {
     ctx->prefetch_wait_pending = true;
 }
 
+// paged K/V: the kernels address blocks by device address, so the cache has to ask the buffer
+uint64_t ggml_backend_vk_buffer_get_device_address(ggml_backend_buffer_t buffer) {
+    auto * ctx = static_cast<ggml_backend_vk_buffer_context *>(buffer->context);
+    if (!ctx) {
+        return 0;
+    }
+
+    vk_device device = ctx->device.lock();
+    if (!device || !device->buffer_device_address || !ctx->dev_buffer) {
+        return 0;
+    }
+
+    return ctx->dev_buffer->bda_addr;
+}
+
 static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
@@ -16646,6 +16688,7 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
         { "ggml_backend_vk_prefetch_tensor", (void *) ggml_backend_vk_prefetch_tensor },
         { "ggml_backend_vk_prefetch_submit", (void *) ggml_backend_vk_prefetch_submit },
         { "ggml_backend_vk_prefetch_wait",   (void *) ggml_backend_vk_prefetch_wait   },
+        { "ggml_backend_vk_buffer_get_device_address", (void *) ggml_backend_vk_buffer_get_device_address },
     };
     for (const auto & entry : prefetch_api) {
         if (strcmp(name, entry.name) == 0) {

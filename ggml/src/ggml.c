@@ -5631,6 +5631,82 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+// op_params layout of a paged op: 64-bit table addresses at [5..6] (and [8..9] for a second
+// table), block size at [7]. SET_ROWS uses [0..1] / [2] because it has no other params.
+static void set_paged_params(struct ggml_tensor * a, int slot, uint64_t addr) {
+    ggml_set_op_params_i32(a, slot + 0, (int32_t) (uint32_t) addr);
+    ggml_set_op_params_i32(a, slot + 1, (int32_t) (uint32_t) (addr >> 32));
+}
+
+static uint64_t get_paged_addr(const struct ggml_tensor * a, int slot) {
+    const uint32_t lo = (uint32_t) ggml_get_op_params_i32(a, slot + 0);
+    const uint32_t hi = (uint32_t) ggml_get_op_params_i32(a, slot + 1);
+
+    return (uint64_t) lo | ((uint64_t) hi << 32);
+}
+
+void ggml_flash_attn_ext_set_paged(
+        struct ggml_tensor * a,
+        uint64_t             k_table_addr,
+        uint64_t             v_table_addr,
+        int32_t              block_size) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(k_table_addr != 0 && v_table_addr != 0);
+
+    set_paged_params(a, 5, k_table_addr);
+    ggml_set_op_params_i32(a, 7, block_size);
+    set_paged_params(a, 8, v_table_addr);
+}
+
+bool ggml_flash_attn_ext_get_paged(
+        const struct ggml_tensor * a,
+        uint64_t                  * k_table_addr,
+        uint64_t                  * v_table_addr,
+        int32_t                   * block_size) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const int32_t bs = ggml_get_op_params_i32(a, 7);
+    if (bs <= 0) {
+        return false;
+    }
+
+    *k_table_addr = get_paged_addr(a, 5);
+    *v_table_addr = get_paged_addr(a, 8);
+    *block_size   = bs;
+
+    return true;
+}
+
+void ggml_set_rows_set_paged(
+        struct ggml_tensor * a,
+        uint64_t             table_addr,
+        int32_t              block_size) {
+    GGML_ASSERT(a->op == GGML_OP_SET_ROWS);
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(table_addr != 0);
+
+    set_paged_params(a, 0, table_addr);
+    ggml_set_op_params_i32(a, 2, block_size);
+}
+
+bool ggml_set_rows_get_paged(
+        const struct ggml_tensor * a,
+        uint64_t                  * table_addr,
+        int32_t                   * block_size) {
+    GGML_ASSERT(a->op == GGML_OP_SET_ROWS);
+
+    const int32_t bs = ggml_get_op_params_i32(a, 2);
+    if (bs <= 0) {
+        return false;
+    }
+
+    *table_addr = get_paged_addr(a, 0);
+    *block_size = bs;
+
+    return true;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

@@ -585,6 +585,8 @@ struct common_params {
     bool no_kv_offload     = false; // disable KV offloading
     int32_t kv_grow_initial = -1;   // cells up front for K/V: -1 auto, 0 = n_ctx, > 0 explicit
     int32_t fa_chunk_mib   = 256;   // cap on the long prefill attention score buffer, 0 = one buffer for the whole span
+    bool    kv_page        = false; // paged K/V: fixed-size blocks + a table of block addresses
+    int32_t kv_block       = 2048;  // cells per block in paged K/V
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

@@ -416,6 +416,11 @@ extern "C" {
         // cap in MiB on the score buffer of the long cross-chunk prefill attention path: the query dimension is
         // split so that each score buffer stays under it. 0 = keep the whole span in one buffer
         int32_t fa_chunk_mib;
+        // paged K/V: cells are grouped in fixed-size blocks addressed through a table, so growth does not
+        // copy and one allocation failure only costs one block. F16 + flash attn only; off by default.
+        bool kv_page;
+        // cells per block, a multiple of 256 (default 2048)
+        uint32_t kv_block;
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device
         bool swa_full;    // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)

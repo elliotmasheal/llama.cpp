@@ -2430,6 +2430,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_GROW"));
     add_opt(common_arg(
+        {"--kv-page"},
+        {"--no-kv-page"},
+        "paged K/V: fixed-size blocks addressed through a table, so growth does not copy and a device\n"
+        "allocation failure costs one block (F16 + flash attn only; default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_page = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PAGE"));
+    add_opt(common_arg(
+        {"--kv-block"}, "N",
+        "cells per block in paged K/V, a multiple of 256 (default: 2048)",
+        [](common_params & params, int value) {
+            if (value < 256 || value % 256 != 0) {
+                throw std::invalid_argument("must be a multiple of 256 and at least 256");
+            }
+            params.kv_block = value;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCK"));
+    add_opt(common_arg(
         {"-fac", "--fa-chunk-mib"}, "N",
         "cap in MiB on the score buffer of the long prefill attention path: the query dimension is split to stay under it\n"
         "0 keeps one buffer for the whole span (default: 256)",

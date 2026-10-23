@@ -1,0 +1,45 @@
+#version 450
+// M0c probe: route logical cells to physical blocks through a table of 64-bit device
+// addresses. mode 0 writes through the table, mode 1 reads through it.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer F16Ref { f16vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer TabRef { uint64_t addr[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t table_addr;
+    uint64_t out_addr;
+    uint32_t n_cells;
+    uint32_t bs;
+    uint32_t cell4;
+    uint32_t mode;
+} pc;
+
+void main() {
+    TabRef table   = TabRef(pc.table_addr);
+    F16Ref out_ref = F16Ref(pc.out_addr);
+    const uint   stride  = gl_WorkGroupSize.x * gl_NumWorkGroups.x;
+    const uint   nvec    = pc.n_cells * pc.cell4;
+
+    for (uint i = gl_GlobalInvocationID.x; i < nvec; i += stride) {
+        const uint c = i / pc.cell4;
+        const uint d = i % pc.cell4;
+
+        F16Ref blk = F16Ref(table.addr[c / pc.bs]);
+        const uint idx = (c % pc.bs) * pc.cell4 + d;
+
+        if (pc.mode == 0u) {
+            // every component is a small integer, exactly representable in f16
+            blk.v[idx] = f16vec4(float(c % 512u), float(d), float(c / pc.bs), 1.0);
+        } else {
+            out_ref.v[i] = blk.v[idx];
+        }
+    }
+}

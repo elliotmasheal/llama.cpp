@@ -1767,6 +1767,18 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // Paged destination: row idx maps to block idx/block_size and row idx%block_size.
+    // table_addr points at this layer's array of 64-bit block addresses (uint64 table[blocks]).
+    GGML_API void ggml_set_rows_set_paged(
+            struct ggml_tensor * a,
+            uint64_t             table_addr,
+            int32_t              block_size);
+
+    GGML_API bool ggml_set_rows_get_paged(
+            const struct ggml_tensor * a,
+            uint64_t                  * table_addr,
+            int32_t                   * block_size);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -2527,6 +2539,20 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Paged K/V: cell i lives at k_table_addr[i / block_size] + (i % block_size)*nb1, same for V.
+    // Each table points at this layer's array of 64-bit block addresses.
+    GGML_API void ggml_flash_attn_ext_set_paged(
+            struct ggml_tensor * a,
+            uint64_t             k_table_addr,
+            uint64_t             v_table_addr,
+            int32_t              block_size);
+
+    GGML_API bool ggml_flash_attn_ext_get_paged(
+            const struct ggml_tensor * a,
+            uint64_t                  * k_table_addr,
+            uint64_t                  * v_table_addr,
+            int32_t                   * block_size);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

@@ -141,8 +141,9 @@
 | `GGML_VK_VRAM_LIMIT_MIB` | 未设 | **显存档位模拟**，见 `README.md` 第 2 节 | 2026-10-23 报告值已验证；各档性能未测 |
 | `-kvg` / `--kv-grow` | **-1（auto）** | K/V 初始 cells：-1 = 按工作集增长（上限 `n_ctx`，设备失败回退 host）、0 = 一次分配 `n_ctx`、>0 = 指定初始 cells | 256K+10K：PP 178.5 -> 477、TG 6.4 -> 13.8、RAM 峰值 -7.2 GiB；`0` 时 PP 239.4（`RESULTS.md` 0.3） |
 | `-fac` / `--fa-chunk-mib` | **256** | 长跨距 prefill 注意力每块 score 的上限；query 维按预算切块，0 = 整段一块（旧行为）。规划器的 score 预留同步取这个值 | 8176 档：0 -> PP 458、64 -> 657、128 -> 673、**256 -> 680**、512 -> 627（`RESULTS.md` 0.4） |
-| `--kv-page` / `--kv-block`（**规划中，未在树里**，见 `THREE-TIER.md` F10） | off（M2b 前）；`--kv-block` 2048 | K/V 改为固定大小块 + 块表：扩容零拷贝、峰值 = 1 块、块级设备/host 放置 | 待 M1-M2b 实测，默认值由目标口径决定 |
+| `--kv-page` / `--kv-block`（**M1 已进树**，见 `THREE-TIER.md` F10） | off；`--kv-block` 2048 | K/V 改为固定大小块 + 块表：扩容零拷贝、峰值 = 1 块、块级设备/host 放置 | M1（CPU 内核）已验收：逐位相同、33/33；设备路径要等 M2b |
 | `GGML_SCHED_TRACE` / `GGML_MOE_COPY_TRACE` / `GGML_VK_TIME_COPIES` / `GGML_VK_MEMORY_LOGGER` / `GGML_VK_PERF_LOGGER` | 关 | 诊断；PERF_LOGGER 拖慢 decode 2.6x | 只看占比 |
+| `GGML_VK_FA_TRACE` | 未设 | 每个不同的 FA 形状打一行（path/Br/Bc/D_split/sparse/dequant_kv），F10 M0b 用它定案 | 诊断，只打几种形状 |
 | `GGML_SCHED_HW_SIGNAL` / `_HW_PIPELINE` / `_HW_NOWAIT`、`GGML_MOE_CACHE_MAX_FULL` / `_LRU_DIV`、`LLAMA_ROUTING_DIAG` | 已回退，不在树里 | 见第 3 节 | - |
 
 ## 5. 代码级硬约束（改之前先读）
@@ -221,10 +222,21 @@
     两者都只影响常数，不影响正确性，属于下一轮的小优化。
 12. A 的第二阶段（设备段 + host 段 + LSE 合并）**由 F10 取代**（2026-10-23）：不用 LSE 合并，改为分块 KV + 块表间接寻址，
     所有块在同一注意力内统一寻址。F10 的容量收益来自块级放置与零拷贝扩容，decode 速度仍随 host 字节线性下降。
-13. **P1，F10（分块 KV，块表间接寻址）**：设计、里程碑 M0-M4 与验收见 `THREE-TIER.md` F10，**未开始**。
-    动手前需确认该节第 12 项的四个决定；第 6 条的 FA 5332 已补齐（M0a 的前置已解除）。
-    M0-M2b 只改寻址，数值应逐位相同，不依赖 F6。
-    上下文压缩（agent / 多轮）是 M5 的延伸，三条硬约束见 `THREE-TIER.md` F10 9.5：
+13. **P1，F10（分块 KV，块表间接寻址）**：设计、里程碑 M0-M4 与验收见 `THREE-TIER.md` F10，
+    **M0 已完成（2026-10-23，读数 `RESULTS.md` 6.1），M1 已完成（`RESULTS.md` 6.2）**，M2b 进行中。
+    四个决定已定：BS=2048、先 M2a 后 M2b、M4 接受 host 块作容量档、表通过 `op_params` 传（不占 `src` 槽）。
+    M0 的三条实现约束：目标工况 `FA_SCALAR` + `Bc=32`（所以 BS 必须是 32 与 256 的公倍数）；
+    `use_dequant_kv` 在分页时必须显式关闭（锚的虚拟连续 `nb` 会让 `is_dense_kv_cache()` 误判）；
+    `use_sparse` 目标工况实测为 0，第一版遇到就退回连续路径并计数。
+    M1 的落地形态与遗留：
+    (a) 块 = 一次后端分配（`init_pages` / `add_block`），块表 `uint64[2*n_layer_kv*n_blocks]` 在设备上，
+        经 `ggml_backend_vk_buffer_get_device_address`（proc address）取地址；CPU 时表项是主机指针。
+    (b) 锚是"虚拟"张量：`data` 指向 256 B 的占位 buffer，调度器据此判 backend，内核从不读它。
+        它必须是 `data != NULL`，否则 `ggml_gallocr` 会去分配 256 MiB 的虚拟张量。
+    (c) 分页下 `get_can_shift()` = false（K-shift 逐块化留到 M3），`state_write/read` 已按块拆分。
+    (d) 设备 K/V 目前被守卫挡下（`device K/V needs the paged Vulkan kernel (M2b)`），M1 只在 CPU 上验收。
+    上下文压缩（agent / 多轮）是 M5 的延伸，**已决定不做**：丢中间段会让输出偏离预期，
+    三条硬约束仍留在 `THREE-TIER.md` F10 9.5 供将来参考：
     (a) hybrid 的 `seq_rm` 删不了头部（recurrent 只支持全删与尾回滚，`src/llama-memory-recurrent.cpp:184-232`），
     要新增只动 attention 段的操作；(b) server 的命中判定只看 token LCP、不看 `seq_pos_min`
     （`tools/server/server-context.cpp:3972`），压缩后必须补校验，否则静默漏历史；

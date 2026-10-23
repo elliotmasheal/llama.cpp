@@ -1,0 +1,71 @@
+#version 450
+// M0d probe: the decode-style FA read loop, once over a contiguous K/V and once over
+// K/V addressed through a per-block table. Same bytes, same instruction mix, only the
+// address computation differs. -DPAGED selects the table variant.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 128) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer KVRef { f16vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer TabRef { uint64_t addr[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer F32Ref { float v[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t k_base;
+    uint64_t v_base;
+    uint64_t table_addr;
+    uint64_t out_addr;
+    uint32_t n_kv;
+    uint32_t bs;
+    uint32_t cell4;
+    uint32_t n_blocks;
+    uint32_t chunk;
+} pc;
+
+shared float part[128];
+
+void main() {
+    TabRef  table  = TabRef(pc.table_addr);
+    F32Ref  out_ref = F32Ref(pc.out_addr);
+    const uint t  = gl_LocalInvocationIndex;
+    const uint c0 = gl_WorkGroupID.x * pc.chunk;
+    const uint c1 = min(c0 + pc.chunk, pc.n_kv);
+
+    float acc = 0.0;
+
+    for (uint c = c0; c < c1; ++c) {
+#ifdef PAGED
+        const uint b   = c / pc.bs;
+        const uint row = c % pc.bs;
+        KVRef k = KVRef(table.addr[b]);
+        KVRef v = KVRef(table.addr[pc.n_blocks + b]);
+        const uint idx = row * pc.cell4 + t;
+#else
+        KVRef k = KVRef(pc.k_base);
+        KVRef v = KVRef(pc.v_base);
+        const uint idx = c * pc.cell4 + t;
+#endif
+        const vec4 a = vec4(k.v[idx]);
+        const vec4 b2 = vec4(v.v[idx]);
+        acc += dot(a, a) + dot(b2, b2);
+    }
+
+    part[t] = acc;
+    barrier();
+
+    for (uint s = 64; s > 0; s >>= 1) {
+        if (t < s) {
+            part[t] += part[t + s];
+        }
+        barrier();
+    }
+
+    if (t == 0) {
+        out_ref.v[gl_WorkGroupID.x] = part[0];
+    }
+}

@@ -437,6 +437,99 @@ CONCAT 用 `ggml_cont(transpose)` 物化后 pp2048 728.37 → **865.51**（+18.8
   `-o MUL_MAT_ID -b Vulkan1` 939/939、`-o MUL_MAT -b Vulkan1` 2275/2275、`-o FLASH_ATTN_EXT -b Vulkan1` 5332/5332、
   `ctest --test-dir build-vulkan` 32/32；`-o MUL_MAT_ID_MASK -b Vulkan1` = 0/0（Vulkan 无此 op）。
 
+### 6.1 F10 M0 spike（分块 KV 的前置验证，2026-10-23 21:5x，`60feaa082` + 工作区，平衡 + AC，dGPU 独占）
+
+三件事：确认目标工况真正走哪条 FA 路径（M0b）、块表经 BDA 在多个独立分配上是否正确（M0c）、
+按块寻址对 FA 读取的代价（M0d）。
+
+M0b 口径：`GGML_VK_FA_TRACE=1` 的目标命令（256K ctx + `prompt10k.txt` + `-n 64`，`-lm none`，未设显存档位）。
+日志把每个不同的 FA 形状打一行（`bench/raw/m0-20261023/fa-trace-256k10k.err`）：
+
+| N | KV | path | Br | Bc | D_split | row_split | sgs | wg | aligned | f32acc | flags | sparse | dequant_kv |
+|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 256 | scalar | 8 | 32 | 8 | 4 | 64 | 256 | 1 | 1 | 10 | 0 | 0 |
+| 2048 | 2048 | scalar | 8 | 32 | 8 | 4 | 64 | 256 | 1 | 1 | 11 | 0 | **1** |
+| 198 | 8448 | scalar | 8 | 32 | 8 | 4 | 64 | 256 | 1 | 1 | 11 | 0 | 0 |
+| 8 | 10496 | scalar | 8 | 32 | 8 | 4 | 64 | 256 | 1 | 1 | 10 | 0 | 0 |
+| 8 | 10752 | scalar | 8 | 32 | 8 | 4 | 64 | 256 | 1 | 1 | 10 | 0 | 0 |
+
+- PP 与 TG 都是 `FA_SCALAR`（RDNA2 无 coopmat），没有独立的 decode phase（`flash_attn_decode_phase_*` 只在 Intel Xe 路径）。
+  decode 的 N 是 8 而不是 1：`n_head_q/n_head_kv = 16/2` 的 gqa 合并在 `ggml-vulkan.cpp:8316-8324` 把 N 提到 8。
+- `Bc = 32`，所以分块大小只需满足 `BS % 32 == 0` 与 `BS % 256 == 0`（后者来自 `get_n_kv` 的 padding），2048 两者都满足。
+- `flags` 10 = 老 AMD Windows 路径 + mask；11 = 再加 `use_mask_opt`。分页沿用同一组变体，不新增 flags。
+- `sparse = 0`：目标工况没有走稀疏聚集，分页不需要考虑与 gather 的交互。
+- `dequant_kv = 1` 只在第一个 ubatch 出现，原因是那一批 `n_kv == kv_size` 让 `is_dense_kv_cache()` 成立；
+  它会把整段 K/V 拷进 f16 scratch。分页后这个判据仍会"看起来连续"，所以 M2b 必须在分页时显式关掉它。
+- 这次运行的 MoE bank 是 0（`common_moe_plan_impl: no device memory for a cache`，桌面占用导致赤字），
+  所以上面这轮**不产出 PP/TG 数字**，也不与 `0.3`/`0.4` 比较。
+
+M0c（`bench/tools/vkpage.cpp table`，两个能力已确认：`bufferDeviceAddress=1`、`shaderInt64=1`、
+`storageBuffer16BitAccess=1`）：8 个逻辑块放到 3 个**独立 VkBuffer** 的 3 个槽位里，映射 `2l+1 mod 3`，
+块表是 `uint64[8]` 的设备地址数组。写入经表、读回经表、按物理位置逐 cell 校验、未映射槽位必须全 0：
+
+| 检查 | 结果 |
+|---|---|
+| 读经表（512 cell x 4 vec4 逐值比对） | ok |
+| 未映射块的非零 half | 0 |
+| 物理布局（每块每 cell 的 c/d/blk/1 编码） | ok |
+| 总判定 | **PASS** |
+
+M0d（`bench/tools/vkpage.cpp bench`，每 cell 读 2 KiB = K 512 + V 512 个 f16，一个 workgroup 处理 `chunk` 个 cell；
+`chunk=256`、r=20-50）：
+
+| cells | K+V | 连续 buffer | 经块表 | 差值 |
+|---:|---:|---:|---:|---:|
+| 10240 | 20.0 MiB | 0.034 ms / 616.6 GB/s | 0.035 ms / 597.3 GB/s | +3.2% |
+| 32768 | 64.0 MiB | 0.317 ms / 211.7 GB/s | 0.299 ms / 224.3 GB/s | -5.6% |
+| 131072 | 256.0 MiB | 1.600 ms / 167.8 GB/s | 1.614 ms / 166.4 GB/s | +0.9% |
+| 262144 | 512.0 MiB | 3.189 ms / 168.3 GB/s | 3.201 ms / 167.7 GB/s | +0.4% |
+
+- 10K 这一行带宽 616 GB/s 远高于 224 GB/s 的显存带宽：20 MiB 全在 Infinity Cache 里，是热缓存读数，不是 DRAM 读数。
+- **测量陷阱**：同一程序用 `chunk=1024`（10K 只有 10 个 workgroup，1280 个线程塞不满 28 CU）时得到
+  0.025 对 0.043 ms（**+69%**），换成 `chunk=256`（40 组）就变成 +3.2%。这个 +69% 是占用率造成的，不是表寻址；
+  记在这里是为了防止被后人当结论引用。`chunk=64`（160 组）时 10K = -5.3%、128K = +0.3%。
+- 这个微基准**每个 cell 查一次表**，是上界。真实 FA 一个 tile 查一次（`Bc=32`），查表次数少 32 倍，
+  所以第 5.7 节"< 1%"的假设成立，而且富余很大。
+- 128K 只有 168 GB/s 而非 224 GB/s：这个 kernel 是两个流 + f16 转 f32 的纯读，不是带宽上限探针；两臂用的是同一套代码，
+  差值仍可比。
+
+复现：
+```
+cd bench/tools && glslc -O vkpage_rw.comp -o vkpage_rw.spv
+glslc -O vkpage_fa.comp -o vkpage_fa.spv && glslc -O -DPAGED=1 vkpage_fa.comp -o vkpage_fa_paged.spv
+g++ -O2 -std=c++17 vkpage.cpp -I"%VULKAN_SDK%\Include" -L"%VULKAN_SDK%\Lib" -lvulkan-1 -o vkpage.exe
+vkpage.exe info | table | bench 131072 20 256
+```
+
+### 6.2 F10 M1：分块 KV 的 CPU 参考实现（2026-10-23 23:0x，工作区，`--kv-page` 默认关）
+
+`--kv-page` / `--kv-block` 已进树（`llama_context_params` -> `llama_cparams` -> `llama_kv_cache`），
+块表经 `op_params` 传给 `FLASH_ATTN_EXT` 与 `SET_ROWS`（`ggml_flash_attn_ext_set_paged` /
+`ggml_set_rows_set_paged`，见 `THREE-TIER.md` 4 节）。M1 只实现 CPU 内核，设备 K/V 会被守卫挡下并打
+`kv-page disabled: device K/V needs the paged Vulkan kernel (M2b)`。
+
+单元级（`tests/test-kv-page.cpp`，已进 CTest，共 33 个用例）：
+
+| 检查 | 结果 |
+|---|---|
+| paged FA 对 contiguous FA（8 块乱序映射 `(5b+3)%8`，`BS=32`） | **4096/4096 逐位相同**，max\|diff\| = 0 |
+| contiguous FA 对 host 双精度参考 | max\|diff\| = 8.6e-3（f16 K/V 内核的正常量级，阈值 2e-2） |
+| paged SET_ROWS：64 个乱序 cell 写到物理块 | 0/64 错位 |
+| paged SET_ROWS：锚（填 NaN）被写坏的 half 数 | 0 |
+
+模型级（CPU 后端，`-ngl 0 -c 512 --kv-block 256`，`bench/raw/m0-20261023/cpu-kvpage-{off,on}.{out,err}`）：
+
+| 臂 | 放置 | 输出 | PP | TG |
+|---|---|---|---|---|
+| `off` | 连续 512 cells | "The user gave me a classic pangram" | 30.0 t/s | 4.1 t/s |
+| `on` | 2 块 x 256 cells（10 MiB） | 同上，逐字相同 | 29.8 t/s | 4.1 t/s |
+
+- 这两行是 CPU 后端读数，**不与第 0 节的 Vulkan 矩阵比较**；它只证明寻址正确。
+- `init_pages` 日志：`paged K/V: 2 blocks of 256 cells (10 layers), table 320 bytes, 10.00 MiB allocated`。
+- 分页模式下 `get_can_shift()` 返回 false（K-shift 逐块化在 M3），`state_write/read` 已按块拆分
+  （`page_write_run` / `page_read_run`），`state_read_meta` 先 `ensure_blocks`。
+- 回归：`ctest --test-dir build-vulkan` **33/33**（新增 `test-kv-page`）。
+
 ## 7. 质量与参考数字
 
 ### 7.1 质量门（F6，2026-10-23 恢复）

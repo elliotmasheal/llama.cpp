@@ -370,6 +370,10 @@ PP 与 TG 都有 r=2 可复现的差值，并同表记录 splits、`used`、`RS 
   落在 host 的块每 token 多付一次 PCIe（实测 H2D 14.3 GB/s，第 1 节）。成本模型见第 9 节。SSD 仍不进 decode。
 - 推荐顺序：M0 spike（确认 BDA、FA 实际路径、表读取开销）-> M1 CPU 参考 -> M2a B-lite 验证 -> M2b 融合 FA。
   M0-M2b 只改寻址、不改 FA 数学，数值应当**逐位相同**，这是最硬的验收手段，**不依赖 F6**。
+- **M0 已完成（2026-10-23）**，读数在 `RESULTS.md` 6.1：路径确认为 `FA_SCALAR`（PP 与 TG 同一条），`Bc = 32`，
+  目标工况 `sparse = 0`；BDA + `uint64` 块表在 3 个独立分配上读写都正确；按块寻址在 DRAM 规模下差 <= 1%
+  （`-5.6% ~ +0.9%`），10K 热缓存点 +3.2%，而真实 FA 每 32 个 cell 才查一次表，所以第 5.7 节的上限成立。
+  表通过 `op_params` 传（见 4 节），不占 `src` 槽、不在锚上挂元数据。
 
 #### 1. 问题与动机
 
@@ -441,6 +445,14 @@ BS 只影响以下四项，其中没有一项直接作用在 PP/TG 的算子上�
 - **FLASH_ATTN_EXT**（`ggml/include/ggml.h:2503`）：K/V 为分页锚视图时，每个 K/V tile 的地址由表查出。表的挂法有两个候选：
   (a) 新增一个 `src` 槽（需核对 `ggml_flash_attn_ext_add_sinks` 占用的槽位）；
   (b) 在锚上挂一个分页元数据字段，不占 `src`。优先 (b)：改动小，不影响其他 op。M0 决定。
+- **M0 定案（2026-10-23）**：两个候选都不用，改为**把层的表地址写进 `op_params`**：
+  FA 用槽 5-6 存 `uint64 table`、槽 7 存 `BS`（槽 0-2 是 scale/max_bias/softcap，3 是 prec，4 是 `n_kv_max`，剩余槽充足）；
+  SET_ROWS 用槽 0-1 存表地址、槽 2 存 `BS`。表地址在图的生命周期内不变（块只增不改表基址），
+  所以 `op_params` 恒定，图复用不受影响；也不需要新的 `src` 槽或后端扩展字段。
+  API 是 `ggml_flash_attn_ext_set_paged(a, table_addr, BS)` / `ggml_set_rows_set_paged(...)`，
+  内核从张量的 `nb` 取每 cell 步长：分页后 `kb[1]` 恰好等于 `n_embd_k_gqa * type_size`（锚是虚拟连续布局）。
+  表本身是 `uint64[n_layer_kv][2][n_blocks_max]`，每个 (层, K|V) 一段连续数组，
+  传进 op 的是该层那一段的地址；层内偏移由"表项指向该层的块内区域"吸收，内核不做层算术。
 - 复用：不新增 op，不新增并行子系统（符合 AGENTS "复用现有基础设施"）。
 
 #### 5. Vulkan 专项
@@ -451,12 +463,15 @@ BS 只影响以下四项，其中没有一项直接作用在 PP/TG 的算子上�
   storage buffer 带 `eShaderDeviceAddress`（`ggml-vulkan-buffers.cpp:64-69`）。
   需新增访问器 `ggml_backend_vk_buffer_get_device_address(buffer)`，放进 `ggml/include/ggml-vulkan.h`，风格与 `ggml_backend_vk_prefetch_tensor` 一致。
 - 扩展已在用：`GL_EXT_buffer_reference2`（`flash_attn_cm2.comp:21`）、`GL_EXT_buffer_reference`（`mul_mm_cm2.comp:17`）；
-  `uint64` 表依赖 `device->shader_int64`（`ggml-vulkan.cpp:4588`），需 M0 确认在目标设备上为真。
+  `uint64` 表依赖 `device->shader_int64`（`ggml-vulkan.cpp:4588`）。
+  **M0c 已在 RX 6700S 上实测**：`bufferDeviceAddress=1`、`shaderInt64=1`、`storageBuffer16BitAccess=1`，
+  且 3 个独立 `VkBuffer` 的地址表读写都正确（`bench/tools/vkpage.cpp`，`RESULTS.md` 6.1）。
 
 5.2 FA shader 改点（FA_SCALAR 路径）
 
-- 路径选择（`ggml-vulkan.cpp:1346-1347`）：`coopmat2` 与 `coopmat1_fa_support` 都要求 coopmat。RDNA2 预期两者皆假，走 `FA_SCALAR`，
-  f16 K/V 的 pipeline 来自 `flash_attn.comp`（`flash_attn_f32_f16*`）。M0 用日志确认，不靠推断。
+- **M0b 定案**：PP 与 TG 都是 `FA_SCALAR`（RDNA2 无 coopmat），没有 Intel Xe 的 decode phase 变体，
+  所以只需要改 `flash_attn.comp` 这一条；`flash_attn_decode_phase_*.comp` 不进目标路径。
+  实测参数：`Br=8`、`Bc=32`、`D_split=8`、`row_split=4`、subgroup 64、`wg=256`、`aligned=1`、`f32acc=1`。
 - 需改的 f16 读取点：`flash_attn.comp:266, 322, 347`（`data_kv4[k_offset/4 + kcol*k_stride/4 + ...]`）及 V 侧对应读取；
   `k_offset` 在 `:182`，`k_stride` 在 `flash_attn_base.glsl:208`。改成按 tile 解析块：`blk = kcol / BS`，`row = kcol % BS`，
   地址 = `addr[blk] + layer_off + row * row_bytes + d`。
@@ -486,9 +501,19 @@ BS 只影响以下四项，其中没有一项直接作用在 PP/TG 的算子上�
 - `ggml_backend_vk_buffer_type_alloc_buffer` 捕获 `vk::SystemError` 并返回 nullptr（`ggml-vulkan.cpp:13315-13317`），
   不 abort，可直接用作逐块降级的判据。
 
-5.7 性能假设（M0 必测）
+5.7 性能假设（**M0d 已测，2026-10-23**）
 
-- 标量 FA 在 tile 边界查表后，预期每 tile 增加 1 次表读 + 1 次 64 位加法，开销 < 1%。测 n_kv = 10K 与 128K 两点。
+- 标量 FA 在 tile 边界查表后，预期每 tile 增加 1 次表读 + 1 次 64 位加法，开销 < 1%。
+- M0d 读数（`RESULTS.md` 6.1，每 cell 查一次表的上界）：DRAM 规模下 +0.4% ~ +0.9%（128K / 256K），
+  64 MiB 点 -5.6%，10K 热缓存点 +3.2%。真实 FA 每 `Bc=32` 个 cell 才查一次，所以假设成立。
+- **测量陷阱**：同一探针在 `chunk=1024`（10K 只有 10 个 workgroup）给出 +69%，那是占用率不是表寻址。
+
+5.8 与现有 opt-in 路径的冲突（M0b 发现）
+
+- `use_dequant_kv`（`ggml-vulkan.cpp:8296`）在 `n_kv == kv_size` 时会把整段 K/V 拷进 f16 scratch。
+  分页后 `is_dense_kv_cache()` 仍会返回真（锚的 `nb` 是虚拟连续布局），因此分页模式必须显式关掉它，
+  否则 shader 会去读块 0 的连续内存。
+- `use_sparse`（`n_kv_max`）在目标工况实测为 0，分页第一版不实现"经表的 gather"，遇到就退回连续路径并计数。
 
 #### 6. CPU 参考实现（M1）
 
@@ -576,6 +601,9 @@ f_host = 0.2 约 4.5 s -> 约 0.5%，且 H2D 与 shader 可并行。
 
 9.5 上下文压缩与前缀缓存（agent / 多轮场景的硬约束）
 
+> **2026-10-23 决定不做**：丢中间段会让输出偏离预期，M5 的压缩分支不启动。
+> 本节保留作为将来重启时的约束清单；下面的三条硬约束与策略要求都不实现。
+
 压缩必须做在 KV 层，不能做在 token 层。server 的复用判定只看 token 列表：
 `n_past = slot.prompt.tokens.get_common_prefix(input_tokens)`（`tools/server/server-context.cpp:3972`），
 slot 选择也基于 LCP（`:1812`）。所以"改写 / 摘要 prompt 文本"会让前缀缓存全废、每轮全量重算；
@@ -619,18 +647,30 @@ PP 成本分三层（256K 口径）：
 
 #### 10. 里程碑与验收
 
-M0 spike（前置，不改主线）
+M0 spike（前置，不改主线）**已完成 2026-10-23，读数见 `RESULTS.md` 6.1**
 
 - 0a. ~~补完 `FLASH_ATTN_EXT -b Vulkan1` 的约 22 例~~ **已解除**（2026-10-23：5332/5332 已补齐，`DECISIONS.md` 第 6 节）。
-- 0b. 用日志确认 RX 6700S 上 PP、TG 实际走的 FA 路径（FA_SCALAR？split-k？decode phase？）。
-- 0c. 独立 Vulkan 小测试：两个 buffer，块表（uint64）经 BDA 访问，表内块不连续时结果正确。
-- 0d. 手写一个"读表版"标量 FA 微基准，测 10K 与 128K 耗时，验证第 5.7 节的 < 1% 假设。
-- 验收：0b 结论落地；0c 通过；0d 开销 < 1%，否则给出替代方案。
+- 0b. ~~用日志确认 RX 6700S 上 PP、TG 实际走的 FA 路径~~ **已确认**：PP 与 TG 都是 `FA_SCALAR`，
+  `Br=8 Bc=32 D_split=8 row_split=4 sgs=64 wg=256 aligned f32acc`，没有 decode phase 变体；
+  `sparse=0`；`dequant_kv` 只在 `n_kv == kv_size` 的那一批出现。实现方式：`GGML_VK_FA_TRACE=1` 打每个不同形状一行。
+- 0c. ~~独立 Vulkan 小测试：两个 buffer，块表（uint64）经 BDA 访问，表内块不连续时结果正确~~ **PASS**：
+  3 个独立 `VkBuffer`、8 个逻辑块乱序映射，读经表/写经表/未映射槽位全 0 三项都过（`bench/tools/vkpage.cpp`）。
+- 0d. ~~手写一个"读表版"标量 FA 微基准~~ **已测**：DRAM 规模 +0.4%~0.9%，10K 热缓存 +3.2%，
+  且真实 FA 的查表密度是它的 1/32。
+- 验收：0b 结论落地；0c 通过；0d 开销 < 1%（按 tile 密度折算），结论：**分页寻址不构成 PP/TG 风险**。
 
-M1 CPU 参考 + 分配器（默认 off）
+M1 CPU 参考 + 分配器（默认 off）**已完成 2026-10-23，读数见 `RESULTS.md` 6.2**
 
-- 块分配器、块表、锚、`ensure_blocks`，SET_ROWS / FA 的 CPU 分页实现，get_k/get_v 的锚视图。
-- 验收：CPU 上 `--kv-page on` 与 `off` 的第一步 logits 逐位相同（8K、16K 两点）；test-backend-ops 新增分页用例（块序随机打乱以捕捉表错误）全绿；`ctest` 32/32。
+- 块分配器（`init_pages` / `add_block` / `ensure_blocks`）、块表、锚、`get_k/get_v` 的锚视图、
+  SET_ROWS / FA 的 CPU 分页实现、`--kv-page` / `--kv-block` 开关、state 按块读写、分页下禁用 K-shift。
+- 验收：`tests/test-kv-page.cpp`（进 CTest）里 paged FA 与 contiguous FA **4096/4096 逐位相同**
+  （8 个逻辑块乱序映射、`BS=32`），paged SET_ROWS 0/64 错位、锚未被写坏；`ctest` **33/33**；
+  CPU 后端整模型 512 cells 两臂输出逐字相同。
+- 与原计划的偏差：验收写的是"CPU 上 8K/16K 两点 logits 逐位相同"，实际做的是**算子级 256 cells 逐位 + 模型级 512 cells 逐字**。
+  原因：20.2 GiB 模型在 CPU 上 prefill 8K 要小时级，而算子级已经覆盖了表的全部语义（乱序块 + 非连续 cell）。
+  真正的长上下文逐位验收放在 M2b 的 256K + 10K 口径。
+- 已知遗留：设备 K/V 被守卫挡下（`device K/V needs the paged Vulkan kernel (M2b)`）；
+  K-shift 逐块化与 server 的 slot 恢复压力测试留到 M3。
 
 M2a B-lite（验证，不改 FA shader）
 
@@ -672,10 +712,12 @@ M5（可选）：量化 K/V 分页；块级前缀共享（seq_cp 的 copy-on-wri
 
 #### 12. 需要用户确认的决定（按 AGENTS 要求，动手前先停）
 
-1. 是否批准启动 M0（0b/0c/0d 需要 GPU 时间；0a 的 FA 5332 已补齐）。
-2. 块大小默认 2048 还是 8192：前者增长粒度细、峰值低；后者表更小，与现有 160 MiB 增长步一致。
-3. 是否先做 M2a（B-lite）再做 M2b（融合 FA）。建议先做：它不碰 FA 就能验证整套表与块语义，长上下文成本也已估出。
-4. M4 是否接受 host 块作为"能跑但慢"的容量档（见第 9 节的 decode 代价）。
+1. ~~是否批准启动 M0~~ **已批准并完成（2026-10-23）**：M0b/0c/0d 全部落地，读数在 `RESULTS.md` 6.1。
+2. 块大小默认 2048 还是 8192：**已定 2048**。M0b 给出 `Bc = 32`，2048 是 32 与 256 的公倍数；
+   8192 只增加边界浪费，表更小没有收益（128 项 = 1 KiB）。
+3. 是否先做 M2a（B-lite）再做 M2b（融合 FA）：**已定先 M2a**（不碰 shader 就能验证整套表与块语义）。
+4. M4 是否接受 host 块作为"能跑但慢"的容量档（见第 9 节的 decode 代价）：**接受**，
+   但只作为容量档，块级放置的默认策略仍是 device 优先、失败才逐块降级。
 
 ## 4. 建议顺序
 

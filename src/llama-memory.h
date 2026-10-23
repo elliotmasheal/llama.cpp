@@ -64,6 +64,11 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // paged K/V: the two block tables of layer il; returns false when this memory is contiguous
+    virtual bool get_kv_page(int32_t /* il */, uint64_t * /* k_table */, uint64_t * /* v_table */, int32_t * /* block_size */) const {
+        return false;
+    }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
