@@ -3065,6 +3065,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                  int   il) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
+    // paged K/V: the long-span matmul path reads K/V as matrices and cannot resolve blocks, so a
+    // paged cache keeps every span on the attention kernel
+    ggml_tensor * k_table = nullptr;
+    ggml_tensor * v_table = nullptr;
+    int32_t       page_bs = 0;
+    const bool    paged   = mctx && mctx->get_kv_page(il, &k_table, &v_table, &page_bs);
+
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
 
@@ -3084,7 +3091,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const int64_t fa_score_max = llama_fa_long_kv_score_max_bytes();
     const int64_t n_tok_q  = q->ne[1];
     const int64_t n_tok_kv = k->ne[1];
-    const bool fa_span = fa_score_max > 0 && kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
+    const bool fa_span = !paged && fa_score_max > 0 && kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
                          n_tok_q >= 512 && n_tok_kv > n_tok_q + n_tok_q / 2;
     // the score buffer is n_kv x n_head x 4B per query row, so the query dim is what the budget splits
     const int64_t score_row = n_tok_kv * q->ne[2] * (int64_t) sizeof(float);
@@ -3116,14 +3123,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         // paged KV: the kernel resolves every cell through this layer's block tables
-        {
-            uint64_t k_table = 0;
-            uint64_t v_table = 0;
-            int32_t  block_size = 0;
-
-            if (mctx && mctx->get_kv_page(il, &k_table, &v_table, &block_size)) {
-                ggml_flash_attn_ext_set_paged(cur, k_table, v_table, block_size);
-            }
+        if (paged) {
+            ggml_flash_attn_ext_set_paged(cur, k_table, v_table, page_bs);
         }
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);

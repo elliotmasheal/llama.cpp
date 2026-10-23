@@ -129,7 +129,7 @@ public:
     const llama_ubatch & get_ubatch() const override;
 
     // paged K/V lives in the attention cache, the recurrent state is never paged
-    bool get_kv_page(int32_t il, uint64_t * k_table, uint64_t * v_table, int32_t * block_size) const override;
+    bool get_kv_page(int32_t il, ggml_tensor ** k_table, ggml_tensor ** v_table, int32_t * block_size) const override;
 
     //
     // llama_memory_hybrid_context

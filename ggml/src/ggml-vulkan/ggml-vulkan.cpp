@@ -1342,8 +1342,8 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
     return result;
 }
 
-vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
-    FaCodePath path = device->coopmat2 ? FA_COOPMAT2 :
+vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc, bool force_scalar = false) {
+    FaCodePath path = force_scalar ? FA_SCALAR : device->coopmat2 ? FA_COOPMAT2 :
                       device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
 
     if (path == FA_COOPMAT2 && k_type == GGML_TYPE_BF16 && !device->coopmat2_bf16_support) {
@@ -1387,7 +1387,7 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 }
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type, uint32_t page_bs) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -1399,7 +1399,7 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
+    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type, page_bs};
 }
 
 static uint32_t fa_block_bytes(ggml_type t) {
@@ -1427,6 +1427,8 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         /*13 FaTypeV         */ static_cast<uint32_t>(state.v_type),
         /*14 FaBlockBytesK   */ fa_block_bytes(state.k_type),
         /*15 FaBlockBytesV   */ fa_block_bytes(state.v_type),
+        /*16 Paged           */ state.page_bs > 0 ? 1u : 0u,
+        /*17 PageBS          */ state.page_bs,
     };
 }
 
@@ -8274,6 +8276,16 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
 
+    // paged K/V: the tables are bound in place of the K/V rows, and only the scalar path supports them
+    ggml_tensor * page_k = nullptr;
+    ggml_tensor * page_v = nullptr;
+    int32_t       page_bs = 0;
+    const bool    paged = ggml_flash_attn_ext_get_paged(dst, &page_k, &page_v, &page_bs);
+    if (paged) {
+        GGML_ASSERT(k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && "paged K/V is F16 only");
+        GGML_ASSERT(page_k->data && page_v->data);
+    }
+
     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
     auto is_dense_kv_cache = [](const ggml_tensor * t) {
         return t->nb[0] == ggml_type_size(t->type) &&
@@ -8293,7 +8305,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                  v->nb[1] != (uint64_t)HSV * ggml_type_size(v->type)) &&
                                 (HSK % 8) == 0 && (HSV % 8) == 0;
     const size_t kv_scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
-    const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
+    const bool use_dequant_kv = !paged && ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -8310,7 +8322,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
-    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
+    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc, paged);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
     if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
@@ -8323,7 +8335,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         workgroups_y /= gqa_ratio;
     }
 
-    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, paged);
 
     float scale         = 1.0f;
     float max_bias      = 0.0f;
@@ -8349,7 +8361,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         return (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) ||
                (t->nb[1] | t->nb[2] | t->nb[3]) % (4 * sizeof(ggml_fp16_t)) == 0;
     };
-    const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask &&
+    const bool use_sparse = !paged && !disable_sparse && n_kv_max > 0 && mask &&
                             max_bias == 0.0f && logit_softcap == 0.0f &&
                             (tuning_params.path != FA_COOPMAT2 || (sparse_gather_aligned(k) && sparse_gather_aligned(v))) &&
                             nem0 == KV &&
@@ -8392,7 +8404,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff, paged ? (uint32_t) page_bs : 0u);
 
     // M0b of the paged-KV plan: one line per distinct shape, so the log shows which FA
     // path the target workload really runs. Off by default.
@@ -8411,9 +8423,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             last_KV = KV;
             const char * path_name = fa_pipeline_state.path == FA_SCALAR ? "scalar" :
                                      fa_pipeline_state.path == FA_COOPMAT1 ? "coopmat1" : "coopmat2";
-            GGML_LOG_INFO("ggml_vulkan: fa-trace path=%s N=%u KV=%u Br=%u Bc=%u D_split=%u row_split=%u "
+            GGML_LOG_INFO("ggml_vulkan: fa-trace path=%s N=%u KV=%u paged=%d bs=%d Br=%u Bc=%u D_split=%u row_split=%u "
                           "sgs=%u wg=%u aligned=%d f32acc=%d flags=%u sparse=%d dequant_kv=%d mask=%d k=%s v=%s\n",
-                          path_name, N, KV, fa_pipeline_state.Br, fa_pipeline_state.Bc, fa_pipeline_state.D_split,
+                          path_name, N, KV, (int) paged, (int) page_bs, fa_pipeline_state.Br, fa_pipeline_state.Bc, fa_pipeline_state.D_split,
                           fa_pipeline_state.row_split, fa_pipeline_state.subgroup_size, fa_pipeline_state.workgroup_size,
                           (int) fa_pipeline_state.aligned, (int) fa_pipeline_state.f32acc, fa_pipeline_state.flags,
                           (int) use_sparse, (int) use_dequant_kv, (int) (mask != nullptr),
@@ -8428,7 +8440,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool xe_fa_supported_platform =
         (ctx->device.get()->architecture == INTEL_XE2 && ctx->device.get()->properties.deviceID != 0xFD80 && ctx->device.get()->properties.deviceID != 0xFD81) ||
         (ctx->device.get()->architecture == INTEL_XE1 && ctx->device.get()->coopmat_support && ctx->device.get()->uma);
-    bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && q->nb[1] > q->nb[2] && k->nb[1] > k->nb[2] && v->nb[1] > v->nb[2] && mask != nullptr;
+    bool xe_fa_supported_usage = !paged && neq0 % 32 == 0 && nev0 % 16 == 0 && q->nb[1] > q->nb[2] && k->nb[1] > k->nb[2] && v->nb[1] > v->nb[2] && mask != nullptr;
     bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && (mask != nullptr && mask->type == GGML_TYPE_F16);
     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
     vk_pipeline xe_fa_pipeline = nullptr;
@@ -8603,8 +8615,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
-    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
-    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
+    // paged: the K and V bindings carry the block tables, the shader resolves every cell itself
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, paged ? page_k : k);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, paged ? page_v : v);
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;

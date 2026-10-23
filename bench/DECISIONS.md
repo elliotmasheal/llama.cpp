@@ -223,7 +223,7 @@
 12. A 的第二阶段（设备段 + host 段 + LSE 合并）**由 F10 取代**（2026-10-23）：不用 LSE 合并，改为分块 KV + 块表间接寻址，
     所有块在同一注意力内统一寻址。F10 的容量收益来自块级放置与零拷贝扩容，decode 速度仍随 host 字节线性下降。
 13. **P1，F10（分块 KV，块表间接寻址）**：设计、里程碑 M0-M4 与验收见 `THREE-TIER.md` F10，
-    **M0 已完成（2026-10-23，读数 `RESULTS.md` 6.1），M1 已完成（`RESULTS.md` 6.2）**，M2b 进行中。
+    **M0 已完成（2026-10-23，读数 `RESULTS.md` 6.1），M1 已完成（6.2），M2b 部分完成（6.3）**。
     四个决定已定：BS=2048、先 M2a 后 M2b、M4 接受 host 块作容量档、表通过 `op_params` 传（不占 `src` 槽）。
     M0 的三条实现约束：目标工况 `FA_SCALAR` + `Bc=32`（所以 BS 必须是 32 与 256 的公倍数）；
     `use_dequant_kv` 在分页时必须显式关闭（锚的虚拟连续 `nb` 会让 `is_dense_kv_cache()` 误判）；
@@ -234,7 +234,10 @@
     (b) 锚是"虚拟"张量：`data` 指向 256 B 的占位 buffer，调度器据此判 backend，内核从不读它。
         它必须是 `data != NULL`，否则 `ggml_gallocr` 会去分配 256 MiB 的虚拟张量。
     (c) 分页下 `get_can_shift()` = false（K-shift 逐块化留到 M3），`state_write/read` 已按块拆分。
-    (d) 设备 K/V 目前被守卫挡下（`device K/V needs the paged Vulkan kernel (M2b)`），M1 只在 CPU 上验收。
+    (d) **设备 K/V 仍被守卫挡下**（`device K/V needs the paged SET_ROWS kernel`）：FA 的分页分支已在树里
+        且非分页门禁 5332/5332 不变，但 `SET_ROWS` 还没有分页变体，写不进块（`RESULTS.md` 6.3）。
+    (e) **长跨距 matmul 注意力不能分页**，`fa_span` 已加 `!paged`；分页模式下 PP 会失去 `-fac 256` 的收益，
+        三条候选（接受回退 / 每 ubatch gather / 只在 host 块 > 0 时启用）见 `RESULTS.md` 6.3，**需要决定**。
     上下文压缩（agent / 多轮）是 M5 的延伸，**已决定不做**：丢中间段会让输出偏离预期，
     三条硬约束仍留在 `THREE-TIER.md` F10 9.5 供将来参考：
     (a) hybrid 的 `seq_rm` 删不了头部（recurrent 只支持全删与尾回滚，`src/llama-memory-recurrent.cpp:184-232`），

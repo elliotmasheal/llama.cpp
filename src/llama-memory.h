@@ -66,7 +66,7 @@ struct llama_memory_context_i {
     virtual llama_memory_status get_status() const = 0;
 
     // paged K/V: the two block tables of layer il; returns false when this memory is contiguous
-    virtual bool get_kv_page(int32_t /* il */, uint64_t * /* k_table */, uint64_t * /* v_table */, int32_t * /* block_size */) const {
+    virtual bool get_kv_page(int32_t /* il */, struct ggml_tensor ** /* k_table */, struct ggml_tensor ** /* v_table */, int32_t * /* block_size */) const {
         return false;
     }
 };

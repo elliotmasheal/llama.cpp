@@ -151,11 +151,16 @@ int main() {
     ggml_tensor * mask     = ggml_new_tensor_4d(ctx_in, GGML_TYPE_F16, NC, NQ, 1, 1);
     ggml_tensor * k_cur    = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F16, DK, NT);
     ggml_tensor * idxs     = ggml_new_tensor_1d(ctx_in, GGML_TYPE_I32, NT);
+    ggml_tensor * k_tab_t  = ggml_new_tensor_1d(ctx_in, GGML_TYPE_I64, NBLK);
+    ggml_tensor * v_tab_t  = ggml_new_tensor_1d(ctx_in, GGML_TYPE_I64, NBLK);
 
     if (!ggml_backend_alloc_ctx_tensors(ctx_in, backend)) {
         std::printf("cannot allocate the input tensors\n");
         return 1;
     }
+
+    ggml_backend_tensor_set(k_tab_t, k_tab.data(), 0, k_tab.size()*sizeof(uint64_t));
+    ggml_backend_tensor_set(v_tab_t, v_tab.data(), 0, v_tab.size()*sizeof(uint64_t));
 
     ggml_backend_sched_t sched = ggml_backend_sched_new(&backend, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
 
@@ -180,7 +185,7 @@ int main() {
         const float scale = 1.0f/std::sqrt((float) HSK);
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k_view, v_view, mask, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_paged(out, (uint64_t) (uintptr_t) k_tab.data(), (uint64_t) (uintptr_t) v_tab.data(), BS);
+        ggml_flash_attn_ext_set_paged(out, k_tab_t, v_tab_t, BS);
 
         // the same attention over a contiguous K/V: the paged result must match it bit for bit
         ggml_tensor * k_cview = ggml_view_4d(ctx, k_contig, HSK, NHKV, NC, 1,
@@ -300,7 +305,7 @@ int main() {
         ggml_context * ctx = ggml_init(ip);
 
         ggml_tensor * out = ggml_set_rows(ctx, k_anchor, k_cur, idxs);
-        ggml_set_rows_set_paged(out, (uint64_t) (uintptr_t) k_tab.data(), BS);
+        ggml_set_rows_set_paged(out, k_tab_t, BS);
 
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);

@@ -679,6 +679,11 @@ M2a B-lite（验证，不改 FA shader）
 
 M2b 融合 FA（Vulkan）
 
+- **进行中（2026-10-24）**：FA 的分页分支已落地（`Paged`/`PageBS` spec constant、块表绑定在 binding 1/2、
+  `fa_load_kv()` 经 BDA 解引用、`page_bs` 进 pipeline 键），非分页门禁 5332/5332 不变，读数 `RESULTS.md` 6.3。
+- 剩余：`SET_ROWS` 的分页变体（独立 SPIR-V 变体 + 绑定 + `PageBS` 走 `param3`），
+  以及长跨距 matmul 路径的策略选择（`fa_span` 已加 `!paged`，代价见 `RESULTS.md` 6.3）。
+
 - 分页 SET_ROWS 变体；`flash_attn.comp` 的 f16 读取改表（5.2）；分页模式强制 FA_SCALAR（RDNA2 本来就走它）。
 - 门禁（AGENTS 第 3 节）：`MUL_MAT_ID` CPU 945/945、`MUL_MAT_ID_MASK` CPU 4/4、`MUL_MAT_ID` Vulkan 939/939、
   `MUL_MAT` Vulkan 2275/2275、`FLASH_ATTN_EXT` Vulkan 5332/5332、`ctest` 32/32。

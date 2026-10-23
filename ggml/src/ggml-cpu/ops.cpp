@@ -5561,9 +5561,9 @@ static void ggml_compute_forward_set_rows_impl(
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
     // paged KV: the cell index selects a block, the block base replaces dst->data + i1*nb1
-    uint64_t page_table = 0;
+    ggml_tensor * page_tab = nullptr;
     int32_t  page_bs    = 0;
-    const bool paged = ggml_set_rows_get_paged(dst, &page_table, &page_bs);
+    const bool paged = ggml_set_rows_get_paged(dst, &page_tab, &page_bs);
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -5578,7 +5578,7 @@ static void ggml_compute_forward_set_rows_impl(
 
                 char * dst_row;
                 if (paged) {
-                    const uint64_t blk = ((const uint64_t *) (uintptr_t) page_table)[i1 / page_bs];
+                    const uint64_t blk = ((const uint64_t *) page_tab->data)[i1 / page_bs];
                     GGML_ASSERT(blk != 0 && "paged set_rows: cell index outside the allocated blocks");
                     dst_row = (char *) (uintptr_t) blk + (i1 % page_bs)*nb1 + i02*nb2 + i03*nb3;
                 } else {
@@ -8945,12 +8945,12 @@ void ggml_compute_forward_top_k(
 
 // paged KV: cell ic lives in block ic/bs, and the block table replaces base + ic*nb1
 static inline const char * ggml_fa_kv_row(const char * base, int64_t nb1, int64_t ic, int64_t off,
-                                          bool paged, uint64_t table, int32_t bs) {
+                                          bool paged, const void * table, int32_t bs) {
     if (!paged) {
         return base + ic*nb1 + off;
     }
 
-    const uint64_t blk = ((const uint64_t *) (uintptr_t) table)[ic / bs];
+    const uint64_t blk = ((const uint64_t *) table)[ic / bs];
     GGML_ASSERT(blk != 0 && "paged FA: cell index outside the allocated blocks");
 
     return (const char *) (uintptr_t) blk + (ic % bs)*nb1 + off;
@@ -9039,10 +9039,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
     // paged KV: derive every cell address from this layer's block table
-    uint64_t page_k_table = 0;
-    uint64_t page_v_table = 0;
+    ggml_tensor * page_k_tab = nullptr;
+    ggml_tensor * page_v_tab = nullptr;
     int32_t  page_bs      = 0;
-    const bool paged = ggml_flash_attn_ext_get_paged(dst, &page_k_table, &page_v_table, &page_bs);
+    const bool paged = ggml_flash_attn_ext_get_paged(dst, &page_k_tab, &page_v_tab, &page_bs);
+    const void * page_k_table = paged ? page_k_tab->data : nullptr;
+    const void * page_v_table = paged ? page_v_tab->data : nullptr;
 
     int ith = params->ith;
 
@@ -9255,10 +9257,12 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const int64_t rv3 = neq3/nev3;
 
     // paged KV: derive every cell address from this layer's block table
-    uint64_t page_k_table = 0;
-    uint64_t page_v_table = 0;
+    ggml_tensor * page_k_tab = nullptr;
+    ggml_tensor * page_v_tab = nullptr;
     int32_t  page_bs      = 0;
-    const bool paged = ggml_flash_attn_ext_get_paged(dst, &page_k_table, &page_v_table, &page_bs);
+    const bool paged = ggml_flash_attn_ext_get_paged(dst, &page_k_tab, &page_v_tab, &page_bs);
+    const void * page_k_table = paged ? page_k_tab->data : nullptr;
+    const void * page_v_table = paged ? page_v_tab->data : nullptr;
 
     float scale         = 1.0f;
     float max_bias      = 0.0f;

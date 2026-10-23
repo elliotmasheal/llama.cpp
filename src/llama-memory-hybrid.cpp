@@ -288,7 +288,7 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
     return static_cast<const llama_kv_cache_context *>(ctx_attn.get());
 }
 
-bool llama_memory_hybrid_context::get_kv_page(int32_t il, uint64_t * k_table, uint64_t * v_table, int32_t * block_size) const {
+bool llama_memory_hybrid_context::get_kv_page(int32_t il, ggml_tensor ** k_table, ggml_tensor ** v_table, int32_t * block_size) const {
     const auto * attn = get_attn();
     return attn && attn->get_kv_page(il, k_table, v_table, block_size);
 }

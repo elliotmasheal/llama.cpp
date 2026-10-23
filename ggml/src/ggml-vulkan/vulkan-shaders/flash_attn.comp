@@ -20,6 +20,10 @@
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_vote : enable
 
+// paged K/V: the block table holds 64-bit device addresses
+#extension GL_EXT_buffer_reference2 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
 #include "types.glsl"
 #include "dot_product_funcs.glsl"
 #include "flash_attn_base.glsl"
@@ -40,7 +44,22 @@ layout (binding = 1) readonly buffer K {float16_t data_k[];};
 layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
 layout (binding = 2) readonly buffer V {float16_t data_v[];};
 layout (binding = 2) readonly buffer VV4 {f16vec4 data_vv4[];};
+// paged K/V (Paged != 0): the K and V bindings hold the block table instead of the rows
+layout (binding = 1) readonly buffer KTab {uint64_t data_ktab[];};
+layout (binding = 2) readonly buffer VTab {uint64_t data_vtab[];};
+layout (buffer_reference, std430, buffer_reference_align = 8) readonly buffer PageKV {f16vec4 data[];};
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
+
+// one f16vec4 of K or V: the paged variant resolves the cell through the block table
+FLOAT_TYPEV4 fa_load_kv(uint32_t is_v, uint32_t col, uint32_t dvec, uint32_t off, uint32_t stride) {
+    if (Paged != 0) {
+        const uint64_t blk = is_v != 0 ? data_vtab[col / PageBS] : data_ktab[col / PageBS];
+        return FLOAT_TYPEV4(PageKV(blk).data[(col % PageBS) * (stride / 4) + off / 4 + dvec]);
+    }
+    return is_v != 0 ? FLOAT_TYPEV4(data_vv4[off / 4 + col * stride / 4 + dvec])
+                     : FLOAT_TYPEV4(data_kv4[off / 4 + col * stride / 4 + dvec]);
+}
+
 
 // If SubGroupSize is set to 0 then only use shmem reductions
 const uint32_t tmpsh_size = (SubGroupSize > 0) ? (row_split == 1 ? num_subgroups * D_split : num_subgroups) : WorkGroupSize;
@@ -263,7 +282,7 @@ void main() {
                             uint iqs = (coord % BLOCK_SIZE_K);
                             K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
                         } else {
-                            K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + kcol * k_stride / 4 + d]);
+                            K_Tf = fa_load_kv(0, kcol, d, k_offset, k_stride);
                         }
                     }
 
@@ -319,7 +338,7 @@ void main() {
                         uint iqs = (coord % BLOCK_SIZE_K);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
                     } else {
-                        K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + kcol * k_stride / 4 + d * D_split + d_tid]);
+                        K_Tf = fa_load_kv(0, kcol, d * D_split + d_tid, k_offset, k_stride);
                     }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                         Sf[r][c] = dot_product(Q_cache[r], K_Tf, Sf[r][c]);
@@ -344,7 +363,7 @@ void main() {
                         uint iqs = (coord % BLOCK_SIZE_K);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
                     } else {
-                        K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + kcol * k_stride / 4 + d * D_split + d_tid]);
+                        K_Tf = fa_load_kv(0, kcol, d * D_split + d_tid, k_offset, k_stride);
                     }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                         Sf[r][c] = dot_product(Qf[tile_row(r) * qf_stride + d * D_split + d_tid], K_Tf, Sf[r][c]);
@@ -501,7 +520,7 @@ void main() {
                             uint iqs = (coord % BLOCK_SIZE_V);
                             V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
                         } else {
-                            V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + vcol * v_stride / 4 + d]);
+                            V_Tf = fa_load_kv(1, vcol, d, v_offset, v_stride);
                         }
                     }
 
@@ -534,7 +553,7 @@ void main() {
                     uint iqs = (coord % BLOCK_SIZE_V);
                     Vf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
                 } else {
-                    Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + vcol * v_stride / 4 + d * D_split + d_tid]);
+                    Vf = fa_load_kv(1, vcol, d * D_split + d_tid, v_offset, v_stride);
                 }
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                     Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);

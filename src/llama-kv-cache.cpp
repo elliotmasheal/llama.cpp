@@ -128,14 +128,15 @@ llama_kv_cache::llama_kv_cache(
             else if (n_stream != 1)     why = "more than one stream";
             else if (kv_block < 256 || (kv_block % 256) != 0) why = "block size is not a multiple of 256";
             else if (offload) {
-                // M1 only has the CPU kernels; the Vulkan shader reads K/V through a table in M2b
+                // the Vulkan attention kernel resolves blocks through the table, but SET_ROWS has no
+                // paged variant yet, so a device cache would never receive its K/V
                 for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
                     if (!hparams.has_kv(il)) {
                         continue;
                     }
                     auto * dev = model.dev_layer(il);
                     if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                        why = "device K/V needs the paged Vulkan kernel (M2b)";
+                        why = "device K/V needs the paged SET_ROWS kernel";
                     }
                     break;
                 }
@@ -1383,7 +1384,7 @@ void llama_kv_cache::init_pages(uint32_t cells) {
 
     {
         ggml_init_params params = {
-            /*.mem_size   =*/ size_t(8*ggml_tensor_overhead()),
+            /*.mem_size   =*/ size_t((2*n_layer_kv + 8)*ggml_tensor_overhead()),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
@@ -1392,15 +1393,19 @@ void llama_kv_cache::init_pages(uint32_t cells) {
             throw std::runtime_error("failed to create the kv page table context");
         }
 
-        page_table = ggml_new_tensor_1d(page_table_ctx.get(), GGML_TYPE_I64, (int64_t) 2*n_layer_kv*n_blocks_max);
-        ggml_format_name(page_table, "cache_page_table");
+        for (size_t i = 0; i < n_layer_kv; ++i) {
+            ggml_tensor * tk = ggml_new_tensor_1d(page_table_ctx.get(), GGML_TYPE_I64, (int64_t) n_blocks_max);
+            ggml_tensor * tv = ggml_new_tensor_1d(page_table_ctx.get(), GGML_TYPE_I64, (int64_t) n_blocks_max);
+            ggml_format_name(tk, "cache_page_ktab_%zu", i);
+            ggml_format_name(tv, "cache_page_vtab_%zu", i);
+            page_tab_k.push_back(tk);
+            page_tab_v.push_back(tv);
+        }
 
         page_table_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(page_table_ctx.get(), page_buft));
         if (!page_table_buf) {
             throw std::runtime_error("failed to allocate the kv page table");
         }
-
-        page_table_host.assign((size_t) 2*n_layer_kv*n_blocks_max, 0);
     }
 
     const uint32_t n_init = (cells + kv_block_size - 1)/kv_block_size;
@@ -1410,9 +1415,9 @@ void llama_kv_cache::init_pages(uint32_t cells) {
         }
     }
 
-    LLAMA_LOG_INFO("%s: paged K/V: %u blocks of %u cells (%zu layers), table %zu bytes, %.2f MiB allocated\n",
-            __func__, kv_page_blocks, kv_block_size, n_layer_kv, page_table_host.size()*sizeof(uint64_t),
-            (double) total_size()/1024.0/1024.0);
+    LLAMA_LOG_INFO("%s: paged K/V: %u blocks of %u cells (%zu layers), table %.2f KiB, %.2f MiB allocated\n",
+            __func__, kv_page_blocks, kv_block_size, n_layer_kv,
+            (double) (2*n_layer_kv*n_blocks_max*sizeof(uint64_t))/1024.0, (double) total_size()/1024.0/1024.0);
 }
 
 bool llama_kv_cache::add_block() {
@@ -1471,17 +1476,17 @@ bool llama_kv_cache::add_block() {
     const uint32_t b = kv_page_blocks;
 
     for (size_t i = 0; i < n_layer_kv; ++i) {
-        page_table_host[(2*i + 0)*n_blocks_max + b] = kv_tensor_addr(blk.k[i]);
-        page_table_host[(2*i + 1)*n_blocks_max + b] = kv_tensor_addr(blk.v[i]);
+        const uint64_t addr_k = kv_tensor_addr(blk.k[i]);
+        const uint64_t addr_v = kv_tensor_addr(blk.v[i]);
 
-        if (page_table_host[(2*i + 0)*n_blocks_max + b] == 0 || page_table_host[(2*i + 1)*n_blocks_max + b] == 0) {
+        if (addr_k == 0 || addr_v == 0) {
             LLAMA_LOG_WARN("%s: block %u has no address for layer %zu\n", __func__, b, i);
             return false;
         }
-    }
 
-    // the table must live on the device: one host read per tile would dominate the kernel
-    ggml_backend_tensor_set(page_table, page_table_host.data(), 0, page_table_host.size()*sizeof(uint64_t));
+        ggml_backend_tensor_set(page_tab_k[i], &addr_k, (size_t) b*sizeof(uint64_t), sizeof(uint64_t));
+        ggml_backend_tensor_set(page_tab_v[i], &addr_v, (size_t) b*sizeof(uint64_t), sizeof(uint64_t));
+    }
 
     page_blocks.push_back(std::move(blk));
     ++kv_page_blocks;
@@ -1489,21 +1494,15 @@ bool llama_kv_cache::add_block() {
     return true;
 }
 
-uint64_t llama_kv_cache::page_table_addr(int32_t ikv, bool is_v) const {
-    if (!kv_page || !page_table || ikv < 0) {
-        return 0;
+ggml_tensor * llama_kv_cache::page_table(int32_t ikv, bool is_v) const {
+    if (!kv_page || ikv < 0 || (size_t) ikv >= page_tab_k.size()) {
+        return nullptr;
     }
 
-    const uint32_t n_blocks_max = kv_size_max / kv_block_size;
-    const uint64_t base = kv_tensor_addr(page_table);
-    if (base == 0) {
-        return 0;
-    }
-
-    return base + (uint64_t) (2*ikv + (is_v ? 1 : 0))*n_blocks_max*sizeof(uint64_t);
+    return is_v ? page_tab_v[ikv] : page_tab_k[ikv];
 }
 
-bool llama_kv_cache::get_kv_page(int32_t il, uint64_t * k_table, uint64_t * v_table, int32_t * block_size) const {
+bool llama_kv_cache::get_kv_page(int32_t il, ggml_tensor ** k_table, ggml_tensor ** v_table, int32_t * block_size) const {
     if (!kv_page) {
         return false;
     }
@@ -1513,11 +1512,11 @@ bool llama_kv_cache::get_kv_page(int32_t il, uint64_t * k_table, uint64_t * v_ta
         return false;
     }
 
-    *k_table    = page_table_addr(it->second, false);
-    *v_table    = page_table_addr(it->second, true);
+    *k_table    = page_table(it->second, false);
+    *v_table    = page_table(it->second, true);
     *block_size = (int32_t) kv_block_size;
 
-    return *k_table != 0 && *v_table != 0;
+    return *k_table != nullptr && *v_table != nullptr;
 }
 
 bool llama_kv_cache::ensure_blocks(uint32_t n_extra) {
@@ -1892,7 +1891,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     ggml_tensor * res = ggml_set_rows(ctx, k, k_cur, k_idxs);
 
     if (kv_page) {
-        ggml_set_rows_set_paged(res, page_table_addr(ikv, false), (int32_t) kv_block_size);
+        ggml_set_rows_set_paged(res, page_table(ikv, false), (int32_t) kv_block_size);
     }
 
     return res;
@@ -1933,7 +1932,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
         ggml_tensor * res = ggml_set_rows(ctx, v, v_cur, v_idxs);
 
         if (kv_page) {
-            ggml_set_rows_set_paged(res, page_table_addr(ikv, true), (int32_t) kv_block_size);
+            ggml_set_rows_set_paged(res, page_table(ikv, true), (int32_t) kv_block_size);
         }
 
         return res;
@@ -3488,7 +3487,7 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     return ubatches[i_cur];
 }
 
-bool llama_kv_cache_context::get_kv_page(int32_t il, uint64_t * k_table, uint64_t * v_table, int32_t * block_size) const {
+bool llama_kv_cache_context::get_kv_page(int32_t il, ggml_tensor ** k_table, ggml_tensor ** v_table, int32_t * block_size) const {
     return kv->get_kv_page(il, k_table, v_table, block_size);
 }
 

@@ -530,6 +530,38 @@ vkpage.exe info | table | bench 131072 20 256
   （`page_write_run` / `page_read_run`），`state_read_meta` 先 `ensure_blocks`。
 - 回归：`ctest --test-dir build-vulkan` **33/33**（新增 `test-kv-page`）。
 
+### 6.3 F10 M2b：Vulkan 侧的进度与两个新发现（2026-10-24 00:2x，工作区，**设备路径仍未开启**）
+
+已完成（在树里，但设备 K/V 仍被守卫挡下）：
+
+- `flash_attn.comp` 增加分页分支：`Paged` / `PageBS` 两个 spec constant（16、17），
+  K/V 绑定在分页时换成块表（`uint64` 设备地址数组），每个 f16vec4 由 `fa_load_kv()` 经
+  `PageKV(blk)` 解引用。非分页路径逐字未变：`FLASH_ATTN_EXT -b Vulkan1` **5332/5332**。
+- `ggml_vk_flash_attn` 侧：`paged` 时强制 `FA_SCALAR`、关闭 `use_dequant_kv` 与 `use_sparse`、
+  关闭 Intel Xe 分支，并把块表绑定到 binding 1/2；`page_bs` 进 `vk_fa_pipeline_state`（参与 pipeline 缓存键）。
+- `GGML_VK_FA_TRACE` 的读数确认了这条链路真的走到：`paged=1 bs=256 ... sparse=0 dequant_kv=0`。
+
+未完成，因此设备路径不可用：
+
+- **`SET_ROWS` 没有分页变体**。`copy_to_quant.comp` 仍然按连续 dst 计算 `dst_idx`，分页时它写进的是
+  256 B 的锚而不是块，K/V 永远是 0。实测症状：`-c 512 --kv-page` 在 Vulkan 上输出与 `off` 不同
+  （`bench/raw/m0-20261023/vk-kvpage-{off,on}.out`：off = "The user gave me a classic pangram..."，
+  on = "The user is asking me to count something..."），而不是崩或 NaN —— 正是"读到全 0 的 K/V"的表现。
+  守卫因此改成 `kv-page disabled: device K/V needs the paged SET_ROWS kernel`。
+
+两个设计层的新发现（M0 没覆盖到）：
+
+1. **长跨距 prefill 的 matmul 注意力路径无法分页**。`build_attn_mha` 的 `fa_long_kv` 分支用
+   `MUL_MAT` 直接读 K/V 矩阵，读的是视图的连续布局，分页后就是锚。因此 `fa_span` 已加 `!paged`：
+   分页模式下所有跨度都留在注意力内核上。代价是 `-fac 256` 带来的 PP 680 用不上（同一档 `-fac 0` 是 458，
+   `RESULTS.md` 0.4），**这是 M2b 验收里"PP 持平"不成立的地方，需要单独决定**：
+   (a) 接受分页模式的 PP 回退（容量模式，KV 装不下时才开）；
+   (b) 为 matmul 路径加"每层每 ubatch 一次 gather 到连续 scratch"，代价是 K 读流量约 +40%；
+   (c) 只在 host 块占比 > 0 时才启用分页，全驻显存时保持连续布局（分页就只是容量档）。
+2. **`SET_ROWS` 的分页变体需要一个独立的 SPIR-V 变体**（`PAGED` 是编译期宏，不是 spec constant），
+   并把块表绑到 binding 2、虚拟 dst 步长走 push constant（`param3` 可放 `PageBS`）。
+   工作量约 80 行 + 生成器一条变体 + 分发处一次手工 dispatch。
+
 ## 7. 质量与参考数字
 
 ### 7.1 质量门（F6，2026-10-23 恢复）

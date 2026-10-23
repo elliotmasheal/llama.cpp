@@ -176,7 +176,7 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
 
     // paged K/V: the two tables of one layer, false when the cache is contiguous
-    bool get_kv_page(int32_t il, uint64_t * k_table, uint64_t * v_table, int32_t * block_size) const;
+    bool get_kv_page(int32_t il, ggml_tensor ** k_table, ggml_tensor ** v_table, int32_t * block_size) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -318,13 +318,13 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
-    // paged mode: anchors (virtual views), the address table and the block list
+    // paged mode: anchors (virtual views), the per-layer address tables and the block list
     ggml_context_ptr        page_anchor_ctx;
     ggml_backend_buffer_ptr page_anchor_buf;
     ggml_context_ptr        page_table_ctx;
     ggml_backend_buffer_ptr page_table_buf;
-    ggml_tensor *           page_table = nullptr;  // i64 [2 * n_layer_kv * n_blocks_max]
-    std::vector<uint64_t>   page_table_host;       // host mirror, written through on every block add
+    std::vector<ggml_tensor *> page_tab_k;   // [layers.size()] i64 [n_blocks_max]
+    std::vector<ggml_tensor *> page_tab_v;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
@@ -399,8 +399,8 @@ private:
     // allocate the anchors, the address table and the first blocks; called from the ctor
     void init_pages(uint32_t cells);
 
-    // address of the table slice of one (layer, K|V): the first block index and the count are fixed
-    uint64_t page_table_addr(int32_t ikv, bool is_v) const;
+    // address table of one (layer, K|V): an I64 tensor with one block address per block
+    ggml_tensor * page_table(int32_t ikv, bool is_v) const;
 
     // grow the block list so that used_max + n_extra cells fit; returns true if it grew
     bool ensure_blocks(uint32_t n_extra);
@@ -461,7 +461,7 @@ public:
     const llama_ubatch & get_ubatch() const override;
 
     // paged K/V: the two tables of one layer, false when the cache is contiguous
-    bool get_kv_page(int32_t il, uint64_t * k_table, uint64_t * v_table, int32_t * block_size) const override;
+    bool get_kv_page(int32_t il, ggml_tensor ** k_table, ggml_tensor ** v_table, int32_t * block_size) const override;
 
     //
     // llama_kv_cache_context specific API
