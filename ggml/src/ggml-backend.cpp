@@ -191,6 +191,15 @@ size_t ggml_backend_buft_get_max_size(ggml_backend_buffer_type_t buft) {
     return SIZE_MAX;
 }
 
+size_t ggml_backend_buft_get_max_alloc_size(ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(buft);
+    // get_max_alloc_size is optional, defaults to get_max_size
+    if (buft->iface.get_max_alloc_size) {
+        return buft->iface.get_max_alloc_size(buft);
+    }
+    return ggml_backend_buft_get_max_size(buft);
+}
+
 size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     GGML_ASSERT(buft);
     // get_alloc_size is optional, defaults to ggml_nbytes

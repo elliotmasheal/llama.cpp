@@ -30,6 +30,8 @@ extern "C" {
         size_t                (*get_alloc_size_n)(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
         // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
         bool                  (*is_host)         (ggml_backend_buffer_type_t buft);
+        // (optional) max size of a single allocation, a tensor may exceed get_max_size and still get its own buffer (defaults to get_max_size)
+        size_t                (*get_max_alloc_size)(ggml_backend_buffer_type_t buft);
     };
 
     struct ggml_backend_buffer_type {

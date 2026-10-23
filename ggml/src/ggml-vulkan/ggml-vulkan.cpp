@@ -13331,6 +13331,16 @@ size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft)
     return ctx->device->suballocation_block_size;
 }
 
+size_t ggml_backend_vk_buffer_type_get_max_alloc_size(ggml_backend_buffer_type_t buft) {
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    const vk_device & device = ctx->device;
+    size_t res = std::min(device->max_memory_allocation_size, device->max_buffer_size);
+    if (!device->shader_64b_indexing) {
+        res = std::min(res, (size_t) device->properties.limits.maxStorageBufferRange);
+    }
+    return res;
+}
+
 size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     return ggml_nbytes(tensor);
 
@@ -13414,6 +13424,7 @@ ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_for_device(size_t de
                 /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
                 /* .get_alloc_size_n    = */ NULL,
                 /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+                /* .get_max_alloc_size  = */ NULL,
             },
             /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num),
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
