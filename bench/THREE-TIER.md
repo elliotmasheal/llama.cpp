@@ -679,10 +679,14 @@ M2a B-lite（验证，不改 FA shader）
 
 M2b 融合 FA（Vulkan）
 
-- **进行中（2026-10-24）**：FA 的分页分支已落地（`Paged`/`PageBS` spec constant、块表绑定在 binding 1/2、
-  `fa_load_kv()` 经 BDA 解引用、`page_bs` 进 pipeline 键），非分页门禁 5332/5332 不变，读数 `RESULTS.md` 6.3。
-- 剩余：`SET_ROWS` 的分页变体（独立 SPIR-V 变体 + 绑定 + `PageBS` 走 `param3`），
-  以及长跨距 matmul 路径的策略选择（`fa_span` 已加 `!paged`，代价见 `RESULTS.md` 6.3）。
+- **进行中（2026-10-24）**：FA 与 SET_ROWS 的分页内核都已进树，算子级在 CPU 与 Vulkan 上都逐位正确
+  （`tests/test-kv-page.cpp`，两种后端；表以 I64 张量挂在 `src[5]/src[6]` 与 `src[3]`）。
+  非分页门禁 `FLASH_ATTN_EXT -b Vulkan1` 5332/5332 不变。
+- **模型级 Vulkan 路径仍不对**（同文本 PPL 4.1412 对 6.0684），所以设备 K/V 仍被守卫挡下
+  （`kv-page disabled: device K/V is not verified yet`）。已排除项与下一步见 `RESULTS.md` 6.3。
+- **2026-10-24 决定**：分页先当容量档——`--kv-page auto` 用 `common/fit.cpp` 的预算判决，
+  初始 KV 装得进设备 surplus 就保持连续布局（保住 PP 680），装不进才开分页。
+  因此长跨距 matmul 路径的 gather（`F11`）**暂不实现**，保留设计。
 
 - 分页 SET_ROWS 变体；`flash_attn.comp` 的 f16 读取改表（5.2）；分页模式强制 FA_SCALAR（RDNA2 本来就走它）。
 - 门禁（AGENTS 第 3 节）：`MUL_MAT_ID` CPU 945/945、`MUL_MAT_ID_MASK` CPU 4/4、`MUL_MAT_ID` Vulkan 939/939、
@@ -744,3 +748,168 @@ F6 已于 2026-10-23 落地（`bash bench/tools/quality-gate.sh`），所以 9.5
 质量门可以直接用，不再是阻塞项。
 
 混合精度分层仍是唯一能改变 TG 屋顶线的选项（屋顶线见 `RESULTS.md` 第 5 节），但它的前提是 F6 + repack KLD = 0。
+
+## F11 分页 KV 的 prefill 路径：块 -> 稠密工作区 -> 现有 chunked matmul（**设计，未实测**，P0）
+
+> **2026-10-24 状态**：`RESULTS.md` 6.3 记下了当天的决定——分页先按容量档推进（选项 c：
+> 只有 KV 装不下显存时才启用分页，全驻显存保持连续布局），因此 F11 的 gather **暂不实现**。
+> 本节保留为将来"容量档也要 PP"时的方案与成本模型。
+
+
+### 0. 结论先行
+
+- 现状（`RESULTS.md` 6.3）：`fa_span` 被 `!paged` 关掉（`src/llama-graph.cpp:3094`），
+  于是 `--kv-page` 下 prefill 的所有跨度都留在 `FLASH_ATTN_EXT` 上，B2 的 `-fac 256` 换来的 PP 680 用不上，
+  同一档 `-fac 0` 只有 458（`DECISIONS.md` 判决 18）。
+- 还有一条没人算过的代价：FA 的 prefill 按 query 行组重复读 K/V。`n_tokens = 2048` 时 `Br = 8`、`gqa_ratio = 1`
+  （`ggml-vulkan.cpp:8332-8345` 的两段 tuning，gqa 合并只在 `N <= 8` 生效），
+  所以 `workgroups_x = ceil(2048/8) = 256`，每个 workgroup 都扫一遍整段 KV（`flash_attn.comp:213-449`）。
+  **只要有块落在 host，prefill 的 PCIe 就是 KV 字节的 256 倍**（第 5 节）。
+- 方案：分页模式下的 prefill 换成"**按块拷进一块稠密工作区，再喂现有的 chunked matmul 路径**"。
+  这就是 `THREE-TIER.md` F10 M2a 已经写下的机制（`ggml_cpy` 逐块），也是 vLLM 长前缀收集的同一思路。
+  不新增 op、不新增 shader、不改数值（拷贝是逐字节的），只把 `k`/`v` 的来源从锚换成工作区。
+- 预期：PP 458 -> 约 680（拿回 B2 的收益），代价是 10.5K 口径约 7 ms/整段 prefill（0.05%）+ 32 MiB 常驻；
+  host 块场景的 PCIe 从"KV 字节 x 256"降到"KV 字节 x 1"。
+- 不做：上下文并行（单 GPU）、选择性 KV 加载（dense causal，`use_sparse = 0`），理由见第 4 节。
+
+### 1. 为什么分页 FA 不能当 prefill 的答案
+
+- 分页寻址本身不是问题：M0d 实测表寻址 <= 1%（`RESULTS.md` 6.1），真实 FA 每 `Bc = 32` 个 cell 才查一次表。
+- 问题在 tile 形状：AMD 上 `hsk = 256 > 128` 会把 `block_rows` 减半（`ggml-vulkan.cpp:1230-1244`），
+  实测 `Br = 8 / Bc = 32 / row_split = 4`；判决 9 的 1.07 TF 对 4.08 TF 就是这个形状造成的。
+- 每个行组都要把 `j = 0 .. KV/Bc` 走完，K/V 的读取次数是 `n_q / Br`，与是否分页无关。
+  全驻显存时这是 L2/DRAM 带宽问题，有 host 块时就是 PCIe 问题。
+- 目标口径的形状（`RESULTS.md` 6.1 的 fa-trace）：prefill 是 `N = 2048 / 198`、`Br = 8`，
+  行组数 `ceil(N/Br) = 256`（`N = 8` 的 gqa 合并不适用；那两行是 decode）。最后几个 ubatch 的
+  `n_kv` 接近 10496，即 `KV/Bc = 328` 个 K/V tile x 256 个行组，每层每 ubatch 约 5.4 GiB 的 K/V 读取请求。
+
+### 2. 设计
+
+#### L0 前置：SET_ROWS 分页变体（已在工作区，只差验收）
+
+- `copy_to_quant.comp` 的 `PAGED` 分支（:18-26、:336-342）把 `dst_idx` 换成
+  `data_qtab[cell / BS]` + `(cell % BS)` 行内偏移；`pipeline_set_rows_paged` 在
+  `ggml-vulkan.cpp:3393-3397` 建立，分发在 `:10946-10963`（`PageBS` 走 `param3`）。
+- `cell -> 块` 是恒等映射：`add_block` 只追加（`src/llama-kv-cache.cpp:1426-1498`），`ensure_blocks` 只增长，
+  所以块 `b` 覆盖 cell `[b*BS, (b+1)*BS)`。**gather 依赖这条不变量**，将来做块回收/压缩（F10 9.5）时必须同步改。
+- 验收：`-c 512 --kv-page` 输出与 `off` 逐字相同；`tests/test-kv-page.cpp` 补一条 Vulkan 后端用例；
+  `FLASH_ATTN_EXT -b Vulkan1` 5332/5332 不变；`ctest` 34/34。
+
+#### L1 主线：块 -> 稠密工作区 -> chunked matmul
+
+(a) 工作区（KV cache 持有）
+
+- `page_scratch_k` / `page_scratch_v`：`[n_embd_k_gqa, cells]` / `[n_embd_v_gqa, cells]` 的 f16 张量。
+  行步长必须与块内一致：块的 2D 张量是 `[n_embd_k_gqa, BS]`、`nb[1] = row_size(n_embd_k_gqa)`
+  （`src/llama-kv-cache.cpp:1447-1450`），与连续布局同构，所以一次 `ggml_cpy` 就是一次 memcpy。
+- 初始 32 MiB（约 16K cells），按 2 倍长到 `--kv-gather-mib`（默认 256 MiB，0 = 关），
+  增长点与 `ensure_blocks` 同批；分配失败 -> 本次不 gather，退回分页 FA 并计数告警（红线：不 abort）。
+- cap 与 matmul 判据是同一个范围：`-fac 256` 要求 `chunk_q >= 64`，即 `n_kv <= 65536`，
+  而 64K cells 的工作区只要 `65536 x 2 KiB = 128 MiB`。256 MiB 的 cap 因此覆盖 matmul 路径的全部有效区间。
+
+(b) 图（`src/llama-graph.cpp:3055` `build_attn_mha`）
+
+- 判据拆两步：先算与分页无关的 `span_ok`（现在的 `n_tok_q >= 512 && n_tok_kv > n_tok_q + n_tok_q/2` 等），
+  再对分页缓存调 `mctx->get_kv_page_dense(ctx0, il, n_kv, &kd, &vd)`；成功则 `fa_span = span_ok`，
+  失败保持 `fa_span = false`（原行为）。**gather 只在 matmul 路径真会用到时才做**，decode 与短跨距一次都不拷。
+- `kd` / `vd` 用与 `get_k` / `get_v`（`src/llama-kv-cache.cpp:1810-1860`）完全相同的 `ggml_view_4d` 数学指向工作区，
+  后面的 chunk 切分、mask 切分、`ggml_concat` 一行不改；`v_trans` 也因此与连续布局一致（false）。
+- 拷贝节点：每块一条 `ggml_cpy(block.k[i], view_2d(sk, ne0, BS, sk->nb[1], b*BS*sk->nb[1]))`，V 同理。
+  10.5K + BS 2048 = 6 块 -> 12 条/层/ubatch；尾块按 `n_kv - b*BS` 截断。
+- 不需要新的同步逻辑：Vulkan 侧按 buffer range 自动插 barrier（`ggml-vulkan.cpp:12541-12607` 的
+  `unsynced_nodes_written/read`），SET_ROWS 写块与 gather 读块命中同一个范围，这就是现在
+  "SET_ROWS 写块 -> FA 经表读块"能正确工作的同一条机制。
+- 每层复用同一块工作区（层的节点在图上串行）。若实测出重叠，退化成 2 块轮转（+1 份内存）。
+
+(c) 内存/预算
+
+- `common/fit.cpp:954-960` 现在扣 `llama_fa_long_kv_reserve_bytes()`（等于 `-fac` 的 cap）。
+  新增 `llama_kv_gather_reserve_bytes()`，扣**初始值 32 MiB**（不是 cap），并在计划日志里打印一行。
+- 只扣初始值的理由：A 已经把"按工作集分配"变成默认（`-kvg -1`），工作区同理。
+  扣 cap 会在 6144 档再挤掉 256 MiB，可能把 bank 压到 512 slots/组以下（判决 19 的预取门槛）。
+
+#### L2 只在 L1 实测不够时做（两条独立终态）
+
+(a) **分页 MUL_MAT**：f16 K/V 专用变体，`Paged` / `PageBS` spec constant，表经 `op_params`
+    （与 FA 同一套约定，不占 `src` 槽），每 `BN` 行查一次表（要求 `BS % BN == 0`）。
+    收益 = 省掉工作区与那 25% 的 K 额外读写；风险 = 动最热 kernel，必须 `MUL_MAT -b Vulkan1` 2275/2275 + 质量门。
+(b) **KV 分块 + LSE 合并**：只服务 `n_kv > 64K`（此时 `-fac 256` 的判据本身不触发，matmul 路径本来就不在），
+    改数值，受 F6 门禁。**不在本轮**。
+
+#### L3 host 块（不需要单独实现，L1 一开就有）
+
+见第 5 节。它同时是 F10 M4 的前置：没有 L1，块级 host 放置的容量档在 prefill 上不是慢一点，是差两个数量级。
+
+### 3. 容量与判据算术（10.5K / BS 2048 / -ub 2048 / -fac 256）
+
+- `score_row = n_kv x n_head x 4B = 10496 x 16 x 4 = 672 KiB`；
+  `chunk_q = 268435456 / 688128 = 390`；`n_chunks = ceil(2048/390) = 6`。
+- 工作区 = `n_kv x 2 KiB = 21 MiB`（K+V 合计，每层；10 层共用一块）。块数 6（12288 cells）。
+- 每次 gather = 21 MiB 读 + 21 MiB 写 = 42 MiB/层 -> 420 MiB/ubatch -> 2.6 ms @168 GB/s。
+- 整段 prompt 重拷 5 次，总量约 `sum(n_kv) x 20 KiB = 614 MiB` -> 7.4 ms，
+  对 PP 680（10.5K / 680 = 15.4 s）是 **0.05%**；dispatch 120 条/ubatch（约 2-4 ms）同量级。
+- 对照：现有 matmul 路径的 score 流量是 6 chunk x 262 MiB（写+读）x 10 层 = 31 GiB/ubatch；
+  gather 是它的 1/70。
+- 重拷的 N^2 上限：总量约 `5 x N^2` 字节；N = 32K 是 5.4 GB（32 ms），N = 64K 是 21.5 GB（128 ms，
+  对 96 s 的 prefill 是 0.13%）。所以**不需要增量 gather**，也不需要在跨 ubatch 保留工作区。
+- host 块：gather 每层只读一次 host，见第 5 节。
+
+### 4. 与业界四条路径的对照（为什么只取第 2 条）
+
+| 路径 | 本项目判定 | 依据 |
+|---|---|---|
+| 分页感知融合内核（ONNX Runtime WebGPU / flashinfer） | **已就位**（FA 分页分支），但只能当 decode 与短跨距；prefill 用它就是 458 | 判决 9 的 1.07 TF 对 4.08，加上 `Br = 8` 的重复读 |
+| 长前缀收集 + 稠密工作区（vLLM Volta） | **本方案主线**（L1）。阈值不是 "Q >= 4096 且 KV >= 8192"，而是"matmul 判据成立"，即 `3072 < n_kv <= 64K` | 判据本来就在 `fa_span`（`src/llama-graph.cpp:3094-3102`） |
+| 上下文并行（vLLM CP / ring attention） | **排除**：单 dGPU（RX 6700S），无第二设备可切；历史双 GPU 尝试是 SSD 污染 + OOM | 判决 3 |
+| 选择性 KV 加载（CompactAttention / ChunkAttn） | **排除**：10 个全注意力层是 dense causal，M0b 实测 `sparse = 0`，没有 2D 块稀疏掩码可用；共享前缀在本项目走 server LCP + cell 复用（F10 M5），不属于 prefill kernel | `RESULTS.md` 6.1 |
+| （补充）分页 GEMM | L2(a)，L1 实测后若工作区/拷贝成为瓶颈再做 | - |
+
+### 5. host 块：L1 顺带解决的硬问题
+
+10.5K 口径、每层 K+V 共 21 MiB、PCIe 14.3 GB/s：
+
+| host 块占比 | FA prefill 每层每 ubatch | gather 后 | 倍数 |
+|---|---:|---:|---:|
+| 10%（2.1 MiB/层） | 537 MiB | 2.1 MiB | 256x |
+| 20%（4.2 MiB/层） | 1.07 GiB | 4.2 MiB | 256x |
+| 100%（21 MiB/层） | 5.4 GiB | 21 MiB | 256x |
+
+即 100% host 时 FA 路径每 ubatch 要 3.8 s（10 层 x 377 ms），gather 后 14 ms。
+所以**F10 M4 的 host 块必须和 L1 同批验收**，否则那一档的 prefill 数字没有意义。
+
+### 6. 里程碑与验收
+
+| 里程碑 | 内容 | 验收 |
+|---|---|---|
+| L0 | SET_ROWS 分页收尾（已在工作区） | `-c 512` 逐字；`ctest` 34/34；FA 5332/5332 |
+| L1a | 工作区 + 逐块 cpy + `get_kv_page_dense` | 单测：块表乱序时工作区与连续布局逐字节相同；锚不被写坏 |
+| L1b | 图切换 + 判据 + 开关 | 256K + 10K，四臂（off / paged / paged+gather / 连续 + `-fac 256`）x 三档 x r=2 |
+| L1c | 预算 + 文档 | fit 日志一行；`RESULTS.md` 新表；`DECISIONS.md` 开关表 |
+| L2a | 分页 MUL_MAT（可选） | `MUL_MAT` 2275/2275 + 质量门 |
+
+L1 验收线：
+
+- 数值：gather 是纯拷贝，`--kv-page` 与 `off` 在 `temp 0` 下输出**逐字相同**；
+  质量门 `KLD -0.000000` / top-p 100%（与 B2 的验收口径一致，`RESULTS.md` 7.1）。
+- 性能：paged + gather 的 PP >= 连续布局 `-fac 256` 的 95%（8176 档目标 646 以上）；
+  TG 不退步（decode 不走 gather）；三档 `status = ok`；`reallocs` / `hit %` / 工作区 MiB 进表。
+- 4096 档若 bank 仍为 0，只要求不退化（这一档分页本来就是容量档）。
+- 新增 trace：`GGML_KV_PAGE_TRACE=1` 每 ubatch 一行（`n_kv`、blocks、`dense|fa`、gather MiB、scratch MiB），
+  给矩阵提供口径。
+
+### 7. 风险
+
+| 风险 | 影响 | 缓解 |
+|---|---|---|
+| 每层共用工作区的调度重叠 | 数值错乱且静默 | 先跑 `-c 512` 与 10K 逐字；靠 buffer-range 同步；必要时 2 块轮转 |
+| 工作区把 bank 挤到预取门槛下 | PP 反而降 | 只扣 32 MiB 初始值；6144 档先验 512 slots |
+| 逐块 cpy 的 dispatch 数 | 长上下文吃 dispatch | 10.5K 120 条/ubatch（2-4 ms）；>64K 走 L2(b)，或合并成单个 `page_gather` kernel |
+| 块在 host 时 cpy 变成 H2D | 慢，但只一次 | 正是目的（替代 256 次） |
+| 非均匀 head_dim / 多流 / V 转置 | 用不了工作区 | 已有守卫 + 退回分页 FA，计数 |
+| 开关组合爆炸 | 维护成本 | 只加 `--kv-gather-mib` 一个数，0 = 关 |
+
+### 8. 需要确认的决定
+
+1. 顺序：L1 先行，L2 视测量（建议是）。
+2. 工作区 cap 默认 256 MiB、初始 32 MiB（建议是）。
+3. host 块与 L1 同批进 F10 M4 验收（建议是）。

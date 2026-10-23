@@ -3390,6 +3390,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     SET_ROWS(1, f16, _i64)
 #undef SET_ROWS
 
+    ggml_vk_create_pipeline(device, device->pipeline_set_rows_paged[0], "set_rows_f32_f16_i64_paged",
+            set_rows_f32_f16_i64_paged_len, set_rows_f32_f16_i64_paged_data, "main", 3,
+            sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_set_rows_paged[1], "set_rows_f16_f16_i64_paged",
+            set_rows_f16_f16_i64_paged_len, set_rows_f16_f16_i64_paged_data, "main", 3,
+            sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q1_0], "cpy_q1_0_f32", cpy_q1_0_f32_len, cpy_q1_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q1_0), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q2_0], "cpy_q2_0_f32", cpy_q2_0_f32_len, cpy_q2_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q2_0), 1, 1}, {}, 1);
@@ -9627,7 +9634,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
 }
 
 template<typename PC>
-static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst, ggml_op op, PC&& pc, vk_pipeline pipeline_override = nullptr) {
+static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst, ggml_op op, PC&& pc, vk_pipeline pipeline_override = nullptr, const ggml_tensor * dst_buf_override = nullptr) {
     VK_LOG_DEBUG("ggml_vk_op_f32((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     if (src1 != nullptr) {
         std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -9680,7 +9687,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     vk_subbuffer src1_buf = use_src1 ? ggml_vk_tensor_subbuffer(ctx, src1, true) : vk_subbuffer{};
     vk_subbuffer src2_buf = use_src2 ? ggml_vk_tensor_subbuffer(ctx, src2, true) : vk_subbuffer{};
     vk_subbuffer src3_buf = use_src3 ? ggml_vk_tensor_subbuffer(ctx, src3, true) : vk_subbuffer{};
-    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst_buf_override ? dst_buf_override : dst, true);
 
     // Compute misalignment offset for descriptors and store it in in push constants.
     init_pushconst_tensor_offsets(ctx, pc, src0, src1, src2, src3, dst);
@@ -10936,14 +10943,24 @@ void ggml_vk_set_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const g
         return;
     }
 
+    // paged K/V: the destination rows live in per-block allocations, the binding carries the table
+    ggml_tensor * page_tab = nullptr;
+    int32_t       page_bs  = 0;
+    const bool    paged    = ggml_set_rows_get_paged(dst, &page_tab, &page_bs);
+    if (paged) {
+        GGML_ASSERT((src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) && dst->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_I64 &&
+                "the paged SET_ROWS kernel handles f16 into f16 with i64 indices only");
+        GGML_ASSERT(page_tab && page_tab->data);
+    }
+
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SET_ROWS, {
         (uint32_t)ggml_nelements(src0),
         (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
         (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
-        0.0f, 0.0f, 0,
-    });
+        0.0f, 0.0f, paged ? page_bs : 0,
+    }, paged ? ctx->device->pipeline_set_rows_paged[src0->type == GGML_TYPE_F16 ? 1 : 0] : nullptr, paged ? page_tab : nullptr);
 }
 
 void ggml_vk_silu_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

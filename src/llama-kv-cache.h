@@ -173,6 +173,7 @@ public:
     ggml_type type_v() const;
 
     std::vector<uint32_t> get_layer_ids() const;
+
     ggml_tensor * get_k_storage(int32_t il) const;
 
     // paged K/V: the two tables of one layer, false when the cache is contiguous
@@ -411,6 +412,7 @@ private:
     // write/read one cell run of one (layer, K|V) through the block table
     void page_write_run(llama_io_write_i & io, int32_t ikv, bool is_v, uint32_t from, uint32_t to, size_t row_size) const;
     void page_read_run (llama_io_read_i  & io, int32_t ikv, bool is_v, uint32_t from, uint32_t to, size_t row_size) const;
+
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;

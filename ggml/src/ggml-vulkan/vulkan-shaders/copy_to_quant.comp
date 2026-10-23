@@ -15,7 +15,15 @@ layout (binding = 0) readonly buffer S {S_TYPE data_s[];};
 #if defined(SET_ROWS)
 #include "generic_binary_head.glsl"
 layout (binding = 1) readonly buffer C {B_TYPE data_i[];};
+#ifdef PAGED
+// paged K/V: binding 2 holds the block table, the rows live in per-block allocations
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout (binding = 2) readonly buffer QTab {uint64_t data_qtab[];};
+layout (buffer_reference, std430) writeonly buffer PageRow {A_TYPE data[];};
+#else
 layout (binding = 2) writeonly buffer Q {A_TYPE data_q[];};
+#endif
 
 #if B_SIZE == 64
 #define DATA_I_SWIZZLE .x
@@ -28,6 +36,7 @@ layout (binding = 2) writeonly buffer Q {A_TYPE data_q[];};
 layout (binding = 1) writeonly buffer Q {A_TYPE data_q[];};
 #endif
 
+#ifndef PAGED
 #if defined(DATA_A_Q4_0)
 void quantize(uint dst_idx, uint src_idx)
 {
@@ -300,6 +309,8 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+#endif // !PAGED
+
 #if defined(SET_ROWS)
 
 void main() {
@@ -322,10 +333,19 @@ void main() {
 
     uint i1 = data_i[src1_idx(i10, i11, i12, 0) + get_boffset()] DATA_I_SWIZZLE;
 
-    uint src0_idx = src0_idx(i00, i01, i02, i03) + get_aoffset();
-    uint dst_idx = dst_idx(i00 / QUANT_K, i1, i02, i03) + get_doffset();
+#ifdef PAGED
+    // the cell index selects a block, the row inside it comes from the virtual destination strides
+    const uint bs  = uint(p.param3);
+    const uint64_t blk = data_qtab[i1 / bs];
+    const uint off = (i00 / QUANT_K) * p.nb20 + (i1 % bs) * p.nb21 + i02 * p.nb22 + i03 * p.nb23;
 
-    quantize(dst_idx, src0_idx);
+    PageRow(blk).data[off] = A_TYPE(float(data_s[src0_idx(i00, i01, i02, i03) + get_aoffset()]));
+#else
+    uint src0_idx_v = src0_idx(i00, i01, i02, i03) + get_aoffset();
+    uint dst_idx_v = dst_idx(i00 / QUANT_K, i1, i02, i03) + get_doffset();
+
+    quantize(dst_idx_v, src0_idx_v);
+#endif
 }
 
 #else

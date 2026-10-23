@@ -234,10 +234,19 @@
     (b) 锚是"虚拟"张量：`data` 指向 256 B 的占位 buffer，调度器据此判 backend，内核从不读它。
         它必须是 `data != NULL`，否则 `ggml_gallocr` 会去分配 256 MiB 的虚拟张量。
     (c) 分页下 `get_can_shift()` = false（K-shift 逐块化留到 M3），`state_write/read` 已按块拆分。
-    (d) **设备 K/V 仍被守卫挡下**（`device K/V needs the paged SET_ROWS kernel`）：FA 的分页分支已在树里
-        且非分页门禁 5332/5332 不变，但 `SET_ROWS` 还没有分页变体，写不进块（`RESULTS.md` 6.3）。
-    (e) **长跨距 matmul 注意力不能分页**，`fa_span` 已加 `!paged`；分页模式下 PP 会失去 `-fac 256` 的收益，
-        三条候选（接受回退 / 每 ubatch gather / 只在 host 块 > 0 时启用）见 `RESULTS.md` 6.3，**需要决定**。
+    (d) **设备 K/V 仍被守卫挡下**（`device K/V is not verified yet`）：FA 与 SET_ROWS 的分页内核都已进树，
+        算子级在 CPU 与 Vulkan 上都逐位正确（`tests/test-kv-page.cpp` 两后端），但模型级 Vulkan 路径
+        PPL 4.1412 对 6.0684，未定位（`RESULTS.md` 6.3 列了已排除项与下一步）。
+    (e) ~~长跨距 matmul 注意力不能分页~~ **2026-10-23 已决定：每层每 ubatch gather 到稠密工作区**
+        （设计见 `THREE-TIER.md` F11）。`fa_span` 里的 `!paged` 保留为兜底，gather 成功时按连续布局走
+        chunked matmul。否决 `RESULTS.md` 6.3 的另两条：(a) 接受回退等于放弃 `-fac 256` 的 PP 680；
+        (c) "只在 host 块 > 0 时启用"在全驻显存时同样需要，因为 FA prefill 每层要按 `n_q/Br = 256` 个行组
+        重复读 K/V（`ggml-vulkan.cpp:8332-8345` 的 gqa 合并只对 `N <= 8` 生效，prefill 的 `gqa_ratio = 1`）。
+        M2a（B-lite，gather 之后喂 FA）的验证目的已由 L0 与 `test-kv-page` 覆盖，不再单独做；
+        它的 `ggml_cpy` 机制并入 F11 L1，但目标是 matmul 而不是 FA。
+        **2026-10-24 更正**：上面的 (b) 与用户当天的选择冲突，最终取 **(c)**——分页先当容量档，
+        `--kv-page auto` 由 fit 预算判决（初始 KV 装得进设备 surplus 就保持连续布局），
+        因此 F11 的 gather 暂不实现，`!paged` 是分页模式下的唯一路径。两条记录都保留，以便回溯。
     上下文压缩（agent / 多轮）是 M5 的延伸，**已决定不做**：丢中间段会让输出偏离预期，
     三条硬约束仍留在 `THREE-TIER.md` F10 9.5 供将来参考：
     (a) hybrid 的 `seq_rm` 删不了头部（recurrent 只支持全删与尾回滚，`src/llama-memory-recurrent.cpp:184-232`），

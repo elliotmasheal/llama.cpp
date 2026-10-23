@@ -530,7 +530,7 @@ vkpage.exe info | table | bench 131072 20 256
   （`page_write_run` / `page_read_run`），`state_read_meta` 先 `ensure_blocks`。
 - 回归：`ctest --test-dir build-vulkan` **33/33**（新增 `test-kv-page`）。
 
-### 6.3 F10 M2b：Vulkan 侧的进度与两个新发现（2026-10-24 00:2x，工作区，**设备路径仍未开启**）
+### 6.3 F10 M2b：Vulkan 侧的进度与两个新发现（2026-10-24 00:2x-02:xx，工作区，**设备路径仍未开启**）
 
 已完成（在树里，但设备 K/V 仍被守卫挡下）：
 
@@ -540,27 +540,40 @@ vkpage.exe info | table | bench 131072 20 256
 - `ggml_vk_flash_attn` 侧：`paged` 时强制 `FA_SCALAR`、关闭 `use_dequant_kv` 与 `use_sparse`、
   关闭 Intel Xe 分支，并把块表绑定到 binding 1/2；`page_bs` 进 `vk_fa_pipeline_state`（参与 pipeline 缓存键）。
 - `GGML_VK_FA_TRACE` 的读数确认了这条链路真的走到：`paged=1 bs=256 ... sparse=0 dequant_kv=0`。
+- `SET_ROWS` 的分页变体（`copy_to_quant.comp` 的 `PAGED` 分支、`pipeline_set_rows_paged[2]`、
+  表绑到 binding 2、虚拟 dst 步长走 push constant `param3`）已进树，支持 f16 与 f32 源。
+- 表从"裸地址"改成 **I64 张量**（`src[5]/src[6]` / `src[3]`），调度器负责绑定，不再需要新 descriptor。
 
-未完成，因此设备路径不可用：
+单元级（`tests/test-kv-page.cpp`，现在两种后端都跑：`test-kv-page.exe [vulkan]`）：
 
-- **`SET_ROWS` 没有分页变体**。`copy_to_quant.comp` 仍然按连续 dst 计算 `dst_idx`，分页时它写进的是
-  256 B 的锚而不是块，K/V 永远是 0。实测症状：`-c 512 --kv-page` 在 Vulkan 上输出与 `off` 不同
-  （`bench/raw/m0-20261023/vk-kvpage-{off,on}.out`：off = "The user gave me a classic pangram..."，
-  on = "The user is asking me to count something..."），而不是崩或 NaN —— 正是"读到全 0 的 K/V"的表现。
-  守卫因此改成 `kv-page disabled: device K/V needs the paged SET_ROWS kernel`。
+| 检查 | CPU | Vulkan1 |
+|---|---|---|
+| paged FA vs contiguous FA（8 块乱序，BS=32） | 4096/4096 逐位相同 | **4096/4096 逐位相同** |
+| paged SET_ROWS 写位置（f32 源 -> f16 目标） | 0/64 错位 | 0/64 错位 |
+| 锚（填 NaN）被写坏的 half 数 | 0 | 0 |
+
+**模型级仍然不对**（这是设备路径被关掉的原因）：`-c 512` 同一文本，
+`llama-perplexity --chunks 2` 得到 PPL **4.1412（off）对 6.0684（on）**，
+`llama-cli -st` 两臂输出也不同。已排除的项：FA 形状与路径（trace 全部 `paged=1 bs=256 scalar`）、
+表地址（`ggml_vk_buffer_write` 是同步等 fence 的）、两臂的算子级寻址（上表）。
+未定位的剩余差异：多层的表/锚（测试只有一层）、`n_embd_k_gqa=512`（测试 256）、
+以及分页下 `ggml_backend_tensor_get` 读到 0（当时没有先 `llama_synchronize`，回读本身不可信）。
+下一步的调试入口：先在 `llama_synchronize` 之后把块内 K 与连续布局的锚逐字节对比，
+再按层数（1 层 vs 10 层）二分。
 
 两个设计层的新发现（M0 没覆盖到）：
 
 1. **长跨距 prefill 的 matmul 注意力路径无法分页**。`build_attn_mha` 的 `fa_long_kv` 分支用
    `MUL_MAT` 直接读 K/V 矩阵，读的是视图的连续布局，分页后就是锚。因此 `fa_span` 已加 `!paged`：
    分页模式下所有跨度都留在注意力内核上。代价是 `-fac 256` 带来的 PP 680 用不上（同一档 `-fac 0` 是 458，
-   `RESULTS.md` 0.4），**这是 M2b 验收里"PP 持平"不成立的地方，需要单独决定**：
-   (a) 接受分页模式的 PP 回退（容量模式，KV 装不下时才开）；
-   (b) 为 matmul 路径加"每层每 ubatch 一次 gather 到连续 scratch"，代价是 K 读流量约 +40%；
-   (c) 只在 host 块占比 > 0 时才启用分页，全驻显存时保持连续布局（分页就只是容量档）。
+   `RESULTS.md` 0.4）。三条候选：(a) 接受回退；(b) 每层每 ubatch 一次 gather（`THREE-TIER.md` F11）；
+   (c) 只在 KV 装不下显存时才启用分页。
+   **2026-10-24 决定取 (c)**：分页退化为容量档，全驻显存时保持连续布局、保住 PP 680；
+   F11 的 gather 设计保留但暂不实现，只有将来实测证明容量档也需要 PP 时才启用。
+   落地方式（待做）：`--kv-page auto` 由 `common/fit.cpp` 的预算判决——初始 KV（`kv_size_init`）
+   装得进设备 surplus 就关，装不进就开。
 2. **`SET_ROWS` 的分页变体需要一个独立的 SPIR-V 变体**（`PAGED` 是编译期宏，不是 spec constant），
-   并把块表绑到 binding 2、虚拟 dst 步长走 push constant（`param3` 可放 `PageBS`）。
-   工作量约 80 行 + 生成器一条变体 + 分发处一次手工 dispatch。
+   并把块表绑到 binding 2、虚拟 dst 步长走 push constant（`param3` 放 `PageBS`）。已落地（见上）。
 
 ## 7. 质量与参考数字
 

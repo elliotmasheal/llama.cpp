@@ -128,15 +128,15 @@ llama_kv_cache::llama_kv_cache(
             else if (n_stream != 1)     why = "more than one stream";
             else if (kv_block < 256 || (kv_block % 256) != 0) why = "block size is not a multiple of 256";
             else if (offload) {
-                // the Vulkan attention kernel resolves blocks through the table, but SET_ROWS has no
-                // paged variant yet, so a device cache would never receive its K/V
+                // the kernels are in place but the model-level Vulkan path still diverges from the
+                // contiguous layout, so device K/V stays off until that is resolved (RESULTS 6.3)
                 for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
                     if (!hparams.has_kv(il)) {
                         continue;
                     }
                     auto * dev = model.dev_layer(il);
                     if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                        why = "device K/V needs the paged SET_ROWS kernel";
+                        why = "device K/V is not verified yet";
                     }
                     break;
                 }

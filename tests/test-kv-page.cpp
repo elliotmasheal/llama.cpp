@@ -9,6 +9,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml-vulkan.h"
 
 #include <cmath>
 #include <cstdio>
@@ -45,6 +46,25 @@ static float h2f(uint16_t h) {
     return ggml_fp16_to_fp32(v);
 }
 
+// the paged kernels need the address the backend sees: a device address on Vulkan
+static uint64_t tensor_addr(ggml_tensor * t) {
+    if (ggml_backend_buffer_is_host(t->buffer)) {
+        return (uint64_t) (uintptr_t) t->data;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t         reg  = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+
+    auto fn = reg ? (uint64_t (*)(ggml_backend_buffer_t)) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_vk_buffer_get_device_address") : nullptr;
+    if (!fn) {
+        return 0;
+    }
+
+    return fn(t->buffer) + (uint64_t) ((const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer));
+}
+
 static float k_val(int c, int d) {
     return std::sin(0.017f*c + 0.031f*d) * 0.5f;
 }
@@ -77,15 +97,24 @@ static int compare(const char * name, const std::vector<float> & got, const std:
     return ok ? 0 : 1;
 }
 
-int main() {
+int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    const bool use_vk = argc > 1 && strcmp(argv[1], "vulkan") == 0;
+
+    ggml_backend_t backend = nullptr;
+    if (use_vk) {
+        backend = ggml_backend_vk_init(1);   // -dev Vulkan1
+    } else {
+        backend = ggml_backend_cpu_init();
+    }
     if (!backend) {
-        std::printf("cannot init the CPU backend\n");
+        std::printf("cannot init the backend\n");
         return 1;
     }
-    ggml_backend_cpu_set_n_threads(backend, 4);
+    if (!use_vk) {
+        ggml_backend_cpu_set_n_threads(backend, 4);
+    }
 
     const ggml_init_params ip = {
         /*.mem_size   =*/ 8*1024*1024,
@@ -112,8 +141,8 @@ int main() {
     std::vector<uint64_t> k_tab(NBLK);
     std::vector<uint64_t> v_tab(NBLK);
     for (int b = 0; b < NBLK; ++b) {
-        k_tab[b] = (uint64_t) (uintptr_t) k_blk[phys_block(b)]->data;
-        v_tab[b] = (uint64_t) (uintptr_t) v_blk[phys_block(b)]->data;
+        k_tab[b] = tensor_addr(k_blk[phys_block(b)]);
+        v_tab[b] = tensor_addr(v_blk[phys_block(b)]);
     }
 
     // fill the blocks in logical order, written into the physical block that the table names
@@ -149,8 +178,8 @@ int main() {
     ggml_tensor * v_contig = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F16, DV, NC);
     ggml_tensor * q        = ggml_new_tensor_3d(ctx_in, GGML_TYPE_F32, HSK, NQ, NH);
     ggml_tensor * mask     = ggml_new_tensor_4d(ctx_in, GGML_TYPE_F16, NC, NQ, 1, 1);
-    ggml_tensor * k_cur    = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F16, DK, NT);
-    ggml_tensor * idxs     = ggml_new_tensor_1d(ctx_in, GGML_TYPE_I32, NT);
+    ggml_tensor * k_cur    = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F32, DK, NT);   // production V path is f32 in
+    ggml_tensor * idxs     = ggml_new_tensor_1d(ctx_in, GGML_TYPE_I64, NT);
     ggml_tensor * k_tab_t  = ggml_new_tensor_1d(ctx_in, GGML_TYPE_I64, NBLK);
     ggml_tensor * v_tab_t  = ggml_new_tensor_1d(ctx_in, GGML_TYPE_I64, NBLK);
 
@@ -162,7 +191,11 @@ int main() {
     ggml_backend_tensor_set(k_tab_t, k_tab.data(), 0, k_tab.size()*sizeof(uint64_t));
     ggml_backend_tensor_set(v_tab_t, v_tab.data(), 0, v_tab.size()*sizeof(uint64_t));
 
-    ggml_backend_sched_t sched = ggml_backend_sched_new(&backend, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    ggml_backend_t backend_cpu = use_vk ? ggml_backend_cpu_init() : backend;
+    ggml_backend_t sched_backends[2] = { backend, backend_cpu };
+    const int     n_sched_backends  = use_vk ? 2 : 1;
+
+    ggml_backend_sched_t sched = ggml_backend_sched_new(sched_backends, nullptr, n_sched_backends, GGML_DEFAULT_GRAPH_SIZE, false, false);
 
     int rc = 0;
 
@@ -314,19 +347,21 @@ int main() {
             return 1;
         }
 
-        std::vector<uint16_t> rows((size_t) NT*DK);
+        std::vector<float>    rows((size_t) NT*DK);
+        std::vector<uint16_t> rows_h((size_t) NT*DK);
         for (int t = 0; t < NT; ++t) {
             for (int d = 0; d < DK; ++d) {
-                rows[(size_t) t*DK + d] = f2h(0.5f + 0.001f*(float) (t*DK + d));
+                rows[(size_t) t*DK + d]   = 0.5f + 0.001f*(float) (t*DK + d);
+                rows_h[(size_t) t*DK + d] = f2h(rows[(size_t) t*DK + d]);
             }
         }
-        ggml_backend_tensor_set(k_cur, rows.data(), 0, rows.size()*sizeof(uint16_t));
+        ggml_backend_tensor_set(k_cur, rows.data(), 0, rows.size()*sizeof(float));
 
-        std::vector<int32_t> ids(NT);
+        std::vector<int64_t> ids(NT);
         for (int t = 0; t < NT; ++t) {
             ids[t] = (t*37) % NC;   // spread across blocks, out of order
         }
-        ggml_backend_tensor_set(idxs, ids.data(), 0, ids.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(idxs, ids.data(), 0, ids.size()*sizeof(int64_t));
 
         std::vector<uint16_t> anchor((size_t) DK*NC, f2h(NAN));
         ggml_backend_tensor_set(k_anchor, anchor.data(), 0, anchor.size()*sizeof(uint16_t));
@@ -345,7 +380,7 @@ int main() {
             const int phys = phys_block(c/BS);
             ggml_backend_tensor_get(k_blk[phys], got.data(), (size_t) r*DK*sizeof(uint16_t), (size_t) DK*sizeof(uint16_t));
             for (int d = 0; d < DK; ++d) {
-                if (got[(size_t) d] != rows[(size_t) t*DK + d]) {
+                if (got[(size_t) d] != rows_h[(size_t) t*DK + d]) {
                     ++bad;
                     break;
                 }

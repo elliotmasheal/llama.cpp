@@ -848,6 +848,7 @@ struct vk_device_struct {
     // [src0 0=fp32,1=fp16][dst]
     vk_pipeline pipeline_set_rows_i32[2][GGML_TYPE_COUNT];
     vk_pipeline pipeline_set_rows_i64[2][GGML_TYPE_COUNT];
+    vk_pipeline pipeline_set_rows_paged[2];  // [src f16], f16 out, i64 indices, block table at binding 2
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
