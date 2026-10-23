@@ -1244,6 +1244,14 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         }
 
         result.block_cols = (D & 8) ? 64 : 32;
+
+        // RDNA with 256-wide heads: fewer, wider column blocks halve the outer-loop barriers
+        // for the decode shapes (n_rows <= 8 comes from the GQA rewrite). Opt-in until measured,
+        // see bench/RESULTS.md 2.2.
+        static const bool fa_bc64 = getenv("GGML_VK_FA_BC64") != nullptr;
+        if (fa_bc64 && device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN && hsk >= 256 && n_rows <= 8) {
+            result.block_cols = 64;
+        }
     }
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
@@ -1484,7 +1492,7 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
 // Four k-blocks per iteration amortize the k-block barriers of the id GEMM but need 4x the LDS.
 // On this 32 KB-LDS device the m/l tiles lose occupancy and run ~2% slower, so only the s tile
 // uses that variant. GGML_VK_ID_BK4=1 puts every id tile on it for hardware with more LDS.
-// See bench/moe-baseline/P11-ID-BK4-ML.md.
+// See bench/DECISIONS.md 3.
 static bool ggml_vk_id_bk4_all(const vk_device& device) {
     static const bool enable = getenv("GGML_VK_ID_BK4") != nullptr;
     return enable && device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN;
@@ -8193,6 +8201,16 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+// Workgroup waves that the KV split of the FA kernel aims for. 2 is the historical value; long
+// decode spans leave the device under-filled (42 workgroups on a 28 CU card), see FA-DECODE-KV.md.
+static uint32_t ggml_vk_fa_split_waves() {
+    static const uint32_t waves = [] {
+        const char * env = getenv("GGML_VK_FA_WAVES");
+        return env != nullptr ? (uint32_t) std::max(1, atoi(env)) : 2u;
+    }();
+    return waves;
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -8430,16 +8448,24 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
         split_k = CEIL_DIV(total_blocks, per_blocks);
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+        split_k = shader_core_count * ggml_vk_fa_split_waves() / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
-        if (total_wgs_no_split < shader_core_count * 2) {
-            split_k = shader_core_count * 2 / total_wgs_no_split;
+        if (total_wgs_no_split < shader_core_count * ggml_vk_fa_split_waves()) {
+            split_k = shader_core_count * ggml_vk_fa_split_waves() / total_wgs_no_split;
         }
     }
 
-    if (!use_sparse && split_k > 1) {
-        // Try to evenly split KV into split_k chunks, but it needs to be a multiple
+    // Debug override for the KV split count of the non-sparse path (0 keeps the heuristic).
+    static const uint32_t fa_split_k_force = [] {
+        const char * env = getenv("GGML_VK_FA_SPLIT_K");
+        return env != nullptr ? (uint32_t) std::max(0, atoi(env)) : 0u;
+    }();
+    if (!use_sparse && fa_split_k_force > 0) {
+        split_k = fa_split_k_force;
+    }
+
+    if (!use_sparse && split_k > 1) {        // Try to evenly split KV into split_k chunks, but it needs to be a multiple
         // of "align", so recompute split_k based on that.
         split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), alignment);
         split_k = CEIL_DIV(KV, split_kv);
