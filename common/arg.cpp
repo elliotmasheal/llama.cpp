@@ -2430,6 +2430,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_GROW"));
     add_opt(common_arg(
+        {"-fac", "--fa-chunk-mib"}, "N",
+        "cap in MiB on the score buffer of the long prefill attention path: the query dimension is split to stay under it\n"
+        "0 keeps one buffer for the whole span (default: 256)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.fa_chunk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_FA_CHUNK_MIB"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

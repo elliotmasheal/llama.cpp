@@ -279,6 +279,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_grow_initial         = params.kv_grow_initial;
+    cparams.fa_chunk_mib            = params.fa_chunk_mib;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -4191,6 +4192,7 @@ llama_context_params llama_context_default_params() {
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.kv_grow_initial             =*/ -1,
+        /*.fa_chunk_mib                =*/ 256,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,

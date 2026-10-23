@@ -413,6 +413,9 @@ extern "C" {
         //   -1 = auto (working set, grows on demand up to n_ctx), 0 = allocate n_ctx up front, > 0 = initial cells
         // the allocation falls back to host memory when the device is full
         int32_t kv_grow_initial;
+        // cap in MiB on the score buffer of the long cross-chunk prefill attention path: the query dimension is
+        // split so that each score buffer stays under it. 0 = keep the whole span in one buffer
+        int32_t fa_chunk_mib;
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device
         bool swa_full;    // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)

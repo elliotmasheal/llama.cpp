@@ -125,13 +125,18 @@ static int64_t llama_fa_long_kv_score_max_bytes(void) {
 
 // the largest score buffer the path can ask for at this configuration, 0 when it cannot fire.
 // sched_reserve builds the graph with n_kv = n_ctx, where the criterion declines, so nothing else sees it.
-int64_t llama_fa_long_kv_reserve_bytes(int32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
+int64_t llama_fa_long_kv_reserve_bytes(int32_t n_head, uint32_t n_ubatch, uint32_t n_ctx, int32_t fa_chunk_mib) {
     const int64_t max = llama_fa_long_kv_score_max_bytes();
     if (max <= 0 || n_head <= 0 || n_ubatch < 512) {
         return 0;
     }
     if ((int64_t) n_ctx <= (int64_t) n_ubatch + n_ubatch / 2) {
         return 0;
+    }
+    const int64_t chunk_cap = (int64_t) fa_chunk_mib << 20;
+    if (chunk_cap > 0) {
+        // the query dim is split so that one chunk never exceeds the cap
+        return chunk_cap;
     }
     return std::min(max, (int64_t) n_ctx * n_ubatch * n_head * (int64_t) sizeof(float));
 }
@@ -3075,16 +3080,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     // FA is limited to 8 rows per K/V read for hsk > 128 on AMD, so a long cross-chunk span runs at
-    // ~1 TFLOPS against 4 for the matmul path. Decode and short spans keep FA (bench/longctx/FA-LONG-KV.md).
-    static const int64_t fa_long_kv_max_mib = [] {
-        const char * env = getenv("LLAMA_FA_LONG_KV_MIB");
-        return env != nullptr ? atoll(env) : (int64_t) 1536;
-    }();
+    // ~1 TFLOPS against 4 for the matmul path. Decode and short spans keep FA (bench/RESULTS.md 2.2).
+    const int64_t fa_score_max = llama_fa_long_kv_score_max_bytes();
     const int64_t n_tok_q  = q->ne[1];
     const int64_t n_tok_kv = k->ne[1];
-    const bool fa_long_kv = fa_long_kv_max_mib > 0 && kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
-                            n_tok_q >= 512 && n_tok_kv > n_tok_q + n_tok_q / 2 &&
-                            n_tok_kv * n_tok_q * q->ne[2] * (int64_t) sizeof(float) <= fa_long_kv_max_mib << 20;
+    const bool fa_span = fa_score_max > 0 && kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
+                         n_tok_q >= 512 && n_tok_kv > n_tok_q + n_tok_q / 2;
+    // the score buffer is n_kv x n_head x 4B per query row, so the query dim is what the budget splits
+    const int64_t score_row = n_tok_kv * q->ne[2] * (int64_t) sizeof(float);
+    const int64_t chunk_cap = (int64_t) cparams.fa_chunk_mib << 20;
+    const int64_t chunk_q   = chunk_cap > 0 && score_row > 0 ? std::max<int64_t>(1, chunk_cap/score_row) : n_tok_q;
+    // below this the chunks are too narrow for the matmul path to pay off, such a span stays on FA
+    const bool    chunked   = fa_span && chunk_q >= 64 && chunk_q < n_tok_q;
+    const bool fa_long_kv = fa_span && (chunked || score_row * n_tok_q <= fa_score_max);
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !fa_long_kv;
     if (use_flash_attn) {
@@ -3131,60 +3139,82 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
-        cb(kq, "kq", il);
-
-        // note: this op tends to require high floating point range
-        //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_prec_set_acc(kq, GGML_PREC_F32);
-
-        if (arch == LLM_ARCH_GROK) {
-            // need to do the following:
-            // multiply by attn_output_multiplier
-            // and then :
-            // kq = 30 * tanh(kq / 30)
-            // before the softmax below
-
-            kq = ggml_tanh(ctx0, ggml_scale(ctx0, kq, hparams.f_attn_out_scale / hparams.f_attn_logit_softcapping));
-            cb(kq, "kq_tanh", il);
-            kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled", il);
-        }
-
-        if (hparams.attn_soft_cap) {
-            kq = ggml_scale(ctx0, kq, 1.0f / hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled_1", il);
-            kq = ggml_tanh (ctx0, kq);
-            cb(kq, "kq_tanh", il);
-            kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
-            cb(kq, "kq_scaled_2", il);
-        }
-
-        if (kq_b) {
-            kq = ggml_add(ctx0, kq, kq_b);
-            cb(kq, "kq_plus_kq_b", il);
-        }
-
-        kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
-        ggml_soft_max_add_sinks(kq, sinks);
-        cb(kq, "kq_soft_max", il);
-
         if (!v_trans) {
             // note: avoid this branch
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
             cb(v, "v_cont", il);
         }
 
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
-        cb(kqv, "kqv", il);
+        // a long span keeps the score buffer inside the budget by splitting the query dim, the K/V read and the
+        // softmax range are unchanged (bench/THREE-TIER.md B2)
+        const int64_t n_chunks = chunked ? (n_tok_q + chunk_q - 1)/chunk_q : 1;
+        ggml_tensor * kqv_all = nullptr;
+        for (int64_t ic = 0; ic < n_chunks; ++ic) {
+            ggml_tensor * q_c    = q;
+            ggml_tensor * mask_c = kq_mask;
+            if (n_chunks > 1) {
+                const int64_t q0 = ic*chunk_q;
+                const int64_t nq = std::min(chunk_q, n_tok_q - q0);
+                q_c = ggml_view_4d(ctx0, q, q->ne[0], nq, q->ne[2], q->ne[3],
+                        q->nb[1], q->nb[2], q->nb[3], q0*q->nb[1]);
+                if (kq_mask != nullptr) {
+                    mask_c = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], nq, kq_mask->ne[2], kq_mask->ne[3],
+                            kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], q0*kq_mask->nb[1]);
+                }
+            }
 
-        // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
-        if (v_mla) {
-            kqv = ggml_mul_mat(ctx0, v_mla, kqv);
-            cb(kqv, "kqv_mla", il);
+            ggml_tensor * kq = ggml_mul_mat(ctx0, k, q_c);
+            cb(kq, "kq", il);
+
+            // note: this op tends to require high floating point range
+            //       while for some models F16 is enough, for others it is not, so we default to F32 here
+            ggml_prec_set_acc(kq, GGML_PREC_F32);
+
+            if (arch == LLM_ARCH_GROK) {
+                // need to do the following:
+                // multiply by attn_output_multiplier
+                // and then :
+                // kq = 30 * tanh(kq / 30)
+                // before the softmax below
+
+                kq = ggml_tanh(ctx0, ggml_scale(ctx0, kq, hparams.f_attn_out_scale / hparams.f_attn_logit_softcapping));
+                cb(kq, "kq_tanh", il);
+                kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
+                cb(kq, "kq_scaled", il);
+            }
+
+            if (hparams.attn_soft_cap) {
+                kq = ggml_scale(ctx0, kq, 1.0f / hparams.f_attn_logit_softcapping);
+                cb(kq, "kq_scaled_1", il);
+                kq = ggml_tanh (ctx0, kq);
+                cb(kq, "kq_tanh", il);
+                kq = ggml_scale(ctx0, kq, hparams.f_attn_logit_softcapping);
+                cb(kq, "kq_scaled_2", il);
+            }
+
+            if (kq_b) {
+                kq = ggml_add(ctx0, kq, kq_b);
+                cb(kq, "kq_plus_kq_b", il);
+            }
+
+            kq = ggml_soft_max_ext(ctx0, kq, mask_c, kq_scale, hparams.f_max_alibi_bias);
+            ggml_soft_max_add_sinks(kq, sinks);
+            cb(kq, "kq_soft_max", il);
+
+            ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+            cb(kqv, "kqv", il);
+
+            // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
+            // (the chunked path declines v_mla, so this only runs for the single-chunk case)
+            if (v_mla) {
+                kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+                cb(kqv, "kqv_mla", il);
+            }
+
+            kqv_all = kqv_all == nullptr ? kqv : ggml_concat(ctx0, kqv_all, kqv, 1);
         }
 
-        cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+        cur = ggml_permute(ctx0, kqv_all, 0, 2, 1, 3);
 
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);

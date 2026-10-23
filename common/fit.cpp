@@ -956,7 +956,7 @@ static bool common_moe_plan_impl(
     // Keep it out of the bank, otherwise the device spills in the middle of a long prompt
     // (bench/RESULTS.md 2.2: +1276.7 MiB measured, nothing reserved).
     const int64_t fa_score = cparams_plan.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ? 0 :
-        llama_fa_long_kv_reserve_bytes(meas.n_head, meas.n_ubatch, meas.n_ctx);
+        llama_fa_long_kv_reserve_bytes(meas.n_head, meas.n_ubatch, meas.n_ctx, cparams_plan.fa_chunk_mib);
     surplus -= fa_score;
     for (const int64_t b : geo.expert_bytes) {
         expert_total += b;
