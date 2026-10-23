@@ -4,13 +4,18 @@
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -257,6 +262,31 @@ struct llama_moe_cache::impl {
         size_t bytes  = 0;
     };
 
+    // [LLAMA_MOE_HYBRID_EXEC] the experts that a decode token misses in the cache, computed by the worker on a
+    // detached graph. one job per cached layer, built the first time the graph of the layer is created
+    struct hybrid_job {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+
+        ggml_tensor * inp     = nullptr; // F32 [n_embd, 1, 1]
+        ggml_tensor * ids     = nullptr; // I32 [n_expert_used, 1, 1]
+        ggml_tensor * mask    = nullptr; // I32 [n_expert_used, 1], 1 = compute on the CPU
+        ggml_tensor * weights = nullptr; // F32 [1, n_expert_used, 1]
+        ggml_tensor * out     = nullptr; // F32 [n_embd, 1], the sum of the misses
+
+        ggml_cgraph * graph = nullptr;
+        ggml_cplan    cplan = {};
+        std::vector<uint8_t> work; // work_data of this graph, only one job runs at a time but the graphs are built between evals
+
+        ggml_tensor * cpu_out = nullptr; // the device F32 [n_embd, 1] read by the combine split
+        ggml_tensor * out_host = nullptr; // pinned staging of the worker result
+
+        const ggml_tensor * src_inp     = nullptr; // the tensors staged by the post-split callback
+        const ggml_tensor * src_weights = nullptr;
+
+        int32_t seq = -1; // the submission sequence number, -1 if the worker has nothing to wait for
+    };
+
     static constexpr int64_t max_batch = 32;
 
     const bool hybrid_mode; // the misses are computed on the CPU from the host experts
@@ -343,6 +373,53 @@ struct llama_moe_cache::impl {
     mutable int32_t ids_staged_il = -1;
     mutable size_t  ids_staged_bytes = 0;
 
+    // [LLAMA_MOE_HYBRID_EXEC] the worker and its mailbox: the slot map callback submits a layer, the combine
+    // callback of the same layer waits, so at most one job is in flight
+    bool                 hybrid_exec  = false;
+    // the misses of a decode token are 1-3 experts per layer, so one thread beats a pool: the barriers of the
+    // ~12 tiny ops per layer cost more than they save
+    int32_t              hybrid_threads = 1;
+    int64_t              hybrid_n_embd = 0;
+    std::vector<hybrid_job> mutable hybrid_jobs;            // [n_layer], the graphs are built during graph build
+    std::unordered_map<const ggml_tensor *, int32_t> cpu_out_of; // cpu_out -> layer
+    mutable std::unordered_map<const ggml_tensor *, int32_t> hybrid_srcs; // staged inp/weights -> layer
+    ggml_tensor * inp_host = nullptr; // pinned staging of the layer input
+    ggml_tensor * w_host   = nullptr; // pinned staging of the router weights
+
+    // the staged tensor of the last split, nullptr while it has not been read by a submit
+    mutable const ggml_tensor * inp_staged = nullptr;
+    mutable const ggml_tensor * w_staged   = nullptr;
+
+    std::thread             hybrid_thread;
+    std::mutex              hybrid_mtx;
+    std::condition_variable hybrid_cv;
+    std::condition_variable hybrid_cv_done;
+    int32_t             hybrid_slot   = -1;
+    int32_t             hybrid_submitted = 0;
+    int32_t             hybrid_completed = 0;
+    bool                hybrid_stop   = false;
+    bool                hybrid_failed = false;
+    ggml_threadpool_t   hybrid_tp     = nullptr;
+    size_t              hybrid_waits  = 0;
+    size_t              hybrid_skips  = 0; // layers whose experts were all in the bank
+    int64_t             hybrid_wait_us = 0; // host time blocked in the combine callback
+    int64_t             hybrid_jobs_us = 0; // worker time
+    size_t              hybrid_inp_staged  = 0;
+    size_t              hybrid_inp_sync    = 0; // the readback was not staged, the submit had to drain
+    size_t              hybrid_w_staged    = 0;
+    size_t              hybrid_w_sync      = 0;
+
+    // [LLAMA_MOE_HYBRID_EXEC] rolling residency: every lookup plans the next token with the LRU and starts the
+    // promotion through the prefetch batch, the map published to the device lags one token behind the plan
+    bool  rolling = false;
+    std::vector<ggml_tensor *>        promote_map;     // [n_layer] pinned map that the device map is copied from
+    std::vector<uint8_t>              promote_pending; // [n_layer] the promotion of the layer is in flight
+    std::vector<moe_cache_slru::fill> promote_fills;
+    size_t                            promote_bytes = 0;
+    size_t                            promote_waits = 0;
+    size_t                            promote_fallbacks = 0;
+    int64_t                           promote_wait_us = 0;
+
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
@@ -377,6 +454,30 @@ struct llama_moe_cache::impl {
         }
         if (hybrid_mode) {
             usage.assign(model.layers.size()*n_expert, 0);
+        }
+
+        // the executor is experimental and off by default, LLAMA_MOE_HYBRID_EXEC=1 turns it on
+        hybrid_exec = hybrid_mode && getenv("LLAMA_MOE_HYBRID_EXEC") != nullptr &&
+            atoi(getenv("LLAMA_MOE_HYBRID_EXEC")) != 0;
+        if (hybrid_exec) {
+            const char * env_threads = getenv("LLAMA_MOE_HYBRID_EXEC_T");
+            if (env_threads != nullptr) {
+                hybrid_threads = std::max(1, atoi(env_threads));
+            }
+            hybrid_n_embd = model.hparams.n_embd;
+            hybrid_jobs.resize(model.layers.size());
+            // the graphs are planned when they are built, so the pool must exist before that
+            struct ggml_threadpool_params ttp = ggml_threadpool_params_default(hybrid_threads);
+            // the jobs arrive a few hundred microseconds apart, a sleeping pool costs more than the work
+            const char * env_poll = getenv("LLAMA_MOE_HYBRID_EXEC_POLL");
+            if (env_poll != nullptr) {
+                ttp.poll = (uint32_t) std::max(0, atoi(env_poll));
+            }
+            hybrid_tp = ggml_threadpool_new(&ttp);
+            if (hybrid_tp == nullptr) {
+                LLAMA_LOG_WARN("%s: cannot create the worker threadpool, the hybrid executor is disabled\n", __func__);
+                hybrid_exec = false;
+            }
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
@@ -528,9 +629,20 @@ struct llama_moe_cache::impl {
         }
 
         // the prefetch rings take two whole layers of slots from each group, otherwise the plain cache is kept
-        if (pf_requested) {
+        // the hybrid executor resolves the API without rings: it uses the prefetch batch for the promotion
+        if (pf_requested || hybrid_exec) {
             init_prefetch_api(model);
+            if (hybrid_exec && pf.ok()) {
+                rolling = true;
+                promote_map.resize(model.layers.size(), nullptr);
+                promote_pending.assign(model.layers.size(), 0);
+                LLAMA_LOG_INFO("%s: rolling residency enabled, the promoted experts go through the prefetch batch\n", __func__);
+            }
             for (const group & g : groups) {
+                if (hybrid_mode) {
+                    // the rings are disabled in hybrid mode, the slots stay in the LRU pool
+                    continue;
+                }
                 if (g.n_slots != 0 && g.n_slots < 2*g.ref[0]->ne[2]) {
                     LLAMA_LOG_WARN("%s: prefetch needs %d slots per group, group %td has %d, disabled\n",
                             __func__, 2*g.ref[0]->ne[2], &g - groups.data(), g.n_slots);
@@ -559,12 +671,24 @@ struct llama_moe_cache::impl {
             while (n_full > 0 && g.n_slots - n_full*n_expert < g.n_slots/5) {
                 n_full--;
             }
+            if (hybrid_mode) {
+                // the residency map and the zero slot cover every layer: a whole layer would be read through a
+                // static view that build_residency does not fill
+                n_full = 0;
+            }
             g.n_full = n_full;
             // the rest of the slots are an LRU on the remaining layers
             g.slru.slot_base = g.n_full*n_expert;
             g.slru.init(model.layers.size(), n_expert, g.n_slots - g.slru.slot_base);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size() + g.n_full);
             n_tensors_host  += g.layers.size()*(hybrid_mode ? 2 : 1);
+            if (hybrid_exec) {
+                n_tensors_host += g.layers.size() + 2; // the pinned staging of the worker output, input and weights
+                n_tensors[g.id] += g.layers.size();    // the device tensor that the combine add reads
+            }
+            if (rolling) {
+                n_tensors_host += g.layers.size(); // the published promotion map of every layer
+            }
         }
         if (n_tensors_host == 0) {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
@@ -607,6 +731,17 @@ struct llama_moe_cache::impl {
         ggml_format_name(ids_host, "moe_cache.ids_host");
         buf_host_size += GGML_PAD(ggml_nbytes(ids_host), alignment_host);
 
+        if (hybrid_exec) {
+            // the worker reads the layer input and the router weights of a decode token from host memory
+            inp_host = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_F32, hybrid_n_embd);
+            ggml_format_name(inp_host, "moe_cache.inp_host");
+            buf_host_size += GGML_PAD(ggml_nbytes(inp_host), alignment_host);
+
+            w_host = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_F32, n_expert_used);
+            ggml_format_name(w_host, "moe_cache.w_host");
+            buf_host_size += GGML_PAD(ggml_nbytes(w_host), alignment_host);
+        }
+
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             group & g = groups[ig];
             if (g.n_slots == 0) {
@@ -647,6 +782,25 @@ struct llama_moe_cache::impl {
                     l.miss_mask = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, n_expert_used, max_batch);
                     ggml_format_name(l.miss_mask, "moe_cache.miss_mask-%d", il);
                     buf_host_size += GGML_PAD(ggml_nbytes(l.miss_mask), alignment_host);
+                    if (rolling) {
+                        ggml_tensor * pm = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                        ggml_format_name(pm, "moe_cache.promote_map-%d", il);
+                        promote_map[il] = pm;
+                        buf_host_size += GGML_PAD(ggml_nbytes(pm), alignment_host);
+                    }
+                }
+                if (hybrid_exec) {
+                    // the combine add runs on the device: a device tensor keeps the add in the MoE split and
+                    // removes the second host round trip of the layer
+                    ggml_tensor * cpu_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hybrid_n_embd, 1);
+                    ggml_format_name(cpu_out, "moe_cache.cpu_out-%d", il);
+                    cpu_out_of[cpu_out]      = il;
+                    hybrid_jobs[il].cpu_out  = cpu_out;
+
+                    ggml_tensor * out_host = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_F32, hybrid_n_embd);
+                    ggml_format_name(out_host, "moe_cache.out_host-%d", il);
+                    hybrid_jobs[il].out_host = out_host;
+                    buf_host_size += GGML_PAD(ggml_nbytes(out_host), alignment_host);
                 }
             }
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
@@ -775,6 +929,12 @@ struct llama_moe_cache::impl {
             load_stats();
             LLAMA_LOG_INFO("%s: MoE stats enabled, decay %.4f, file %s\n", __func__, stats_decay, stats_path.c_str());
         }
+
+        if (hybrid_exec) {
+            hybrid_thread = std::thread([this] { hybrid_worker(); });
+            LLAMA_LOG_INFO("%s: hybrid executor enabled, the misses of a decode token are computed on %d CPU threads\n",
+                __func__, hybrid_threads);
+        }
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -782,6 +942,19 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        if (hybrid_thread.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(hybrid_mtx);
+                hybrid_stop = true;
+            }
+            hybrid_cv.notify_one();
+            hybrid_thread.join();
+        }
+        if (hybrid_tp != nullptr) {
+            ggml_threadpool_free(hybrid_tp);
+            hybrid_tp = nullptr;
+        }
+        hybrid_log();
         // only a context that routed tokens owns the stats file; load-time probe contexts must not clobber it
         if (stats_dirty) {
             save_stats();
@@ -1078,9 +1251,13 @@ struct llama_moe_cache::impl {
                     return cnt[a] != cnt[b] ? cnt[a] > cnt[b] : a < b;
                 });
 
-                std::fill(map, map + n_expert, g.n_slots);
+                // rolling residency keeps the LRU convention (-1 = not in the bank), the published map turns
+                // it back into the zero slot of the GPU map
+                std::fill(map, map + n_expert, rolling ? -1 : g.n_slots);
                 for (int32_t k = 0; k < n_keep; ++k) {
                     map[order[k]] = slot + k;
+                    // the SLRU must know the owner of every slot it may evict
+                    g.slru.key_of[slot + k - g.slru.slot_base] = il*n_expert + order[k];
                 }
                 for (size_t ip = 0; ip < layers[il].experts.size(); ++ip) {
                     const ggml_tensor * w = layers[il].experts[ip];
@@ -1113,7 +1290,7 @@ struct llama_moe_cache::impl {
     // [LLAMA_MOE_PREFETCH] resolve the optional backend API and check the preconditions of the whole-layer
     // prefetch, called before the residency split so that an unusable prefetch leaves the plain cache unchanged
     void init_prefetch_api(const llama_model & model) {
-        if (model.hparams.no_alloc || hybrid_mode) {
+        if (model.hparams.no_alloc || (hybrid_mode && !hybrid_exec)) {
             pf_requested = false;
             return;
         }
@@ -1147,7 +1324,8 @@ struct llama_moe_cache::impl {
 
     // [LLAMA_MOE_PREFETCH] the layers stream through the rings in execution order, the whole layers keep their static views
     void init_prefetch(const llama_model & model) {
-        if (!pf_requested) {
+        // the prefetch rings are for large ubatches, the hybrid executor uses the batch for the promotion
+        if (!pf_requested || hybrid_mode) {
             return;
         }
         pf_pos.assign(layers.size(), -1);
@@ -1335,21 +1513,43 @@ struct llama_moe_cache::impl {
 
     void clear_ids() const {
         ids_tensors.clear();
+        hybrid_srcs.clear();
         ids_staged = nullptr;
         ids_staged_il = -1;
         ids_staged_bytes = 0;
+        inp_staged = nullptr;
+        w_staged   = nullptr;
     }
 
     // the selected experts of a layer are computed by one split, the readback joins that split's submission
     // the host reads ids_host only after the scheduler waits for the backend before the next copy callback
-    void stage_ids(ggml_backend_t backend, ggml_cgraph * graph) const {
+    void stage_inputs(ggml_backend_t backend, ggml_cgraph * graph) {
         static const bool enabled = getenv("LLAMA_MOE_STAGE_IDS") == nullptr || atoi(getenv("LLAMA_MOE_STAGE_IDS")) != 0;
-        if (!enabled || ids_tensors.empty() || ids_host == nullptr || ids_host->data == nullptr) {
+        if (!enabled || (ids_tensors.empty() && hybrid_srcs.empty()) ||
+            ids_host == nullptr || ids_host->data == nullptr) {
             return;
         }
         const int n_nodes = ggml_graph_n_nodes(graph);
         for (int i = 0; i < n_nodes; ++i) {
             const ggml_tensor * node = ggml_graph_node(graph, i);
+            const auto it_h = hybrid_srcs.find(node);
+            if (it_h != hybrid_srcs.end()) {
+                // the layer input and the router weights of the hybrid executor, staged next to the ids
+                hybrid_job & j = hybrid_jobs[it_h->second];
+                const bool is_inp = node == j.src_inp || node == j.src_inp->view_src;
+                ggml_tensor * dst = is_inp ? inp_host : w_host;
+                if (dst == nullptr || dst->data == nullptr || backend != devices[layers[it_h->second].ig].backend ||
+                    node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || ggml_nbytes(node) > ggml_nbytes(dst)) {
+                    continue;
+                }
+                ggml_backend_tensor_get_async(backend, node, dst->data, 0, ggml_nbytes(node));
+                if (is_inp) {
+                    inp_staged = j.src_inp;
+                } else {
+                    w_staged = j.src_weights;
+                }
+                continue;
+            }
             const auto it = ids_tensors.find(node);
             if (it == ids_tensors.end()) {
                 continue;
@@ -1370,6 +1570,266 @@ struct llama_moe_cache::impl {
             ids_staged = node;
             ids_staged_il = il;
             ids_staged_bytes = bytes;
+        }
+    }
+
+    ggml_tensor * get_cpu_out(int32_t il) const {
+        if (!hybrid_exec || il < 0 || il >= (int32_t) hybrid_jobs.size()) {
+            return nullptr;
+        }
+        return hybrid_jobs[il].graph != nullptr ? hybrid_jobs[il].cpu_out : nullptr;
+    }
+
+    // the CPU branch of build_moe_ffn as a detached graph: the same ops, the same shapes, the host experts
+    // a layer that does not match keeps the in-graph branch, the worker is only used by the layers registered here
+    bool register_hybrid(int32_t il, const ggml_tensor * inp, const ggml_tensor * weights,
+                         const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down) const {
+        if (!hybrid_exec || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+            return false;
+        }
+        hybrid_job & j = hybrid_jobs[il];
+        if (j.graph != nullptr) {
+            j.src_inp     = inp;
+            j.src_weights = weights;
+            hybrid_srcs[inp]     = il;
+            hybrid_srcs[weights] = il;
+            // the scheduler splits on the producer, which is the base tensor when the layer input is a view
+            if (inp->view_src != nullptr)     { hybrid_srcs[inp->view_src]     = il; }
+            if (weights->view_src != nullptr) { hybrid_srcs[weights->view_src] = il; }
+            return true;
+        }
+
+        auto fail = [&](const char * why) {
+            LLAMA_LOG_WARN("%s: layer %d: %s, this layer keeps the in-graph CPU branch\n", __func__, il, why);
+            j.ctx.reset();
+            j.buf.reset();
+            j.graph = nullptr;
+            return false;
+        };
+
+        if (inp->type != GGML_TYPE_F32 || !ggml_is_contiguous(inp) ||
+            inp->ne[0] != hybrid_n_embd || inp->ne[1] != 1 || inp->ne[2] != 1 || inp->ne[3] != 1 ||
+            weights->type != GGML_TYPE_F32 || !ggml_is_contiguous(weights) ||
+            !ggml_backend_buffer_is_host(up->buffer) || !ggml_backend_buffer_is_host(gate->buffer) ||
+            !ggml_backend_buffer_is_host(down->buffer) ||
+            bindings.find(up) == bindings.end() || bindings.find(gate) == bindings.end() ||
+            bindings.find(down) == bindings.end()) {
+            return fail("the tensors of the CPU branch are not the ones the worker expects");
+        }
+        const int64_t n_used = ggml_nelements(weights);
+        if (n_used < 1 || n_used > n_expert_used || ggml_nbytes(weights) != (size_t) n_used*sizeof(float) ||
+            gate->ne[2] != down->ne[2] || gate->ne[1] != down->ne[0]) {
+            return fail("the expert layout of the layer does not match the worker graph");
+        }
+
+        // the graph object lives in the same context, so its overhead is part of the budget
+        const size_t graph_size = 32 + 4*n_used;
+        ggml_init_params params = {
+            /*.mem_size   =*/ (16 + 4*n_used)*ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        j.ctx.reset(ggml_init(params));
+        if (!j.ctx) {
+            return fail("failed to create the worker context");
+        }
+        ggml_context * ctx = j.ctx.get();
+
+        j.inp  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hybrid_n_embd, 1, 1);
+        j.ids  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_used, 1, 1);
+        j.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
+        j.weights = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, weights->ne);
+
+        // the ggml builders take non-const srcs but do not write them
+        ggml_tensor * up_cpu   = ggml_mul_mat_id_mask(ctx, const_cast<ggml_tensor *>(up),   j.inp, j.ids, j.mask);
+        ggml_tensor * gate_cpu = ggml_mul_mat_id_mask(ctx, const_cast<ggml_tensor *>(gate), j.inp, j.ids, j.mask);
+        ggml_tensor * act      = ggml_swiglu_split(ctx, gate_cpu, up_cpu);
+        ggml_tensor * down_cpu = ggml_mul_mat_id_mask(ctx, const_cast<ggml_tensor *>(down), act, j.ids, j.mask);
+        ggml_tensor * w_cpu    = ggml_mul(ctx, down_cpu, j.weights);
+
+        ggml_tensor * sum = nullptr;
+        for (int64_t i = 0; i < n_used; ++i) {
+            ggml_tensor * view = ggml_view_2d(ctx, w_cpu, hybrid_n_embd, 1, w_cpu->nb[2], i*w_cpu->nb[1]);
+            sum = sum == nullptr ? view : ggml_add(ctx, sum, view);
+        }
+        j.out = sum;
+
+        j.graph = ggml_new_graph_custom(ctx, graph_size, false);
+        ggml_build_forward_expand(j.graph, j.out);
+
+        j.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type()));
+        if (!j.buf || ggml_nbytes(j.out) != (size_t) hybrid_n_embd*sizeof(float)) {
+            return fail("failed to allocate the worker graph");
+        }
+        j.cplan = ggml_graph_plan(j.graph, hybrid_threads, hybrid_tp);
+        j.work.resize(j.cplan.work_size);
+        j.cplan.work_data = j.work.empty() ? nullptr : j.work.data();
+
+        j.src_inp     = inp;
+        j.src_weights = weights;
+        hybrid_srcs[inp]     = il;
+        hybrid_srcs[weights] = il;
+        if (inp->view_src != nullptr)     { hybrid_srcs[inp->view_src]     = il; }
+        if (weights->view_src != nullptr) { hybrid_srcs[weights->view_src] = il; }
+
+        LLAMA_LOG_INFO("%s: layer %d: worker graph for %d experts, %zu KiB of work data\n",
+            __func__, il, (int) n_used, j.cplan.work_size/1024);
+        return true;
+    }
+
+    // hand the job of a layer to the worker, the inputs are the readback staged by the split that computed them
+    void hybrid_submit(int32_t il, ggml_backend_t backend) {
+        hybrid_job & j = hybrid_jobs[il];
+
+        GGML_ASSERT(j.graph != nullptr && (int64_t) ids.size() == ggml_nelements(j.ids));
+        ggml_backend_tensor_set(j.ids, ids.data(), 0, ggml_nbytes(j.ids));
+        ggml_backend_tensor_set(j.mask, layers[il].miss_mask->data, 0, ggml_nbytes(j.mask));
+
+        if (inp_staged == j.src_inp) {
+            ggml_backend_tensor_set(j.inp, inp_host->data, 0, ggml_nbytes(j.inp));
+            inp_staged = nullptr;
+            hybrid_inp_staged++;
+        } else {
+            hybrid_inp_sync++;
+            ggml_backend_tensor_get_async(backend, j.src_inp, inp_host->data, 0, ggml_nbytes(j.inp));
+            ggml_backend_synchronize(backend);
+            ggml_backend_tensor_set(j.inp, inp_host->data, 0, ggml_nbytes(j.inp));
+        }
+        if (w_staged == j.src_weights) {
+            ggml_backend_tensor_set(j.weights, w_host->data, 0, ggml_nbytes(j.weights));
+            w_staged = nullptr;
+            hybrid_w_staged++;
+        } else {
+            hybrid_w_sync++;
+            ggml_backend_tensor_get_async(backend, j.src_weights, w_host->data, 0, ggml_nbytes(j.weights));
+            ggml_backend_synchronize(backend);
+            ggml_backend_tensor_set(j.weights, w_host->data, 0, ggml_nbytes(j.weights));
+        }
+
+        std::unique_lock<std::mutex> lock(hybrid_mtx);
+        // the combine of the previous layer waits first, so the mailbox holds one job
+        GGML_ASSERT(hybrid_completed == hybrid_submitted);
+        j.seq = ++hybrid_submitted;
+        hybrid_slot = il;
+        lock.unlock();
+        hybrid_cv.notify_one();
+    }
+
+    void hybrid_combine(ggml_backend_t backend, int32_t il, ggml_tensor * dst) {
+        hybrid_job & j = hybrid_jobs[il];
+
+        int32_t seq;
+        {
+            std::lock_guard<std::mutex> lock(hybrid_mtx);
+            GGML_ASSERT(j.seq >= 0 && "the slot map callback of the layer must submit the job first");
+            seq = j.seq;
+            j.seq = -1;
+        }
+        if (seq == 0) {
+            // every expert was in the bank, the combine only adds zeros
+            hybrid_skips++;
+            std::memset(j.out_host->data, 0, ggml_nbytes(j.out));
+            ggml_backend_tensor_set_async(backend, j.cpu_out, j.out_host->data, 0, ggml_nbytes(j.out));
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        {
+            std::unique_lock<std::mutex> lock(hybrid_mtx);
+            hybrid_cv_done.wait(lock, [&] { return hybrid_completed >= seq || hybrid_stop; });
+            if (hybrid_failed) {
+                GGML_ABORT("the hybrid executor worker failed");
+            }
+        }
+        hybrid_wait_us += ggml_time_us() - t0;
+        hybrid_waits++;
+
+        // the worker output is pageable, copy it to the pinned staging first: an async copy of a pageable
+        // source goes through the staging buffer and drains the device
+        GGML_ASSERT(ggml_nbytes(j.out) == ggml_nbytes(j.out_host));
+        memcpy(j.out_host->data, j.out->data, ggml_nbytes(j.out));
+        ggml_backend_tensor_set_async(backend, dst, j.out_host->data, 0, ggml_nbytes(j.out));
+    }
+
+    void hybrid_worker() {
+        for (;;) {
+            int32_t il = -1;
+            {
+                std::unique_lock<std::mutex> lock(hybrid_mtx);
+                hybrid_cv.wait(lock, [&] { return hybrid_stop || hybrid_completed < hybrid_submitted; });
+                if (hybrid_stop) {
+                    return;
+                }
+                il = hybrid_slot;
+            }
+            hybrid_job & j = hybrid_jobs[il];
+
+            const int64_t t0 = ggml_time_us();
+            const enum ggml_status ec = ggml_graph_compute(j.graph, &j.cplan);
+            hybrid_jobs_us += ggml_time_us() - t0;
+
+            std::unique_lock<std::mutex> lock(hybrid_mtx);
+            if (ec != GGML_STATUS_SUCCESS) {
+                hybrid_failed = true;
+            }
+            hybrid_completed = hybrid_submitted;
+            lock.unlock();
+            hybrid_cv_done.notify_all();
+        }
+    }
+
+    // the promotion copies write into the banks, the context calls this before the backends are freed
+    void wait_promotion() {
+        if (rolling && pf.ok() && !devices.empty()) {
+            pf.wait(devices[0].backend);
+        }
+    }
+
+    // the combine add of the hybrid executor runs on the device, the worker result is uploaded before the
+    // split that reads it: the transfer queue orders it, so no host weight copy and no device drain
+    void pre_split(ggml_backend_t backend, ggml_cgraph * graph) {
+        if (!hybrid_exec || cpu_out_of.empty()) {
+            return;
+        }
+        const int n_nodes = ggml_graph_n_nodes(graph);
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src = node->src[s];
+                if (src == nullptr) {
+                    continue;
+                }
+                if (src->view_src != nullptr) {
+                    src = src->view_src;
+                }
+                const auto it = cpu_out_of.find(src);
+                if (it == cpu_out_of.end()) {
+                    continue;
+                }
+                hybrid_job & j = hybrid_jobs[it->second];
+                if (j.seq < 0) {
+                    continue;
+                }
+                hybrid_combine(backend, it->second, j.cpu_out);
+            }
+        }
+    }
+
+    void hybrid_log() const {
+        if (hybrid_waits == 0) {
+            return;
+        }
+        LLAMA_LOG_INFO("llama_moe_cache: hybrid executor: %zu jobs (%zu layers skipped, all hits), worker %.3f ms, "
+                "combine wait %.3f ms (%.3f ms and %.3f ms per job), staged inp %zu/%zu, weights %zu/%zu\n",
+            hybrid_waits, hybrid_skips, hybrid_jobs_us/1000.0, hybrid_wait_us/1000.0,
+            hybrid_jobs_us/1000.0/hybrid_waits, hybrid_wait_us/1000.0/hybrid_waits,
+            hybrid_inp_staged, hybrid_inp_staged + hybrid_inp_sync,
+            hybrid_w_staged, hybrid_w_staged + hybrid_w_sync);
+        if (rolling || promote_bytes > 0 || promote_fallbacks > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: rolling residency: %zu waits, wait %.3f ms (%.3f ms per layer), "
+                    "promoted %.1f MiB, %zu fallbacks\n",
+                promote_waits, promote_wait_us/1000.0,
+                promote_waits > 0 ? promote_wait_us/1000.0/promote_waits : 0.0,
+                promote_bytes/1024.0/1024.0, promote_fallbacks);
         }
     }
 
@@ -1484,7 +1944,27 @@ struct llama_moe_cache::impl {
             const int64_t n_ids = (int64_t) ids.size();
             GGML_ASSERT(n_ids > 0 && n_ids % ne0 == 0);
             GGML_ASSERT(n_ids / ne0 <= l.miss_mask->ne[1]);
-            const int32_t * map  = g.slru.slot_map[il];
+
+            // rolling residency: the promotion planned for the previous token must be in the bank before the
+            // device map of this token is built, then the planned map is published
+            const int32_t * map = g.slru.slot_map[il];
+            if (rolling) {
+                int32_t * pub = (int32_t *) promote_map[il]->data;
+                if (promote_pending[il]) {
+                    const int64_t tw = ggml_time_us();
+                    this->pf.wait(backend);
+                    promote_wait_us += ggml_time_us() - tw;
+                    promote_waits++;
+                    promote_pending[il] = 0;
+                }
+                // the host expert tensors use the zero slot for the experts that are not in the bank
+                const int32_t * planned = g.slru.slot_map[il];
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    pub[e] = planned[e] >= 0 ? planned[e] : g.n_slots;
+                }
+                map = pub;
+            }
+
             int32_t *       mask = (int32_t *) l.miss_mask->data;
             size_t n_hit = 0;
             for (int64_t i = 0; i < n_ids; ++i) {
@@ -1507,7 +1987,56 @@ struct llama_moe_cache::impl {
             }
 
             // the residency map is copied as is, the misses are computed by the CPU branch from the host experts
-            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+            if (hybrid_exec && n_tokens == 1 && hybrid_jobs[il].graph != nullptr) {
+                if (n_hit == (size_t) n_ids) {
+                    // no miss in this layer, the combine reads zeros and the worker stays idle
+                    hybrid_job & j = hybrid_jobs[il];
+                    std::memset(j.out->data, 0, ggml_nbytes(j.out));
+                    {
+                        std::lock_guard<std::mutex> lock(hybrid_mtx);
+                        j.seq = 0;
+                    }
+                    inp_staged = nullptr;
+                    w_staged   = nullptr;
+                } else {
+                    // the worker starts while the copies of this split are still being queued
+                    hybrid_submit(il, backend);
+                }
+            }
+            ggml_backend_tensor_set_async(backend, dst, rolling ? promote_map[il]->data : src->data, 0, ggml_nbytes(src));
+
+            // plan the next token and promote the planned experts now, no other token reads these slots: the
+            // victims selected by the plan are not used by this token and the previous split is drained
+            if (rolling) {
+                size_t n_hit_plan = 0;
+                if (!g.slru.plan(il, ids.data(), ids.size(), promote_fills, n_hit_plan)) {
+                    GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+                }
+                if (!promote_fills.empty()) {
+                    bool ok = true;
+                    for (const auto & f : promote_fills) {
+                        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                            const ggml_tensor * w = l.experts[ip];
+                            const size_t expert_size = w->nb[2];
+                            ok = ok && this->pf.tensor(backend, g.banks[ip], (const uint8_t *) w->data + (size_t) f.expert*expert_size,
+                                    (size_t) f.slot*expert_size, expert_size);
+                            promote_bytes += expert_size;
+                        }
+                    }
+                    if (!ok) {
+                        // the planned experts are not in the bank, drop the rolling plan and rebuild the static
+                        // residency so that the next lookup computes the misses on the CPU
+                        if (promote_fallbacks++ == 0) {
+                            LLAMA_LOG_WARN("%s: promotion of layer %d failed, rolling residency disabled\n", __func__, il);
+                        }
+                        rolling  = false;
+                        resident = false;
+                    } else {
+                        this->pf.submit(backend);
+                        promote_pending[il] = 1;
+                    }
+                }
+            }
             return true;
         }
 
@@ -1620,6 +2149,19 @@ bool llama_moe_cache::hybrid(int32_t il) const {
     return pimpl->hybrid(il);
 }
 
+bool llama_moe_cache::hybrid_exec() const {
+    return pimpl->hybrid_exec;
+}
+
+ggml_tensor * llama_moe_cache::get_cpu_out(int32_t il) const {
+    return pimpl->get_cpu_out(il);
+}
+
+bool llama_moe_cache::register_hybrid(int32_t il, const ggml_tensor * inp, const ggml_tensor * weights,
+                                      const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down) const {
+    return pimpl->register_hybrid(il, inp, weights, up, gate, down);
+}
+
 ggml_tensor * llama_moe_cache::get_miss_mask(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
     return pimpl->get_miss_mask(il, n_tokens, n_expert_used);
 }
@@ -1644,12 +2186,20 @@ void llama_moe_cache::clear_ids() const {
     pimpl->clear_ids();
 }
 
-void llama_moe_cache::stage_ids(ggml_backend_t backend, ggml_cgraph * graph) const {
-    pimpl->stage_ids(backend, graph);
+void llama_moe_cache::stage_inputs(ggml_backend_t backend, ggml_cgraph * graph) const {
+    pimpl->stage_inputs(backend, graph);
+}
+
+void llama_moe_cache::wait_promotion() {
+    pimpl->wait_promotion();
 }
 
 bool llama_moe_cache::wait_deferred(ggml_backend_t backend, ggml_cgraph * graph) {
     return pimpl->wait_deferred(backend, graph);
+}
+
+void llama_moe_cache::pre_split(ggml_backend_t backend, ggml_cgraph * graph) {
+    pimpl->pre_split(backend, graph);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {

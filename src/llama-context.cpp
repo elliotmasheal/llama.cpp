@@ -665,6 +665,9 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (moe_cache) {
+        moe_cache->wait_promotion();
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -806,6 +809,7 @@ static void sched_pre_split(ggml_backend_t backend, ggml_cgraph * graph, void * 
     llama_moe_cache * moe_cache = lctx->get_moe_cache();
     if (moe_cache != nullptr) {
         moe_cache->wait_deferred(backend, graph);
+        moe_cache->pre_split(backend, graph);
     }
 }
 
@@ -813,7 +817,7 @@ static void sched_post_split(ggml_backend_t backend, ggml_cgraph * graph, void *
     auto * lctx = static_cast<llama_context *>(user_data);
     llama_moe_cache * moe_cache = lctx->get_moe_cache();
     if (moe_cache != nullptr) {
-        moe_cache->stage_ids(backend, graph);
+        moe_cache->stage_inputs(backend, graph);
     }
 }
 
@@ -2889,11 +2893,16 @@ ggml_status llama_context::graph_compute(
         if (!selftest_done && env_moe_selftest != nullptr && atoi(env_moe_selftest) != 0) {
             selftest_done = true;
             ggml_backend_sched_synchronize(sched.get());
+            const char * env_exec_cpu = getenv("LLAMA_MOE_EXEC_CPU");
+            const bool exec_cpu = env_exec_cpu != nullptr && atoi(env_exec_cpu) != 0;
             ggml_backend_t exec_backend = nullptr;
             for (ggml_backend_t backend : backend_ptrs) {
-                if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                const enum ggml_backend_dev_type type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+                if (type == (exec_cpu ? GGML_BACKEND_DEVICE_TYPE_CPU : GGML_BACKEND_DEVICE_TYPE_GPU)) {
                     exec_backend = backend;
-                    break;
+                    if (!exec_cpu) {
+                        break;
+                    }
                 }
             }
             const char * env_layer = getenv("LLAMA_MOE_EXEC_LAYER");

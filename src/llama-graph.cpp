@@ -2618,32 +2618,44 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (hybrid) {
         // the CPU computes the misses from the host expert tensors, the GPU result holds the cached experts only
-        ggml_tensor * mask = ggml_view_2d(ctx0, miss_mask, n_expert_used, n_tokens, miss_mask->nb[1], 0);
-        cb(mask, "ffn_moe_miss_mask", il);
-
-        ggml_tensor * up_cpu   = ggml_mul_mat_id_mask(ctx0, up_exps,   inp, selected_experts, mask);
-        ggml_tensor * gate_cpu = ggml_mul_mat_id_mask(ctx0, gate_exps, inp, selected_experts, mask);
-        cb(up_cpu,   "ffn_moe_up_cpu",   il);
-        cb(gate_cpu, "ffn_moe_gate_cpu", il);
-
-        ggml_tensor * cur_cpu = ggml_swiglu_split(ctx0, gate_cpu, up_cpu);
-        cb(cur_cpu, "ffn_moe_swiglu_cpu", il);
-
-        cur_cpu = ggml_mul_mat_id_mask(ctx0, down_exps, cur_cpu, selected_experts, mask);
-        cb(cur_cpu, "ffn_moe_down_cpu", il);
-
-        cur_cpu = ggml_mul(ctx0, cur_cpu, weights);
-        cb(cur_cpu, "ffn_moe_weighted_cpu", il);
-
-        ggml_tensor * moe_out_cpu = nullptr;
-        for (uint32_t i = 0; i < n_expert_used_il; ++i) {
-            ggml_tensor * view = ggml_view_2d(ctx0, cur_cpu, n_embd, n_tokens, cur_cpu->nb[2], i*cur_cpu->nb[1]);
-            moe_out_cpu = i == 0 ? view : ggml_add(ctx0, moe_out_cpu, view);
+        ggml_tensor * cpu_out = nullptr;
+        if (moe_cache->hybrid_exec() && n_tokens == 1 &&
+                moe_cache->register_hybrid(il, inp, weights, up_exps, gate_exps, down_exps)) {
+            cpu_out = moe_cache->get_cpu_out(il);
         }
-        ggml_build_forward_expand(gf, moe_out_cpu);
 
-        moe_out = ggml_add(ctx0, moe_out, moe_out_cpu);
-        ggml_build_forward_expand(gf, moe_out);
+        if (cpu_out != nullptr) {
+            // the worker fills cpu_out outside the scheduler, the copy callback uploads it before this add
+            moe_out = ggml_add(ctx0, moe_out, cpu_out);
+            ggml_build_forward_expand(gf, moe_out);
+        } else {
+            ggml_tensor * mask = ggml_view_2d(ctx0, miss_mask, n_expert_used, n_tokens, miss_mask->nb[1], 0);
+            cb(mask, "ffn_moe_miss_mask", il);
+
+            ggml_tensor * up_cpu   = ggml_mul_mat_id_mask(ctx0, up_exps,   inp, selected_experts, mask);
+            ggml_tensor * gate_cpu = ggml_mul_mat_id_mask(ctx0, gate_exps, inp, selected_experts, mask);
+            cb(up_cpu,   "ffn_moe_up_cpu",   il);
+            cb(gate_cpu, "ffn_moe_gate_cpu", il);
+
+            ggml_tensor * cur_cpu = ggml_swiglu_split(ctx0, gate_cpu, up_cpu);
+            cb(cur_cpu, "ffn_moe_swiglu_cpu", il);
+
+            cur_cpu = ggml_mul_mat_id_mask(ctx0, down_exps, cur_cpu, selected_experts, mask);
+            cb(cur_cpu, "ffn_moe_down_cpu", il);
+
+            cur_cpu = ggml_mul(ctx0, cur_cpu, weights);
+            cb(cur_cpu, "ffn_moe_weighted_cpu", il);
+
+            ggml_tensor * moe_out_cpu = nullptr;
+            for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+                ggml_tensor * view = ggml_view_2d(ctx0, cur_cpu, n_embd, n_tokens, cur_cpu->nb[2], i*cur_cpu->nb[1]);
+                moe_out_cpu = i == 0 ? view : ggml_add(ctx0, moe_out_cpu, view);
+            }
+            ggml_build_forward_expand(gf, moe_out_cpu);
+
+            moe_out = ggml_add(ctx0, moe_out, moe_out_cpu);
+            ggml_build_forward_expand(gf, moe_out);
+        }
 
         // only the CPU partial sum is copied, the final add runs on the device of the cached experts
         ggml_backend_t backend = moe_cache->backend(il);

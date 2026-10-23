@@ -353,6 +353,7 @@ struct cmd_params {
     std::vector<int>                 n_gpu_layers;
     std::vector<int>                 n_cpu_moe;
     std::vector<int>                 moe_cache_mib;
+    std::vector<bool>                moe_hybrid;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
@@ -400,6 +401,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_gpu_layers         */ { -1 },
     /* n_cpu_moe            */ { 0 },
     /* moe_cache_mib        */ { 0 },
+    /* moe_hybrid           */ { false },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
@@ -475,6 +477,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
     printf("  --moe-cache-mib <n>                               (default: %s)\n", join(cmd_params_defaults.moe_cache_mib, ",").c_str());
+    printf("  --moe-hybrid <0|1>                               (default: %s)\n", join(cmd_params_defaults.moe_hybrid, ",").c_str());
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -745,6 +748,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.moe_cache_mib.insert(params.moe_cache_mib.end(), p.begin(), p.end());
+            } else if (arg == "--moe-hybrid") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.moe_hybrid.insert(params.moe_hybrid.end(), p.begin(), p.end());
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1160,6 +1170,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.moe_cache_mib.empty()) {
         params.moe_cache_mib = cmd_params_defaults.moe_cache_mib;
     }
+    if (params.moe_hybrid.empty()) {
+        params.moe_hybrid = cmd_params_defaults.moe_hybrid;
+    }
     if (params.split_mode.empty()) {
         params.split_mode = cmd_params_defaults.split_mode;
     }
@@ -1237,6 +1250,7 @@ struct cmd_params_instance {
     int                n_gpu_layers;
     int                n_cpu_moe;
     int                moe_cache_mib;
+    bool               moe_hybrid;
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
@@ -1309,6 +1323,7 @@ struct cmd_params_instance {
 
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+               moe_cache_mib == other.moe_cache_mib && moe_hybrid == other.moe_hybrid &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
@@ -1330,6 +1345,7 @@ struct cmd_params_instance {
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
         cparams.moe_cache_size  = (size_t) moe_cache_mib*1024*1024;
+        cparams.moe_hybrid      = moe_hybrid;
 
         return cparams;
     }
@@ -1346,6 +1362,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & ncmoe : params.n_cpu_moe)
     for (const auto & mcm : params.moe_cache_mib)
+    for (const auto & mh : params.moe_hybrid)
     for (const auto & sm : params.split_mode)
     for (const auto & lm : params.load_mode)
     for (const auto & lzm : params.lazy_mode)
@@ -1388,6 +1405,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .moe_cache_mib         = */ mcm,
+                /* .moe_hybrid            = */ mh,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1427,6 +1445,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .moe_cache_mib         = */ mcm,
+                /* .moe_hybrid            = */ mh,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
@@ -1466,6 +1485,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_gpu_layers          = */ nl,
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .moe_cache_mib         = */ mcm,
+                /* .moe_hybrid            = */ mh,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,

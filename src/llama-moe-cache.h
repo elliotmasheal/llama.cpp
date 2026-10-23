@@ -41,6 +41,17 @@ public:
     // the bank view of w when the whole layer is resident, nullptr otherwise
     ggml_tensor * get_experts_static(const ggml_tensor * w) const;
 
+    // [LLAMA_MOE_HYBRID_EXEC] the misses of a decode token are computed by a CPU worker outside the scheduler
+    bool hybrid_exec() const;
+
+    // the host F32 [n_embd, 1] tensor that the worker of layer il fills, nullptr if the executor is not used
+    ggml_tensor * get_cpu_out(int32_t il) const;
+
+    // graph build: connect the CPU branch of layer il to the worker, returns false if the tensors of the layer
+    // do not have the shapes the worker graph expects, so the layer keeps the in-graph CPU branch
+    bool register_hybrid(int32_t il, const ggml_tensor * inp, const ggml_tensor * weights,
+                         const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down) const;
+
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
@@ -48,12 +59,21 @@ public:
     void register_ids(int32_t il, const ggml_tensor * ids) const;
     void clear_ids() const;
 
-    // ggml_backend_sched post-split callback: stages the readback of the selected experts in the split
-    // that computes them, so the copy callback finds them in host memory
-    void stage_ids(ggml_backend_t backend, ggml_cgraph * graph) const;
+    // ggml_backend_sched post-split callback: stages the readback of the selected experts, and of the layer
+    // input and the router weights of the hybrid layers, in the split that computes them, so the copy callback
+    // finds them in host memory
+    void stage_inputs(ggml_backend_t backend, ggml_cgraph * graph) const;
 
     // if a deferred upload batch is pending and this split consumes it, wait for it before the compute
     bool wait_deferred(ggml_backend_t backend, ggml_cgraph * graph);
+
+    // ggml_backend_sched pre-split callback: the combine of the hybrid executor waits for the worker and
+    // uploads its result before the split that adds it, no host weight copy and no device drain
+    void pre_split(ggml_backend_t backend, ggml_cgraph * graph);
+
+    // [LLAMA_MOE_HYBRID_EXEC] wait for the promotion of the last token, the context calls this before
+    // the backends and the cache buffers are freed
+    void wait_promotion();
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache
