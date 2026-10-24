@@ -179,7 +179,7 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 | id | lane | 内容 | 验收要点 |
 |---|---|---|---|
 | M1-1 | bench | 补齐 10 个 full-attention 层与 layer 39 的解码路由 | 40 层 x 128 token 都有记录；根因进 DECISIONS |
-| M1-2a | data | 非技术语料：对话 / 代码 / 多语言各 10K | token 实测并写进 RESULTS；报唯一 token 比例 |
+| M1-2a | data | 非技术语料：对话 / 代码 / 多语言各 10K | 10002 / 10149 / 9636 token；shingle 97.7-100% |
 | M1-2b | bench | 三类文本局部性复测（技术类已完成） | 与 M0 偏差 <= 5 pp 或已解释 |
 | M1-3a | data | 受限草稿词表（16K）与生成脚本 | 覆盖生成 token 流 >= 95% |
 | M1-3c | impl | draft-mtp 受限候选集（16K，默认关闭） | 空集/坏文件回退完整词表并告警，不 abort |

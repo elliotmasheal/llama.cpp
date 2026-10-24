@@ -174,7 +174,7 @@
       "id": "M1-2a",
       "milestone": "M1",
       "lane": "data",
-      "status": "doing",
+      "status": "done",
       "claimed_at": "2026-10-24T15:40:00",
       "title": "非技术语料：对话、代码、多语言各一份 10K prompt",
       "deps": [],
