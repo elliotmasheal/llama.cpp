@@ -1,0 +1,2 @@
+# bash scripts must stay LF even with core.autocrlf=true, or they fail with "syntax error near unexpected token"
+*.sh text eol=lf
