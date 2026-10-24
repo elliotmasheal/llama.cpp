@@ -2,12 +2,12 @@
   "schema": 2,
   "track": "qwen36-runtime",
   "updated": "2026-10-24",
-  "phase": "M1",
-  "phase_status": "blocked",
+  "phase": "M2",
+  "phase_status": "in_progress",
   "decision_gate": {
     "id": "M1",
-    "open": true,
-    "result": "fail",
+    "open": false,
+    "result": "pass",
     "criteria": [
       "E >= 130 x measured cycle at the selected k (design 6.3: k=4 needs 2.90 at CPU 0.118 / 2.72 at 0.090; k=5 needs 3.23 / 2.88). Measured 16K: 2.850 (k=4), 3.055 (k=5), so both pass only at CPU 0.090 (RESULTS section 19)",
       "per-pass submit+sync < 1 ms, and the GPU leg within 10% of the roofline model at k=1/2/4/5/8",
@@ -19,7 +19,11 @@
       "speculative output fidelity under the U-7 rule: divergence is allowed only where greedy's top-1 margin is below 0.05 nats. k=4 passed 2x128 tokens with no fork (max batch perturbation 0.0808, tightest margins 0.1192/0.1286); k=5 forks at a 0.1192 margin and fails (RESULTS sections 21/23)",
       "CPU expert leg: the user moved M3-1a inside the gate (U-6). Technical text needs <=0.090 ms/expert, code needs <=0.059 (target 0.055); the measured E clears 2.72 / 2.88 at 0.090 (RESULTS section 19)"
     ],
-    "on_fail": "stop and ask the user: lower the TG target, change the ctx cost, or page the KV (design section 9)"
+    "on_fail": "stop and ask the user: lower the TG target, change the ctx cost, or page the KV (design section 9)",
+    "decided": "2026-10-24",
+    "conditions": [
+      "conditional pass (user 2026-10-24, option A): code TG 130 and M3-6 stay contingent on M3-1a reaching 0.059 ms/expert; if it does not, go to U-2 and lower the code target"
+    ]
   },
   "targets": {
     "tg_min": 130,
@@ -106,26 +110,34 @@
       "lane": "bench",
       "head": null,
       "order": [
-        "R1",
-        "M1-3e",
-        "M1-4b"
+        "M2-7",
+        "M2-8",
+        "M4-1",
+        "M4-2",
+        "M4-3",
+        "M4-4"
       ],
-      "note": "M1-3e/M1-4b done; bench is idle until the M1 gate decision (no runnable M1 task left)"
+      "note": "M1 measurements are closed. M2-7/M2-8 wait for the runtime (M2-5/M2-6)"
     },
     {
       "lane": "impl",
-      "head": "X-1",
+      "head": "M2-0",
       "order": [
-        "M1-4a",
-        "M1-4a-run",
-        "M1-3c",
+        "M2-0",
+        "M2-1",
+        "M2-2",
+        "M2-3",
+        "M2-4",
+        "M2-5",
+        "M2-6",
+        "M2-6a",
         "M3-1a",
         "M1-3d",
         "X-1",
         "X-2",
         "X-4"
       ],
-      "note": "M3-1a round 2 done: the t=1..5 ramp says the CPU leg must use the multiplicity (mean 1.70 at k=5), not t=k. code 0.059 still open. X-1 next"
+      "note": "M2 starts at M2-0 (scaffold + QRT_* CLI). M3-1a stays partial on code 0.059"
     },
     {
       "lane": "data",
@@ -149,12 +161,11 @@
     },
     {
       "lane": "user",
-      "head": "M1-GATE",
+      "head": null,
       "order": [
-        "M1-GATE",
         "U-2"
       ],
-      "note": "review done: 8 of 9 criteria pass; code CPU 0.059 is the only hard gap. Choose A (conditional pass), B (U-2 lower the code TG) or C (stay in M1)"
+      "note": "M1 closed by conditional pass; U-2 only if M3-1a misses 0.059"
     }
   ],
   "tasks": [
@@ -320,14 +331,13 @@
       "id": "M1-GATE",
       "milestone": "M1",
       "lane": "user",
-      "status": "todo",
+      "status": "done",
       "title": "M1 决策门评审",
       "deps": [
         "M1-1",
         "M1-2b",
         "M1-3b",
         "M1-3d",
-        "M3-1a",
         "U-7",
         "M1-4b",
         "M1-5",
@@ -338,7 +348,7 @@
       ],
       "resources": [],
       "paths": [],
-      "done_when": "state.json 的 decision_gate.criteria 全过则 phase=M2；任一不过置 blocked 并走 U-2/U-3，不许自行改阈值"
+      "done_when": "conditional pass (2026-10-24): the nine criteria were reviewed; code CPU 0.059 is deferred to M3-1a, and M3-6 gates on it. phase=M2"
     },
     {
       "id": "U-1",

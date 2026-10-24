@@ -72,10 +72,10 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 ## 2. 当前状态
 
 <!-- STATE:BEGIN -->
-phase: M1
-phase_status: blocked
-decision_gate: M1 open
-queues: bench=- impl=X-1 data=M5-1 io=- user=M1-GATE
+phase: M2
+phase_status: in_progress
+decision_gate: M1 closed
+queues: bench=- impl=M2-0 data=M5-1 io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -86,11 +86,10 @@ blockers: none
 **现状摘要（人读，不参与机器校验）**
 
 - M0 完成：张量账、10K + 128 token 路由 trace、局部性与命中率（`RESULTS.md` 第 1-2、7 节）。
-- M1 进行中：M1-1 / M1-2b / M1-3b / M1-3c / M1-3d / M1-3e / M1-4a / M1-4a-run / M1-4b / M1-5 / M1-6 / M1-7
-  已完成，R0 / R1 已完成，语料与词表 M1-2a / M1-3a 已交付；M3-1a 已提前做完（partial，见下）。
-  **M1 评审已做：9 条判据 8 过 1 不过（code 的 CPU 0.059），phase_status=blocked，等用户选择。**
-- 队列：bench 空（M1 测量全部完成），impl X-1，data M5-1，io 等 M5-1，user M1-GATE。
-- M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`（九条），E 门槛用公式而不是常数。
+- M0 完成。**M1 已条件通过（用户 2026-10-24 选 A）**：9 条判据 8 过，唯一缺口 code 的 CPU 0.059
+  留作 M3-1a 的硬门（M3-6 卡它，不达走 U-2）。R0 / R1 完成，语料、词表、E、保真、显存预算都已收口。
+- **phase = M2（prefill）**。队列：bench 空（等运行时），impl M2-0，data M5-1，io 等 M5-1，user 空。
+- M1 的判据与证据见 `state.json` 的 `decision_gate` 与 `DECISIONS.md` 第 16 节。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。
 - 未决：无。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）、U-4（平衡电源为基准）、
