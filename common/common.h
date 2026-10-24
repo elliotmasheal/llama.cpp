@@ -336,6 +336,8 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
+    std::string draft_vocab_file; // restricted candidate set for MTP drafting (empty - full vocab)
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -94,6 +95,114 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
         result += ggml_backend_dev_name(devices[i]);
     }
     return result.empty() ? "default" : result;
+}
+
+// Reads a restricted draft candidate set: binary little-endian int32, or ASCII text with one id per line.
+// Returns false (with a reason) on anything unexpected, so the caller can fall back to the full vocab.
+static bool spec_draft_vocab_load(
+        const std::string & path,
+        int32_t n_vocab,
+        std::vector<int32_t> & ids,
+        std::string & err) {
+    ids.clear();
+
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        err = "cannot open file";
+        return false;
+    }
+
+    std::string data;
+    char buf[4096];
+    size_t n_read = 0;
+    // a set cannot hold more ids than the vocab, so bound the read instead of trusting the file size
+    const size_t max_bytes = (size_t) n_vocab * 8 + 64;
+    while ((n_read = fread(buf, 1, sizeof(buf), f)) > 0) {
+        data.append(buf, n_read);
+        if (data.size() > max_bytes) {
+            fclose(f);
+            err = "file is larger than a full-vocab id list";
+            return false;
+        }
+    }
+    const bool read_err = ferror(f) != 0;
+    fclose(f);
+
+    if (read_err) {
+        err = "read error";
+        return false;
+    }
+
+    if (data.empty()) {
+        err = "file is empty";
+        return false;
+    }
+
+    bool is_text = true;
+    for (char c : data) {
+        if ((c < '0' || c > '9') && c != '-' && c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+            is_text = false;
+            break;
+        }
+    }
+
+    if (is_text) {
+        const char * p = data.data();
+        const char * end = p + data.size();
+        while (p < end) {
+            while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) {
+                ++p;
+            }
+            if (p >= end) {
+                break;
+            }
+            char * q = nullptr;
+            const long v = strtol(p, &q, 10);
+            if (q == p || v < 0 || v >= n_vocab) {
+                err = "text token id out of range";
+                ids.clear();
+                return false;
+            }
+            ids.push_back((int32_t) v);
+            p = q;
+            if (ids.size() > (size_t) n_vocab) {
+                err = "more token ids than the vocab";
+                ids.clear();
+                return false;
+            }
+        }
+    } else if (data.size() % sizeof(int32_t) == 0) {
+        const size_t n_ids = data.size() / sizeof(int32_t);
+        ids.resize(n_ids);
+        memcpy(ids.data(), data.data(), n_ids * sizeof(int32_t));
+        for (size_t i = 0; i < n_ids; ++i) {
+            if (ids[i] < 0 || ids[i] >= n_vocab) {
+                err = "binary token id out of range";
+                ids.clear();
+                return false;
+            }
+        }
+    } else {
+        err = "neither text nor a multiple of 4 bytes";
+        return false;
+    }
+
+    if (ids.empty()) {
+        err = "no token ids";
+        return false;
+    }
+
+    std::vector<uint8_t> seen(n_vocab, 0);
+    for (const int32_t id : ids) {
+        if (seen[id]) {
+            err = "duplicate token id";
+            ids.clear();
+            return false;
+        }
+        seen[id] = 1;
+    }
+
+    return true;
 }
 
 struct common_speculative_config {
@@ -1441,6 +1550,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
+    // Restricted draft candidate set (empty - full vocab). The bias is applied before top_k and
+    // only changes which token the draft proposes; the verification pass stays on the full vocab.
+    std::vector<llama_logit_bias> draft_vocab_bias;
+    std::vector<uint8_t>          draft_vocab_is_cand;
+    bool                          draft_vocab_warned = false; // one warning if a draft escapes the set
+
     int32_t n_embd = 0;
 
     // One MTP draft driver, three modes (set once in the ctor):
@@ -1492,12 +1607,39 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         batch = common_batch(ctx_dft);
 
+        // restricted draft candidate set: load before building the samplers so both chains can carry the mask
+        const llama_vocab * vocab_dft = llama_model_get_vocab(llama_get_model(ctx_dft));
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab_dft);
+        if (!this->params.draft_vocab_file.empty()) {
+            std::vector<int32_t> ids;
+            std::string err;
+            if (spec_draft_vocab_load(this->params.draft_vocab_file, n_vocab, ids, err)) {
+                draft_vocab_is_cand.assign(n_vocab, 0);
+                for (const int32_t id : ids) {
+                    draft_vocab_is_cand[id] = 1;
+                }
+                draft_vocab_bias.reserve(n_vocab - ids.size());
+                for (int32_t id = 0; id < n_vocab; ++id) {
+                    if (!draft_vocab_is_cand[id]) {
+                        draft_vocab_bias.push_back({ id, -INFINITY });
+                    }
+                }
+                SPC_INF("draft candidate set '%s': %zu of %d ids, %zu masked out\n",
+                        this->params.draft_vocab_file.c_str(), ids.size(), n_vocab, draft_vocab_bias.size());
+            } else {
+                SPC_WRN("ignoring '%s': %s; drafting over the full vocab\n",
+                        this->params.draft_vocab_file.c_str(), err.c_str());
+            }
+        }
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            // the CPU chain also carries the mask: it is the fallback when the backend chain is not installed
+            sparams.logit_bias = draft_vocab_bias;
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
@@ -1506,6 +1648,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                // must precede top_k, otherwise the draft argmax can land outside the candidate set
+                if (!draft_vocab_bias.empty()) {
+                    auto * smpl_bias = llama_sampler_init_logit_bias(
+                            n_vocab, (int32_t) draft_vocab_bias.size(), draft_vocab_bias.data());
+                    llama_sampler_chain_add(chain, smpl_bias);
+                }
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
@@ -1784,6 +1932,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // add drafted token for each sequence
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+
+                // an escaped token means the mask did not reach whichever sampler picked it
+                if (!draft_vocab_is_cand.empty() &&
+                        (id < 0 || id >= (llama_token) draft_vocab_is_cand.size() || !draft_vocab_is_cand[id])) {
+                    if (!draft_vocab_warned) {
+                        SPC_WRN("draft token %d is outside the restricted candidate set\n", id);
+                        draft_vocab_warned = true;
+                    }
+                }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
