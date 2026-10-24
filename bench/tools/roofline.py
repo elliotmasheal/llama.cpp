@@ -12,7 +12,9 @@ GIB = 1024 * MIB
 GB = 1e9
 
 # hardware ceilings
-VRAM_SPEC = 224.0 * GB          # RX 6700S, 128-bit x 14 Gbps
+# Nominal GDDR6 is 224 GB/s (128-bit x 14 Gbps) but R1a measured 156.1-156.6 GB/s at any ILP,
+# grid or size, so the model uses the observed ceiling. See RESULTS section 12.
+VRAM_SPEC = 156.5 * GB
 PCIE_SPEC = 15.754 * GB         # PCIe 4.0 x8, 128b/130b
 DDR_SPEC = 76.8 * GB            # DDR5-4800, 2 x 64-bit
 FP32_TFLOPS = 7.9               # design 6.4
@@ -27,7 +29,7 @@ CPU_EXPERT_NOW = 0.137          # ms per expert, 4 threads
 EXPERT_BYTES = 1.828 * MIB      # gguf_dims.py, 41 layers x 256 experts
 DENSE_BYTES = 2.030 * GIB
 KV_MAIN = 20480                 # bytes per token, 10 full-attn main layers
-KV_MTP = 22528                  # including the nextn layer
+KV_Q4 = 6336                  # bytes per token with the nextn layer, q4_0 (U-3)
 GLOP_PER_TOKEN = 6.0
 HIT = {20: 0.773, 25: 0.816, 30: 0.854}   # RESULTS section 7
 U = {4: 19.9, 5: 23.5, 8: 31.6}           # unique experts per layer, section 7
@@ -35,8 +37,8 @@ E = {4: 2.84, 5: 3.24, 8: 3.82}           # RESULTS section 3, full vocab
 DRAFT_MIB = 33.0                           # 16K restricted output head per step
 
 # R1 targets and the 0.85 rule
-VRAM_TARGET = 190.0 * GB
-H2D_TARGET = 12.5 * GB
+VRAM_TARGET = 156.5 * GB        # R1a: 190 is not reachable, the observed ceiling is what we get
+H2D_TARGET = 11.9 * GB          # R1a: best concurrent run at 64 MiB chunks
 CPU_EXPERT_TARGET = 0.070
 CPU_EXPERT_SPEC = EXPERT_BYTES / DDR_SPEC * 1e3
 ROOFLINE_FRACTION = 0.85
@@ -45,8 +47,8 @@ PP_MIN = 1000.0
 
 SCEN = (
     ("now", VRAM_NOW, H2D_NOW, CPU_EXPERT_NOW),
-    ("R1", VRAM_TARGET, H2D_TARGET, CPU_EXPERT_TARGET),
-    ("spec", VRAM_SPEC, PCIE_SPEC, CPU_EXPERT_SPEC),
+    ("R1a", VRAM_TARGET, H2D_TARGET, CPU_EXPERT_TARGET),
+    ("ceil", VRAM_SPEC, PCIE_SPEC, CPU_EXPERT_SPEC),
 )
 
 
@@ -59,6 +61,7 @@ def legs():
         ("cpu ms/expert", CPU_EXPERT_SPEC, CPU_EXPERT_NOW, CPU_EXPERT_TARGET, "software"),
     ]
     print("leg               spec      now   target   now/spec  binds")
+    print("  (vram spec = observed ceiling 156.5; the 224 GB/s nominal is not reachable, RESULTS 12)")
     for name, spec, now, target, kind in rows:
         ratio = 100.0 * now / spec
         if name == "cpu ms/expert":
@@ -139,10 +142,11 @@ def capacity_table():
     print("")
     print("VRAM: total %d MiB, usable %d MiB, dense %.0f MiB, draft 100 MiB"
           % (VRAM_TOTAL_MIB, VRAM_TOTAL_MIB - DESKTOP_MIB, DENSE_BYTES / MIB))
-    print("KV per token: %d B main, %d B with nextn (f16)" % (KV_MAIN, KV_MTP))
+    print("KV q4_0: %d B/token; resident window 16384 = %.0f MiB; 256K pages on host = %.0f MiB"
+          % (KV_Q4, KV_Q4 * 16384 / MIB, KV_Q4 * 262144 / MIB))
     print("ctx     kv MiB   cache@700   cache%700   cache%1100")
     for ctx in (10240, 16384, 32768, 65536, 262144):
-        kv = KV_MTP * ctx / MIB
+        kv = KV_Q4 * min(ctx, 16384) / MIB
         base = VRAM_TOTAL_MIB - DESKTOP_MIB - DENSE_BYTES / MIB - 100 - kv
         print("%6d  %8.1f  %9.1f  %9.1f%%  %9.1f%%"
               % (ctx, kv, base - 700,

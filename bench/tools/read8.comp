@@ -1,0 +1,36 @@
+#version 450
+// VRAM read ceiling probe with 8 independent vec4 chains per thread. gemv4 has 4 chains;
+// this one tests whether the 156 GB/s reading was limited by load-level parallelism.
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer Src { vec4 v[]; } src;
+layout(binding = 1) writeonly buffer Dst { float v[]; } dst;
+
+layout(push_constant) uniform PC {
+    uint n;     // number of vec4 elements
+    uint reps;
+} pc;
+
+void main() {
+    uint gid    = gl_GlobalInvocationID.x;
+    uint stride = gl_WorkGroupSize.x * gl_NumWorkGroups.x;
+    vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
+    vec4 a4 = vec4(0.0), a5 = vec4(0.0), a6 = vec4(0.0), a7 = vec4(0.0);
+    for (uint r = 0; r < pc.reps; ++r) {
+        uint i = gid;
+        for (; i + 7u * stride < pc.n; i += 8u * stride) {
+            a0 += src.v[i];
+            a1 += src.v[i + stride];
+            a2 += src.v[i + 2u * stride];
+            a3 += src.v[i + 3u * stride];
+            a4 += src.v[i + 4u * stride];
+            a5 += src.v[i + 5u * stride];
+            a6 += src.v[i + 6u * stride];
+            a7 += src.v[i + 7u * stride];
+        }
+        for (; i < pc.n; i += stride) {
+            a0 += src.v[i];
+        }
+    }
+    dst.v[gid % 4096u] = a0.x + a1.y + a2.z + a3.w + a4.x + a5.y + a6.z + a7.w;
+}

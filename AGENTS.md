@@ -62,7 +62,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M1
 phase_status: in_progress
 decision_gate: M1 open
-queues: bench=R1 impl=M1-4a data=M1-2a io=- user=-
+queues: bench=- impl=M1-4a data=M1-2a io=- user=U-4
 last_gate: G-REG unknown (2026-10-23 record, not re-run since 44bd79305)
 blockers: none
 <!-- STATE:END -->
@@ -78,7 +78,8 @@ blockers: none
 - M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`，E 门槛用公式而不是常数。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。
-- 未决：无。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）均已闭环；M2 开工只等 M1-GATE。
+- 未决：U-4（可选）是否允许一次性能电源方案的显存 A/B；U-1 / U-3 已闭环。
+- 目标：130 是实测 roofline（148）的 88%，不再提"抬到 150"；R1b/R1c 出数后复核。
 
 ## 3. 每轮自主循环
 

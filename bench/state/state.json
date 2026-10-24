@@ -23,11 +23,11 @@
     "rule": "130/1000 are hard floors until the user re-sets them; the design target is 0.85 x the roofline at the binding leg, reported every round by R0",
     "roofline_fraction": 0.85,
     "derived_2026_10_24": {
-      "tg_hardware": 180,
-      "tg_r1": 151,
+      "tg_roofline": 148,
+      "tg_at_085": 126,
       "pp_min_tflops": 7.06,
       "pp_min_chunk": 1420,
-      "source": "bench/RESULTS.md section 11"
+      "source": "bench/RESULTS.md section 12 (R1a)"
     }
   },
   "resources": {
@@ -90,14 +90,14 @@
   "queues": [
     {
       "lane": "bench",
-      "head": "R1",
+      "head": null,
       "order": [
         "R1",
         "M1-4b",
         "M1-3b",
         "M1-2b"
       ],
-      "note": "R1 probes each leg against its hardware ceiling; M1-4b/M1-3b/M1-2b follow once impl/data deliver their inputs"
+      "note": "R1 is running; M1-4b/M1-3b/M1-2b wait for impl/data"
     },
     {
       "lane": "impl",
@@ -133,13 +133,13 @@
     },
     {
       "lane": "user",
-      "head": null,
+      "head": "U-4",
       "order": [
-        "U-3",
+        "U-4",
         "M1-GATE",
         "U-2"
       ],
-      "note": "U-1/U-3 closed; M1-GATE waits for R1/M1-2b/M1-3b/M1-4b"
+      "note": "U-4 (power-plan A/B) is optional; M1-GATE waits for R1/M1-2b/M1-3b/M1-4b"
     }
   ],
   "tasks": [
@@ -869,7 +869,8 @@
       "id": "R1",
       "milestone": "M1",
       "lane": "bench",
-      "status": "todo",
+      "status": "doing",
+      "claimed_at": "2026-10-24T14:28:00",
       "title": "腿级 roofline 探针：调优显存读、CPU 专家核、int8 GEMM、并发 H2D",
       "deps": [],
       "resources": [
@@ -903,6 +904,17 @@
       "done_when": "一条命令对 runtime/kernels 的每个 kernel 与 CPU 参考比对（误差阈值写进代码），并跑 k=1 逐 token；失败返回非 0"
     },
     {
+      "id": "U-4",
+      "milestone": "M1",
+      "lane": "user",
+      "status": "todo",
+      "title": "是否允许一次性能电源方案的显存带宽 A/B（改口径）",
+      "deps": [],
+      "resources": [],
+      "paths": [],
+      "done_when": "允许/拒绝写进 DECISIONS；允许则改口径并重跑 R1a（read8 16 GiB），按新值重算 roofline"
+    },
+    {
       "id": "M2-6a",
       "milestone": "M2",
       "lane": "impl",
@@ -928,5 +940,13 @@
     "detail": "last full record is 2026-10-23 (ctest 32/32, MUL_MAT 2275/2275, MUL_MAT_ID 939/939, FLASH_ATTN_EXT 5332/5332). Commit 44bd79305 changed llama-kv-cells after that record, so the gate is stale. M1 does not touch fork code, so it does not block; rerun before any fork code change."
   },
   "blockers": [],
-  "escalations": []
+  "escalations": [
+    {
+      "id": "U-4",
+      "question": "allow one performance-power-plan A/B on the VRAM read probe? 156.5 GB/s equals 97.8% of 128-bit x 10 Gbps, so the balanced plan may be capping the memory clock",
+      "needs_by": "M4-5",
+      "owner": "user",
+      "note": "optional and not blocking M2; if allowed, it changes the power-state caliber and forces a roofline re-run (RESULTS section 12)"
+    }
+  ]
 }
