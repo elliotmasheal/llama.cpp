@@ -72,8 +72,10 @@ static void gemv_avx2(const uint8_t * w, int rows, int cols,
     const __m256i ones = _mm256_set1_epi16(1);
     for (int r = 0; r < rows; ++r) {
         const uint8_t * row = w + (size_t) r * nb * Q4K_BYTES;
-        __m256 acc_lo = _mm256_setzero_ps();
-        __m256 acc_hi = _mm256_setzero_ps();
+        // Two accumulator pairs: the fma chain per superblock is half as long,
+        // which is what limits this kernel at one row per call.
+        __m256 acc_lo[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
+        __m256 acc_hi[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
         float acc_min = 0.0f;
         for (int b = 0; b < nb; ++b) {
             struct block_q4_k_local blk;
@@ -83,7 +85,11 @@ static void gemv_avx2(const uint8_t * w, int rows, int cols,
             }
             const float d = h2f(blk.d);
             const float dmin = h2f(blk.dmin);
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
             for (int g = 0; g < 4; ++g) {
+                const int slot = g & 1;
                 const __m256i q = _mm256_loadu_si256((const __m256i *) (blk.qs + 32 * g));
                 const __m256i lo = _mm256_and_si256(q, m4);
                 const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
@@ -96,14 +102,15 @@ static void gemv_avx2(const uint8_t * w, int rows, int cols,
                 const __m256i b1 = _mm256_loadu_si256((const __m256i *) (q8 + (size_t) k1 * QK8));
                 const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, b0), ones);
                 const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, b1), ones);
-                acc_lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0),
-                                         _mm256_set1_ps(d * (float) s0 * d8[k0]), acc_lo);
-                acc_hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1),
-                                         _mm256_set1_ps(d * (float) s1 * d8[k1]), acc_hi);
+                acc_lo[slot] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0),
+                                               _mm256_set1_ps(d * (float) s0 * d8[k0]), acc_lo[slot]);
+                acc_hi[slot] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1),
+                                               _mm256_set1_ps(d * (float) s1 * d8[k1]), acc_hi[slot]);
                 acc_min -= dmin * ((float) m0 * ssum[k0] + (float) m1 * ssum[k1]);
             }
         }
-        out[r] = hsum_ps(acc_lo) + hsum_ps(acc_hi) + acc_min;
+        out[r] = hsum_ps(_mm256_add_ps(acc_lo[0], acc_lo[1])) +
+                 hsum_ps(_mm256_add_ps(acc_hi[0], acc_hi[1])) + acc_min;
     }
 }
 

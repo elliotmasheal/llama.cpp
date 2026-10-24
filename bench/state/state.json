@@ -1011,6 +1011,7 @@
       "status": "partial",
       "claimed_at": "2026-10-24T21:10:00",
       "title": "CPU 专家核：Q4_K + int8，目标 0.090 ms/专家",
+      "note": "third round: 4 fma chains, 8T median 0.0795-0.0825 ms, first round 0.0661 (RESULTS 29); code 0.059 still 12% away; t=5 ramp 0.199 -> 0.1349 ms",
       "deps": [
         "M1-3b"
       ],
