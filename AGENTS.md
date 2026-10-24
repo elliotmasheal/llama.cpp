@@ -75,7 +75,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M2-4 data=M5-1 io=- user=-
+queues: bench=- impl=M3-1a data=M5-1 io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -96,6 +96,9 @@ blockers: none
 - **M2-2 完成（2026-10-24）**：`vk_dev` 打开 RX 6700S（Vulkan 1.2 + timeline），heapBudget 7378 MiB，
   design 5.5 的 7176 MiB 计划可复现（缓存 4198 MiB = 21.87%）；tier 可注入、预算不足按 256 MiB 回退并计数；
   见 `RESULTS.md` 第 26 节、`DECISIONS.md` 第 19 节。
+- **M2-4 partial（2026-10-24）**：int8 专家 GEMM 3.66 -> **4.49 TFLOPS（+23%）**，6.0 未达到（75%）；
+  6 个 tile 配置全部 `--check` 通过；瓶颈是激活加载与折叠，不是 dot 吞吐；见 `RESULTS.md` 第 27 节、
+  `DECISIONS.md` 第 20 节（等用户选"继续攻"或"下调 PP"）。
 - M1 的判据与证据见 `state.json` 的 `decision_gate` 与 `DECISIONS.md` 第 16 节。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。

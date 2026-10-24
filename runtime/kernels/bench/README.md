@@ -49,15 +49,46 @@ group) and subblock `2g+1` their high nibbles (elements 32-63). Byte `32g+e` map
 
 ## Tile map
 
-128 threads (4 subgroups of 32) per workgroup, tile 64 rows x 32 tokens:
+128 threads (4 subgroups of 32) per workgroup by default. Two knobs select the register tile
+(`Q4K_ROWS` rows and `Q4K_TOKENS` tokens per lane, defaults 2 x 8):
 
-- lane `l` of subgroup `s` covers rows `64*gx + l` and `64*gx + l + 32`, tokens
-  `32*gy + 8*s + t` for `t` in 0..7. That is 2 rows x 8 tokens = 16 float accumulators.
-- per group of 64 elements the 8 weight words of both rows are masked to 8 low-nibble and
-  8 high-nibble `uint`s (16 words, 32 masked values) and reused across the 8 tokens, so a
-  weight load feeds 16 int8 dots and the activation loads of a token feed 2 rows.
-- grid is `(N/64, M/32)` = 8 x 64 = 512 workgroups for the default shape, so every row block
-  is read 64 times (once per token tile).
+- lane `l` of subgroup `s` covers rows `TILE_N*gx + 32*r + l` for `r` in 0..ROWS-1 and tokens
+  `TILE_M*gy + 8*s + t` for `t` in 0..TOKENS-1, with `TILE_N = 32*ROWS`, `TILE_M = 4*TOKENS`.
+  That is `ROWS x TOKENS` float accumulators; one activation word feeds `ROWS` dots and one
+  weight word feeds `TOKENS` dots.
+- per group of 64 elements the 8 weight words of every row are masked to 8 low-nibble and 8
+  high-nibble `uint`s and reused across the tokens.
+- grid is `(N/TILE_N, M/TILE_M)`: 8 x 64 = 512 workgroups at the default shape, so every row
+  block is read 64 times (once per token tile).
+
+## M2-4 sweep (2026-10-24)
+
+The tile knobs were added to close the 6.0 TFLOPS gap of design 6.4. Measured on the same
+shape, `--check` passing for every arm, raw output `bench/raw/m2/q4k-sweep.out`:
+
+| rows x tokens / threads | TFLOPS | note |
+|---|---:|---|
+| R1c kernel before this sweep | 3.61-3.64 | baseline (RESULTS 14: 3.66) |
+| 2 x 8 / 128 | **4.45-4.49** | new default, +23% |
+| 2 x 8 / 256 | 4.40-4.42 | no gain |
+| 4 x 4 / 128 | 3.94-3.97 | more rows, fewer loads, slower |
+| 4 x 8 / 128 | 3.90-3.96 | dots double, loads +11%, still slower |
+
+Static instruction counts per superblock (`spirv-dis`): 2x8 has 1024 `OpSDot` / 655 `OpLoad`
+/ 671 `OpAccessChain`; 4x8 has 2048 / 727 / 759. The 4-row arms are limited by registers
+(4 x 16 weight masks + 32 accumulators) and code size, not by load count. The remaining gap
+to 6.0 is the 16 activation loads and the scale fold per token and group; the order of the
+next steps is in `bench/DECISIONS.md` section 20.
+
+Build a swept arm with the same -D on both the shader and the host, for example:
+
+```
+glslc -O --target-env=vulkan1.1 -DQ4K_DOT4 -DQ4K_ROWS=4 -DQ4K_TOKENS=4 \
+    -Iruntime/kernels/bench runtime/kernels/bench/q4k-gemm.comp -o out/dot-4x4.spv
+g++ -O2 -std=c++17 -DQ4K_ROWS=4 -DQ4K_TOKENS=4 runtime/kernels/bench/q4k-gemm.cpp \
+    -Iruntime/kernels/bench -I"$VULKAN_SDK/Include" -L"$VULKAN_SDK/Lib" -lvulkan-1 -o out/gemm-4x4.exe
+```
+
 
 Estimated instruction mix per 32-element subblock and per output: 8 `dotPacked4x8EXT`, 5
 float ops for the fold, 4 activation word loads, 1 weight load, 2 masks, about 3.4 FLOP per
