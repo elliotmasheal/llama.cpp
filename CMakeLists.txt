@@ -309,3 +309,14 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# qwen36 runtime: CPU expert core microbench (M3-1a), no ggml linkage.
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/runtime/cpu_moe.cpp)
+    add_executable(qrt-cpu-moe runtime/cpu_moe_bench.cpp runtime/cpu_moe.cpp)
+    if (MSVC)
+        target_compile_options(qrt-cpu-moe PRIVATE /O2 /arch:AVX2 /openmp)
+    else()
+        target_compile_options(qrt-cpu-moe PRIVATE -O3 -mavx2 -mfma -fopenmp)
+        target_link_options(qrt-cpu-moe PRIVATE -fopenmp)
+    endif()
+endif()

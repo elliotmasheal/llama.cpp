@@ -85,13 +85,14 @@ blockers: none
 
 - M0 完成：张量账、10K + 128 token 路由 trace、局部性与命中率（`RESULTS.md` 第 1-2、7 节）。
 - M1 进行中：M1-1 / M1-4a / M1-4a-run / M1-5 / M1-6 / M1-7 / M1-3b / M1-3c 已完成，R0 / R1 已完成，
-  语料与词表 M1-2a / M1-3a 已交付。剩 M1-2b（partial，code 66.0%）、M1-3d（k=5 分叉）、
-  M1-4b（partial，计算缓冲未隔离）、M1-GATE。
+  语料与词表 M1-2a / M1-3a 已交付；M3-1a 已提前做完（partial，见下）。剩 M1-2b（partial，code 66.0%）、
+  M1-3d（k=5 分叉）、M1-4b（partial，计算缓冲未隔离）、M1-GATE。
 - 队列：bench M1-4b，impl M1-3d，data M5-1，io 等 M5-1。
-- M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`（八条），E 门槛用公式而不是常数。
+- M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`（九条），E 门槛用公式而不是常数。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。
-- 未决：无。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）、U-4（平衡电源为基准）、U-5（code 纳入 130）均已闭环。
+- 未决：无。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）、U-4（平衡电源为基准）、U-5（code 纳入 130）、
+  U-6（M3-1a 提前到门内）均已闭环。
 - 目标：TG 可行点 21.9% 缓存（4198 MiB，技术类命中约 79%；chat 81.6 / multi 87.3 / code 66.0）、k=5；
   CPU 核 0.118 时 131（E_min 3.23），到 0.090 时 146（E_min 2.88）。
   **U-5：code 纳入 130**；code 66% 命中 -> 需 CPU **0.059**（目标 0.055），当前 0.118 只到 82。
@@ -99,6 +100,9 @@ blockers: none
 - M1-3b 实测（`RESULTS.md` 第 19 节）：16K 词表 k=4 E=2.850、k=5 E=3.055；按 0.118 的 E_min
   分别差 1.7% / 5.4%，按 0.090 都过。**k=5 与 greedy 在第 26 个 token 分叉**（受限与完整词表同样）
   -> G-QUAL 不过，M1-3d 负责定位；k=4 路径逐 token 一致。
+- M3-1a 实测（`RESULTS.md` 第 20 节，U-6 门内）：专用 Q4_K x Q8_1 核，预热后首轮 4 线程 0.091、
+  8 线程 0.082-0.084 ms/专家（fork 通用核 0.115-0.118）；中位受持续满载热漂移影响（0.089-0.118）。
+  **code 的 0.059 未达到（partial）**；技术类 0.090 在 8 线程达到。E 的 CPU 前提按 ~0.09 满足。
 - design 6.5 的前提：(a) 受限词表 E（已测，见上）；(b) miss 自适应分配（M3-2a）；
   (c) 每 pass submit+sync < 1 ms（**已测 0.065-0.084**，M1-4b）；(d) q4 KV + 21.9% 缓存塞进 8 GiB
   （U-3 已定，q4 待 M2-6a 过 G-QUAL）；(e) code 的 CPU 核 0.059（M3-1a）。
@@ -216,7 +220,8 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 E 用公式（16K 实测 k=4 2.850 / k=5 3.055）、GPU 腿对 roofline（偏差 <= 10%）、
 两腿并发重算、显存预算收敛（q4 KV + 21.9%）、局部性 <= 5 pp、
 PP 可行性（int8 ALU 8.67 / 专家 GEMM 3.66，M2-4 到 6.0）、code 纳入 130（CPU 0.059）、
-**推测输出保真（k=5 当前与 greedy 分叉，M1-3d）**。
+**推测输出保真（k=5 当前与 greedy 分叉，M1-3d）**；CPU 腿实测 0.091（4T）/ 0.082（8T），
+技术类 0.090 已到，code 0.059 未到。
 任一项不过：`phase_status=blocked`，走 U-2（改 TG）或 U-3（改 ctx/KV），不许自行改阈值。
 
 **门后**：M2 prefill（M2-0..8，含 M2-6a q4 KV + 16K 窗口）、M3 decode（M3-0..6，含 M3-1a CPU 专家核、

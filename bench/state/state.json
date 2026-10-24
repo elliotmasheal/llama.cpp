@@ -16,7 +16,8 @@
       "VRAM budget closes with q4 KV + a 16384-token resident window (21.9% expert cache, RESULTS section 10)",
       "PP feasibility recorded: int8 ALU 8.67 TFLOPS, expert GEMM baseline 3.66 (RESULTS section 14); PP >= 1000 stays a hard floor (user 2026-10-24) and M2-4 must reach 6.0 TFLOPS",
       "code-included TG feasibility: CPU expert <=0.059 ms at 4 threads (target 0.055, ~107 GFLOPS) with H2D 10.8 gives code TG 130; current 0.118 gives 82 (RESULTS section 17)",
-      "speculative output fidelity: the accepted token stream must equal plain greedy. k=4 does; k=5 forks at token 25 (N14 / M1-3d), so k=5 cannot be the acceptance config yet (RESULTS section 19)"
+      "speculative output fidelity: the accepted token stream must equal plain greedy. k=4 does; k=5 forks at token 26 (N14 / M1-3d), so k=5 cannot be the acceptance config yet (RESULTS section 19)",
+      "CPU expert leg: the user moved M3-1a inside the gate (U-6). Technical text needs <=0.090 ms/expert, code needs <=0.059 (target 0.055); the measured E clears 2.72 / 2.88 at 0.090 (RESULTS section 19)"
     ],
     "on_fail": "stop and ask the user: lower the TG target, change the ctx cost, or page the KV (design section 9)"
   },
@@ -118,12 +119,13 @@
         "M1-4a",
         "M1-4a-run",
         "M1-3c",
+        "M3-1a",
         "M1-3d",
         "X-1",
         "X-2",
         "X-4"
       ],
-      "note": "M1-3d diagnoses the k=5 verification fork (blocks the M1 gate); X-1 waits for the machine (gpu+host-ram)"
+      "note": "M3-1a partial: 0.082 ms at 8 threads, 0.091 at 4 (first rep); code 0.059 not reached. M1-3d is next. X-1 waits for the machine (gpu+host-ram)"
     },
     {
       "lane": "data",
@@ -324,6 +326,7 @@
         "M1-2b",
         "M1-3b",
         "M1-3d",
+        "M3-1a",
         "M1-4b",
         "M1-5",
         "M1-6",
@@ -978,16 +981,20 @@
       "id": "M3-1a",
       "milestone": "M3",
       "lane": "impl",
-      "status": "todo",
+      "status": "partial",
+      "claimed_at": "2026-10-24T18:55:00",
       "title": "CPU 专家核：Q4_K + int8，目标 0.090 ms/专家",
       "deps": [
-        "M2-0"
+        "M1-3b"
       ],
       "resources": [
         "machine-quiet"
       ],
       "paths": [
-        "runtime/cpu_moe.*"
+        "runtime/cpu_moe.*",
+        "runtime/cpu_moe_bench.cpp",
+        "CMakeLists.txt",
+        "bench/raw/m3-1a/**"
       ],
       "done_when": "code 文本、21.9% 缓存下 <=0.059 ms/专家（目标 0.055，约 107 GFLOPS）；技术类 <=0.090；与参考逐 token 一致；6/8 线程不回退；达不到报差距（R1b 基线 0.115-0.118）"
     },
@@ -1036,6 +1043,17 @@
         "runtime/attn.*"
       ],
       "done_when": "q4_0 KV 与窗口可配；窗口外页落主机并可换入；k=1 KLD <= 1e-4、greedy 逐 token 一致（G-QUAL），不过则回退 f16；报 VRAM 峰值与换页次数"
+    },
+    {
+      "id": "U-6",
+      "milestone": "M1",
+      "lane": "user",
+      "status": "done",
+      "title": "U-6 已决：M3-1a 提前到 M1 门内",
+      "deps": [],
+      "resources": [],
+      "paths": [],
+      "done_when": "用户 2026-10-24 定：先把 CPU 专家核（M3-1a）做到 0.090/0.059 再评审 M1 门；M3-1a 的 deps 改为 M1-3b，M1-GATE 增加该前置"
     }
   ],
   "last_gate": {
