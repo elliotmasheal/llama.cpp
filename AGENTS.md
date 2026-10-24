@@ -42,7 +42,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 | 指标 | 目标 | 口径 | 判定里程碑 |
 |---|---|---|---|
 | PP | >= 1000 tok/s | 10K prompt，ctx 256K，chunk 2048；需 int8 >= 6.0 TFLOPS 且 chunk >= 1420 | M2 |
-| TG | >= 130 tok/s | 单流，greedy，10K prompt 之后 128 token；k=5，21.9% 缓存，q4 KV | M3 |
+| TG | >= 130 tok/s | 单流，greedy，10K prompt 之后 128 token；k=4（验收），21.9% 缓存，q4 KV | M3 |
 
 **目标由硬件推算（用户 2026-10-24 定）**
 
@@ -57,7 +57,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
   H2D 单跑 14.17（90%）、并发 10.8（-24%）、解码 miss 18-23%。
 - 显存预算（design 5.5）：桌面 1000 + 稠密 2079 + 专家缓存 4198（21.9%）+ q4 KV 16K 窗口 99
   + 计算缓冲 700-1100 + 草稿 100 = 7176 MiB；计算缓冲每多 100 MiB，缓存覆盖降约 0.5 pp。
-- 开关默认值以 design 第 7 节为准：`QRT_SPEC_K=5`、`QRT_DRAFT_VOCAB=16384`、
+- 开关默认值以 design 第 7 节为准：`QRT_SPEC_K=4`、`QRT_DRAFT_VOCAB=16384`、
   `QRT_EXPERT_CACHE_MIB=4198`、`QRT_CACHE_POLICY=slru`、`QRT_PREFILL_CHUNK=2048`、
   `QRT_MISS_SPLIT=auto`、`QRT_KV_PRECISION=q4_0`、`QRT_KV_PAGE_TOKENS=16384`；
   k=8 实现但默认关闭（design 3.1），`QRT_TELEMETRY=0` 关闭时零开销。
@@ -93,8 +93,9 @@ blockers: none
   硬地板 130 / 1000 在用户重设前不变。
 - 未决：无。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）、U-4（平衡电源为基准）、
   U-5（code 纳入 130）、U-6（M3-1a 提前到门内）、U-7（近分叉 0.05 口径）均已闭环。
-- 目标：TG 可行点 21.9% 缓存（4198 MiB，技术类命中约 79%；chat 81.6 / multi 87.3 / code 66.0）、k=5；
-  CPU 核 0.118 时 131（E_min 3.23），到 0.090 时 146（E_min 2.88）。
+- 目标：TG 可行点 21.9% 缓存（4198 MiB，技术类命中约 79%；chat 81.6 / multi 87.3 / code 66.0）、**k=4**；
+  实测 16K E=2.850；E_min k=4 为 2.90（CPU 0.118）/ 2.72（0.090），即 CPU 约 0.10 时到 130。
+  k=5 的 E=3.055 只作速度上限（保真不过，见 U-7）。
   **U-5：code 纳入 130**；code 66% 命中 -> 需 CPU **0.059**（目标 0.055），当前 0.118 只到 82。
   PP 现状：专家 GEMM 3.66 TFLOPS -> 约 610 tok/s；**PP >= 1000 保留为硬目标**，M2-4 必须做到 6.0（1.64x）。
 - M1-3b 实测（`RESULTS.md` 第 19 节）：16K 词表 k=4 E=2.850、k=5 E=3.055；按 0.118 的 E_min
@@ -231,7 +232,7 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 E 用公式（16K 实测 k=4 2.850 / k=5 3.055）、GPU 腿对 roofline（偏差 <= 10%）、
 两腿并发重算、显存预算收敛（q4 KV + 21.9%）、局部性 <= 5 pp、
 PP 可行性（int8 ALU 8.67 / 专家 GEMM 3.66，M2-4 到 6.0）、code 纳入 130（CPU 0.059）、
-**推测输出保真（k=5 为 0.0136 nats 近分叉，容差待 U-7）**；CPU 腿实测 0.091（4T）/ 0.082（8T），
+**推测输出保真（U-7：margin < 0.05 才允许分叉；k=4 抽样 PASS，k=5 fail）**；CPU 腿实测 0.091（4T）/ 0.082（8T），
 技术类 0.090 已到，code 0.059 未到。
 任一项不过：`phase_status=blocked`，走 U-2（改 TG）或 U-3（改 ctx/KV），不许自行改阈值。
 
