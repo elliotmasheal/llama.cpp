@@ -14,8 +14,8 @@
 ## 1. 统一口径
 
 优化目标：`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`（21.28 GiB，arch `qwen35moe`），
-**10K prompt，greedy，单流**，PP >= 1000、TG >= 130；ctx 256K 的驻留显存不成立
-（`RESULTS.md` 第 10 节），口径待 U-3 裁决。
+**10K prompt，greedy，单流**，PP >= 1000、TG >= 130；ctx 256K 由 q4_0 KV + 16K 常驻窗口支持
+（U-3，`RESULTS.md` 第 10 节），窗口外页面放主机，不计入 TG 目标。
 
 - 运行时尚未落地（M1）。fork 只作参考：路由/接受率用 `llama-cli`，硬件上限用 `bench/tools/` 的探针；
   **性能数字只能来自新 runtime**，fork 的 TG/PP 不作为结论。
@@ -62,6 +62,8 @@ H2D MiB/token | VRAM peak | RAM peak | status
 10. 外部推理进程在 GPU 上时整批数据作废；容量类失败先看 RAM 再怀疑显存。
 11. 编译、repack、第二个模型进程都会扰动计时：跑数前确认 `state_check.py` 的 `quiet` 行是 `free`，
     跑数期间别人不许构建，规则见 `AGENTS.md` 第 4 节。
+12. q4 KV 改动注意力数值路径：不过 G-QUAL（KLD <= 1e-4）就不许当默认；16K 窗口外的页面在主机，
+    长上下文 decode 不计入 TG。
 
 ## 4. 目录
 

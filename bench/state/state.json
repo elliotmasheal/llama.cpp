@@ -13,7 +13,7 @@
       "per-pass submit+sync < 1 ms, and the GPU leg within 10% of the roofline model at k=1/2/4/5/8",
       "locality within 5 pp of M0 on non-technical text",
       "two miss legs measured and the cycle recomputed with an adaptive split (RESULTS section 9)",
-      "VRAM budget closes at some (ctx, cache) point, or U-3 selects the fallback (RESULTS section 10)"
+      "VRAM budget closes with q4 KV + a 16384-token resident window (21.9% expert cache, RESULTS section 10)"
     ],
     "on_fail": "stop and ask the user: lower the TG target, change the ctx cost, or page the KV (design section 9)"
   },
@@ -133,13 +133,13 @@
     },
     {
       "lane": "user",
-      "head": "U-3",
+      "head": null,
       "order": [
         "U-3",
         "M1-GATE",
         "U-2"
       ],
-      "note": "U-3 (KV/ctx) blocks every M2 implementation task; U-1 is closed"
+      "note": "U-1/U-3 closed; M1-GATE waits for R1/M1-2b/M1-3b/M1-4b"
     }
   ],
   "tasks": [
@@ -343,7 +343,7 @@
       "id": "U-3",
       "milestone": "M1",
       "lane": "user",
-      "status": "todo",
+      "status": "done",
       "title": "256K KV 与 8 GiB 互斥：降口径 ctx / KV 分页 / KV 量化",
       "deps": [],
       "resources": [],
@@ -501,6 +501,7 @@
       "deps": [
         "M2-5",
         "M2-6",
+        "M2-6a",
         "X-1"
       ],
       "resources": [
@@ -619,6 +620,7 @@
       "deps": [
         "M3-3",
         "M3-4",
+        "M2-6a",
         "X-1"
       ],
       "resources": [
@@ -880,7 +882,7 @@
         "bench/tools/membw_probe.py",
         "bench/raw/roofline/**"
       ],
-      "done_when": "显存读 >= 190 GB/s、CPU 专家 <= 0.08 ms/专家（4 线程）、int8 GEMM >= 6 TFLOPS 有效、并发 H2D >= 12.5 GB/s；每项 r=2 并写进 RESULTS；达不到就报差距与原因，不改成目标"
+      "done_when": "显存读 >= 190 GB/s、CPU 专家 <= 0.070 ms/专家（4 线程）、int8 GEMM >= 7 TFLOPS 有效（硬地板 6，0.85 规则 7.06）、并发 H2D >= 12.5 GB/s；每项 r=2 并写进 RESULTS；达不到就报差距与原因，不改成目标"
     },
     {
       "id": "X-4",
@@ -899,6 +901,24 @@
         "runtime/tests/**"
       ],
       "done_when": "一条命令对 runtime/kernels 的每个 kernel 与 CPU 参考比对（误差阈值写进代码），并跑 k=1 逐 token；失败返回非 0"
+    },
+    {
+      "id": "M2-6a",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "KV q4_0 量化 + 16384 token 常驻窗口分页",
+      "deps": [
+        "M2-6"
+      ],
+      "resources": [
+        "gpu",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/attn.*"
+      ],
+      "done_when": "q4_0 KV 与窗口可配；窗口外页落主机并可换入；k=1 KLD <= 1e-4、greedy 逐 token 一致（G-QUAL），不过则回退 f16；报 VRAM 峰值与换页次数"
     }
   ],
   "last_gate": {
@@ -908,13 +928,5 @@
     "detail": "last full record is 2026-10-23 (ctest 32/32, MUL_MAT 2275/2275, MUL_MAT_ID 939/939, FLASH_ATTN_EXT 5332/5332). Commit 44bd79305 changed llama-kv-cells after that record, so the gate is stale. M1 does not touch fork code, so it does not block; rerun before any fork code change."
   },
   "blockers": [],
-  "escalations": [
-    {
-      "id": "U-3",
-      "question": "256K KV needs 5120-5632 MiB of the 7176 MiB usable VRAM, which is incompatible with any expert cache: reduce ctx, page KV to host, or quantize KV",
-      "needs_by": "M2-0",
-      "owner": "user",
-      "note": "M1-6 numbers in RESULTS section 10; 25% cache does not fit at any ctx, the feasible corner is ctx <= 16K with a 20% cache; the target workload (10K prompt) only needs 220 MiB resident"
-    }
-  ]
+  "escalations": []
 }

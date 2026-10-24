@@ -36,8 +36,8 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 256 专家 top-8）。硬件：RX 6700S 8 GiB（`-dev Vulkan1`）+ Ryzen 7 6800HS + 40172 MiB RAM，
 笔记本「平衡」电源 + AC 供电。
 
-统一工况：10K prompt，greedy，单流；ctx 256K 的**驻留显存**不成立（`RESULTS.md` 第 10 节），
-口径由 U-3 裁决，裁决前目标工况只要求 10K 使用长度。
+统一工况：10K prompt，greedy，单流；ctx 256K 由 q4_0 KV + 16384 token 常驻窗口支持
+（U-3，`RESULTS.md` 第 10 节），窗口外页面放主机，不计入 TG 目标。
 
 | 指标 | 目标 | 口径 | 判定里程碑 |
 |---|---|---|---|
@@ -62,7 +62,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M1
 phase_status: in_progress
 decision_gate: M1 open
-queues: bench=R1 impl=M1-4a data=M1-2a io=- user=U-3
+queues: bench=R1 impl=M1-4a data=M1-2a io=- user=-
 last_gate: G-REG unknown (2026-10-23 record, not re-run since 44bd79305)
 blockers: none
 <!-- STATE:END -->
@@ -78,7 +78,7 @@ blockers: none
 - M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`，E 门槛用公式而不是常数。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。
-- 未决：U-3（256K KV 与 8 GiB 互斥，三选一），M2 开工前必须有答案；U-1 已闭环。
+- 未决：无。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）均已闭环；M2 开工只等 M1-GATE。
 
 ## 3. 每轮自主循环
 
@@ -183,10 +183,10 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 | M1-4a | impl | Vulkan 原型（k=1/2/4/5/8） | 每 pass 的 submit/sync 与计算缓冲可测 |
 | M1-4b | bench | GPU 腿与每 pass 开销 | 与 roofline 偏差 <= 10%，submit+sync < 1 ms，报缓冲 MiB |
 | M1-5 | bench | 带宽同口径复测 | 偏差 <= 5% 或更新 RESULTS |
-| M1-6 | data | full-attention 层数与 256K KV 预算 | 10 主层 + 1 nextn，20-22 KiB/token，超预算 1335 MiB |
+| M1-6 | data | full-attention 层数与 256K KV 预算 | 10 主层 + 1 nextn；U-3 定 q4_0 + 16K 窗口 |
 | M1-7 | bench | H2D 与 CPU 读并发 + 每专家代价 | 聚合 33.5-41.0 GB/s，0.123-0.137 ms/专家 |
 | R0 | data | roofline 模型与目标推导 | TG_max / PP_max 曲线，0.85 x roofline 的目标值 |
-| R1 | bench | 腿级 roofline 探针 | 显存读 >= 190、CPU <= 0.08、int8 >= 6 TFLOPS、并发 H2D >= 12.5 |
+| R1 | bench | 腿级 roofline 探针 | 显存读 >= 190、CPU <= 0.070、int8 >= 7 TFLOPS、并发 H2D >= 12.5 |
 | M1-GATE | user | 决策门评审 | `decision_gate.criteria` 全过才进 M2 |
 
 **决策门 M1 的通过条件**（以 `state.json` 的 `decision_gate.criteria` 为准）：

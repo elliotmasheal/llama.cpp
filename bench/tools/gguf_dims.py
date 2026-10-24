@@ -16,8 +16,9 @@ MIB = 1024 * 1024
 GIB = 1024 * MIB
 # bench/RESULTS.md section 8: large-buffer VRAM read ceiling, replaces the 217 GB/s figure.
 GPU_BW_MEASURED = 156.5e9
-# QRT_KV_PRECISION default is f16; design 7 forbids lowering it without a quality gate.
-KV_BYTES_PER_ELEM = 2
+# QRT_KV_PRECISION default is q4_0 after U-3 (2026-10-24), gated by G-QUAL; f16 is the fallback.
+KV_BYTES_PER_ELEM_F16 = 2
+KV_BYTES_PER_ELEM_Q4 = 18.0 / 32.0   # q4_0: 16 data bytes + 2 scale bytes per 32 elements
 VRAM_TOTAL_MIB = 8176
 DESKTOP_MIB = 1000
 COMPUTE_MIB = (700, 1100)
@@ -82,15 +83,20 @@ def main(paths):
         interval = field(r, f"{arch}.full_attention_interval")
         main_full = sorted(L for L in full_layers if L < n_main)
         mtp_full = sorted(L for L in full_layers if L >= n_main)
-        kv_layer = n_kv * (k_len + v_len) * KV_BYTES_PER_ELEM
+        kv_layer = n_kv * (k_len + v_len) * KV_BYTES_PER_ELEM_F16
+        kv_layer_q4 = n_kv * (k_len + v_len) * KV_BYTES_PER_ELEM_Q4
 
         print(f"  full_attention_interval={interval} n_ctx={n_ctx}")
         print(f"  full-attn layers: main={main_full} ({len(main_full)}), "
               f"nextn={mtp_full} ({len(mtp_full)})")
         print(f"  kv bytes/token/layer = {kv_layer} B "
-              f"({n_kv} kv heads x ({k_len}+{v_len}) x {KV_BYTES_PER_ELEM} B)")
+              f"({n_kv} kv heads x ({k_len}+{v_len}) x {KV_BYTES_PER_ELEM_F16} B)")
         print(f"  kv bytes/token main = {kv_layer * len(main_full)} B, "
               f"with nextn = {kv_layer * len(full_layers)} B")
+        print(f"  kv q4_0 bytes/token main = {kv_layer_q4 * len(main_full):.0f} B, "
+              f"with nextn = {kv_layer_q4 * len(full_layers):.0f} B")
+        print(f"  kv q4_0 at 256K = {kv_layer_q4 * len(full_layers) * n_ctx / MIB:.0f} MiB, "
+              f"16K window = {kv_layer_q4 * len(full_layers) * 16384 / MIB:.0f} MiB")
 
         usable = VRAM_TOTAL_MIB - DESKTOP_MIB
         print(f"  vram budget: total={VRAM_TOTAL_MIB} MiB usable={usable} MiB "
