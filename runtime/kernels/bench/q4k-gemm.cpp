@@ -162,20 +162,26 @@ static void gen_weights(std::vector<q4k_block> & blocks, uint32_t n, uint32_t nk
     }
 }
 
-// Valid Q8_1: int8 quants, d = delta, s = d * sum(qs) as ggml stores it.
-static void gen_acts(std::vector<q8_1_block> & blocks, uint32_t m, uint32_t nk32, Rng & rng) {
-    blocks.assign((size_t) m * nk32, q8_1_block{});
-    for (size_t i = 0; i < blocks.size(); ++i) {
-        q8_1_block & b = blocks[i];
+// Valid Q8_1 split into two planes: qs (32 int8 per block) and ds (f16 delta + int16
+// sum(qs) per block). The planes make the 32 qs bytes 16-byte aligned, so the shader reads
+// two uvec4 per block instead of eight scalar words.
+static void gen_acts(std::vector<uint8_t> & qs_plane, std::vector<uint32_t> & ds_plane,
+        uint32_t m, uint32_t nk32, Rng & rng) {
+    const size_t n_blocks = (size_t) m * nk32;
+    qs_plane.assign(n_blocks * 32, 0);
+    ds_plane.assign(n_blocks, 0);
+    for (size_t i = 0; i < n_blocks; ++i) {
+        uint8_t * qs = qs_plane.data() + i * 32;
         int32_t sum = 0;
         for (uint32_t j = 0; j < 32; ++j) {
             const int32_t q = (int32_t) (rng.next() % 255u) - 127;
-            b.qs[j] = (int8_t) q;
+            qs[j] = (uint8_t) (int8_t) q;
             sum += q;
         }
         const float d = rng.uniform(5.0e-3f, 2.0e-2f);
-        b.d = f32_to_f16(d);
-        b.s = f32_to_f16(f16_to_f32(b.d) * (float) sum);
+        const uint32_t dh = f32_to_f16(d);
+        const uint32_t sh = (uint32_t) (uint16_t) (sum + 32768);
+        ds_plane[i] = dh | (sh << 16);
     }
 }
 
@@ -397,15 +403,15 @@ static void init_ctx(Ctx & c, int dev_index, bool force_fallback, bool list_only
     sci.pNext = &stci;
     VK_TRY(vkCreateSemaphore(c.dev, &sci, nullptr, &c.timeline));
 
-    VkDescriptorSetLayoutBinding b[3]{};
-    for (uint32_t i = 0; i < 3; ++i) {
+    VkDescriptorSetLayoutBinding b[4]{};
+    for (uint32_t i = 0; i < 4; ++i) {
         b[i].binding         = i;
         b[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         b[i].descriptorCount = 1;
         b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslci.bindingCount = 3;
+    dslci.bindingCount = 4;
     dslci.pBindings    = b;
     VK_TRY(vkCreateDescriptorSetLayout(c.dev, &dslci, nullptr, &c.dsl));
 
@@ -420,7 +426,7 @@ static void init_ctx(Ctx & c, int dev_index, bool force_fallback, bool list_only
     plci.pPushConstantRanges    = &pcr;
     VK_TRY(vkCreatePipelineLayout(c.dev, &plci, nullptr, &c.pl));
 
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets       = 1;
     dpci.poolSizeCount = 1;
@@ -592,10 +598,9 @@ struct RefPair {
     double abs_sum; // sum of |term| over the reduction, the error scale
 };
 
-static RefPair ref_element(const q4k_block * w, const q8_1_block * a, uint32_t row, uint32_t tok,
-        uint32_t nk, uint32_t nk32) {
-    const q4k_block *  wr = w + (size_t) row * nk;
-    const q8_1_block * ar = a + (size_t) tok * nk32;
+static RefPair ref_element(const q4k_block * w, const uint8_t * a_qs, const uint32_t * a_ds,
+        uint32_t row, uint32_t tok, uint32_t nk, uint32_t nk32) {
+    const q4k_block * wr = w + (size_t) row * nk;
     double pos = 0.0;
     double abs_sum = 0.0;
     double min_direct = 0.0;
@@ -609,19 +614,21 @@ static RefPair ref_element(const q4k_block * w, const q8_1_block * a, uint32_t r
                 const uint32_t j  = 2 * g + half;
                 const double   sc = (double) scale_of(b, j);
                 const double   mn = (double) min_of(b, j);
-                const q8_1_block & ab = ar[sb * BLOCKS_PER_SB + j];
-                const double aq = f16_to_f32(ab.d);
-                double s_block = 0.0;
+                const size_t   bi = (size_t) tok * nk32 + sb * BLOCKS_PER_SB + j;
+                const uint8_t * aq8 = a_qs + bi * 32;
+                const uint32_t dsw  = a_ds[bi];
+                const double aq = f16_to_f32((uint16_t) (dsw & 0xFFFFu));
+                const double sum_qs = (double) ((int) (dsw >> 16) - 32768);
                 for (uint32_t e = 0; e < 32; ++e) {
                     const uint8_t byte = b.qs[32 * g + e];
                     const int q = half == 0 ? (byte & 0xF) : (byte >> 4);
-                    const double term = (d * sc * aq) * ((double) q * (double) ab.qs[e]);
+                    const int a = (int8_t) aq8[e];
+                    const double term = (d * sc * aq) * ((double) q * (double) a);
                     pos += term;
                     abs_sum += std::fabs(term);
-                    s_block += (double) ab.qs[e];
                 }
-                min_direct += (dmin * mn) * (aq * s_block);
-                min_folded += (dmin * mn) * (double) f16_to_f32(ab.s);
+                min_direct += (dmin * mn) * (aq * sum_qs);
+                min_folded += (dmin * mn) * (aq * sum_qs);
             }
         }
     }
@@ -786,13 +793,15 @@ int main(int argc, char ** argv) {
     const uint32_t n_gx  = args.n / Q4K_TILE_N;
     const uint32_t n_gy  = args.m / Q4K_TILE_M;
 
-    std::vector<q4k_block>  w_blocks;
-    std::vector<q8_1_block> a_blocks;
+    std::vector<q4k_block> w_blocks;
+    std::vector<uint8_t>   a_qs;
+    std::vector<uint32_t>  a_ds;
     Rng rng(args.seed);
     gen_weights(w_blocks, args.n, nk, rng);
-    gen_acts(a_blocks, args.m, nk32, rng);
-    const VkDeviceSize w_size = (VkDeviceSize) (w_blocks.size() * sizeof(q4k_block));
-    const VkDeviceSize a_size = (VkDeviceSize) (a_blocks.size() * sizeof(q8_1_block));
+    gen_acts(a_qs, a_ds, args.m, nk32, rng);
+    const VkDeviceSize w_size   = (VkDeviceSize) (w_blocks.size() * sizeof(q4k_block));
+    const VkDeviceSize aq_size  = (VkDeviceSize) a_qs.size();
+    const VkDeviceSize ads_size = (VkDeviceSize) (a_ds.size() * sizeof(uint32_t));
 
     // Pick the pipeline: int8 dot when the device and shader agree, else the portable one.
     bool use_dot = c.dot_enabled;
@@ -821,11 +830,14 @@ int main(int argc, char ** argv) {
             : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     Buf w_buf = make_buf(c, w_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
             VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    Buf a_buf = make_buf(c, a_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+    Buf aq_buf = make_buf(c, aq_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Buf ads_buf = make_buf(c, ads_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
             VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     Buf o_buf = make_buf(c, o_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, out_flags);
     upload(c, w_buf.buf, w_blocks.data(), w_size);
-    upload(c, a_buf.buf, a_blocks.data(), a_size);
+    upload(c, aq_buf.buf, a_qs.data(), aq_size);
+    upload(c, ads_buf.buf, a_ds.data(), ads_size);
 
     VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsa.descriptorPool     = c.dpool;
@@ -833,11 +845,12 @@ int main(int argc, char ** argv) {
     dsa.pSetLayouts        = &c.dsl;
     VkDescriptorSet set = VK_NULL_HANDLE;
     VK_TRY(vkAllocateDescriptorSets(c.dev, &dsa, &set));
-    const VkDescriptorBufferInfo bi[3] = {{w_buf.buf, 0, VK_WHOLE_SIZE},
-                                          {a_buf.buf, 0, VK_WHOLE_SIZE},
-                                          {o_buf.buf, 0, VK_WHOLE_SIZE}};
-    VkWriteDescriptorSet wds[3]{};
-    for (uint32_t i = 0; i < 3; ++i) {
+    const VkDescriptorBufferInfo bi[4] = {{w_buf.buf, 0, VK_WHOLE_SIZE},
+                                          {aq_buf.buf, 0, VK_WHOLE_SIZE},
+                                          {o_buf.buf, 0, VK_WHOLE_SIZE},
+                                          {ads_buf.buf, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet wds[4]{};
+    for (uint32_t i = 0; i < 4; ++i) {
         wds[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wds[i].dstSet          = set;
         wds[i].dstBinding      = i;
@@ -845,14 +858,15 @@ int main(int argc, char ** argv) {
         wds[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         wds[i].pBufferInfo     = &bi[i];
     }
-    vkUpdateDescriptorSets(c.dev, 3, wds, 0, nullptr);
+    vkUpdateDescriptorSets(c.dev, 4, wds, 0, nullptr);
 
     Pc pc{args.n, args.k, args.m};
 
     std::printf("# shape m=%u n=%u k=%u tile=%dx%d wg=%d nk=%u\n", args.m, args.n, args.k,
             Q4K_TILE_N, Q4K_TILE_M, Q4K_WG_INVOCATIONS, nk);
-    std::printf("# bytes weights=%llu activations=%llu out=%llu grid=%ux%u\n",
-            (unsigned long long) w_size, (unsigned long long) a_size,
+    std::printf("# bytes weights=%llu qs=%llu ds=%llu out=%llu grid=%ux%u\n",
+            (unsigned long long) w_size, (unsigned long long) aq_size,
+            (unsigned long long) ads_size,
             (unsigned long long) o_size, n_gx, n_gy);
 
     if (args.check) {
@@ -877,7 +891,8 @@ int main(int argc, char ** argv) {
         VK_TRY(vkMapMemory(c.dev, o_buf.mem, 0, VK_WHOLE_SIZE, 0, &p));
         const float * out = (const float *) p;
         const q4k_block *  w = w_blocks.data();
-        const q8_1_block * a = a_blocks.data();
+        const uint8_t *    aq = a_qs.data();
+        const uint32_t *   ads = a_ds.data();
 
         std::vector<uint32_t> rows;
         std::vector<uint32_t> toks;
@@ -906,7 +921,7 @@ int main(int argc, char ** argv) {
         for (uint32_t row : rows) {
             for (uint32_t tok : toks) {
                 const float got = out[(size_t) row * args.m + tok];
-                const RefPair ref = ref_element(w, a, row, tok, nk, nk32);
+                const RefPair ref = ref_element(w, aq, ads, row, tok, nk, nk32);
                 const double diff = std::fabs((double) got - ref.direct);
                 const double denom = std::max(ref.abs_sum, 1.0);
                 if (diff > max_abs) {
@@ -930,8 +945,8 @@ int main(int argc, char ** argv) {
         std::printf("check,pipeline,samples,max_abs,max_rel_l1,tol,result\n");
         std::printf("check,%s,%u,%.3e,%.3e,%.1e,%s\n", use_dot ? "dot" : "fallback", samples,
                 max_abs, max_rel, TOL_REL, max_rel <= TOL_REL ? "pass" : "fail");
-        Buf bufs[3] = {w_buf, a_buf, o_buf};
-        shutdown(c, bufs, 3, cb);
+        Buf bufs[4] = {w_buf, aq_buf, ads_buf, o_buf};
+        shutdown(c, bufs, 4, cb);
         return max_rel <= TOL_REL ? 0 : 1;
     }
 
@@ -980,7 +995,7 @@ int main(int argc, char ** argv) {
             args.runs, ms, tflops, w_gbs);
     std::fflush(stdout);
 
-    Buf bufs[3] = {w_buf, a_buf, o_buf};
-    shutdown(c, bufs, 3, cb);
+    Buf bufs[4] = {w_buf, aq_buf, ads_buf, o_buf};
+    shutdown(c, bufs, 4, cb);
     return 0;
 }

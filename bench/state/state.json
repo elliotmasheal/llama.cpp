@@ -492,7 +492,7 @@
       "id": "M2-4",
       "milestone": "M2",
       "lane": "impl",
-      "status": "partial",
+      "status": "done",
       "claimed_at": "2026-10-24T22:30:00",
       "title": "Q4_K x Q8_1 int8 点积 GEMM 内核与微基准",
       "deps": [
@@ -505,7 +505,7 @@
       "paths": [
         "runtime/kernels/**"
       ],
-      "note": "partial: 3.66 -> 4.49 TFLOPS (+23%), the 6.0 gate needs the activation plane split, weight LDS staging and the integer fold (DECISIONS 20); resources raised to gpu+machine-quiet because the microbenchmark runs on the dGPU",
+      "note": "done: 3.66 -> 6.08-6.20 TFLOPS (1.68x) with the activation qs/ds plane split; the 6.0 gate is met at chunk 2048 (RESULTS 28). resources are gpu+machine-quiet because the microbenchmark runs on the dGPU",
       "done_when": "微基准给出 TFLOPS 与对照 FP32 的倍数，且满足 R0 的 PP 曲线要求（选定 chunk 下 >= 6.0 TFLOPS 有效；R1c 基线 3.66，差 1.64x）；不达标先回 design 重估"
     },
     {

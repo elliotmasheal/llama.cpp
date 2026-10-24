@@ -26,8 +26,13 @@ Weights: row-major `N x K`, `K/256` superblocks of 144 B per row (d, dmin, 12 sc
 128 `qs` bytes). Blocks are addressed as 36 32-bit words: word 0 = (d, dmin) as half2,
 words 1-3 = the 12 scale bytes, words 4-35 = `qs`.
 
-Activations: row-major `M x K`, `K/32` blocks of 36 B per token (d, s, 32 int8). Word 0 =
-(d, s) as half2, words 1-8 = `qs`.
+Activations are split into two planes, which is what makes the qs bytes 16-byte aligned
+(the runtime produces its own activation layout, so this is a free choice):
+
+- `qs` plane: `M x K/32` blocks of 32 int8, read as two `uvec4` per block.
+- `ds` plane: one 32-bit word per block: low half = f16 delta `aq`, high half = `sum(qs)`
+  as a uint16 biased by 32768 (so `sum = int(high) - 32768`). Carrying the integer sum
+  instead of ggml's f16 `s` keeps the min term exact.
 
 For a 32-element subblock `j` with 6-bit `sc`/`m` and a Q8_1 block with delta `aq` and
 `s = aq * sum(qs)`, the contribution to the output element is
@@ -69,16 +74,21 @@ shape, `--check` passing for every arm, raw output `bench/raw/m2/q4k-sweep.out`:
 | rows x tokens / threads | TFLOPS | note |
 |---|---:|---|
 | R1c kernel before this sweep | 3.61-3.64 | baseline (RESULTS 14: 3.66) |
-| 2 x 8 / 128 | **4.45-4.49** | new default, +23% |
-| 2 x 8 / 256 | 4.40-4.42 | no gain |
-| 4 x 4 / 128 | 3.94-3.97 | more rows, fewer loads, slower |
-| 4 x 8 / 128 | 3.90-3.96 | dots double, loads +11%, still slower |
+| 2 x 8 / 128, word loads | 4.45-4.49 | tile restructure only (+23%) |
+| **2 x 8 / 128, plane loads** | **6.08-6.20** | **meets the 6.0 gate (+68% over R1c)** |
+| 2 x 4 / 128, plane loads | 4.96-5.06 | too few tokens per weight load |
+| 2 x 16 / 128, plane loads | 3.86-3.97 | register pressure |
+| 4 x 4 / 128, plane loads | 4.74 | more rows, more masks |
+| 4 x 8 / 128, plane loads | 4.14 | dots double, registers run out |
 
-Static instruction counts per superblock (`spirv-dis`): 2x8 has 1024 `OpSDot` / 655 `OpLoad`
-/ 671 `OpAccessChain`; 4x8 has 2048 / 727 / 759. The 4-row arms are limited by registers
-(4 x 16 weight masks + 32 accumulators) and code size, not by load count. The remaining gap
-to 6.0 is the 16 activation loads and the scale fold per token and group; the order of the
-next steps is in `bench/DECISIONS.md` section 20.
+The plane split was the decisive change: 16 scalar activation loads per token and group
+became 4 `uvec4` loads, and the integer `sum(qs)` removed the f16 `s` from the fold. The
+check tolerance also tightened by two orders of magnitude (`max_rel_l1` 6.65e-6 -> 2.48e-8)
+because the min term no longer goes through an f16 sum.
+
+Static instruction counts per superblock (`spirv-dis`): 2x8 with word loads has 1024
+`OpSDot` / 655 `OpLoad` / 671 `OpAccessChain`; 4x8 has 2048 / 727 / 759. The 4-row arms are
+limited by registers (4 x 16 weight masks + 32 accumulators) and code size, not by loads.
 
 Build a swept arm with the same -D on both the shader and the host, for example:
 
