@@ -1,0 +1,1153 @@
+# pantry/units.py
+"""Unit handling for the pantry recipe manager.
+
+Quantities are kept as Fraction instances so that scaling a recipe by 3/4
+or halving a batch never accumulates floating point drift. Only display
+code is allowed to turn them into floats.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from fractions import Fraction
+from typing import Iterable
+
+# Mass units are normalized to grams, volume units to milliliters.
+# Everything else is a countable unit and converts only to itself.
+MASS_TO_GRAMS: dict[str, Fraction] = {
+    "mg": Fraction(1, 1000),
+    "g": Fraction(1),
+    "kg": Fraction(1000),
+    "oz": Fraction(28349, 1000),
+    "lb": Fraction(453592, 1000),
+}
+
+VOLUME_TO_ML: dict[str, Fraction] = {
+    "ml": Fraction(1),
+    "cl": Fraction(10),
+    "dl": Fraction(100),
+    "l": Fraction(1000),
+    "tsp": Fraction(4929, 1000),
+    "tbsp": Fraction(14787, 1000),
+    "cup": Fraction(236588, 1000),
+    "floz": Fraction(29574, 1000),
+    "pint": Fraction(473176, 1000),
+    "quart": Fraction(946353, 1000),
+}
+
+# Singular and plural spellings both map to the canonical symbol.
+ALIASES: dict[str, str] = {
+    "gram": "g",
+    "grams": "g",
+    "kilogram": "kg",
+    "kilograms": "kg",
+    "kilo": "kg",
+    "ounce": "oz",
+    "ounces": "oz",
+    "pound": "lb",
+    "pounds": "lb",
+    "milliliter": "ml",
+    "milliliters": "ml",
+    "millilitre": "ml",
+    "liter": "l",
+    "liters": "l",
+    "litre": "l",
+    "teaspoon": "tsp",
+    "teaspoons": "tsp",
+    "tablespoon": "tbsp",
+    "tablespoons": "tbsp",
+    "cups": "cup",
+    "fluid ounce": "floz",
+    "fluid ounces": "floz",
+    "pints": "pint",
+    "quarts": "quart",
+    "pinch": "pinch",
+    "pinches": "pinch",
+    "clove": "clove",
+    "cloves": "clove",
+    "can": "can",
+    "cans": "can",
+    "slice": "slice",
+    "slices": "slice",
+    "bunch": "bunch",
+    "bunches": "bunch",
+    "sprig": "sprig",
+    "sprigs": "sprig",
+    "": "unit",
+}
+
+
+class UnitError(ValueError):
+    """Raised when two quantities cannot be combined or converted."""
+
+
+@dataclass(frozen=True, slots=True)
+class Quantity:
+    """An amount with an optional unit.
+
+    A missing unit means "count", which is how eggs, onions and cans are
+    stored. A unit of "unit" is treated the same way.
+    """
+
+    amount: Fraction
+    unit: str = "unit"
+
+    def __post_init__(self) -> None:
+        if self.amount < 0:
+            raise UnitError(f"negative amount: {self.amount}")
+        unit = self.unit.strip().lower()
+        unit = ALIASES.get(unit, unit)
+        object.__setattr__(self, "unit", unit or "unit")
+
+    def dimension(self) -> str:
+        if self.unit in MASS_TO_GRAMS:
+            return "mass"
+        if self.unit in VOLUME_TO_ML:
+            return "volume"
+        return "count"
+
+    def scale(self, factor: Fraction) -> "Quantity":
+        if factor <= 0:
+            raise UnitError(f"scale factor must be positive, got {factor}")
+        return Quantity(self.amount * factor, self.unit)
+
+    def to(self, unit: str) -> "Quantity":
+        target = ALIASES.get(unit.strip().lower(), unit.strip().lower())
+        if target == self.unit:
+            return self
+        if self.dimension() == "mass" and target in MASS_TO_GRAMS:
+            grams = self.amount * MASS_TO_GRAMS[self.unit]
+            return Quantity(grams / MASS_TO_GRAMS[target], target)
+        if self.dimension() == "volume" and target in VOLUME_TO_ML:
+            ml = self.amount * VOLUME_TO_ML[self.unit]
+            return Quantity(ml / VOLUME_TO_ML[target], target)
+        raise UnitError(f"cannot convert {self.unit} to {target}")
+
+    def __add__(self, other: "Quantity") -> "Quantity":
+        if not isinstance(other, Quantity):
+            return NotImplemented
+        if self.unit == other.unit:
+            return Quantity(self.amount + other.amount, self.unit)
+        if self.dimension() != other.dimension():
+            raise UnitError(f"cannot add {self.unit} and {other.unit}")
+        # Convert the smaller amount into the larger unit so the result
+        # stays in whatever unit the cook wrote first.
+        if self.amount >= other.amount:
+            return Quantity(self.amount + other.to(self.unit).amount, self.unit)
+        return Quantity(other.amount + self.to(other.unit).amount, other.unit)
+
+    def __str__(self) -> str:
+        return f"{format_amount(self.amount)} {self.unit}".strip()
+
+
+def format_amount(value: Fraction) -> str:
+    """Render a Fraction the way a cook would write it.
+
+    Whole numbers stay whole, common fractions use a slash, and anything
+    with a denominator above 16 falls back to one decimal place.
+    """
+    if value.denominator == 1:
+        return str(value.numerator)
+    if value.denominator <= 16:
+        whole, rest = divmod(value.numerator, value.denominator)
+        if whole:
+            return f"{whole} {rest}/{value.denominator}"
+        return f"{rest}/{value.denominator}"
+    return f"{float(value):.1f}"
+
+
+def parse_amount(text: str) -> Fraction:
+    """Parse '1', '1/2', '1 1/2' and '0.75' into a Fraction."""
+    text = text.strip()
+    if not text:
+        raise UnitError("empty amount")
+    if "/" in text:
+        parts = text.split()
+        if len(parts) == 2:
+            whole = Fraction(parts[0])
+            num, den = parts[1].split("/")
+            return whole + Fraction(int(num), int(den))
+        num, den = text.split("/")
+        return Fraction(int(num), int(den))
+    return Fraction(text)
+
+
+def merge(quantities: Iterable[Quantity]) -> list[Quantity]:
+    """Sum quantities that share a dimension and unit.
+
+    The output order is stable: the unit of the first item in a group is
+    kept and later items are converted into it.
+    """
+    groups: dict[tuple[str, str], Quantity] = {}
+    order: list[tuple[str, str]] = []
+    for item in quantities:
+        key = (item.dimension(), item.unit)
+        if key not in groups:
+            groups[key] = item
+            order.append(key)
+        else:
+            groups[key] = groups[key] + item
+    return [groups[key] for key in order]
+
+# pantry/ingredients.py
+"""Parse ingredient lines such as '2 1/2 cups flour, sifted'.
+
+Recipe files are hand written, so the parser is forgiving: it accepts a
+missing amount, a missing unit, parenthetical notes and a trailing
+preparation phrase after a comma. Anything it cannot parse is returned as
+an Ingredient with amount=None so the cook can fix it in the editor
+instead of losing the line.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from fractions import Fraction
+
+from .units import Quantity, UnitError, parse_amount
+
+_LEADING_AMOUNT = re.compile(
+    r"^\s*(?P<amount>\d+\s+\d+/\d+|\d+/\d+|\d+(?:[.,]\d+)?)\s*(?P<rest>.*)$"
+)
+_PAREN = re.compile(r"\(([^)]*)\)")
+_LEADING_ARTICLE = re.compile(r"^(a|an|the)\s+", re.IGNORECASE)
+_RANGE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(?:-|to)\s*(\d+(?:\.\d+)?)\s*")
+
+# Words that are never a unit even when they follow a number, so that
+# "3 large eggs" does not become 3 of the unit "large".
+NOT_UNITS = {
+    "large",
+    "medium",
+    "small",
+    "ripe",
+    "fresh",
+    "frozen",
+    "chopped",
+    "diced",
+    "minced",
+    "whole",
+    "boneless",
+}
+
+
+@dataclass(slots=True)
+class Ingredient:
+    name: str
+    quantity: Quantity | None
+    note: str = ""
+    raw: str = ""
+    aliases: list[str] = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        """Stable key used to merge identical ingredients across recipes."""
+        base = self.name.strip().lower()
+        return " ".join(base.split())
+
+
+def _split_note(text: str) -> tuple[str, str]:
+    notes = _PAREN.findall(text)
+    cleaned = _PAREN.sub(" ", text)
+    return " ".join(cleaned.split()), "; ".join(n.strip() for n in notes if n.strip())
+
+
+def _strip_preparation(text: str) -> tuple[str, str]:
+    if "," not in text:
+        return text, ""
+    head, tail = text.split(",", 1)
+    return head.strip(), tail.strip()
+
+
+def _parse_range(text: str) -> tuple[Fraction, str] | None:
+    match = _RANGE.match(text)
+    if not match:
+        return None
+    low, high = match.group(1), match.group(2)
+    # Take the midpoint; a range is not a precise measurement anyway.
+    value = (Fraction(low) + Fraction(high)) / 2
+    return value, text[match.end():]
+
+
+def parse_line(line: str) -> Ingredient:
+    raw = line.strip()
+    if not raw:
+        raise ValueError("empty ingredient line")
+
+    body, note = _split_note(raw)
+    head, prep = _strip_preparation(body)
+    if prep:
+        note = f"{note}; {prep}" if note else prep
+
+    body = _LEADING_ARTICLE.sub("", head.strip())
+    quantity: Quantity | None = None
+
+    ranged = _parse_range(body)
+    if ranged is not None:
+        amount, remainder = ranged
+        words = remainder.split()
+        unit = words[0].lower().rstrip(".") if words else ""
+        if unit in NOT_UNITS or not unit:
+            quantity = Quantity(amount, "unit")
+            name = remainder
+        else:
+            quantity = Quantity(amount, unit)
+            name = " ".join(words[1:])
+        return Ingredient(name=name.strip(), quantity=quantity, note=note, raw=raw)
+
+    match = _LEADING_AMOUNT.match(body)
+    if match:
+        try:
+            amount = parse_amount(match.group("amount").replace(",", "."))
+        except (UnitError, ZeroDivisionError, ValueError):
+            amount = None
+        if amount is not None:
+            remainder = match.group("rest").strip()
+            words = remainder.split()
+            unit = words[0].lower().rstrip(".") if words else ""
+            if unit in NOT_UNITS or not unit:
+                quantity = Quantity(amount, "unit")
+                name = remainder
+            else:
+                quantity = Quantity(amount, unit)
+                name = " ".join(words[1:])
+            return Ingredient(name=name.strip(), quantity=quantity, note=note, raw=raw)
+
+    # No amount at all: "salt to taste", "olive oil for the pan".
+    return Ingredient(name=body.strip(), quantity=None, note=note, raw=raw)
+
+
+def scale_ingredient(item: Ingredient, factor: Fraction) -> Ingredient:
+    if item.quantity is None:
+        return Ingredient(
+            name=item.name,
+            quantity=None,
+            note=item.note,
+            raw=item.raw,
+            aliases=list(item.aliases),
+        )
+    return Ingredient(
+        name=item.name,
+        quantity=item.quantity.scale(factor),
+        note=item.note,
+        raw=item.raw,
+        aliases=list(item.aliases),
+    )
+
+
+def parse_ingredients(lines: list[str]) -> list[Ingredient]:
+    parsed: list[Ingredient] = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            parsed.append(parse_line(line))
+        except ValueError:
+            continue
+    return parsed
+
+# pantry/storage.py
+"""SQLite persistence for recipes, pantry stock and shopping lists.
+
+The database is a single file in the user's data directory. Migrations are
+plain strings applied in order, so an upgrade is just a schema_version
+bump. Every write goes through a transaction helper to keep a crash in the
+middle of a recipe import from leaving half a row behind.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator, Sequence
+
+SCHEMA_VERSION = 3
+
+MIGRATIONS: list[str] = [
+    """
+    CREATE TABLE IF NOT EXISTS recipe (
+        id          INTEGER PRIMARY KEY,
+        slug        TEXT NOT NULL UNIQUE,
+        title       TEXT NOT NULL,
+        servings    INTEGER NOT NULL DEFAULT 2,
+        minutes     INTEGER,
+        source      TEXT,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS ingredient (
+        id          INTEGER PRIMARY KEY,
+        recipe_id   INTEGER NOT NULL REFERENCES recipe(id) ON DELETE CASCADE,
+        position    INTEGER NOT NULL,
+        name        TEXT NOT NULL,
+        item_key    TEXT NOT NULL,
+        amount      TEXT,
+        unit        TEXT,
+        note        TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS ingredient_recipe ON ingredient(recipe_id, position);
+    CREATE INDEX IF NOT EXISTS ingredient_key ON ingredient(item_key);
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS step (
+        id          INTEGER PRIMARY KEY,
+        recipe_id   INTEGER NOT NULL REFERENCES recipe(id) ON DELETE CASCADE,
+        position    INTEGER NOT NULL,
+        text        TEXT NOT NULL
+    );
+    ALTER TABLE recipe ADD COLUMN notes TEXT NOT NULL DEFAULT '';
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS pantry_item (
+        item_key    TEXT PRIMARY KEY,
+        display     TEXT NOT NULL,
+        amount      TEXT,
+        unit        TEXT,
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS shopping_list (
+        id          INTEGER PRIMARY KEY,
+        name        TEXT NOT NULL,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        closed_at   TEXT
+    );
+    CREATE TABLE IF NOT EXISTS shopping_item (
+        id          INTEGER PRIMARY KEY,
+        list_id     INTEGER NOT NULL REFERENCES shopping_list(id) ON DELETE CASCADE,
+        item_key    TEXT NOT NULL,
+        display     TEXT NOT NULL,
+        amount      TEXT,
+        unit        TEXT,
+        checked     INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS shopping_item_unique
+        ON shopping_item(list_id, item_key, unit);
+    """,
+]
+
+
+@dataclass(slots=True)
+class RecipeRow:
+    id: int
+    slug: str
+    title: str
+    servings: int
+    minutes: int | None
+    source: str | None
+    notes: str
+
+
+class Database:
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self.path))
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        self.migrate()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self) -> "Database":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        try:
+            yield self._conn
+        except Exception:
+            self._conn.rollback()
+            raise
+        else:
+            self._conn.commit()
+
+    def migrate(self) -> None:
+        current = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if current > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema {current} is newer than this build ({SCHEMA_VERSION})"
+            )
+        for index, script in enumerate(MIGRATIONS[current:], start=current + 1):
+            with self.transaction() as conn:
+                conn.executescript(script)
+                conn.execute(f"PRAGMA user_version = {index}")
+
+    def add_recipe(
+        self,
+        slug: str,
+        title: str,
+        servings: int,
+        minutes: int | None = None,
+        source: str | None = None,
+    ) -> int:
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO recipe(slug, title, servings, minutes, source) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (slug, title, servings, minutes, source),
+            )
+            return int(cursor.lastrowid)
+
+    def get_recipe(self, slug: str) -> RecipeRow | None:
+        row = self._conn.execute(
+            "SELECT id, slug, title, servings, minutes, source, notes "
+            "FROM recipe WHERE slug = ?",
+            (slug,),
+        ).fetchone()
+        if row is None:
+            return None
+        return RecipeRow(
+            id=row["id"],
+            slug=row["slug"],
+            title=row["title"],
+            servings=row["servings"],
+            minutes=row["minutes"],
+            source=row["source"],
+            notes=row["notes"],
+        )
+
+    def list_recipes(self, limit: int = 50, offset: int = 0) -> list[RecipeRow]:
+        rows = self._conn.execute(
+            "SELECT id, slug, title, servings, minutes, source, notes "
+            "FROM recipe ORDER BY title COLLATE NOCASE LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        return [
+            RecipeRow(
+                id=row["id"],
+                slug=row["slug"],
+                title=row["title"],
+                servings=row["servings"],
+                minutes=row["minutes"],
+                source=row["source"],
+                notes=row["notes"],
+            )
+            for row in rows
+        ]
+
+    def add_ingredients(self, recipe_id: int, rows: Sequence[tuple[str, str, str, str, str]]) -> None:
+        with self.transaction() as conn:
+            conn.executemany(
+                "INSERT INTO ingredient(recipe_id, position, name, item_key, amount, unit, note) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (recipe_id, position, name, key, amount, unit, note)
+                    for position, (name, key, amount, unit, note) in enumerate(rows)
+                ],
+            )
+
+    def ingredients_for(self, recipe_id: int) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT name, item_key, amount, unit, note FROM ingredient "
+            "WHERE recipe_id = ? ORDER BY position",
+            (recipe_id,),
+        ).fetchall()
+
+    def upsert_pantry(self, item_key: str, display: str, amount: str | None, unit: str | None) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO pantry_item(item_key, display, amount, unit) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(item_key) DO UPDATE SET "
+                "display = excluded.display, amount = excluded.amount, unit = excluded.unit, "
+                "updated_at = datetime('now')",
+                (item_key, display, amount, unit),
+            )
+
+    def pantry_contains(self, item_key: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM pantry_item WHERE item_key = ?", (item_key,)
+        ).fetchone()
+        return row is not None
+
+    def open_shopping_list(self, name: str) -> int:
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO shopping_list(name) VALUES (?)", (name,)
+            )
+            return int(cursor.lastrowid)
+
+    def add_shopping_items(self, list_id: int, items: Sequence[tuple[str, str, str, str]]) -> int:
+        added = 0
+        with self.transaction() as conn:
+            for item_key, display, amount, unit in items:
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO shopping_item(list_id, item_key, display, amount, unit) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (list_id, item_key, display, amount, unit),
+                )
+                added += cursor.rowcount
+        return added
+
+    def pantry_snapshot(self) -> list[tuple[str, str | None, str | None]]:
+        rows = self._conn.execute(
+            "SELECT item_key, amount, unit FROM pantry_item ORDER BY item_key"
+        ).fetchall()
+        return [(row["item_key"], row["amount"], row["unit"]) for row in rows]
+
+    def shopping_items(self, list_name: str) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT si.display, si.amount, si.unit, si.checked "
+            "FROM shopping_item si JOIN shopping_list sl ON sl.id = si.list_id "
+            "WHERE sl.name = ? ORDER BY si.checked, si.display",
+            (list_name,),
+        ).fetchall()
+
+    def check_item(self, list_id: int, item_key: str) -> bool:
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE shopping_item SET checked = 1 WHERE list_id = ? AND item_key = ?",
+                (list_id, item_key),
+            )
+            return cursor.rowcount > 0
+
+# pantry/shopping.py
+"""Turn a set of recipes into a merged shopping list.
+
+The merge is done on Ingredient.key, not on the display name, so "yellow
+onion", "onions" and "Onion" only collapse when the alias table says they
+are the same item. Quantities from recipes with different serving counts
+are rescaled to the target before they are added.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from fractions import Fraction
+from typing import Iterable, Mapping
+
+from .ingredients import Ingredient, scale_ingredient
+from .units import Quantity, UnitError, merge
+
+
+@dataclass(slots=True)
+class PlanItem:
+    key: str
+    display: str
+    quantity: Quantity | None
+    source_recipes: list[str]
+
+    def as_row(self) -> tuple[str, str, str, str]:
+        if self.quantity is None:
+            return (self.key, self.display, "", "")
+        amount = str(self.quantity.amount)
+        return (self.key, self.display, amount, self.quantity.unit)
+
+
+@dataclass(slots=True)
+class Plan:
+    items: list[PlanItem]
+    skipped: list[str]
+
+    def covered_keys(self) -> set[str]:
+        return {item.key for item in self.items}
+
+
+def _factor_for(recipe_servings: int, target_servings: int) -> Fraction:
+    if recipe_servings <= 0 or target_servings <= 0:
+        raise ValueError("servings must be positive")
+    return Fraction(target_servings, recipe_servings)
+
+
+def build_plan(
+    recipes: Iterable[tuple[str, int, list[Ingredient]]],
+    target_servings: int | None = None,
+    pantry: Mapping[str, Quantity | None] | None = None,
+) -> Plan:
+    """Merge scaled ingredients and subtract what is already in the pantry."""
+    grouped: dict[str, list[tuple[str, Ingredient]]] = {}
+    display: dict[str, str] = {}
+    skipped: list[str] = []
+
+    for slug, servings, ingredients in recipes:
+        factor = (
+            _factor_for(servings, target_servings)
+            if target_servings is not None
+            else Fraction(1)
+        )
+        for item in ingredients:
+            scaled = scale_ingredient(item, factor)
+            key = scaled.key
+            if not key:
+                skipped.append(item.raw or item.name)
+                continue
+            grouped.setdefault(key, []).append((slug, scaled))
+            display.setdefault(key, scaled.name.strip())
+
+    items: list[PlanItem] = []
+    for key, entries in grouped.items():
+        sources = sorted({slug for slug, _ in entries})
+        quantities = [q.quantity for _, q in entries if q.quantity is not None]
+        if pantry and key in pantry:
+            have = pantry[key]
+            if have is not None:
+                quantities = _subtract(quantities, have)
+        if not quantities:
+            items.append(PlanItem(key, display[key], None, sources))
+            continue
+        try:
+            merged = merge(quantities)
+        except UnitError:
+            # Mixed dimensions: keep them as separate lines instead of
+            # silently dropping the part that does not convert.
+            for quantity in quantities:
+                items.append(PlanItem(key, display[key], quantity, sources))
+            continue
+        for quantity in merged:
+            items.append(PlanItem(key, display[key], quantity, sources))
+
+    items.sort(key=lambda item: (item.display.lower(), str(item.quantity)))
+    return Plan(items=items, skipped=skipped)
+
+
+def _subtract(quantities: list[Quantity], have: Quantity) -> list[Quantity]:
+    remaining: list[Quantity] = []
+    for quantity in quantities:
+        if quantity.dimension() != have.dimension():
+            remaining.append(quantity)
+            continue
+        try:
+            converted = have.to(quantity.unit)
+        except UnitError:
+            remaining.append(quantity)
+            continue
+        left = quantity.amount - converted.amount
+        if left > 0:
+            remaining.append(Quantity(left, quantity.unit))
+    return remaining
+
+
+def format_plan(plan: Plan, width: int = 0) -> str:
+    lines: list[str] = []
+    for item in plan.items:
+        label = item.display
+        if item.quantity is not None:
+            label = f"{item.quantity} {label}"
+        if width:
+            lines.append(label.ljust(width))
+        else:
+            lines.append(label)
+    if plan.skipped:
+        lines.append("")
+        lines.append("could not parse:")
+        lines.extend(f"  {line}" for line in plan.skipped)
+    return "\n".join(lines)
+
+
+def group_by_section(plan: Plan, sections: Mapping[str, str]) -> dict[str, list[PlanItem]]:
+    """Split a plan using an explicit item_key -> section mapping."""
+    result: dict[str, list[PlanItem]] = {}
+    for item in plan.items:
+        section = sections.get(item.key, "other")
+        result.setdefault(section, []).append(item)
+    return dict(sorted(result.items()))
+
+# pantry/cli.py
+"""Command line entry point for the pantry tool.
+
+The CLI is intentionally thin: it reads arguments, builds the domain
+objects and prints text. All state changes go through Database so the
+commands stay easy to test with a temporary file.
+
+usage:
+    pantry add recipes/lemon-cake.md
+    pantry list --limit 20
+    pantry plan lemon-cake --servings 8 --list weekend
+    pantry pantry add flour 2 kg
+    pantry shop show weekend
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from fractions import Fraction
+from pathlib import Path
+
+from .ingredients import parse_ingredients
+from .shopping import build_plan, format_plan
+from .storage import Database
+from .units import Quantity, UnitError
+
+DEFAULT_DB = Path.home() / ".local" / "share" / "pantry" / "pantry.sqlite3"
+
+
+def _read_recipe(path: Path) -> tuple[str, int, list[str]]:
+    """Read a Markdown recipe: first heading is the title, '## Ingredients' the list."""
+    title = ""
+    servings = 2
+    lines = path.read_text(encoding="utf-8").splitlines()
+    in_ingredients = False
+    ingredients: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("# ") and not title:
+            title = stripped[2:].strip()
+            continue
+        if stripped.lower().startswith("servings:"):
+            try:
+                servings = int(stripped.split(":", 1)[1].strip())
+            except ValueError:
+                servings = 2
+            continue
+        if stripped.lower() in {"## ingredients", "## ingredients:"}:
+            in_ingredients = True
+            continue
+        if in_ingredients:
+            if stripped.startswith("##"):
+                break
+            if stripped.startswith(("- ", "* ")):
+                ingredients.append(stripped[2:])
+    return title or path.stem, servings, ingredients
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    path = Path(args.path)
+    title, servings, lines = _read_recipe(path)
+    ingredients = parse_ingredients(lines)
+    with Database(args.db) as db:
+        if db.get_recipe(path.stem):
+            print(f"recipe already exists: {path.stem}", file=sys.stderr)
+            return 1
+        recipe_id = db.add_recipe(path.stem, title, servings, args.minutes, str(path))
+        db.add_ingredients(
+            recipe_id,
+            [
+                (
+                    item.name,
+                    item.key,
+                    str(item.quantity.amount) if item.quantity else "",
+                    item.quantity.unit if item.quantity else "",
+                    item.note,
+                )
+                for item in ingredients
+            ],
+        )
+    print(f"added {path.stem}: {len(ingredients)} ingredients")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    with Database(args.db) as db:
+        rows = db.list_recipes(args.limit, args.offset)
+    if not rows:
+        print("no recipes yet")
+        return 0
+    for row in rows:
+        minutes = f"{row.minutes} min" if row.minutes else "-"
+        print(f"{row.slug:<28} {row.servings:>3} servings  {minutes}")
+    return 0
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    selected = []
+    with Database(args.db) as db:
+        for slug in args.recipes:
+            row = db.get_recipe(slug)
+            if row is None:
+                print(f"unknown recipe: {slug}", file=sys.stderr)
+                continue
+            stored = db.ingredients_for(row.id)
+            lines = []
+            for item in stored:
+                if item["amount"]:
+                    lines.append(f"{item['amount']} {item['unit']} {item['name']}")
+                else:
+                    lines.append(item["name"])
+            selected.append((slug, row.servings, parse_ingredients(lines)))
+        pantry: dict[str, Quantity | None] = {}
+        for item_key, amount, unit in db.pantry_snapshot():
+            if amount and unit:
+                pantry[item_key] = Quantity(Fraction(amount), unit)
+            else:
+                pantry[item_key] = None
+
+    plan = build_plan(selected, args.servings, pantry)
+    text = format_plan(plan, width=0)
+    if args.json:
+        payload = [
+            {
+                "key": item.key,
+                "name": item.display,
+                "amount": str(item.quantity.amount) if item.quantity else None,
+                "unit": item.quantity.unit if item.quantity else None,
+                "recipes": item.source_recipes,
+            }
+            for item in plan.items
+        ]
+        print(json.dumps(payload, indent=2))
+        return 0
+    print(text)
+    if args.list_name:
+        with Database(args.db) as db:
+            list_id = db.open_shopping_list(args.list_name)
+            added = db.add_shopping_items(list_id, [item.as_row() for item in plan.items])
+        print(f"\n{added} items added to list '{args.list_name}'")
+    return 0
+
+
+def cmd_pantry_add(args: argparse.Namespace) -> int:
+    key = " ".join(args.name.lower().split())
+    with Database(args.db) as db:
+        db.upsert_pantry(key, args.name, args.amount, args.unit)
+    print(f"pantry: {key} = {args.amount or ''} {args.unit or ''}".strip())
+    return 0
+
+
+def cmd_shop_show(args: argparse.Namespace) -> int:
+    with Database(args.db) as db:
+        rows = db._conn.execute(
+            "SELECT si.display, si.amount, si.unit, si.checked "
+            "FROM shopping_item si JOIN shopping_list sl ON sl.id = si.list_id "
+            "WHERE sl.name = ? ORDER BY si.checked, si.display",
+            (args.name,),
+        ).fetchall()
+    if not rows:
+        print("list is empty or does not exist")
+        return 1
+    for row in rows:
+        mark = "x" if row["checked"] else " "
+        amount = f"{row['amount']} {row['unit']}".strip()
+        print(f"[{mark}] {amount:<10} {row['display']}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="pantry", description=__doc__.splitlines()[0])
+    parser.add_argument("--db", type=Path, default=DEFAULT_DB)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    add = sub.add_parser("add", help="import a Markdown recipe")
+    add.add_argument("path")
+    add.add_argument("--minutes", type=int, default=None)
+    add.set_defaults(func=cmd_add)
+
+    listing = sub.add_parser("list", help="show stored recipes")
+    listing.add_argument("--limit", type=int, default=50)
+    listing.add_argument("--offset", type=int, default=0)
+    listing.set_defaults(func=cmd_list)
+
+    plan = sub.add_parser("plan", help="merge recipes into a shopping plan")
+    plan.add_argument("recipes", nargs="+")
+    plan.add_argument("--servings", type=int, default=None)
+    plan.add_argument("--list", dest="list_name", default=None)
+    plan.add_argument("--json", action="store_true")
+    plan.set_defaults(func=cmd_plan)
+
+    pantry = sub.add_parser("pantry", help="manage pantry stock")
+    pantry_sub = pantry.add_subparsers(dest="pantry_command", required=True)
+    pantry_add = pantry_sub.add_parser("add")
+    pantry_add.add_argument("name")
+    pantry_add.add_argument("amount", nargs="?")
+    pantry_add.add_argument("unit", nargs="?")
+    pantry_add.set_defaults(func=cmd_pantry_add)
+
+    shop = sub.add_parser("shop", help="inspect shopping lists")
+    shop_sub = shop.add_subparsers(dest="shop_command", required=True)
+    shop_show = shop_sub.add_parser("show")
+    shop_show.add_argument("name")
+    shop_show.set_defaults(func=cmd_shop_show)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except (UnitError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+# tests/test_recipes.py
+"""Unit tests for parsing, scaling and plan merging.
+
+These run against a temporary SQLite file so the migrations are exercised
+on every run. The expected numbers are written as Fractions on purpose:
+if a test starts failing with a float comparison the code has drifted
+away from exact scaling.
+"""
+
+from __future__ import annotations
+
+from fractions import Fraction
+from pathlib import Path
+
+import pytest
+
+from pantry.ingredients import Ingredient, parse_ingredients, parse_line
+from pantry.shopping import build_plan, format_plan
+from pantry.storage import Database
+from pantry.units import Quantity, UnitError, format_amount, merge, parse_amount
+
+
+def test_parse_amount_forms() -> None:
+    assert parse_amount("2") == Fraction(2)
+    assert parse_amount("1/2") == Fraction(1, 2)
+    assert parse_amount("1 1/2") == Fraction(3, 2)
+    assert parse_amount("0.75") == Fraction(3, 4)
+
+
+def test_parse_amount_rejects_garbage() -> None:
+    with pytest.raises(UnitError):
+        parse_amount("half")
+    with pytest.raises(ZeroDivisionError):
+        parse_amount("1/0")
+
+
+def test_format_amount_prefers_mixed_numbers() -> None:
+    assert format_amount(Fraction(2)) == "2"
+    assert format_amount(Fraction(3, 2)) == "1 1/2"
+    assert format_amount(Fraction(1, 4)) == "1/4"
+    assert format_amount(Fraction(1, 100)) == "0.0"
+
+
+def test_quantity_converts_within_dimension() -> None:
+    assert Quantity(Fraction(1), "kg").to("g") == Quantity(Fraction(1000), "g")
+    assert Quantity(Fraction(2), "cup").to("ml") == Quantity(Fraction(473176, 1000), "ml")
+
+
+def test_quantity_refuses_cross_dimension_conversion() -> None:
+    with pytest.raises(UnitError):
+        Quantity(Fraction(1), "kg").to("cup")
+
+
+def test_quantity_aliases_and_negative_amounts() -> None:
+    assert Quantity(Fraction(1), "Grams").unit == "g"
+    with pytest.raises(UnitError):
+        Quantity(Fraction(-1), "g")
+
+
+def test_merge_keeps_first_unit() -> None:
+    merged = merge([Quantity(Fraction(500), "g"), Quantity(Fraction(1), "kg")])
+    assert merged == [Quantity(Fraction(1500), "g")]
+
+
+def test_parse_line_simple() -> None:
+    item = parse_line("2 cups flour, sifted")
+    assert item.name == "flour"
+    assert item.quantity == Quantity(Fraction(2), "cup")
+    assert item.note == "sifted"
+
+
+def test_parse_line_without_amount() -> None:
+    item = parse_line("salt to taste")
+    assert item.name == "salt to taste"
+    assert item.quantity is None
+
+
+def test_parse_line_keeps_adjectives_off_the_unit() -> None:
+    item = parse_line("3 large eggs")
+    assert item.name == "large eggs"
+    assert item.quantity == Quantity(Fraction(3), "unit")
+
+
+def test_parse_line_averages_a_range() -> None:
+    item = parse_line("2-3 tablespoons olive oil")
+    assert item.quantity == Quantity(Fraction(5, 2), "tbsp")
+    assert item.name == "olive oil"
+
+
+def test_parse_line_extracts_parenthetical_note() -> None:
+    item = parse_line("1 can tomatoes (400 g)")
+    assert item.name == "tomatoes"
+    assert "400 g" in item.note
+
+
+def test_parse_ingredients_skips_comments_and_blanks() -> None:
+    items = parse_ingredients(["# shopping", "", "1 tsp salt", "pepper"])
+    assert [item.name for item in items] == ["salt", "pepper"]
+
+
+def _recipe(slug: str, servings: int, lines: list[str]) -> tuple[str, int, list[Ingredient]]:
+    return (slug, servings, parse_ingredients(lines))
+
+
+def test_build_plan_scales_to_target_servings() -> None:
+    recipes = [_recipe("cake", 4, ["200 g flour", "2 eggs"])]
+    plan = build_plan(recipes, target_servings=8)
+    by_key = {item.key: item for item in plan.items}
+    assert by_key["flour"].quantity == Quantity(Fraction(400), "g")
+    assert by_key["eggs"].quantity == Quantity(Fraction(4), "unit")
+
+
+def test_build_plan_merges_same_ingredient_across_recipes() -> None:
+    recipes = [
+        _recipe("a", 2, ["100 g butter"]),
+        _recipe("b", 2, ["150 g butter"]),
+    ]
+    plan = build_plan(recipes)
+    assert len(plan.items) == 1
+    assert plan.items[0].quantity == Quantity(Fraction(250), "g")
+    assert plan.items[0].source_recipes == ["a", "b"]
+
+
+def test_build_plan_subtracts_pantry_stock() -> None:
+    recipes = [_recipe("a", 2, ["500 g flour"])]
+    plan = build_plan(recipes, pantry={"flour": Quantity(Fraction(300), "g")})
+    assert plan.items[0].quantity == Quantity(Fraction(200), "g")
+
+
+def test_build_plan_drops_item_when_pantry_covers_it() -> None:
+    recipes = [_recipe("a", 2, ["200 g rice"])]
+    plan = build_plan(recipes, pantry={"rice": Quantity(Fraction(1), "kg")})
+    assert plan.items == []
+
+
+def test_build_plan_keeps_unconvertible_lines_separate() -> None:
+    recipes = [_recipe("a", 2, ["1 bunch parsley", "30 g parsley"])]
+    plan = build_plan(recipes)
+    assert len(plan.items) == 2
+
+
+def test_format_plan_lists_unparsed_lines() -> None:
+    plan = build_plan([_recipe("a", 2, ["1 tsp salt"])])
+    plan.skipped.append("???")
+    assert "could not parse:" in format_plan(plan)
+
+
+def test_database_round_trip(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.sqlite3")
+    recipe_id = db.add_recipe("soup", "Winter soup", 4, 35, "handwritten card")
+    db.add_ingredients(
+        recipe_id,
+        [
+            ("onion", "onion", str(Fraction(2)), "unit", "diced"),
+            ("stock", "stock", str(Fraction(1)), "l", ""),
+        ],
+    )
+    row = db.get_recipe("soup")
+    assert row is not None
+    assert row.title == "Winter soup"
+    assert row.minutes == 35
+    stored = db.ingredients_for(recipe_id)
+    assert [item["name"] for item in stored] == ["onion", "stock"]
+    db.close()
+
+
+def test_database_refuses_duplicate_slug(tmp_path: Path) -> None:
+    db = Database(tmp_path / "test.sqlite3")
+    db.add_recipe("soup", "Winter soup", 4)
+    with pytest.raises(Exception):
+        db.add_recipe("soup", "Another soup", 2)
+    db.close()
+
+
+def test_database_migration_is_idempotent(tmp_path: Path) -> None:
+    path = tmp_path / "test.sqlite3"
+    with Database(path) as db:
+        db.add_recipe("soup", "Winter soup", 4)
+    with Database(path) as db:
+        assert db.get_recipe("soup") is not None
