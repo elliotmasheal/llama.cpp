@@ -57,7 +57,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M1
 phase_status: in_progress
 decision_gate: M1 open
-queues: bench=- impl=M1-4a data=M1-6 io=- user=U-1
+queues: bench=- impl=M1-4a data=M1-2a io=- user=U-1
 last_gate: G-REG unknown (2026-10-23 record, not re-run since 44bd79305)
 blockers: none
 <!-- STATE:END -->

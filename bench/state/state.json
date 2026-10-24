@@ -98,7 +98,7 @@
     },
     {
       "lane": "data",
-      "head": "M1-6",
+      "head": "M1-2a",
       "order": [
         "M1-6",
         "M1-2a",
@@ -121,6 +121,7 @@
       "head": "U-1",
       "order": [
         "U-1",
+        "U-3",
         "M1-GATE",
         "U-2"
       ],
@@ -263,7 +264,7 @@
       "id": "M1-6",
       "milestone": "M1",
       "lane": "data",
-      "status": "todo",
+      "status": "done",
       "title": "从 GGUF 确认 full-attention 层数与 256K KV 预算",
       "deps": [],
       "resources": [],
@@ -313,6 +314,17 @@
       "resources": [],
       "paths": [],
       "done_when": "给出新阈值并改 design；agent 不得自行下调"
+    },
+    {
+      "id": "U-3",
+      "milestone": "M1",
+      "lane": "user",
+      "status": "todo",
+      "title": "256K KV 与 8 GiB 互斥：降口径 ctx / KV 分页 / KV 量化",
+      "deps": [],
+      "resources": [],
+      "paths": [],
+      "done_when": "三选一写进 DECISIONS 并由用户改 design 1.1、5.5 与 README 的统一口径；agent 不得自选"
     },
     {
       "id": "X-1",
@@ -803,6 +815,13 @@
       "needs_by": "M2-0",
       "owner": "user",
       "note": "M1 is measurement only, so this does not block M1; choosing the fork requires rewriting design 3.3"
+    },
+    {
+      "id": "U-3",
+      "question": "256K KV needs 5120-5632 MiB of the 7176 MiB usable VRAM, which is incompatible with any expert cache: reduce ctx, page KV to host, or quantize KV",
+      "needs_by": "M2-0",
+      "owner": "user",
+      "note": "M1-6 numbers in RESULTS section 10; 25% cache does not fit at any ctx, the feasible corner is ctx <= 16K with a 20% cache; the target workload (10K prompt) only needs 220 MiB resident"
     }
   ]
 }
