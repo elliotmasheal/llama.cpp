@@ -30,6 +30,10 @@ struct common_moe_plan {
     int64_t ring_bytes  = 0;    // bytes of the two whole-layer prefetch rings
     bool    prefetch    = false;
     bool    resident    = false;
+    // --kv-page auto: true when the initial contiguous K/V cache does not fit the device budget,
+    // so paging keeps the working set there (bench/THREE-TIER.md F11)
+    bool    kv_page     = false;
+    int64_t kv_init_bytes = 0;  // bytes of the initial K/V allocation at this configuration
 };
 
 // measures the model once and fills the plan, returns false if the model is not a MoE model
@@ -39,6 +43,7 @@ bool common_moe_plan_get(
       const llama_model_params * mparams,
      const llama_context_params * cparams,
                     const size_t * margins,      // margins of memory to leave per device in bytes
+                             bool   kv_page_auto, // fill plan.kv_page from the budget
               common_moe_plan * out,
                 ggml_log_level log_level);       // minimum log level to print during the measurement
 

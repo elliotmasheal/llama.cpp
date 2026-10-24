@@ -540,8 +540,11 @@ BS 只影响以下四项，其中没有一项直接作用在 PP/TG 的算子上�
 
 #### 8. 开关与默认
 
-- `--kv-page auto|on|off`（env `LLAMA_ARG_KV_PAGE`）、`--kv-block N`（默认 2048，必须是 256 的倍数）。
-- 默认值：M2b 之前为 off；M2b 过门禁并在目标口径 256K + 10K 三档 r=2 上 PP/TG 不退步后，改 auto，并登记进 `DECISIONS.md` 第 4 节。
+- `--kv-page` / `--no-kv-page`（env `LLAMA_ARG_KV_PAGE`）、`--kv-page-auto auto|on|off`
+  （env `LLAMA_ARG_KV_PAGE_AUTO`）、`--kv-block N`（默认 2048，必须是 256 的倍数）。
+- 默认值：**off**。`--kv-page-auto auto` 让 `common/fit.cpp` 的预算判决（`DECISIONS.md` 第 4 节开关表、
+  第 6 节第 16 条；实测 4096 档判分页、6144/8176 判连续）。M2b + L1 的验收本来允许直接改 auto，
+  但 `DECISIONS.md` 第 6 节第 17 条的 10K 输出差异未定性，所以默认值先不动。
 - 每次退回都打印一次原因（`kv-page disabled: <reason>`）。
 
 #### 9. 成本模型（M0/M2 实测前的估算基线）
@@ -802,15 +805,24 @@ F6 已于 2026-10-23 落地（`bash bench/tools/quality-gate.sh`），所以 9.5
 - 验收：`-c 512 --kv-page` 输出与 `off` 逐字相同；`tests/test-kv-page.cpp` 补一条 Vulkan 后端用例；
   `FLASH_ATTN_EXT -b Vulkan1` 5332/5332 不变；`ctest` 34/34。
 
-#### L1 主线：块 -> 稠密工作区 -> chunked matmul（**代码已落地，2026-10-24；性能待目标口径矩阵**）
+#### L1 主线：块 -> 稠密工作区 -> chunked matmul（**L1a-L1d 已落地，2026-10-24**）
 
 - 落地形态与设计一致：`--kv-gather-mib`（默认 256，0 = 关）、工作区按工作集 2 倍增长、
   每层每块一条 `ggml_cpy`、`llama_memory_context_i::get_kv_page_dense()` 在 `build_attn_mha` 里接上。
   正确性见 `RESULTS.md` 6.4：gather 与连续布局**逐字节相同**（`test-kv-page`，CPU 与 Vulkan 各一遍），
   4535 token 的生成文本与 `off` 逐字相同。
-- 目标工况读数（r=2，8176 档，`RESULTS.md` 6.4 第 4 条）：连续 509.3、**paged + gather 529.7**、
-  paged + `--kv-gather-mib 0` 449.5，TG 三者持平。即 gather 把分页 prefill 拉回并高于连续布局约 4%。
-- 还没测的：256K + 10K 的 6144/4096 两档（L1d），以及 host 块占比 > 0 的臂。
+- **L1d 挖出一个工作区覆盖缺口并已修**：`ensure_capacity` 原来按 `used_max() + n_ubatch` 决定工作区大小，
+  而 `used_max()` 在个别路径上比图真正读的范围小一整批，于是 10K prompt 的最后一个 ubatch
+  （`n_kv = 10240`）拿不到工作区、静默退回 paged FA。现在 `build_paged_dense()` 记下每个图请求的最大范围
+  （`page_dense_need`），`ensure_dense_workspace` 取它与 `used_max() + n_extra` 的较大值。
+  判据日志：`GGML_KV_PAGE_TRACE=1` 下 `build_paged_dense: layer N: X cells, workspace Y cells, usable 0/1`。
+- 目标工况读数（r=2，`RESULTS.md` 6.5）：三档 x 三臂，gather 把分页 prefill 从 paged FA 拉高 12-20%，
+  与连续布局持平或更好；TG 三者持平。三档 `status = ok`。
+- **host 块臂在目标口径造不出来**：10K cells 的 KV 只有 320 MiB，三档的设备都能放下；
+  显式 `-B 3072` 只会让 bank 和 compute 互相挤（4096 档 PP 387 -> 169.9），产生不了 host 块。
+  host 块只在工作集本身超过设备（`n_kv` 约 10 万以上）时出现，那是 L2(b) 的区间，见 3.1 的区间表。
+- 未结项：10K prompt 的分页输出与连续布局差 1 个 token（`DECISIONS.md` 第 6 节第 17 条），
+  所以 `--kv-page` 不改默认，`--kv-page-auto` 需要显式打开。
 
 (a) 工作区（KV cache 持有）
 
@@ -938,14 +950,16 @@ F6 已于 2026-10-23 落地（`bash bench/tools/quality-gate.sh`），所以 9.5
 | L1a | 工作区 + 逐块 cpy + `get_kv_page_dense` | **完成**：单测逐字节相同（CPU + Vulkan） |
 | L1b | 图切换 + 判据 + 开关 | **完成**：4535 token 逐字相同 |
 | L1c | 预算 + 文档 | **完成**：fit 扣 32 MiB、开关表已登记 |
-| L1d | 目标口径矩阵：三臂（off / paged + gather / paged + `--kv-gather-mib 0`）x 三档 x r=2 | **部分**：8176 档 r=1 已有（530.48 / 509.94 / 449.20）；6144/4096 与 r=2 待做 |
-| L2a | 分页 MUL_MAT（可选） | 未开始，等 L1d 的读数 |
+| L1d | 目标口径矩阵：三臂（off / paged + gather / paged + `--kv-gather-mib 0`）x 三档 x r=2 | **完成**（`RESULTS.md` 6.5）：三档 `ok`，gather 比 paged FA 高 12-20%；host 块臂在目标口径造不出来（见 L1 节） |
+| L2a | 分页 MUL_MAT（可选） | 未开始：L1d 的读数没有给出理由（>64K 与 host 块臂不在目标口径），等第 6 节第 17 条定性 |
+| L1e | 10K prompt 下分页与连续布局的输出一致性 | **未完成**（`DECISIONS.md` 第 6 节第 17 条） |
 
 L1 验收线：
 
-- 数值：**已达成**。gather 与连续布局逐字节相同（`test-kv-page`，CPU + Vulkan）；
-  `--kv-page` 与 `off` 的 PPL 相同（2.1676）、4535 token 输出逐字相同；
-  质量门带 `--kv-page` 通过：`mean KLD -0.000000`、`same top p 100.000%`（`RESULTS.md` 6.4 第 5 条）。
+- 数值：**部分达成**。gather 与连续布局逐字节相同（`test-kv-page`，CPU + Vulkan）；
+  `--kv-page` 与 `off` 的 PPL 相同（2.1676）、4535 token 输出逐字相同；质量门带 `--kv-page` 通过
+  （`mean KLD -0.000000`、`same top p 100.000%`，`RESULTS.md` 6.4 第 5 条）。
+  **但 10K prompt 上两边差 1 个 token**（第 6 节第 17 条），所以上限只到 `n_kv <= 8192`。
 - 性能：paged + gather 的 PP >= 连续布局 `-fac 256` 的 95%（8176 档目标 646 以上）；
   TG 不退步（decode 不走 gather）；三档 `status = ok`；`reallocs` / `hit %` / 工作区 MiB 进表。
 - 4096 档若 bank 仍为 0，只要求不退化（这一档分页本来就是容量档）。

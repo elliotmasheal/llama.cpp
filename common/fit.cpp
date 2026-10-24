@@ -899,6 +899,7 @@ static bool common_moe_plan_impl(
         const llama_model_params * mparams,
         const llama_context_params * cparams,
         const size_t * margins_s,
+        bool kv_page_auto,
         common_moe_plan * out,
         ggml_log_level log_level) {
     constexpr int64_t MiB = 1024*1024;
@@ -957,10 +958,19 @@ static bool common_moe_plan_impl(
     // (bench/RESULTS.md 2.2: +1276.7 MiB measured, nothing reserved).
     const int64_t fa_score = cparams_plan.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ? 0 :
         llama_fa_long_kv_reserve_bytes(meas.n_head, meas.n_ubatch, meas.n_ctx, cparams_plan.fa_chunk_mib);
+
+    // --kv-page auto: `surplus` is what the MoE bank would get, i.e. the device room left after the model,
+    // the initial K/V and the compute buffers. If even the score reserve does not fit, the configuration is
+    // in deficit and there is no room for the 2x growth of a contiguous cache; paging then keeps the working
+    // set on the device because blocks fail one at a time instead of the whole cache
+    // (bench/THREE-TIER.md F11). With -nkvo the K/V is on the host anyway, so auto stays off.
+    const int64_t kv_slack = surplus - fa_score;
+    const bool    kv_page  = kv_page_auto ? (cparams_plan.offload_kqv && kv_slack < 0) : cparams_plan.kv_page;
+
     surplus -= fa_score;
 
     // the paged prefill gather keeps one dense K/V workspace in device memory (bench/THREE-TIER.md F11)
-    const int64_t kv_gather = cparams_plan.kv_page ? llama_kv_gather_reserve_bytes(cparams_plan.kv_gather_mib) : 0;
+    const int64_t kv_gather = kv_page ? llama_kv_gather_reserve_bytes(cparams_plan.kv_gather_mib) : 0;
     surplus -= kv_gather;
     for (const int64_t b : geo.expert_bytes) {
         expert_total += b;
@@ -1005,6 +1015,8 @@ static bool common_moe_plan_impl(
     out->ring_bytes  = ring;
     out->prefetch    = prefetch;
     out->resident    = pinned;
+    out->kv_page     = kv_page;
+    out->kv_init_bytes = kv_bytes;
 
     LOG_INF("%s: %d expert layers, %d experts (top %d), %.1f MiB of experts per layer, %.1f GiB in total\n",
             __func__, geo.n_layer_expert, geo.n_expert, geo.n_expert_used,
@@ -1020,6 +1032,10 @@ static bool common_moe_plan_impl(
     if (kv_gather > 0) {
         LOG_INF("%s: paged prefill gather keeps %.1f MiB of the surplus for its dense K/V workspace\n",
                 __func__, (double) kv_gather/MiB);
+    }
+    if (kv_page_auto) {
+        LOG_INF("%s: %.1f MiB left after the initial K/V (%.1f MiB) and the %.1f MiB score reserve -> kv-page %s\n",
+                __func__, (double) kv_slack/MiB, (double) kv_bytes/MiB, (double) fa_score/MiB, kv_page ? "on" : "off");
     }
 
     if (bank > 0) {
@@ -1051,9 +1067,10 @@ bool common_moe_plan_get(
         const llama_model_params * mparams,
         const llama_context_params * cparams,
         const size_t * margins,
+        bool kv_page_auto,
         common_moe_plan * out,
         ggml_log_level log_level) {
-    return common_moe_plan_impl(path_model, mparams, cparams, margins, out, log_level);
+    return common_moe_plan_impl(path_model, mparams, cparams, margins, kv_page_auto, out, log_level);
 }
 
 enum common_params_fit_status common_fit_params(

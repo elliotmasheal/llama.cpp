@@ -585,7 +585,10 @@ struct common_params {
     bool no_kv_offload     = false; // disable KV offloading
     int32_t kv_grow_initial = -1;   // cells up front for K/V: -1 auto, 0 = n_ctx, > 0 explicit
     int32_t fa_chunk_mib   = 256;   // cap on the long prefill attention score buffer, 0 = one buffer for the whole span
-    bool    kv_page        = false; // paged K/V: fixed-size blocks + a table of block addresses
+    // paged K/V: fixed-size blocks + a table of block addresses. -1 = let the memory plan decide
+    // (paged only when the initial contiguous cache does not fit the device), 0 = contiguous, 1 = paged.
+    // The default stays off until the 10K-prompt output difference is explained (bench/DECISIONS.md)
+    int32_t kv_page        = 0;
     int32_t kv_block       = 2048;  // cells per block in paged K/V
     int32_t kv_gather_mib  = 256;   // cap on the dense workspace of the paged prefill gather, 0 = off
     bool warmup            = true;  // warmup run

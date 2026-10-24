@@ -1280,20 +1280,29 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
-    if (!model_only && !params.moe_cache_size_set) {
-        // the MoE cache is sized by the memory plan unless the user set --moe-cache-mib
+    if (!model_only && (!params.moe_cache_size_set || params.kv_page < 0)) {
+        // the MoE cache is sized by the memory plan unless the user set --moe-cache-mib,
+        // and --kv-page auto (the default) is decided by the same budget
         const char * env_plan = getenv("LLAMA_MOE_PLAN");
         if (env_plan == nullptr || atoi(env_plan) != 0) {
             common_moe_plan plan;
             const bool planned = common_moe_plan_get(params.model.path.c_str(), &mparams, &cparams,
-                    params.fit_params_target.data(), &plan,
+                    params.fit_params_target.data(), params.kv_page < 0, &plan,
                     params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-            if (planned && plan.cache_bytes > 0) {
+            if (planned && !params.moe_cache_size_set && plan.cache_bytes > 0) {
                 params.moe_cache_size = plan.cache_bytes;
                 cparams.moe_cache_size = plan.cache_bytes;
                 LOG_INF("MoE cache: %.1f MiB from the memory plan (%s)\n", plan.cache_bytes/1024.0/1024.0,
                         plan.prefetch ? "whole-layer prefetch available" : "no prefetch");
             }
+            if (planned && params.kv_page < 0) {
+                params.kv_page = plan.kv_page ? 1 : 0;
+                cparams.kv_page = plan.kv_page;
+                LOG_INF("K/V cache: %s layout from the memory plan (initial %.1f MiB)\n",
+                        plan.kv_page ? "paged" : "contiguous", plan.kv_init_bytes/1024.0/1024.0);
+            }
+        } else if (params.kv_page < 0) {
+            LOG_WRN("%s", "LLAMA_MOE_PLAN=0: no budget for --kv-page auto, keeping the contiguous layout\n");
         }
     }
 
@@ -1759,7 +1768,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.kv_grow_initial   = params.kv_grow_initial;
     cparams.fa_chunk_mib      = params.fa_chunk_mib;
-    cparams.kv_page           = params.kv_page;
+    cparams.kv_page           = params.kv_page > 0;
     cparams.kv_block          = (uint32_t) params.kv_block;
     cparams.kv_gather_mib     = params.kv_gather_mib;
     cparams.no_perf           = params.no_perf;

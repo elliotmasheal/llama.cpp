@@ -2435,9 +2435,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "paged K/V: fixed-size blocks addressed through a table, so growth does not copy and a device\n"
         "allocation failure costs one block (F16 + flash attn only; default: disabled)",
         [](common_params & params, bool value) {
-            params.kv_page = value;
+            params.kv_page = value ? 1 : 0;
         }
     ).set_env("LLAMA_ARG_KV_PAGE"));
+    add_opt(common_arg(
+        {"--kv-page-auto"}, "auto|on|off",
+        "let the memory plan decide whether the K/V is paged: paged only when the device has no room for\n"
+        "the contiguous cache plus the long-prefill score reserve (bench/THREE-TIER.md F11)",
+        [](common_params & params, const std::string & value) {
+            if (common_arg_utils::is_autoy(value)) {
+                params.kv_page = -1;
+            } else if (common_arg_utils::is_truthy(value)) {
+                params.kv_page = 1;
+            } else if (common_arg_utils::is_falsey(value)) {
+                params.kv_page = 0;
+            } else {
+                throw std::invalid_argument("expected auto, on or off");
+            }
+        }
+    ).set_env("LLAMA_ARG_KV_PAGE_AUTO"));
     add_opt(common_arg(
         {"--kv-block"}, "N",
         "cells per block in paged K/V, a multiple of 256 (default: 2048)",

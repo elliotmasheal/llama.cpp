@@ -8,6 +8,7 @@
 #   bench/tools/run-matrix.sh                          # 8176,6144,4096 at ctx 262144 with -nkvo
 #   bench/tools/run-matrix.sh -T 8176 -C 16384 -B 3584 -K   # one arm, KV on GPU
 #   bench/tools/run-matrix.sh -L mmap                  # the RAM-short tier
+#   bench/tools/run-matrix.sh -K -a paged -A "--kv-page"   # one named arm with extra CLI args (F11 L1d)
 set -u
 
 cd "$(dirname "$0")/../.." || exit 1
@@ -29,6 +30,8 @@ THREADS=5
 GAP=30
 OUT=""
 EXTRA_ENV=""
+EXTRA_ARGS=()
+ARM="contig"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -42,6 +45,8 @@ while [ $# -gt 0 ]; do
     -g) GEN=$2; shift 2 ;;
     -G) GAP=$2; shift 2 ;;
     -E) EXTRA_ENV=$2; shift 2 ;;
+    -a) ARM=$2; shift 2 ;;
+    -A) read -r -a EXTRA_ARGS <<< "$2"; shift 2 ;;
     -O) OUT=$2; shift 2 ;;
     -h) sed -n '1,14p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -63,7 +68,19 @@ esac
 busy=$(tasklist 2>/dev/null | grep -icE "^llama-")
 [ "$busy" -eq 0 ] || { echo "ERROR: $busy inference process(es) hold the dGPU, stop them first" >&2; exit 1; }
 
-printf 'tier,run,load,ctx,kv,bank,ncmoe,pp_tps,tg_tps,vram_peak_mib,held_mib,vram_used_mib,ram_peak_mib,reallocs,hit_pct,status\n' > "$CSV"
+# a resident load needs the whole model in RAM; a short batch on a machine that has just given the
+# 20.2 GiB back reports ErrorOutOfDeviceMemory during the upload and looks like a VRAM defect
+if [ "$LOAD" = "none" ]; then
+    free_ram=$(powershell -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1024" 2>/dev/null | tr -d '\r' | cut -d. -f1)
+    [ -n "$free_ram" ] || free_ram=0
+    if [ "$free_ram" -lt 22000 ]; then
+        echo "ERROR: ${free_ram} MiB of RAM free, a -lm none load needs about 22 GiB; use -L mmap or free RAM first" >&2
+        exit 1
+    fi
+    echo "RAM free: ${free_ram} MiB"
+fi
+
+printf 'arm,tier,run,load,ctx,kv,bank,ncmoe,pp_tps,tg_tps,vram_peak_mib,held_mib,vram_used_mib,ram_peak_mib,reallocs,hit_pct,host_blk,gather_mib,status\n' > "$CSV"
 
 sample_gpu() { # $1 = windows pid
     powershell -NoProfile -Command \
@@ -74,7 +91,7 @@ sample_gpu() { # $1 = windows pid
 
 run_arm() { # $1 = tier, $2 = run index
     tier=$1; run=$2
-    arm="vram${tier}_c${CTX}_b${BANK}_r${run}"
+    arm="${ARM}_vram${tier}_c${CTX}_b${BANK}_r${run}"
     out="$OUT/$arm.out"; err="$OUT/$arm.err"
 
     set -- -m "$MODEL" -dev Vulkan1 -ngl 99 -fa on -t "$THREADS" -b "$UB" -ub "$UB" \
@@ -83,6 +100,8 @@ run_arm() { # $1 = tier, $2 = run index
     [ "$BANK" = auto ] || set -- "$@" --moe-cache-mib "$BANK"
     [ "$NCMOE" -ge 0 ] && set -- "$@" -ncmoe "$NCMOE"
     [ "$KV_ON_GPU" -eq 1 ] || set -- "$@" -nkvo
+    # the arm's extra flags (F11: --kv-page / --kv-gather-mib)
+    [ "${#EXTRA_ARGS[@]}" -eq 0 ] || set -- "$@" "${EXTRA_ARGS[@]}"
 
     GGML_VK_VRAM_LIMIT_MIB=$tier env $EXTRA_ENV "$EXE" "$@" > "$out" 2> "$err" &
     job=$!
@@ -114,6 +133,10 @@ run_arm() { # $1 = tier, $2 = run index
     tg=$(echo "$line" | sed -n 's/.*Generation: \([0-9.]*\) t.*/\1/p')
     hit=$(grep -oE "hit rate = [0-9.]+%" "$err" | sed -n 's/hit rate = //; s/%//p' | \
           awk '{s+=$1; n++} END {if (n>0) printf "%.1f", s/n}')
+    # F11 L1d: blocks that fell back to host (device allocation failed), and the grown dense workspace
+    hostblk=$(grep -c "placed on the host" "$err")
+    gather=$(grep -oE "gather grown to [0-9]+ cells \([0-9.]+ MiB\)" "$err" | \
+             sed -n 's/.*(\([0-9.]*\) MiB)/\1/p' | awk '{if ($1>m) m=$1} END {printf "%.0f", m+0}')
     if [ -n "$pp" ]; then status=ok
     elif grep -q "ErrorOutOfDeviceMemory" "$err"; then status=vram-oom
     elif grep -qE "GGML_ABORT|the experts of layer .* are selected|\.cpp:[0-9]+: " "$err"; then status=abort
@@ -125,8 +148,8 @@ run_arm() { # $1 = tier, $2 = run index
     used=$(echo "$peak_i ${held:-0}" | awk '{printf "%.0f", $1-$2}')
     kv=$([ "$KV_ON_GPU" = 1 ] && echo gpu || echo host)
 
-    echo "$tier,$run,$LOAD,$CTX,$kv,$BANK,$NCMOE,${pp:-},${tg:-},$peak_i,${held:-0},$used,$ram_i,$reallocs,${hit:-},$status" >> "$CSV"
-    echo "arm $arm: PP=${pp:-?} TG=${tg:-?} peak=$peak_i held=${held:-0} used=$used ram=$ram_i reallocs=$reallocs status=$status"
+    echo "$ARM,$tier,$run,$LOAD,$CTX,$kv,$BANK,$NCMOE,${pp:-},${tg:-},$peak_i,${held:-0},$used,$ram_i,$reallocs,${hit:-},$hostblk,${gather:-0},$status" >> "$CSV"
+    echo "arm $arm: PP=${pp:-?} TG=${tg:-?} peak=$peak_i held=${held:-0} used=$used ram=$ram_i reallocs=$reallocs hostblk=$hostblk gather=${gather:-0}MiB status=$status"
     [ "$run" -lt "$REPEAT" ] && sleep "$GAP"
     return 0
 }
@@ -142,6 +165,6 @@ for tier in "${tier_list[@]}"; do
 done
 
 echo ""
-echo "| tier | run | load | ctx | KV | bank | ncmoe | PP t/s | TG t/s | peak MiB | held MiB | used MiB | RAM peak MiB | reallocs | hit % | status |"
-echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
-tail -n +2 "$CSV" | awk -F, '{printf "|"; for (i = 1; i <= 16; i++) printf " %s |", $i; print ""}'
+echo "| arm | tier | run | load | ctx | KV | bank | ncmoe | PP t/s | TG t/s | peak MiB | held MiB | used MiB | RAM peak MiB | reallocs | hit % | host blk | gather MiB | status |"
+echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+tail -n +2 "$CSV" | awk -F, '{printf "|"; for (i = 1; i <= NF; i++) printf " %s |", $i; print ""}'

@@ -413,6 +413,8 @@ private:
     ggml_tensor *           page_dense_k = nullptr;  // [n_embd_k_gqa, page_dense_cells]
     ggml_tensor *           page_dense_v = nullptr;
     uint32_t                page_dense_cells = 0;
+    // largest cell range a graph has asked the workspace for; used_max() can lag behind it (F11 L1d)
+    mutable uint32_t        page_dense_need = 0;
 
     // grow the dense workspace so that `cells` cells fit; false when it does not fit under the cap
     bool ensure_dense_workspace(uint32_t cells);

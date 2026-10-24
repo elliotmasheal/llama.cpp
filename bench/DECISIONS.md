@@ -141,8 +141,8 @@
 | `GGML_VK_VRAM_LIMIT_MIB` | 未设 | **显存档位模拟**，见 `README.md` 第 2 节 | 2026-10-23 报告值已验证；各档性能未测 |
 | `-kvg` / `--kv-grow` | **-1（auto）** | K/V 初始 cells：-1 = 按工作集增长（上限 `n_ctx`，设备失败回退 host）、0 = 一次分配 `n_ctx`、>0 = 指定初始 cells | 256K+10K：PP 178.5 -> 477、TG 6.4 -> 13.8、RAM 峰值 -7.2 GiB；`0` 时 PP 239.4（`RESULTS.md` 0.3） |
 | `-fac` / `--fa-chunk-mib` | **256** | 长跨距 prefill 注意力每块 score 的上限；query 维按预算切块，0 = 整段一块（旧行为）。规划器的 score 预留同步取这个值 | 8176 档：0 -> PP 458、64 -> 657、128 -> 673、**256 -> 680**、512 -> 627（`RESULTS.md` 0.4） |
-| `--kv-page` / `--kv-block`（**M1 已进树**，见 `THREE-TIER.md` F10） | off；`--kv-block` 2048 | K/V 改为固定大小块 + 块表：扩容零拷贝、峰值 = 1 块、块级设备/host 放置 | M1（CPU 内核）逐位相同；**M2b 设备路径已打开并验收**（`RESULTS.md` 6.4）：PPL 2.1676 对 2.1676、4535 token 逐字相同、质量门 KLD -0.000000 / top-p 100%、FA 5332/5332、SET_ROWS 319/319、`ctest` 33/33 |
-| `--kv-gather-mib` / `LLAMA_ARG_KV_GATHER_MIB`（F11 L1） | **256**；0 = 关 | 分页 prefill 的稠密 K/V 工作区上限：长跨距注意力先把块 gather 进工作区，再走 `-fac` 的 chunked matmul；按工作集 2 倍增长，失败退回分页 FA 并计数 | 正确性已验收：gather 与连续布局逐字节相同（`test-kv-page`，CPU+Vulkan）；10.5K 口径仅需 21 MiB。目标口径 PP 待矩阵 |
+| `--kv-page` / `--kv-block` / `--no-kv-page` / `--kv-page-auto`（**M1/M2b/L1 已进树**，见 `THREE-TIER.md` F10/F11） | **off**；auto 需显式 `--kv-page-auto auto`；`--kv-block` 2048 | K/V 改为固定大小块 + 块表：扩容零拷贝、峰值 = 1 块、块级设备/host 放置。auto 由 `common/fit.cpp` 判决：扣掉 score 预留后设备没有余量就开分页，`-nkvo` 下恒关 | M1（CPU 内核）逐位相同；**M2b 设备路径已打开并验收**（`RESULTS.md` 6.4）：PPL 2.1676 对 2.1676、4535 token 逐字相同、质量门 KLD -0.000000 / top-p 100%、FA 5332/5332、SET_ROWS 319/319、`ctest` 33/33。三档矩阵见 `RESULTS.md` 6.5；10K prompt 的输出一致性未过（第 6 节第 17 条） |
+| `--kv-gather-mib` / `LLAMA_ARG_KV_GATHER_MIB`（F11 L1） | **256**；0 = 关 | 分页 prefill 的稠密 K/V 工作区上限：长跨距注意力先把块 gather 进工作区，再走 `-fac` 的 chunked matmul；按工作集 2 倍增长，失败退回分页 FA 并计数 | 正确性：gather 与连续布局逐字节相同（`test-kv-page`，CPU+Vulkan）。目标口径 PP（r=2 均值）：6144 档 400.3 对连续 391.3、4096 档 390.4 对 374.5；`--kv-gather-mib 0` 是 349.5 / 343.2（`RESULTS.md` 6.5） |
 | `GGML_SCHED_TRACE` / `GGML_MOE_COPY_TRACE` / `GGML_VK_TIME_COPIES` / `GGML_VK_MEMORY_LOGGER` / `GGML_VK_PERF_LOGGER` | 关 | 诊断；PERF_LOGGER 拖慢 decode 2.6x | 只看占比 |
 | `GGML_VK_FA_TRACE` | 未设 | 每个不同的 FA 形状打一行（path/Br/Bc/D_split/sparse/dequant_kv），F10 M0b 用它定案 | 诊断，只打几种形状 |
 | `GGML_SCHED_HW_SIGNAL` / `_HW_PIPELINE` / `_HW_NOWAIT`、`GGML_MOE_CACHE_MAX_FULL` / `_LRU_DIV`、`LLAMA_ROUTING_DIAG` | 已回退，不在树里 | 见第 3 节 | - |
@@ -256,7 +256,8 @@
         剩余是目标口径的 PP/TG 矩阵（本轮 planner 判 deficit、bank 0，测不出 gather 的收益）。
         **2026-10-24 更正**：当天早些时候写过"取 (c)、gather 暂不实现"，随后用户确认 (b)，已按 (b) 落地
         （`RESULTS.md` 6.4：paged + gather 530.48 对连续 509.94、对 paged FA 449.20）。
-        (c) 保留的含义只剩**默认模式选择**：`--kv-page auto` 由 fit 预算决定初始是否开分页，**该 auto 未实现**；
+        (c) 保留的含义只剩**默认模式选择**：`--kv-page auto` 由 fit 预算决定初始是否开分页，**该 auto 已于同日落地**
+        （本节第 16 条，默认值就是 auto）；
         它不再影响 `!paged` 这个兜底条件的作用域。
     上下文压缩（agent / 多轮）是 M5 的延伸，**已决定不做**：丢中间段会让输出偏离预期，
     三条硬约束仍留在 `THREE-TIER.md` F10 9.5 供将来参考：
@@ -274,9 +275,25 @@
 15. **P1，4096 档 bank 仍是 0**：`-fac 256` 之后 score 预留只有 256 MiB，surplus 仍然不够（`RESULTS.md` 0.4 读数 6）。
     这一档要么论证"0 就是最优"，要么继续查设备 compute 的其它归属（0.2 表 A 的 +1134 MiB 已在 A 里按工作集收掉，
     剩下的固定项还没拆）。
-16. **P2，`--kv-page auto`**：按 `common/fit.cpp` 的预算（初始 KV 装不装得进设备 surplus）决定默认开不开分页。
-    现在只能手工 `--kv-page`。分页在 F11 L1 之后不再牺牲 prefill PP，所以这条只是默认值的便利，
-    不是正确性问题；它取代了 2026-10-24 早上"分页只当容量档"的用法。
+16. **`--kv-page-auto` 已落地，默认仍 off**（2026-10-24）：`common_params.kv_page` 是三态（`-1` auto / `0` / `1`，默认 0），
+    `common_moe_plan` 新增 `kv_page` 与 `kv_init_bytes`，判据是 `surplus - fa_score`（规划器给 bank 的那笔余量）
+    是否为负，且要求 `offload_kqv`（`-nkvo` 下恒关）。日志两行：
+    `common_moe_plan_impl: ... left after the initial K/V ... -> kv-page on/off` 与
+    `K/V cache: paged|contiguous layout from the memory plan (initial ... MiB)`。
+    实测判决：8176 档 +1900 MiB、6144 档 +1644 MiB -> 连续；4096 档 -147.8 MiB -> 分页。
+    `LLAMA_MOE_PLAN=0` 时自动判决失效，退回连续并打 warning。
+    **默认没有改成 auto**，因为第 17 条的 10K 输出差异还没定性。
+17. **P0，分页 KV 在 10K prompt 上与连续布局的输出不一致**（2026-10-24 发现，未结项）。证据（同一二进制、
+    `-c 16384 -ub 2048 -f prompt10k.txt -n 16 --temp 0 --moe-cache-mib 0`，`bench/raw/l1d-20261024/`）：
+    - 分页（gather 开）与分页（`--kv-gather-mib 0`，走 paged FA）**逐字相同**（md5 `8a940649`，两种预填 kernel 同结果），
+      说明差异不在预填的 matmul/FA 选择上；
+    - 连续布局（`--no-kv-page`）是 `b5b211df`，与分页差在**第 1 个生成 token**，之后的重合；
+    - 把两边的分配都固定成 12288 cells（`-kvg 12288` 对分页默认增长到 12288）仍然不同，所以不是 mask/分配尺寸；
+    - 各自 3 次重复都稳定（分页 3/3 相同），排除采样或竞态噪声；
+    - `-c 4096 --chunks 2` 的质量门两边一致（`RESULTS.md` 6.4 第 5 条），所以差异只在长 n_kv 路径。
+    下一步：用 `GGML_VK_FA_TRACE` 比较两臂 decode 时的 FA 形状（path/Br/Bc/D_split），再对 10K 的
+    prompt logits 做逐层对比（`llama-perplexity` 不能跑 `-c > 5214`，需要临时探针）。
+    **在定性之前**：`--kv-page` 不做默认、F11 的"逐字相同"验收只覆盖 `n_kv <= 8192`（`RESULTS.md` 6.4 的 4535 token）。
 
 新增行为（F7 的 offload 开关、F8 的分块开关）落地时必须进第 4 节开关表，默认值由目标口径实测决定；
 `-kvg/--kv-grow` 已按此规则登记（默认 -1，实测见 `RESULTS.md` 0.3）。

@@ -1576,8 +1576,16 @@ bool llama_kv_cache::ensure_dense_workspace(uint32_t cells) {
         return false;
     }
 
+    // used_max() can lag behind the range the next graph reads, so also cover what the graph already asked for
+    cells = std::max(cells, page_dense_need);
+
     // get_n_kv pads the shared range to 256 cells, so the workspace has to cover the padded range
     cells = std::min((cells + 255)/256*256, kv_size_max);
+
+    static const bool trace = getenv("GGML_KV_PAGE_TRACE") != nullptr;
+    if (trace) {
+        LLAMA_LOG_INFO("%s: %u cells requested, workspace holds %u cells\n", __func__, cells, page_dense_cells);
+    }
 
     if (cells <= page_dense_cells) {
         return false;
@@ -1599,8 +1607,7 @@ bool llama_kv_cache::ensure_dense_workspace(uint32_t cells) {
         return false;
     }
 
-    const uint32_t want = std::min(cap_cells, std::max(cells, 2*page_dense_cells));
-
+    const uint32_t want = std::min(std::min(cap_cells, kv_size_max), std::max(cells, 2*page_dense_cells));
     ggml_init_params params = {
         /*.mem_size   =*/ size_t(4*ggml_tensor_overhead()),
         /*.mem_buffer =*/ nullptr,
@@ -1654,6 +1661,16 @@ bool llama_kv_cache::ensure_dense_workspace(uint32_t cells) {
 bool llama_kv_cache::build_paged_dense(
         ggml_context * ctx, ggml_cgraph * gf, int32_t il, uint32_t n_kv,
         ggml_tensor ** k, ggml_tensor ** v) const {
+    static const bool trace = getenv("GGML_KV_PAGE_TRACE") != nullptr;
+    if (trace && il >= 0) {
+        LLAMA_LOG_INFO("%s: layer %d: %u cells, workspace %u cells, usable %d\n",
+                __func__, il, n_kv, page_dense_cells,
+                kv_page && page_dense_ok && n_kv > 0 && n_kv <= page_dense_cells);
+    }
+
+    // the next ensure_capacity only knows used_max(), which can be behind the cells the graph reads
+    page_dense_need = std::max(page_dense_need, n_kv);
+
     if (!kv_page || !page_dense_ok || n_kv == 0 || n_kv > page_dense_cells ||
         page_dense_k == nullptr || page_dense_v == nullptr) {
         return false;
@@ -1696,8 +1713,8 @@ bool llama_kv_cache::build_paged_dense(
     const int64_t  n_embd_v = layers[ikv].v->ne[0];
     const uint32_t ns       = 1;   // paged mode requires a single stream
 
-    static const bool trace = getenv("GGML_KV_PAGE_TRACE") != nullptr;
-    if (trace) {
+    static const bool trace_done = false;
+    if (trace_done) {
         LLAMA_LOG_INFO("%s: gather layer %d: %u cells, %u blocks, workspace %u cells\n",
                 __func__, il, n_kv, n_blocks, page_dense_cells);
     }

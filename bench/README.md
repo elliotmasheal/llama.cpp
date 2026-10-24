@@ -27,13 +27,18 @@ llama-cli -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on \
 - **K/V 默认按工作集分配**（`-kvg -1`，见 `DECISIONS.md` 第 4 节）：256K + 10K 只用 320 MiB，驻设备。
   所以本口径**不再加 `-nkvo`**；`-nkvo` 只用于"工作集超过显存"的对照臂，且它和 `--moe-cache-mib` 非零同时出现会触发
   `llama-moe-cache.cpp:1910`（F1 未修）。要复现旧行为用 `-kvg 0`（一次分配 `n_ctx`，256K 下 5120 MiB）。
-- `used` 里的 KV 只算当前分配，不再等于 `n_ctx x 20 KiB`；比较不同臂时先看日志的 `K/V grown to N cells`。
+- **`--kv-page` 默认仍是 off**：`--kv-page-auto auto` 让 `common/fit.cpp` 判决（扣掉 score 预留后没有余量就开分页，
+  3 个档位的实测判决见 `RESULTS.md` 6.5），`--kv-page` / `--no-kv-page` 强制开/关。分页臂必须配 `-K`（KV 在设备），
+  gather 的稠密工作区由 `--kv-gather-mib`（默认 256）封顶。默认值不改的原因见 `DECISIONS.md` 第 6 节第 17 条
+  （10K prompt 下分页与连续布局的输出不一致，未定性）。
+- `used` 里的 KV 只算当前分配，不再等于 `n_ctx x 20 KiB`；比较不同臂时先看日志的 `K/V grown to N cells`
+  （连续布局）或 `paged K/V: N blocks of M cells`（分页）。
 - 长跨距注意力的 score 缓冲由 `-fac/--fa-chunk-mib`（默认 256）封顶，query 维按预算切块；`-fac 0` 是旧行为
   （整段一块，`RESULTS.md` 0.4 有五个 cap 的消融）。改这个值要同时看 bank 与 `reallocs`。
 - 不加 `--moe-cache-mib` 时由内存规划器（`common_moe_plan_get()`）自己算 bank，这就是"自适应 RAM 条件"。
 - 显存档位用 `GGML_VK_VRAM_LIMIT_MIB` 实现，见第 2 节。
-- 电源：「平衡」方案 + AC 供电（`bench/env/power.txt` 记 GUID），dGPU 上不得有其它推理进程。
-  脚本会先检查这两条，不合格直接停。
+- 电源：「平衡」方案 + AC 供电（`bench/env/power.txt` 记 GUID），dGPU 上不得有其它推理进程，
+  `-lm none` 还要求至少 22 GiB 空闲 RAM。脚本会先检查这三条，不合格直接停。
 
 ## 2. 显存与内存档位
 
@@ -54,9 +59,15 @@ Vulkan0（680M，UMA）两次都是 22842.2 MiB，不受影响。
 ## 3. 每轮优化要报的列
 
 `bash bench/tools/run-matrix.sh -T 8176,6144,4096 -r 2` 直接产出这些列，缺一不可（参数见脚本 `-h`：
-`-T` 显存档 / `-C` ctx / `-B` bank / `-K` KV 在 GPU / `-L` load 模式 / `-r` 重复 / `-E` 附加 env）：
+`-T` 显存档 / `-C` ctx / `-B` bank / `-K` KV 在 GPU / `-L` load 模式 / `-r` 重复 / `-E` 附加 env /
+`-a` 臂名 / `-A` 该臂的附加 CLI 参数）：
 
-`tier | run | load | bank | ncmoe | -nkvo | PP t/s | TG t/s | VRAM peak | held | VRAM used | RAM peak | reallocs | hit % | status`
+`arm | tier | run | load | ctx | KV | bank | ncmoe | PP t/s | TG t/s | VRAM peak | held | VRAM used | RAM peak | reallocs | hit % | host blk | gather MiB | status`
+
+- `arm` 是 `-a` 给的名字，跨臂比较只看同一 `tier` 下的同名行。
+- `host blk` = 落在 host 的 K/V 块数（分页臂的容量指标，对应日志 `K/V block N placed on the host`）；
+  `gather MiB` = 分页 prefill 稠密工作区长到的最大值，连续布局恒为 0。
+  `gather MiB` 只在 `--kv-page` 下非零，`--kv-gather-mib 0` 是它的对照。
 
 - `VRAM peak` 取**每进程独占**（`\GPU Process Memory(pid_<pid>*)\Dedicated Usage` 的峰值），
   设备总量 8176 MiB 里桌面已占约 0.5-1.4 GiB，看设备总量会误判。
@@ -105,6 +116,13 @@ Vulkan0（680M，UMA）两次都是 22842.2 MiB，不受影响。
     判据：日志里必须出现 `VRAM limited to ...`，否则整批 `tier` 列作废。用
     `"C:\Program Files\Git\bin\bash.exe" -c ...` 启动；Git Bash 的 `PATH` 以 `/mingw64/bin` 开头且没有 `/mnt/`，
     WSL 的 `PATH` 以 `/usr/local/sbin` 开头并带 `/mnt/c/...`，一眼可辨。
+16. **RAM 刚被腾出来时，`-lm none` 的失败长得像显存缺陷**：2026-10-24 在用户刚结束一个 19 GiB 的 chat 进程后
+    立刻开跑，前三次 `status=vram-oom`（日志是 `llama_model_load: vk::Queue::submit: ErrorOutOfDeviceMemory`，
+    发生在 18.9 GiB 的 `Vulkan_Host` 专家上传阶段），而同一批后三次全部 `ok`、`ram peak` 19.4 GiB。
+    当时 `FreePhysicalMemory` 只有 9.5 GiB，低于 resident 门槛。所以 `vram-oom` 先看 RAM 再看显存；
+    脚本已在 preflight 里要求 `-lm none` 至少有 22 GiB 空闲 RAM。
+17. 不要在跑批过程中编辑 `run-matrix.sh`：bash 按偏移增量读脚本，改了长度之后尾部会被读成乱码
+    （实测报 `syntax error near unexpected token 'done'`，CSV 本身没坏）。要改就先跑完这一批。
 
 ## 5. 目录里还留着什么
 
