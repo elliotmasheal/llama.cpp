@@ -75,7 +75,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M3-1a data=M5-1 io=- user=-
+queues: bench=- impl=X-1 data=- io=M5-2 user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -96,6 +96,11 @@ blockers: none
 - **M2-2 完成（2026-10-24）**：`vk_dev` 打开 RX 6700S（Vulkan 1.2 + timeline），heapBudget 7378 MiB，
   design 5.5 的 7176 MiB 计划可复现（缓存 4198 MiB = 21.87%）；tier 可注入、预算不足按 256 MiB 回退并计数；
   见 `RESULTS.md` 第 26 节、`DECISIONS.md` 第 19 节。
+- **M3-1a done（2026-10-24）**：CPU 专家核 0.115-0.118 -> 0.0908 -> 0.0661 -> **0.0575-0.0587**
+  （8 线程首轮，门禁口径），code 的 0.059 达到、技术类 0.0665 中位；t=1..5 曲线在 `RESULTS.md` 第 31 节。
+  遗留：design 6.2 回填（用户）、逐 token（X-4）。U-2 不再需要。
+- **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、
+  每专家 SHA-256、索引即 journal）；io 队首解到 M5-2。
 - **M2-4 完成（2026-10-24）**：int8 专家 GEMM 3.66 -> **6.08-6.20 TFLOPS（1.68x）**，达到 6.0 硬门；
   关键改动是激活分 `qs`/`ds` 平面（16 次标量加载 -> 4 次 `uvec4`）+ int16 `sum(qs)` 代替 f16 `s`；
   `max_rel_l1` 同时从 6.65e-6 降到 2.48e-8；见 `RESULTS.md` 第 28 节、`DECISIONS.md` 第 20.1 节。
