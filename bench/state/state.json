@@ -114,7 +114,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M1-4a is writing code only; M1-4a-run and every GPU/quiet task wait for R1 to release the machine"
+      "note": "M1-4a code is in (c78945692); M1-4a-run waits for R1 to release gpu/machine-quiet"
     },
     {
       "lane": "data",
@@ -239,7 +239,7 @@
       "id": "M1-4a",
       "milestone": "M1",
       "lane": "impl",
-      "status": "doing",
+      "status": "done",
       "claimed_at": "2026-10-24T15:10:00",
       "title": "Vulkan 原型：k=1/2/4/5/8 的预录命令缓冲与计时壳（只写代码）",
       "deps": [],
