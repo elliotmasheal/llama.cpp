@@ -1,0 +1,82 @@
+{
+  "schema": 1,
+  "track": "qwen36-runtime",
+  "updated": "2026-10-24",
+  "phase": "M1",
+  "phase_status": "in_progress",
+  "decision_gate": {
+    "id": "M1",
+    "open": true,
+    "result": null,
+    "criteria": [
+      "restricted-vocab E >= 2.1 at default draft depth, or >= 2.3 at n-max 4",
+      "Vulkan prototype cycle time within 10% of design section 2.6",
+      "locality within 5 pp of M0 on a non-technical prompt"
+    ],
+    "on_fail": "stop and ask the user whether to lower the TG target (design section 9)"
+  },
+  "tasks": [
+    {
+      "id": "M1-1",
+      "title": "complete decode-time routing trace for the 10 layers with a gap",
+      "status": "todo",
+      "blocked_by": [],
+      "done_when": "trace-10k-g128.bin has 128 decode records for all 40 layers, including layers 3,7,...,35 and layer 39; gap root cause written into DECISIONS",
+      "evidence": "bench/raw/m0-qwen36/trace-10k-g128.bin"
+    },
+    {
+      "id": "M1-2",
+      "title": "locality recheck on non-technical text",
+      "status": "partial",
+      "blocked_by": [],
+      "done_when": "three text classes measured (technical, dialogue/code, multilingual); w=8 unique experts and 25% hit rate reported per class; deviation from M0 <= 5 pp or explained",
+      "evidence": "bench/raw/m0-qwen36/m0-sim-10k.txt, m0-sim-multidoc.txt"
+    },
+    {
+      "id": "M1-3",
+      "title": "restricted-vocab MTP acceptance E",
+      "status": "todo",
+      "blocked_by": [],
+      "done_when": "E measured for the restricted vocab at default depth and n-max 4; accepted tokens match full-vocab greedy; E >= 2.1 / 2.3 or gate fails",
+      "evidence": "bench/raw/m0-qwen36/mtp-*.out"
+    },
+    {
+      "id": "M1-4",
+      "title": "Vulkan prototype cycle time for k in {1,2,4,8}",
+      "status": "todo",
+      "blocked_by": [],
+      "done_when": "cycle time per k measured with submit+sync included; deviation from design section 2.6 <= 10%; per-pass overhead < 1 ms",
+      "evidence": "TBD"
+    },
+    {
+      "id": "M1-5",
+      "title": "re-measure bandwidth on the target machine",
+      "status": "todo",
+      "blocked_by": [],
+      "done_when": "dense GEMV, H2D and 4-thread CPU read measured with the same method as RESULTS R.5; any deviation > 5% updates the design references",
+      "evidence": "bench/raw/h2d-bw, bench/tools/membw_probe.py"
+    }
+  ],
+  "next": {
+    "task_id": "M1-1",
+    "why": "the 10 full-attention layers are missing from the decode trace, so the U_k and hit-rate inputs of the whole performance model are computed on 30 of 40 layers",
+    "first_step": "reproduce with m0-trace on a 512-token prompt and check whether ffn_moe_topk is a VIEW or a fused node in those layers",
+    "done_when": "see task M1-1"
+  },
+  "last_gate": {
+    "id": "G-REG",
+    "result": "unknown",
+    "date": "2026-10-23",
+    "detail": "last full record is DECISIONS section 6 item 6 (ctest 32/32, MUL_MAT 2275/2275, MUL_MAT_ID 939/939, FLASH_ATTN_EXT 5332/5332). Commit 44bd79305 changed llama-kv-cells after that record, so the gate is stale. M1 does not touch fork code, so it does not block; rerun before any fork code change."
+  },
+  "blockers": [],
+  "escalations": [
+    {
+      "id": "N7",
+      "question": "build the runtime outside ggml/llama.cpp (design as written) or refactor inside the fork",
+      "needs_by": "M2 start",
+      "owner": "user",
+      "note": "M1 is measurement only, so this does not block M1; choosing the fork requires rewriting design 3.3"
+    }
+  ]
+}

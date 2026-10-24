@@ -1,17 +1,65 @@
 # bench 索引与测试口径
 
-本目录是这个 fork 唯一的实测记录处。2026-10-23 起从 54 份文档合并成 4 份，职责不重叠：
+本目录是这个 fork 唯一的实测记录处。2026-10-23 起从 54 份文档合并成 4 份，2026-10-24 起
+再按"新主线 / 归档线"分成两条口径，职责不重叠：
 
 | 文件 | 只放什么 | 谁在读 |
 |---|---|---|
-| `bench/README.md` | 测试口径、档位定义、怎么跑、测量陷阱 | 每次跑数之前 |
+| `design/qwen36-moe-runtime-design.md` | 新主线的目标、硬约束、性能模型、里程碑与阈值 | 每轮开始 |
+| `bench/state/state.json` | 机器可读的当前阶段、任务、下一个动作、最近门禁 | 每轮开始，`state_check.py` 校验 |
+| `bench/README.md` | 两条口径、档位定义、怎么跑、必报列、测量陷阱 | 每次跑数之前 |
 | `bench/RESULTS.md` | 数字的唯一来源（含日期、分支、电源态、配置） | 报收益、对比基线 |
 | `bench/DECISIONS.md` | 判决、已证伪清单、开关表、代码级硬约束、未结项 | 决定下一步做什么 |
-| `bench/THREE-TIER.md` | 三层（VRAM+RAM+SSD）与自适应的现状、缺口、步骤 | 动 cache / fit / loader 之前 |
+| `bench/THREE-TIER.md` | 归档线：三层（VRAM+RAM+SSD）的现状、缺口、复用判定 | 只读 |
 
 被合并删除的 54 份 md 与原始日志不再维护，需要原文时查 git 历史（提交 `a44e13e08` 及其之前的工作区）。
 
-## 1. 统一目标口径
+## 0. 两条口径（先读这一节）
+
+2026-10-24 起有两条口径，**数字不可跨口径比较**：
+
+| 口径 | 对象 | 状态 | 数字落在 |
+|---|---|---|---|
+| **新主线** | `design/qwen36-moe-runtime-design.md` 的运行时：Qwen3.6-35B-A3B，10K prompt，ctx 256K，k=8 验证 + MTP 草稿 | M1 进行中，运行时尚未落地 | `RESULTS.md` 第 R 节 |
+| **归档线** | 本 fork 的 `llama-cli` 路径：Ornith-1.5-35B，10K prompt，ctx 256K，单步前向 | 冻结，只维护证据 | `RESULTS.md` 第 0-8 节 |
+
+规则：
+
+- 新主线的目标（PP >= 1000、TG >= 130）只在第 0.1 节口径下成立；归档线的 26.6-27.1 t/s 与 130 不是同一个量，
+  **禁止把两者放在一起比较或推导**。
+- 归档线仍可跑，但只用于两件事：(a) 复用已付过代价的物理常数与已证伪结论；
+  (b) 新运行时借用的 fork 组件做对照。
+- 引用归档线数字时必须写明"归档线"三个字。
+
+### 0.1 新主线必报列（M1 起生效，未定项标 TBD）
+
+```
+date | commit | phase | task | model | ctx | prompt tokens | n_gen | k | draft vocab |
+expert cache MiB | VRAM tier | load | power | PP | TG | E | accept p | hit % |
+H2D MiB/token | VRAM peak | RAM peak | status
+```
+
+- **E 与 p 是导出量**：E = 生成 token / 周期数，周期数 = 生成数 - 接受数（design 2.5）。
+  必须同时给原始 `draft_n` / `draft_n_accepted`，否则 E 不可复核。
+  交叉校验：k=4 时草稿数/周期约 3.9，k=8 时约 7.7。
+- **草稿代价单列**：每个草稿步读一次完整输出头约 0.5 GB / 2.3 ms（design 2.6）。只报总 TG 会把这块藏起来。
+- **两条草稿基线**：完整词表（E 已测 2.84 / 3.24 / 3.82，n-max 默认 / 4 / 8）与受限词表（未测）。
+  报受限词表时必须同时报词表大小，以及同 prompt 的完整词表对照。
+- `status` 不是 `ok` 一律按缺陷进 `DECISIONS.md` 未结项，不得当成"配置不对"跳过。
+- 三个前提未验证前，投影值不得写成结论：局部性跨文本、受限词表 E、每 pass 提交开销 < 1 ms（design 6.5）。
+- 正确性判据与速度分开报：接受的 token 必须与参考 greedy 逐 token 一致；`k=1` 路径另报 logits KLD <= 1e-4。
+
+### 0.2 新主线的测量陷阱
+
+1. 稠密地板：2.17 GB/token / 217 GB/s = 10 ms -> 单步上限 100 tok/s。任何"单步 > 100"的读数先怀疑口径
+   （是不是 k>1、是不是复用了上一 pass 的结果）。
+2. H2D 14.3 GB/s 是硬墙，多流 / 大块 / 更深在途都试过无效；唯一余量是全双工约 23.3 GB/s 合计。
+3. MTP 默认草稿深度不是 1（约 3）。把 63.8% 当成单草稿接受率会得到错误的 TG 投影（design 2.4 / 2.5）。
+4. 日志里没有周期计数，周期数只能由"生成 - 接受"推算；必须与"草稿数/周期"互相校验后再写进报告。
+5. 受限词表只影响速度：验证 pass 永远是完整词表，正确性看接受的 token，而不是草稿的 logits。
+6. `llama-bench` 不可用于本口径（它把 `n_ctx` 设成 `p+n`），必须用 `llama-cli` 或运行时自己的计时。
+
+## 1. 统一目标口径（归档线：Ornith-1.5-35B + `llama-cli`）
 
 优化目标：**256K ctx + 10K prompt**，在 qwen35moe（Ornith-1.5-35B-Q4_K_M，20.2 GiB）上追求 PP/TG 最大化，
 显存、内存、SSD 三层协同，且**显存与内存都不足时 SSD 必须能当临时缓冲**。
@@ -56,7 +104,7 @@ llama-cli -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on \
 `=6144` -> hold back 1234.8 MiB，init 后报 **6142.9**；`=4096` -> hold back 3282.8 MiB，init 后报 **4094.9**；
 Vulkan0（680M，UMA）两次都是 22842.2 MiB，不受影响。
 
-## 3. 每轮优化要报的列
+## 3. 归档线每轮要报的列
 
 `bash bench/tools/run-matrix.sh -T 8176,6144,4096 -r 2` 直接产出这些列，缺一不可（参数见脚本 `-h`：
 `-T` 显存档 / `-C` ctx / `-B` bank / `-K` KV 在 GPU / `-L` load 模式 / `-r` 重复 / `-E` 附加 env /
@@ -127,15 +175,18 @@ Vulkan0（680M，UMA）两次都是 22842.2 MiB，不受影响。
 ## 5. 目录里还留着什么
 
 ```
-bench/README.md  RESULTS.md  DECISIONS.md  THREE-TIER.md   四份文档
+design/          qwen36-moe-runtime-design.md                     新主线规格（只读）
+bench/README.md  RESULTS.md  DECISIONS.md  THREE-TIER.md          四份文档
+bench/state/     state.json                                       机器可读状态
 bench/prompts/   prompt10k.txt (10428 tok)  prompt20k.txt (19758 tok)
-bench/env/       power.txt  machine.txt                      口径依赖的机器事实
+bench/env/       power.txt  machine.txt                           口径依赖的机器事实
 bench/tools/     run-matrix.sh（矩阵） quality-gate.sh（PPL + KLD 门禁）
+                 state_check.py（状态一致性） m0-trace.cpp m0-analyze.py（路由探针）
                  monitor.ps1  run-case.ps1  bench10k.ps1  matrix.ps1
                  ssd_probe.py  membw_probe.py  gguf_dims.py  read_trace.py
-                 summarize_perf.py  vkgate.cpp               可复用探针与门禁
+                 summarize_perf.py  vkgate.cpp  deferred-copy.cpp  vklimit-probe.cpp
 bench/raw/       每次跑的 .out/.err/.csv 产物（不入库）
 ```
 
 原始产物不再进 git。要新证据就重新跑，跑完把结论写进 `RESULTS.md` / `DECISIONS.md`，
-不要再往本目录加第五份 md。
+不要再往本目录加第五份 md；每轮收尾同步 `AGENTS.md` 状态块与 `bench/state/state.json`。

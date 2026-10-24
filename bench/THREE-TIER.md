@@ -3,6 +3,25 @@
 回答"小显存、小内存、大上下文这台机器该怎么分层、下一步做什么"。
 数字与已证伪方向分别见 `RESULTS.md` 与 `DECISIONS.md`，本文件不重复判决。
 
+> **状态（2026-10-24）：归档线，冻结。** 新主线是 `design/qwen36-moe-runtime-design.md`
+> （Qwen3.6-35B-A3B 专用运行时，里程碑 M0-M5）。本文件只保留 Ornith-1.5-35B + `llama-cli` 路径的
+> 现状与缺口记录，**不再追加新计划**；新任务一律进 `bench/state/state.json`。
+>
+> 仍然生效的部分：F1 的"容量不足不得 abort"红线（动 fork 代码时），以及下表的复用判定。
+>
+> | 结论 | 新主线是否复用 | 依据 |
+> |---|---|---|
+> | 命中率来自时间局部性，静态 top-N 不可取 | 复用 | design 2.2 / `RESULTS.md` R.2：25% LRU 97.9% 对静态 46.1% |
+> | H2D 14.3 GB/s 硬墙 | 复用 | design 1.3 / `RESULTS.md` R.5 |
+> | SSD 随机 1.95 MiB = 0.81 GB/s，不进 decode | 复用 | design 1.2 非目标 + `AGENTS.md` 第 8 节 |
+> | `llama-moe-cache` 的调度与预取 | 不复用 | design 3.3：依赖旧图，且静态驻留不如动态 LRU |
+> | `llama_context` 图路径作为 decode 主路径 | 不复用 | design 3.3：每 token 约 4000 节点，MoE 节点在 decode 有缺口 |
+> | `common/fit.cpp` 的预算式 | 借鉴，不直接复用 | design 5.5 要按 k=8 与专家缓存重算 |
+> | KV 分页（F10 / F11） | 待定 | 只在"跑满 256K"时评估；design 5.5 的 KV 行仍是 TBD |
+> | `mul_mat_vec` / `mul_mat_id` 内核与块格式定义 | 复用但需改造 | design 3.3：要改成批量 k 版本 |
+>
+> 引用本文件的数字时必须写明"归档线"（`bench/README.md` 第 0 节）。
+
 ## 0. 最高优先级优化方案（2026-10-23 评审，覆盖下面的顺序）
 
 本节是后续优化的最高优先级，下面第 4 节的顺序以本节为准。方案按"预期收益 x 证据把握"排序。
