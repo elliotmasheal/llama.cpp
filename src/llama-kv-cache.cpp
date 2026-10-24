@@ -157,6 +157,10 @@ llama_kv_cache::llama_kv_cache(
 
         if (kv_page) {
             this->kv_block_size = kv_block;
+            if (kv_block > 2048) {
+                LLAMA_LOG_WARN("%s: block sizes above 2048 cells are not verified for the prefill gather "
+                        "(bench/RESULTS.md 6.6)\n", __func__);
+            }
             // the block is the allocation unit, so the cell count follows it
             kv_size_max = (kv_size_max + kv_block - 1)/kv_block*kv_block;
             kv_size     = (kv_size     + kv_block - 1)/kv_block*kv_block;
@@ -1562,7 +1566,9 @@ bool llama_kv_cache::ensure_blocks(uint32_t n_extra) {
 
     const uint32_t cells = std::min(kv_page_blocks*kv_block_size, kv_size_max);
     for (uint32_t s = 0; s < n_stream; ++s) {
-        v_cells[s].resize(cells);
+        // grow(), not resize(): resize() resets every cell, which drops the positions and seqs of the
+        // K/V this cache already holds (bench/DECISIONS.md 6.17)
+        v_cells[s].grow(cells);
     }
 
     return true;
@@ -1576,7 +1582,8 @@ bool llama_kv_cache::ensure_dense_workspace(uint32_t cells) {
         return false;
     }
 
-    // used_max() can lag behind the range the next graph reads, so also cover what the graph already asked for
+    // used_max() covers the working set, but a graph reserved before the next batch is placed can ask for
+    // more; keep the workspace at the largest range any graph has asked for (F11 L1e)
     cells = std::max(cells, page_dense_need);
 
     // get_n_kv pads the shared range to 256 cells, so the workspace has to cover the padded range

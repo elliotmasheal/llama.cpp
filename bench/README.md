@@ -29,8 +29,8 @@ llama-cli -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on \
   `llama-moe-cache.cpp:1910`（F1 未修）。要复现旧行为用 `-kvg 0`（一次分配 `n_ctx`，256K 下 5120 MiB）。
 - **`--kv-page` 默认仍是 off**：`--kv-page-auto auto` 让 `common/fit.cpp` 判决（扣掉 score 预留后没有余量就开分页，
   3 个档位的实测判决见 `RESULTS.md` 6.5），`--kv-page` / `--no-kv-page` 强制开/关。分页臂必须配 `-K`（KV 在设备），
-  gather 的稠密工作区由 `--kv-gather-mib`（默认 256）封顶。默认值不改的原因见 `DECISIONS.md` 第 6 节第 17 条
-  （10K prompt 下分页与连续布局的输出不一致，未定性）。
+  gather 的稠密工作区由 `--kv-gather-mib`（默认 256）封顶。默认值不改的原因：4096 档分页比连续布局低 3-5%，
+  换到的只是块级降级的安全性（`DECISIONS.md` 第 6 节第 16 条）；`--kv-block` > 2048 在 gather 下仍有偏差（第 18 条）。
 - `used` 里的 KV 只算当前分配，不再等于 `n_ctx x 20 KiB`；比较不同臂时先看日志的 `K/V grown to N cells`
   （连续布局）或 `paged K/V: N blocks of M cells`（分页）。
 - 长跨距注意力的 score 缓冲由 `-fac/--fa-chunk-mib`（默认 256）封顶，query 维按预算切块；`-fac 0` 是旧行为
