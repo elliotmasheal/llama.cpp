@@ -75,9 +75,10 @@
   "queues": [
     {
       "lane": "bench",
-      "head": "M1-5",
+      "head": "M1-7",
       "order": [
         "M1-1",
+        "M1-7",
         "M1-5",
         "M1-3b",
         "M1-2b",
@@ -245,7 +246,7 @@
       "id": "M1-5",
       "milestone": "M1",
       "lane": "bench",
-      "status": "todo",
+      "status": "done",
       "title": "带宽同口径复测：dense GEMV、H2D、4 线程 CPU 读",
       "deps": [],
       "resources": [
@@ -253,7 +254,8 @@
       ],
       "paths": [
         "bench/raw/h2d-bw/**",
-        "bench/tools/membw_probe.py"
+        "bench/tools/membw_probe.py",
+        "bench/tools/vkgate.cpp"
       ],
       "done_when": "三个读数与 RESULTS 第 5 节偏差 <= 5%，否则更新 RESULTS 并提请注意 design 引用"
     },
@@ -767,6 +769,24 @@
         "bench/raw/m5/**"
       ],
       "done_when": "重组/原文件两条路径贪心输出逐 token 一致；删除 sidecar 后能正常启动"
+    },
+    {
+      "id": "M1-7",
+      "milestone": "M1",
+      "lane": "bench",
+      "status": "todo",
+      "title": "H2D 与 CPU 读并发时的聚合主机带宽 + 每专家 CPU 代价",
+      "deps": [],
+      "resources": [
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/h2d-bw/**",
+        "bench/tools/vkgate.cpp",
+        "bench/tools/membw_probe.py"
+      ],
+      "done_when": "H2D 与 4/8 线程 CPU 读同时运行时各自与合计 GB/s 有 r=2 读数；每专家 CPU 代价（ms/专家）在 4/8 线程各测一次；据此判定各半分担投影（RESULTS 第 8 节 133-148）是否成立"
     }
   ],
   "last_gate": {

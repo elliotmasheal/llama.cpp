@@ -82,6 +82,7 @@ struct App {
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     VkPipelineLayout      pl  = VK_NULL_HANDLE;
     VkPipeline            pipe_gemv = VK_NULL_HANDLE;
+    VkPipeline            pipe_gemv4 = VK_NULL_HANDLE;
     VkPipeline            pipe_ids  = VK_NULL_HANDLE;
     VkDescriptorPool      dpool = VK_NULL_HANDLE;
 
@@ -360,6 +361,7 @@ static void init(App & a) {
 
     a.pipe_gemv = make_pipeline(a, "gemv.spv");
     a.pipe_ids  = make_pipeline(a, "ids.spv");
+    a.pipe_gemv4 = make_pipeline(a, "gemv4.spv");
 
     VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
@@ -692,6 +694,57 @@ static void cmd_overlap(App & a, uint32_t transfer_mib, double target_ms) {
             (hidden > 0.15 * denom ? "partial overlap" : "no measurable overlap"));
 }
 
+// vec4 variant of record_compute: n is counted in vec4 elements.
+static void record_compute4(App & a, VkCommandBuffer cb, VkDescriptorSet set, Work w) {
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, a.pipe_gemv4);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, a.pl, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cb, a.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &w);
+    vkCmdDispatch(cb, w.groups, 1, 1);
+}
+
+// Streams a large device buffer to measure achievable VRAM read bandwidth. Sizes above the
+// 32 MB Infinity Cache keep the read off the cache, so the number is a DRAM read ceiling.
+static void cmd_stream(App & a, uint32_t mib, uint32_t dispatches, bool vec4) {
+    Buf stream_w = make_buf(a, (VkDeviceSize) mib * MIB,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Work w;
+    w.n    = vec4 ? (uint32_t) ((VkDeviceSize) mib * MIB / 16) : (uint32_t) ((VkDeviceSize) mib * MIB / 4);
+    w.reps = 1;
+    VkDescriptorSet set = make_set(a, stream_w.buf);
+
+    // one untimed pass so the first touch does not land in the measured window
+    {
+        VkCommandBuffer cb = alloc_cb(a, a.pool_c);
+        begin_cb(cb);
+        if (vec4) { record_compute4(a, cb, set, w); } else { record_compute(a, cb, set, w); }
+        VK_CHECK(vkEndCommandBuffer(cb));
+        uint64_t val = 0;
+        submit_tl(a, a.qc, a.sem_c, &a.val_c, cb, &val);
+        wait_tl(a, a.sem_c, val);
+        vkResetCommandPool(a.dev, a.pool_c, 0);
+    }
+
+    VkCommandBuffer cb = alloc_cb(a, a.pool_c);
+    begin_cb(cb);
+    for (uint32_t i = 0; i < dispatches; ++i) {
+        if (vec4) { record_compute4(a, cb, set, w); } else { record_compute(a, cb, set, w); }
+    }
+    VK_CHECK(vkEndCommandBuffer(cb));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t val = 0;
+    submit_tl(a, a.qc, a.sem_c, &a.val_c, cb, &val);
+    wait_tl(a, a.sem_c, val);
+    const double ms  = ms_since(t0);
+    const double gb  = (double) mib * dispatches / 1024.0;
+    std::printf("%u MiB x %u dispatches: %.2f GiB read in %.2f ms -> %.1f GB/s\n",
+            mib, dispatches, gb, ms, gb / (ms / 1000.0));
+    vkQueueWaitIdle(a.qc);
+    vkDestroyBuffer(a.dev, stream_w.buf, nullptr);
+    vkFreeMemory(a.dev, stream_w.mem, nullptr);
+}
+
 int main(int argc, char ** argv) {
     App a;
     init(a);
@@ -703,8 +756,15 @@ int main(int argc, char ** argv) {
     } else if (mode == "overlap") {
         cmd_overlap(a, argc > 2 ? (uint32_t) std::atoi(argv[2]) : 1400,
                 argc > 3 ? std::atof(argv[3]) : 100.0);
+    } else if (mode == "stream") {
+        cmd_stream(a, argc > 2 ? (uint32_t) std::atoi(argv[2]) : 1024,
+                argc > 3 ? (uint32_t) std::atoi(argv[3]) : 16, false);
+    } else if (mode == "stream4") {
+        cmd_stream(a, argc > 2 ? (uint32_t) std::atoi(argv[2]) : 1024,
+                argc > 3 ? (uint32_t) std::atoi(argv[3]) : 16, true);
     } else {
-        std::printf("usage: %s info | boundary [iters] | overlap [transfer_mib] [target_ms]\n", argv[0]);
+        std::printf("usage: %s info | boundary [iters] | overlap [transfer_mib] [target_ms]"
+                    " | stream [buffer_mib] [dispatches] | stream4 [buffer_mib] [dispatches]\n", argv[0]);
     }
     return 0;
 }

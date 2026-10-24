@@ -17,14 +17,15 @@ from collections import OrderedDict
 DENSE_GB   = 2.17
 EXPERT_MB  = 1.93
 N_LAYER    = 40
-VRAM_GBPS  = 217.0
+VRAM_GBPS  = float(sys.argv[4]) if len(sys.argv) > 4 else 156.5  # M1-5 measured read ceiling
 H2D_GBPS   = 14.3
 DRAFT_MS   = 0.15
 
 path, prefill = sys.argv[1], int(sys.argv[2])
 cache_fracs = [float(x) for x in (sys.argv[3].split(',') if len(sys.argv) > 3 else ['0.20', '0.25', '0.30'])]
-# measured acceptance per cycle for full-vocab drafts; restricted vocab is assumed equal here
-E_BY_K = {3: 2.84, 5: 3.24, 9: 3.82}
+# measured acceptance per cycle for full-vocab drafts; restricted vocab is assumed equal here.
+# E is paired with the verify width it was measured at: drafts/cycle ~ k-1.
+E_BY_K = {4: 2.84, 5: 3.24, 9: 3.82}
 
 with open(path, 'rb') as f:
     n_tok, n_layer, K = struct.unpack('<3i', f.read(12))
@@ -100,7 +101,7 @@ CPU_MS_PER_EXPERT = 0.108   # measured, 4 threads, 8 experts per layer (bench/RE
 for frac in cache_fracs:
     cap = int(TOTAL * frac)
     print('\n[cache %.0f%% = %d experts = %.2f GiB]' % (frac * 100, cap, cap * EXPERT_MB / 1024))
-    print('  k   U_k   miss/win  gpu_ms  h2d_ms  cpu_ms  E     TG(h2d)  TG(cpu)')
+    print('  k   U_k   miss/win  gpu_ms  h2d_ms  cpu_ms  E     TG(h2d)  TG(cpu)  TG(split)')
     for k in (2, 3, 4, 5, 6, 8, 9):
         u = unique_per_layer(k)
         miss = lru_miss_per_window(cap, k)
@@ -111,8 +112,10 @@ for frac in cache_fracs:
         draft = (k - 1) * DRAFT_MS
         period_h2d = max(gpu, h2d) + draft
         period_cpu = max(gpu, cpu) + draft
+        # equal split: half the misses over H2D, half computed on the CPU, both under the GPU
+        period_split = max(gpu, h2d / 2.0, cpu / 2.0) + draft
         e = E_BY_K.get(k, float('nan'))
         def tg(p):
             return e / p * 1000 if (e == e and p > 0) else float('nan')
-        print('  %d  %5.1f  %8.1f  %6.1f  %6.1f  %6.1f  %5.2f  %7.1f  %7.1f' % (
-            k, u, miss, gpu, h2d, cpu, e, tg(period_h2d), tg(period_cpu)))
+        print('  %d  %5.1f  %8.1f  %6.1f  %6.1f  %6.1f  %5.2f  %7.1f  %7.1f  %8.1f' % (
+            k, u, miss, gpu, h2d, cpu, e, tg(period_h2d), tg(period_cpu), tg(period_split)))
