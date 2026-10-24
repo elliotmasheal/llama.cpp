@@ -9,13 +9,14 @@
     "open": true,
     "result": null,
     "criteria": [
-      "E >= TG_min x measured cycle at the selected k (2.73 at k=4, 3.16 at k=5 for the RESULTS section 9 cycle; recompute after R1 instead of hard-coding)",
+      "E >= 130 x measured cycle at the selected k (design 6.3: k=4 needs 2.90 at CPU 0.118 / 2.72 at 0.090; k=5 needs 3.23 / 2.88). Measured 16K: 2.850 (k=4), 3.055 (k=5), so both pass only at CPU 0.090 (RESULTS section 19)",
       "per-pass submit+sync < 1 ms, and the GPU leg within 10% of the roofline model at k=1/2/4/5/8",
       "locality within 5 pp of M0 on non-technical text (M1-2b: chat 81.6, multi 87.3, code 66.0)",
       "two miss legs measured and the cycle recomputed with an adaptive split (RESULTS section 9)",
       "VRAM budget closes with q4 KV + a 16384-token resident window (21.9% expert cache, RESULTS section 10)",
       "PP feasibility recorded: int8 ALU 8.67 TFLOPS, expert GEMM baseline 3.66 (RESULTS section 14); PP >= 1000 stays a hard floor (user 2026-10-24) and M2-4 must reach 6.0 TFLOPS",
-      "code-included TG feasibility: CPU expert <=0.059 ms at 4 threads (target 0.055, ~107 GFLOPS) with H2D 10.8 gives code TG 130; current 0.118 gives 82 (RESULTS section 17)"
+      "code-included TG feasibility: CPU expert <=0.059 ms at 4 threads (target 0.055, ~107 GFLOPS) with H2D 10.8 gives code TG 130; current 0.118 gives 82 (RESULTS section 17)",
+      "speculative output fidelity: the accepted token stream must equal plain greedy. k=4 does; k=5 forks at token 25 (N14 / M1-3d), so k=5 cannot be the acceptance config yet (RESULTS section 19)"
     ],
     "on_fail": "stop and ask the user: lower the TG target, change the ctx cost, or page the KV (design section 9)"
   },
@@ -102,27 +103,27 @@
   "queues": [
     {
       "lane": "bench",
-      "head": null,
+      "head": "M1-4b",
       "order": [
         "R1",
         "M1-4b",
-        "M1-3b",
         "M1-2b"
       ],
-      "note": "M1-4b partial: GPU leg -1.0..+5.8%, submit 0.065-0.084 ms; compute buffer not isolated. M1-3b/M1-2b wait for data"
+      "note": "M1-3b done: 16K E is 2.850 (k=4) / 3.055 (k=5), passes only at CPU 0.090; k=5 diverges from greedy at token 26 (M1-3d). M1-4b partial: compute buffer not isolated. M1-2b partial: code 66.0%."
     },
     {
       "lane": "impl",
-      "head": "X-1",
+      "head": "M1-3d",
       "order": [
         "M1-4a",
         "M1-4a-run",
         "M1-3c",
+        "M1-3d",
         "X-1",
         "X-2",
         "X-4"
       ],
-      "note": "X-1 needs gpu+host-ram; it waits for M1-2a to finish its tokenizer runs"
+      "note": "M1-3d diagnoses the k=5 verification fork (blocks the M1 gate); X-1 waits for the machine (gpu+host-ram)"
     },
     {
       "lane": "data",
@@ -151,7 +152,7 @@
         "M1-GATE",
         "U-2"
       ],
-      "note": "U-1/U-3/U-4/U-5 closed; M1-GATE waits for M1-3b/M1-3c and the code-included CPU target"
+      "note": "U-1/U-3/U-4/U-5 closed; M1-GATE waits for M1-3d, M1-4b and M1-2b, plus the code-included CPU target"
     }
   ],
   "tasks": [
@@ -231,7 +232,8 @@
       "id": "M1-3b",
       "milestone": "M1",
       "lane": "bench",
-      "status": "todo",
+      "status": "done",
+      "claimed_at": "2026-10-24T17:15:00",
       "title": "受限词表 MTP 接受率 E",
       "deps": [
         "M1-3a",
@@ -246,7 +248,7 @@
         "bench/raw/m0-qwen36/mtp-*.out",
         "bench/tools/mtp_accept.py"
       ],
-      "done_when": "默认深度与 n-max 4 各一份；E >= TG_min x 周期（2026-10-24 周期下 2.72 / 2.85，R1 后重算）且接受的 token 与完整词表 greedy 一致；同时报 16K 候选集覆盖率"
+      "done_when": "默认深度与 n-max 4 各一份；E >= 130 x 周期（k=4 需 2.90 / 2.72，k=5 需 3.23 / 2.88，前者 CPU 0.118、后者 0.090）且接受的 token 与完整词表 greedy 一致；同时报 16K 候选集覆盖率"
     },
     {
       "id": "M1-4a",
@@ -321,6 +323,7 @@
         "M1-1",
         "M1-2b",
         "M1-3b",
+        "M1-3d",
         "M1-4b",
         "M1-5",
         "M1-6",
@@ -869,7 +872,8 @@
       "id": "M1-3c",
       "milestone": "M1",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
+      "claimed_at": "2026-10-24T16:50:00",
       "title": "draft-mtp 受限候选集（16K）与接受率口径",
       "deps": [
         "M1-3a"
@@ -883,6 +887,26 @@
         "common/arg.cpp"
       ],
       "done_when": "--spec-draft-vocab-file 读 16K 候选集并只在该集合内草稿（默认关闭）；空集或坏文件回退完整词表并告警，不 abort；M1-3b 用它测 E"
+    },
+    {
+      "id": "M1-3d",
+      "milestone": "M1",
+      "lane": "impl",
+      "status": "todo",
+      "title": "定位 k=5 验证批与 greedy 的数值分叉（含停止位）",
+      "deps": [
+        "M1-3b"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "common/speculative.cpp",
+        "bench/raw/m1-3d/**"
+      ],
+      "done_when": "给出根因（批量验证数值 vs 实现缺陷）；k=5 接受 token 与 greedy 逐 token 一致，或证明 k=5 必须放弃并给出 k=4 的替代预算；r=2；写进 RESULTS 与 DECISIONS"
     },
     {
       "id": "R0",
@@ -1018,7 +1042,7 @@
     "id": "G-REG",
     "result": "unknown",
     "date": "2026-10-23",
-    "detail": "last full record is 2026-10-23 (ctest 32/32, MUL_MAT 2275/2275, MUL_MAT_ID 939/939, FLASH_ATTN_EXT 5332/5332). Commit 44bd79305 changed llama-kv-cells after that record, so the gate is stale. M1 does not touch fork code, so it does not block; rerun before any fork code change."
+    "detail": "backend-ops baseline is 2026-10-23 / 44bd79305 (ctest 32/32 there, 33/33 after 992c2f57a; M1-3c re-ran ctest 33/33). M1-3c touched only common/, so the backend-ops record still stands but is stale; rerun the full set before any ggml or backend change."
   },
   "blockers": [],
   "escalations": []
