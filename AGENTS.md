@@ -64,7 +64,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M1
 phase_status: in_progress
 decision_gate: M1 open
-queues: bench=- impl=X-1 data=M1-3a io=- user=U-5
+queues: bench=- impl=X-1 data=M5-1 io=- user=-
 last_gate: G-REG unknown (2026-10-23 record, not re-run since 44bd79305)
 blockers: none
 <!-- STATE:END -->
@@ -80,8 +80,9 @@ blockers: none
 - M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`，E 门槛用公式而不是常数。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。
-- 未决：无。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）、U-4（平衡电源为基准）均已闭环。
+- 未决：无。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）、U-4（平衡电源为基准）、U-5（code 纳入 130）均已闭环。
 - 目标：TG 可行点 21.9% 缓存、k=5；CPU 核 0.118 时 131（E_min 3.23），到 0.090 时 146（E_min 2.88）。
+  **U-5：code 纳入 130**；code 66% 命中 -> 需 CPU **0.059**（目标 0.055），当前 0.118 只到 82。
   PP 现状：专家 GEMM 3.66 TFLOPS → 约 610 tok/s；**PP >= 1000 保留为硬目标**，M2-4 必须做到 6.0（1.64x）。
 
 ## 3. 每轮自主循环
@@ -180,7 +181,7 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 |---|---|---|---|
 | M1-1 | bench | 补齐 10 个 full-attention 层与 layer 39 的解码路由 | 40 层 x 128 token 都有记录；根因进 DECISIONS |
 | M1-2a | data | 非技术语料：对话 / 代码 / 多语言各 10K | 10002 / 10149 / 9636 token；shingle 97.7-100% |
-| M1-2b | bench | 三类文本局部性复测（技术类已完成） | chat 81.6%（过）、multi 87.3%（+5.7pp）、**code 66.0%（-15.6pp，TG 82-97）** |
+| M1-2b | bench | 三类文本局部性复测（技术类已完成） | chat 81.6%、multi 87.3%、**code 66.0%**；U-5 纳入 code，需 CPU 0.059 |
 | M1-3a | data | 受限草稿词表（16K）与生成脚本 | 覆盖生成 token 流 >= 95% |
 | M1-3c | impl | draft-mtp 受限候选集（16K，默认关闭） | 空集/坏文件回退完整词表并告警，不 abort |
 | M1-3b | bench | 受限词表 MTP 接受率 E | E >= TG_min x 周期（RESULTS 第 9 节周期下 2.73 / 3.16），token 与 greedy 一致 |
