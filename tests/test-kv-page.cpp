@@ -1,4 +1,4 @@
-// test-kv-page.cpp - CPU reference for the paged K/V path (bench/THREE-TIER.md F10, M1).
+// test-kv-page.cpp - CPU reference for the paged K/V path (M1).
 //
 // Cells are addressed through a table of 64-bit block addresses, with the logical blocks
 // placed in shuffled physical order. Two properties are checked:
@@ -334,7 +334,7 @@ int main(int argc, char ** argv) {
         ggml_backend_sched_reset(sched);
     }
 
-    // --- dense gather used by the long-span prefill path (bench/THREE-TIER.md F11) ---
+    // --- dense gather used by the long-span prefill path ---
     // the production path copies each block into one workspace and then reads it as a contiguous cache,
     // so the workspace must be byte-identical to a contiguous cache and the unused tail must stay zero
     {

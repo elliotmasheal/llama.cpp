@@ -142,7 +142,7 @@ int64_t llama_fa_long_kv_reserve_bytes(int32_t n_head, uint32_t n_ubatch, uint32
 }
 
 // the dense workspace of the paged prefill gather starts small and grows with the working set, so the planner
-// only has to keep room for its first size (bench/THREE-TIER.md F11)
+// only has to keep room for its first size
 int64_t llama_kv_gather_reserve_bytes(int32_t kv_gather_mib) {
     if (kv_gather_mib <= 0) {
         return 0;
@@ -3074,7 +3074,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                float   kq_scale,
                  int   il) const {
     // paged K/V: the long-span matmul path reads K/V as matrices and cannot resolve blocks, so a paged cache
-    // gathers the used cells into a dense workspace first and reads that instead (bench/THREE-TIER.md F11)
+    // gathers the used cells into a dense workspace first and reads that instead
     ggml_tensor * k_table = nullptr;
     ggml_tensor * v_table = nullptr;
     int32_t       page_bs = 0;
@@ -3188,7 +3188,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         // a long span keeps the score buffer inside the budget by splitting the query dim, the K/V read and the
-        // softmax range are unchanged (bench/THREE-TIER.md B2)
+        // softmax range are unchanged
         const int64_t n_chunks = chunked ? (n_tok_q + chunk_q - 1)/chunk_q : 1;
         ggml_tensor * kqv_all = nullptr;
         for (int64_t ic = 0; ic < n_chunks; ++ic) {

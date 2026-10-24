@@ -2441,7 +2441,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-page-auto"}, "auto|on|off",
         "let the memory plan decide whether the K/V is paged: paged only when the device has no room for\n"
-        "the contiguous cache plus the long-prefill score reserve (bench/THREE-TIER.md F11)",
+        "the contiguous cache plus the long-prefill score reserve",
         [](common_params & params, const std::string & value) {
             if (common_arg_utils::is_autoy(value)) {
                 params.kv_page = -1;

@@ -14422,7 +14422,7 @@ bool ggml_vk_can_fuse_rope_set_rows(ggml_backend_vk_context * ctx, const struct 
     }
 
     // paged K/V: the epilogue writes straight into the destination, which for a paged cache is the
-    // address-free anchor instead of the block that the table names (bench/THREE-TIER.md F11)
+    // address-free anchor instead of the block that the table names
     {
         ggml_tensor * page_tab = nullptr;
         int32_t       page_bs  = 0;

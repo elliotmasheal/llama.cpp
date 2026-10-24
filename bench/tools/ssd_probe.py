@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Feasibility probe for the SSD tier of the MoE runtime (gap F5 in bench/THREE-TIER.md).
+Feasibility probe for the SSD tier of the MoE runtime.
 
 It reads the expert tensors of a GGUF with FILE_FLAG_NO_BUFFERING, so the page
 cache does not hide the device, and reports what an expert-granularity miss
 would cost.
 
 Usage:
-    python ssd_probe.py F:\\LLM\\llm\\Ornith-1.5-35B-Q4_K_M.gguf [--seq-mib 1024]
+    python ssd_probe.py F:\\LLM\\llm\\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf [--seq-mib 1024]
 
 Only the Python standard library is used (no numpy / gguf-py).
 """

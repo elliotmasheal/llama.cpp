@@ -893,7 +893,7 @@ static void common_params_fit_impl(
 }
 
 // advisory only: prints how to split the free device memory between the MoE cache and the rest
-// the parameters are not modified, see bench/THREE-TIER.md
+// the parameters are not modified
 static bool common_moe_plan_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -963,13 +963,13 @@ static bool common_moe_plan_impl(
     // the initial K/V and the compute buffers. If even the score reserve does not fit, the configuration is
     // in deficit and there is no room for the 2x growth of a contiguous cache; paging then keeps the working
     // set on the device because blocks fail one at a time instead of the whole cache
-    // (bench/THREE-TIER.md F11). With -nkvo the K/V is on the host anyway, so auto stays off.
+    // With -nkvo the K/V is on the host anyway, so auto stays off.
     const int64_t kv_slack = surplus - fa_score;
     const bool    kv_page  = kv_page_auto ? (cparams_plan.offload_kqv && kv_slack < 0) : cparams_plan.kv_page;
 
     surplus -= fa_score;
 
-    // the paged prefill gather keeps one dense K/V workspace in device memory (bench/THREE-TIER.md F11)
+    // the paged prefill gather keeps one dense K/V workspace in device memory
     const int64_t kv_gather = kv_page ? llama_kv_gather_reserve_bytes(cparams_plan.kv_gather_mib) : 0;
     surplus -= kv_gather;
     for (const int64_t b : geo.expert_bytes) {

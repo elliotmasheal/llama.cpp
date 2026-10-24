@@ -117,7 +117,7 @@ public:
                  const char *   name_tag = "",
         // cells to allocate up front; 0 = allocate the full kv_size
                      uint32_t   kv_size_init = 0,
-        // paged K/V: fixed-size blocks addressed through a table (bench/THREE-TIER.md F10)
+        // paged K/V: fixed-size blocks addressed through a table
                          bool   kv_page = false,
                      uint32_t   kv_block = 2048,
                     int32_t   kv_gather_mib = 256);

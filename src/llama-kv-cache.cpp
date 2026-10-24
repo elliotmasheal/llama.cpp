@@ -1574,7 +1574,7 @@ bool llama_kv_cache::ensure_blocks(uint32_t n_extra) {
     return true;
 }
 
-// paged prefill gather (bench/THREE-TIER.md F11): the workspace is reused by every layer, so it is one
+// paged prefill gather: the workspace is reused by every layer, so it is one
 // allocation sized by the working set. Growth happens at ensure_capacity time, where the previous graph has
 // been submitted, the same point where realloc_cache replaces the contiguous buffers.
 bool llama_kv_cache::ensure_dense_workspace(uint32_t cells) {

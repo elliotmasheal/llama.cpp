@@ -424,7 +424,7 @@ extern "C" {
         // paged K/V: MiB of dense workspace that the long-span prefill path gathers the blocks into.
         // The query-chunked matmul attention reads the workspace instead of the block table, so paging does
         // not lose the -fac gain. Grows on demand from the working set; 0 = keep every span on the attention
-        // kernel (bench/THREE-TIER.md F11)
+        // kernel
         int32_t kv_gather_mib;
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device

@@ -67,7 +67,7 @@
     "id": "G-REG",
     "result": "unknown",
     "date": "2026-10-23",
-    "detail": "last full record is DECISIONS section 6 item 6 (ctest 32/32, MUL_MAT 2275/2275, MUL_MAT_ID 939/939, FLASH_ATTN_EXT 5332/5332). Commit 44bd79305 changed llama-kv-cells after that record, so the gate is stale. M1 does not touch fork code, so it does not block; rerun before any fork code change."
+    "detail": "last full record is 2026-10-23 (ctest 32/32, MUL_MAT 2275/2275, MUL_MAT_ID 939/939, FLASH_ATTN_EXT 5332/5332). Commit 44bd79305 changed llama-kv-cells after that record, so the gate is stale. M1 does not touch fork code, so it does not block; rerun before any fork code change."
   },
   "blockers": [],
   "escalations": [

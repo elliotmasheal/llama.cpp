@@ -21,7 +21,7 @@ struct common_fit_extra_model {
     bool shares_model;
 };
 
-// device memory budget for the MoE cache, see bench/THREE-TIER.md
+// device memory budget for the MoE cache
 struct common_moe_plan {
     size_t  cache_bytes = 0;    // recommended cache size, 0 = keep all experts on the host
     int64_t slots       = 0;    // expert slots the cache would hold
@@ -31,7 +31,7 @@ struct common_moe_plan {
     bool    prefetch    = false;
     bool    resident    = false;
     // --kv-page auto: true when the initial contiguous K/V cache does not fit the device budget,
-    // so paging keeps the working set there (bench/THREE-TIER.md F11)
+    // so paging keeps the working set there
     bool    kv_page     = false;
     int64_t kv_init_bytes = 0;  // bytes of the initial K/V allocation at this configuration
 };

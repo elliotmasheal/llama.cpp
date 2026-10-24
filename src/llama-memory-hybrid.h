@@ -42,7 +42,7 @@ public:
     const layer_filter_cb & filter_recr = nullptr,
                             /* cells allocated up front, 0 = kv_size */
                  uint32_t   kv_size_init = 0,
-                            /* paged attention K/V (bench/THREE-TIER.md F10) */
+                            /* paged attention K/V */
                       bool   kv_page = false,
                  uint32_t   kv_block = 2048,
                    int32_t   kv_gather_mib = 256);

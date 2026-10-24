@@ -1,4 +1,4 @@
-// vkpage.cpp - M0 probes for the paged-KV plan (bench/THREE-TIER.md F10).
+// vkpage.cpp - probes for the paged-KV plan.
 //
 // table: M0c. Logical KV cells are mapped onto blocks that live in different VkBuffers,
 //        in a shuffled order. A table of 64-bit device addresses is read by the shader;
