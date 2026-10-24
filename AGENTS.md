@@ -50,8 +50,8 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
   差距分解成具体的优化项，不许用"当前实现就这样"当结论。
 - 硬件极限（不可越）：GDDR6 224 GB/s（128-bit x 14 Gbps）、PCIe 4.0 x8 15.75 GB/s、
   DDR5-4800 双通道 76.8 GB/s、RDNA2 FP32 7.9 TFLOPS、8176 MiB 显存、SSD 随机读 0.81 GB/s。
-- 当前软件读数（**优化目标，不是约束**）：显存读 156.5 GB/s（70%）、CPU 4 线程读 39-41（52%）、
-  CPU 每专家 0.123-0.137 ms（26-39%）、H2D 并发掉 27%（10.4）。R1 负责逐条逼近硬件上限。
+- 当前软件读数（**优化目标，不是约束**）：显存读 156.5 GB/s（规格 224，但 R1a 证明 190 不可达）、
+  CPU 4 线程读 39-41（52%）、CPU 每专家 0.115-0.118 ms（R1b，需求 <= 0.090）、H2D 并发 10.8（-24%）。
 - 运行时不走 fork：fork 只作参考（greedy 基准、接受率口径、硬件探针），内核拷进 `runtime/kernels`。
 - 不改变量化格式；不改变输出：k=1 路径 logits KLD <= 1e-4，推测路径接受的 token 与参考 greedy 一致。
 - 非目标：其他模型 / 量化 / 后端、多用户服务化（design 1.2）。
@@ -62,7 +62,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M1
 phase_status: in_progress
 decision_gate: M1 open
-queues: bench=- impl=M1-4a data=M1-2a io=- user=U-4
+queues: bench=- impl=- data=M1-2a io=- user=U-4
 last_gate: G-REG unknown (2026-10-23 record, not re-run since 44bd79305)
 blockers: none
 <!-- STATE:END -->
@@ -79,7 +79,8 @@ blockers: none
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。
 - 未决：U-4（可选）是否允许一次性能电源方案的显存 A/B；U-1 / U-3 已闭环。
-- 目标：130 是实测 roofline（148）的 88%，不再提"抬到 150"；R1b/R1c 出数后复核。
+- 目标：可行点 21.9% 缓存、k=5；CPU 核 0.118 时 TG 131（E_min 3.23，余量 0.3%），
+  到 0.090 时 146（E_min 2.88）；CPU 专家核是达标前提。
 
 ## 3. 每轮自主循环
 
@@ -187,7 +188,7 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 | M1-6 | data | full-attention 层数与 256K KV 预算 | 10 主层 + 1 nextn；U-3 定 q4_0 + 16K 窗口 |
 | M1-7 | bench | H2D 与 CPU 读并发 + 每专家代价 | 聚合 33.5-41.0 GB/s，0.123-0.137 ms/专家 |
 | R0 | data | roofline 模型与目标推导 | TG_max / PP_max 曲线，0.85 x roofline 的目标值 |
-| R1 | bench | 腿级 roofline 探针 | 显存读 >= 190、CPU <= 0.070、int8 >= 7 TFLOPS、并发 H2D >= 12.5 |
+| R1 | bench | 腿级 roofline 探针 | 显存 156.5（190 不可达）、CPU 0.115-0.118（0.070 不可达，需求 0.090）、H2D 10.8、int8 待测 |
 | M1-GATE | user | 决策门评审 | `decision_gate.criteria` 全过才进 M2 |
 
 **决策门 M1 的通过条件**（以 `state.json` 的 `decision_gate.criteria` 为准）：

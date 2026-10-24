@@ -31,15 +31,17 @@ DENSE_BYTES = 2.030 * GIB
 KV_MAIN = 20480                 # bytes per token, 10 full-attn main layers
 KV_Q4 = 6336                  # bytes per token with the nextn layer, q4_0 (U-3)
 GLOP_PER_TOKEN = 6.0
-HIT = {20: 0.773, 25: 0.816, 30: 0.854}   # RESULTS section 7
+HIT = {20: 0.773, 22: 0.789, 25: 0.816, 30: 0.854}   # RESULTS 7; 22% interpolated for U-3
 U = {4: 19.9, 5: 23.5, 8: 31.6}           # unique experts per layer, section 7
 E = {4: 2.84, 5: 3.24, 8: 3.82}           # RESULTS section 3, full vocab
 DRAFT_MIB = 33.0                           # 16K restricted output head per step
 
 # R1 targets and the 0.85 rule
 VRAM_TARGET = 156.5 * GB        # R1a: 190 is not reachable, the observed ceiling is what we get
-H2D_TARGET = 11.9 * GB          # R1a: best concurrent run at 64 MiB chunks
+H2D_TARGET = 10.8 * GB          # R1a r=2: best concurrent value, 64 MiB chunks
 CPU_EXPERT_TARGET = 0.070
+CPU_EXPERT_MEASURED = 0.118    # R1b: best distinct-expert value at 4 threads (0.115-0.118)
+CPU_EXPERT_REQ = 0.090         # knee: below this the GPU leg binds, 0.070 buys nothing
 CPU_EXPERT_SPEC = EXPERT_BYTES / DDR_SPEC * 1e3
 ROOFLINE_FRACTION = 0.85
 TG_MIN = 130.0
@@ -47,6 +49,7 @@ PP_MIN = 1000.0
 
 SCEN = (
     ("now", VRAM_NOW, H2D_NOW, CPU_EXPERT_NOW),
+    ("R1ab", VRAM_TARGET, H2D_TARGET, CPU_EXPERT_MEASURED),
     ("R1a", VRAM_TARGET, H2D_TARGET, CPU_EXPERT_TARGET),
     ("ceil", VRAM_SPEC, PCIE_SPEC, CPU_EXPERT_SPEC),
 )
@@ -85,7 +88,7 @@ def cycle_ms(k, cache, vram, h2d, cpu_ms):
 
 def best_tg(vram, h2d, cpu):
     best = (0.0, 0, 0)
-    for cache in (20, 25):
+    for cache in (20, 22, 25):
         for k in (4, 5):
             t = cycle_ms(k, cache, vram, h2d, cpu)[0]
             tg = E[k] * 1e3 / t
@@ -98,7 +101,7 @@ def tg_table():
     print("")
     print("TG: miss split by equal leg time, draft = (k-1) x 33 MiB, E = full vocab")
     print("cache  k     E   " + "  ".join("%-20s" % c[0] for c in SCEN))
-    for cache in (20, 25, 30):
+    for cache in (20, 22, 25, 30):
         for k in (4, 5):
             cells = []
             for _name, vram, h2d, cpu in SCEN:
@@ -110,11 +113,11 @@ def tg_table():
 def e_min_table():
     print("")
     print("E_min = 130 x cycle: the observed E must clear this, it is not a constant")
-    print("cache  k     now     R1   spec")
-    for cache in (20, 25):
+    print("cache  k     now   R1ab    R1a   ceil")
+    for cache in (20, 22, 25):
         for k in (4, 5):
             vals = [TG_MIN * cycle_ms(k, cache, *s[1:])[0] / 1e3 for s in SCEN]
-            print("%4d%%  %d  %6.2f  %6.2f  %6.2f" % (cache, k, *vals))
+            print("%4d%%  %d  %6.2f  %6.2f  %6.2f  %6.2f" % (cache, k, *vals))
 
 
 def pp_table():
@@ -166,8 +169,14 @@ def main(_argv):
     print("hardware roofline best: %.0f tok/s (cache %d%%, k=%d)" % (hw_tg, hw_cache, hw_k))
     print("0.85 x hardware roofline: TG >= %.0f (hard floor %.0f)"
           % (ROOFLINE_FRACTION * hw_tg, TG_MIN))
-    print("R1-ready best: %.0f tok/s (cache %d%%, k=%d), 0.85 x it = %.0f"
+    print("R1a best (cpu 0.070): %.0f tok/s (cache %d%%, k=%d), 0.85 x it = %.0f"
           % (r1_tg, r1_cache, r1_k, ROOFLINE_FRACTION * r1_tg))
+    t22 = cycle_ms(5, 22, VRAM_TARGET, H2D_TARGET, CPU_EXPERT_MEASURED)[0]
+    print("R1ab (cpu %.3f measured) at 22%%/k=5: %.0f tok/s, E_min %.2f"
+          % (CPU_EXPERT_MEASURED, E[5] * 1e3 / t22, TG_MIN * t22 / 1e3))
+    t22r = cycle_ms(5, 22, VRAM_TARGET, H2D_TARGET, CPU_EXPERT_REQ)[0]
+    print("at cpu %.3f (knee) 22%%/k=5: %.0f tok/s, E_min %.2f; 0.070 buys nothing below this"
+          % (CPU_EXPERT_REQ, E[5] * 1e3 / t22r, TG_MIN * t22r / 1e3))
     t = cycle_ms(r1_k, r1_cache, VRAM_TARGET, H2D_TARGET, CPU_EXPERT_TARGET)[0]
     for e in (2.85, 3.24):
         tg = e * 1e3 / t

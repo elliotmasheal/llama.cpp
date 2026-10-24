@@ -23,11 +23,15 @@
     "rule": "130/1000 are hard floors until the user re-sets them; the design target is 0.85 x the roofline at the binding leg, reported every round by R0",
     "roofline_fraction": 0.85,
     "derived_2026_10_24": {
-      "tg_roofline": 148,
-      "tg_at_085": 126,
+      "tg_roofline": 146,
+      "tg_now": 131,
+      "tg_at_085": 124,
+      "e_min_now": 3.23,
+      "e_min_knee": 2.88,
+      "cpu_expert_knee_ms": 0.090,
       "pp_min_tflops": 7.06,
       "pp_min_chunk": 1420,
-      "source": "bench/RESULTS.md section 12 (R1a)"
+      "source": "bench/RESULTS.md section 13 (R1b)"
     }
   },
   "resources": {
@@ -101,15 +105,16 @@
     },
     {
       "lane": "impl",
-      "head": "M1-4a",
+      "head": null,
       "order": [
         "M1-4a",
+        "M1-4a-run",
         "M1-3c",
         "X-1",
         "X-2",
         "X-4"
       ],
-      "note": "M2-* and M3-* stay unassigned until gate M1 passes and U-3 is answered"
+      "note": "M1-4a is writing code only; M1-4a-run and every GPU/quiet task wait for R1 to release the machine"
     },
     {
       "lane": "data",
@@ -234,18 +239,16 @@
       "id": "M1-4a",
       "milestone": "M1",
       "lane": "impl",
-      "status": "todo",
-      "title": "Vulkan 原型：k=1/2/4/5/8 的预录命令缓冲与计时壳",
+      "status": "doing",
+      "claimed_at": "2026-10-24T15:10:00",
+      "title": "Vulkan 原型：k=1/2/4/5/8 的预录命令缓冲与计时壳（只写代码）",
       "deps": [],
-      "resources": [
-        "gpu",
-        "machine-quiet"
-      ],
+      "resources": [],
       "paths": [
         "runtime/proto/**",
         "CMakeLists.txt"
       ],
-      "done_when": "能对每层稠密 + 专家读取跑一个 pass（真实 Q4_K 布局或等价字节量），输出 k=1/2/4/5/8 的 submit/sync 时间与计算缓冲 MiB；不预设运行时归属"
+      "done_when": "代码与 CMake target 就位，拿到 quiet 锁后一条命令可构建；本任务不构建、不跑 GPU（机器被 R1 占用）；构建与计时交给 M1-4a-run"
     },
     {
       "id": "M1-4b",
@@ -254,7 +257,7 @@
       "status": "todo",
       "title": "周期时间测量（k=1/2/4/5/8，含提交与同步）",
       "deps": [
-        "M1-4a"
+        "M1-4a-run"
       ],
       "resources": [
         "gpu",
@@ -831,6 +834,24 @@
       "done_when": "H2D 与 4/8 线程 CPU 读同时运行时各自与合计 GB/s 有 r=2 读数；每专家 CPU 代价（ms/专家）在 4/8 线程各测一次；据此判定各半分担投影（RESULTS 第 8 节 133-148）是否成立"
     },
     {
+      "id": "M1-4a-run",
+      "milestone": "M1",
+      "lane": "impl",
+      "status": "todo",
+      "title": "构建并跑 Vulkan 原型（k=1/2/4/5/8，计时）",
+      "deps": [
+        "M1-4a"
+      ],
+      "resources": [
+        "gpu",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/m1-4a/**"
+      ],
+      "done_when": "每 k 的 submit/sync 时间与计算缓冲 MiB 有 r=2 读数，原始输出落 bench/raw/m1-4a；不预设运行时归属"
+    },
+    {
       "id": "M1-3c",
       "milestone": "M1",
       "lane": "impl",
@@ -881,6 +902,7 @@
       "paths": [
         "bench/tools/vkgate.cpp",
         "bench/tools/membw_probe.py",
+        "bench/tools/cpu_expert.cpp",
         "bench/raw/roofline/**"
       ],
       "done_when": "显存读 >= 190 GB/s、CPU 专家 <= 0.070 ms/专家（4 线程）、int8 GEMM >= 7 TFLOPS 有效（硬地板 6，0.85 规则 7.06）、并发 H2D >= 12.5 GB/s；每项 r=2 并写进 RESULTS；达不到就报差距与原因，不改成目标"
