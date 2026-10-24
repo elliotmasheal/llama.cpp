@@ -84,9 +84,9 @@ blockers: none
 **现状摘要（人读，不参与机器校验）**
 
 - M0 完成：张量账、10K + 128 token 路由 trace、局部性与命中率（`RESULTS.md` 第 1-2、7 节）。
-- M1 进行中：M1-1 / M1-4a / M1-4a-run / M1-5 / M1-6 / M1-7 / M1-3b / M1-3c / M1-3d 已完成，R0 / R1 已完成，
-  语料与词表 M1-2a / M1-3a 已交付；M3-1a 已提前做完（partial，见下）。剩 M1-2b（partial，code 66.0%）、
-  M1-4b（partial，计算缓冲未隔离）、U-7（近分叉判据）、M1-GATE。
+- M1 进行中：M1-1 / M1-2b / M1-3b / M1-3c / M1-3d / M1-4a / M1-4a-run / M1-5 / M1-6 / M1-7 已完成，
+  R0 / R1 已完成，语料与词表 M1-2a / M1-3a 已交付；M3-1a 已提前做完（partial，见下）。
+  剩 M1-4b（partial，计算缓冲未隔离）、U-7（近分叉判据）、M1-GATE。
 - 队列：bench M1-4b，impl X-1，data M5-1，io 等 M5-1，user 等 U-7。
 - M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`（九条），E 门槛用公式而不是常数。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
@@ -103,6 +103,10 @@ blockers: none
 - M3-1a 实测（`RESULTS.md` 第 20 节，U-6 门内）：专用 Q4_K x Q8_1 核，预热后首轮 4 线程 0.091、
   8 线程 0.082-0.084 ms/专家（fork 通用核 0.115-0.118）；中位受持续满载热漂移影响（0.089-0.118）。
   **code 的 0.059 未达到（partial）**；技术类 0.090 在 8 线程达到。E 的 CPU 前提按 ~0.09 满足。
+- **N15 已测（`RESULTS.md` 第 22 节）**：同一权重重读一次时，t=1/2/4/5 的每专家代价 8T 为
+  0.079 / 0.106 / 0.160 / 0.199 ms。k=5 的 miss 专家平均服务 1.70 个 token，期望约 **0.10 ms**，
+  与 design 6.2 的 0.115-0.137 同档；**最坏 t=5 是均值的 2 倍**。运行时必须按多重度算，
+  不许对每个 miss 专家都跑满 k 个 token（否则 CPU 腿翻倍）。
 - M1-3d 实测（`RESULTS.md` 第 21 节）：同 prompt 下 greedy 与 k=5 在位置 0-25 完全一致，
   logprob 平均差 0.0030；位置 26 的 top-1 margin 从 0.1192 降到 0.0136 后翻转。
   **任何 k>1 都无法保证 bit-exact**，验收容差需 U-7 定；E 不受影响。
@@ -205,7 +209,7 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 |---|---|---|---|
 | M1-1 | bench | 补齐 10 个 full-attention 层与 layer 39 的解码路由 | 40 层 x 128 token 都有记录；根因进 DECISIONS |
 | M1-2a | data | 非技术语料：对话 / 代码 / 多语言各 10K | 10002 / 10149 / 9636 token；shingle 97.7-100% |
-| M1-2b | bench | 三类文本局部性复测（技术类已完成） | chat 81.6%、multi 87.3%、**code 66.0%**；U-5 纳入 code，需 CPU 0.059 |
+| M1-2b | bench | 三类文本局部性复测 | **已完成**：chat 81.6%（+2.7 pp）、multi 87.3%、code 66.0%；code 偏差已解释并由 U-5 裁决 |
 | M1-3a | data | 受限草稿词表（16K）与生成脚本 | 16384 ids；prompt 覆盖 100%，generated 143/143（弱） |
 | M1-3c | impl | draft-mtp 受限候选集（16K，默认关闭） | 16K 掩码生效；token 与 greedy 一致；空/坏文件回退；ctest 33/33 |
 | M1-3b | bench | 受限词表 MTP 接受率 E | k=4 E=2.850、k=5 E=3.055（完整词表 2.829 / 3.243）；按 0.118 的 E_min 差 1.7% / 5.4%，按 0.090 都过 |

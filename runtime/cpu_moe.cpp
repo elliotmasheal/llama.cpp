@@ -148,6 +148,86 @@ void qrt_gemv_q4k_q8_1(const void * w, int rows, int cols,
 #endif
 }
 
+#if defined(__AVX2__)
+template <int NT>
+static void gemv_multi_impl(const uint8_t * wb, int rows, int cols,
+                            const int8_t * qs, const float * d, const float * ssum,
+                            float * out, int out_stride) {
+    const int nb = cols / QK_K;
+    const int qb = cols / QK8;
+    const __m256i m4 = _mm256_set1_epi8(0x0f);
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t * row = wb + (size_t) r * nb * Q4K_BYTES;
+        __m256 acc_lo[NT];
+        __m256 acc_hi[NT];
+        float acc_min[NT];
+        for (int t = 0; t < NT; ++t) {
+            acc_lo[t] = _mm256_setzero_ps();
+            acc_hi[t] = _mm256_setzero_ps();
+            acc_min[t] = 0.0f;
+        }
+        for (int b = 0; b < nb; ++b) {
+            struct block_q4_k_local blk;
+            memcpy(&blk, row + (size_t) b * Q4K_BYTES, Q4K_BYTES);
+            if (b + 4 < nb) {
+                __builtin_prefetch(row + (size_t) (b + 4) * Q4K_BYTES, 0, 3);
+            }
+            const float dv = h2f(blk.d);
+            const float dmin = h2f(blk.dmin);
+            for (int g = 0; g < 4; ++g) {
+                const __m256i q = _mm256_loadu_si256((const __m256i *) (blk.qs + 32 * g));
+                const __m256i lo = _mm256_and_si256(q, m4);
+                const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
+                uint8_t s0, m0, s1, m1;
+                scale_min_k4(2 * g, blk.scales, &s0, &m0);
+                scale_min_k4(2 * g + 1, blk.scales, &s1, &m1);
+                const int k0 = b * 8 + 2 * g;
+                const int k1 = k0 + 1;
+                for (int t = 0; t < NT; ++t) {
+                    const int8_t * qt = qs + (size_t) t * qb * QK8;
+                    const float * dt = d + (size_t) t * qb;
+                    const float * st = ssum + (size_t) t * qb;
+                    const __m256i b0 = _mm256_loadu_si256((const __m256i *) (qt + (size_t) k0 * QK8));
+                    const __m256i b1 = _mm256_loadu_si256((const __m256i *) (qt + (size_t) k1 * QK8));
+                    const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, b0), ones);
+                    const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, b1), ones);
+                    acc_lo[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0),
+                                                _mm256_set1_ps(dv * (float) s0 * dt[k0]), acc_lo[t]);
+                    acc_hi[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1),
+                                                _mm256_set1_ps(dv * (float) s1 * dt[k1]), acc_hi[t]);
+                    acc_min[t] -= dmin * ((float) m0 * st[k0] + (float) m1 * st[k1]);
+                }
+            }
+        }
+        for (int t = 0; t < NT; ++t) {
+            out[(size_t) t * out_stride + r] = hsum_ps(acc_lo[t]) + hsum_ps(acc_hi[t]) + acc_min[t];
+        }
+    }
+}
+#endif
+
+void qrt_gemv_q4k_q8_1_multi(const void * w, int rows, int cols,
+                             const int8_t * qs, const float * d, const float * ssum,
+                             int n_tok, float * out, int out_stride) {
+#if defined(__AVX2__)
+    const uint8_t * wb = (const uint8_t *) w;
+    switch (n_tok) {
+        case 1: gemv_multi_impl<1>(wb, rows, cols, qs, d, ssum, out, out_stride); return;
+        case 2: gemv_multi_impl<2>(wb, rows, cols, qs, d, ssum, out, out_stride); return;
+        case 3: gemv_multi_impl<3>(wb, rows, cols, qs, d, ssum, out, out_stride); return;
+        case 4: gemv_multi_impl<4>(wb, rows, cols, qs, d, ssum, out, out_stride); return;
+        case 5: gemv_multi_impl<5>(wb, rows, cols, qs, d, ssum, out, out_stride); return;
+        default: break;
+    }
+#endif
+    const int qb = cols / QK8;
+    for (int t = 0; t < n_tok; ++t) {
+        qrt_gemv_q4k_q8_1(w, rows, cols, qs + (size_t) t * qb * QK8, d + (size_t) t * qb,
+                          ssum + (size_t) t * qb, out + (size_t) t * out_stride);
+    }
+}
+
 void qrt_q8_1_quantize(const float * x, int n, int8_t * qs, float * d, float * ssum) {
     const int nb = n / QK8;
     for (int b = 0; b < nb; ++b) {

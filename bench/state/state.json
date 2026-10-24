@@ -32,7 +32,7 @@
       "tg_at_085": 124,
       "e_min_now": 3.23,
       "e_min_knee": 2.88,
-      "cpu_expert_knee_ms": 0.090,
+      "cpu_expert_knee_ms": 0.09,
       "code_tg_now": 82,
       "code_cpu_req_ms": 0.059,
       "code_cpu_target_ms": 0.055,
@@ -125,7 +125,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M1-3d done: the k=5 fork is a 0.0136-nat near tie, so the fidelity rule needs a user decision (U-7). M3-1a stays partial on the code 0.059 target. X-1 builds the quality-gate tool next"
+      "note": "M3-1a round 2 done: the t=1..5 ramp says the CPU leg must use the multiplicity (mean 1.70 at k=5), not t=k. code 0.059 still open. X-1 next"
     },
     {
       "lane": "data",
@@ -199,7 +199,7 @@
       "id": "M1-2b",
       "milestone": "M1",
       "lane": "bench",
-      "status": "partial",
+      "status": "done",
       "claimed_at": "2026-10-24T16:05:00",
       "title": "三类文本的局部性复测（技术类已完成两份）",
       "deps": [
@@ -985,7 +985,7 @@
       "milestone": "M3",
       "lane": "impl",
       "status": "partial",
-      "claimed_at": "2026-10-24T18:55:00",
+      "claimed_at": "2026-10-24T21:10:00",
       "title": "CPU 专家核：Q4_K + int8，目标 0.090 ms/专家",
       "deps": [
         "M1-3b"
@@ -999,7 +999,7 @@
         "CMakeLists.txt",
         "bench/raw/m3-1a/**"
       ],
-      "done_when": "code 文本、21.9% 缓存下 <=0.059 ms/专家（目标 0.055，约 107 GFLOPS）；技术类 <=0.090；与参考逐 token 一致；6/8 线程不回退；达不到报差距（R1b 基线 0.115-0.118）"
+      "done_when": "code 文本、21.9% 缓存下 <=0.059 ms/专家（目标 0.055，约 107 GFLOPS）；技术类 <=0.090；给出 t=1..5 的多 token 摊销曲线（权重只读一次）并回填 design 6.2 的 CPU 腿；与参考逐 token 一致；6/8 线程不回退；达不到报差距（R1b 基线 0.115-0.118）"
     },
     {
       "id": "M3-2a",
