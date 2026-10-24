@@ -758,3 +758,30 @@ GPU 腿、submit 与 sync 已在第 15 节实测（偏差 -1.0..+5.8%，submit 0
   这条作为 M2-2 的待确认项（DECISIONS 第 15 节）。
 - 判决：M1-4b 的 GPU 腿、submit/sync、计算缓冲三项都有数；计算缓冲为**推算值**，
   M2-2 必须用真实分配复核。
+
+## 25. M2-1 GGUF 索引交叉校验（2026-10-24）
+
+口径：模型 `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`（22853663008 B），只读头部约 11 MB，
+不加载权重、不占显存、不进 decode 关键路径。证据：`python bench/tools/gguf_index_check.py`
+（29 项，0 失败，`status = ok`），原始输出 `bench/raw/m2/gguf-index-check.out`；
+参照实现是 `gguf_dims.py` 用的同一套 gguf-py。
+
+| 项 | 读数 |
+|---|---|
+| GGUF 版本 / 张量数 / alignment | 3 / 753 / 32 |
+| 数据段起点 | 10991392 B（与 gguf-py 逐字节一致） |
+| routed_experts | 20122173440 B = 18.740 GiB（41 层 x 256 专家） |
+| 每专家（gate+up+down） | 1917127.8 B = 1.828 MiB |
+| dense（非专家、含 output、不含 token_embd） | 2180153856 B = 2.030 GiB |
+| token_embd | 540344320 B = 0.503 GiB |
+| full-attention 层 | 主 10（3,7,11,...,39）+ MTP 1（40） |
+| 打开并打印 753 行 | 106.6 ms（一次性，含 11 MB 头部读取） |
+
+- 张量表逐项一致：名称、维度、类型 id、绝对偏移、字节数，753 行全同。
+- 元数据一致：arch、block_count、nextn、expert_count、top_k、n_embd、expert_ff、
+  head_count_kv、key_length、value_length、context_length、full_attention_interval。
+- 越界与坏输入：9 个构造文件（坏 magic、截断表、越界张量、未知类型、重名、维度溢出、
+  9 维、超长字符串、嵌套数组）全部 exit 2 + 消息，无崩溃；缺张量同样 exit 2。
+- 第 1 节的张量账由本节独立复算；第 1 节的 1.84 MiB/专家是 M0 的粗算，精确值 1.8284 MiB
+  （差 0.6%，不改第 1 节的口径，也不影响任何字节账）。
+

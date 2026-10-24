@@ -3,7 +3,7 @@
 This directory holds the runtime that replaces the fork's decode path (design section 3.3).
 It links neither ggml nor llama: the runtime parses the GGUF itself and drives Vulkan directly.
 
-## Status: M2-0 scaffold
+## Status: M2-0 scaffold, M2-1 GGUF index
 
 What exists now:
 
@@ -11,12 +11,16 @@ What exists now:
   validation, and non-fatal notes for legal-but-costly values.
 - `qrt_telemetry.*` - a CSV sink with one row per decode pass, holding the columns
   `bench/README.md` section 2 asks for.
-- `qrt_main.cpp` - the `qrt` binary: `--help`, `--print-config`, `--selftest`.
+- `gguf_index.*` - read-only GGUF metadata, tensor table and absolute byte offsets, plus
+  the byte account `bench/tools/gguf_dims.py` prints. No abort path: malformed files come
+  back as an error string.
+- `qrt_main.cpp` - the `qrt` binary: `--help`, `--print-config`, `--selftest`,
+  `--gguf-index`, `--require-tensor`.
 - `CMakeLists.txt` - the `qrt_core` library and the `qrt` executable, plus the
   `qrt_selftest` ctest case.
 
-What does not exist yet: GGUF indexing (M2-1), the Vulkan device and allocator (M2-2),
-weights and the expert cache (M2-3), kernels (M2-4), prefill (M2-5), decode (M3).
+What does not exist yet: the Vulkan device and allocator (M2-2), weights and the expert
+cache (M2-3), kernels (M2-4), prefill (M2-5), decode (M3).
 `runtime/proto/` and `runtime/cpu_moe*` predate the scaffold and keep their own targets.
 
 ## Build
@@ -50,6 +54,41 @@ Notes are not errors. Values that are legal but change the design's cost model (
 example `--prefill-chunk 512`, `--kv-precision f16`, `--draft-vocab 0`) print a `note:`
 line on stderr and keep running.
 
+## GGUF index
+
+```
+build-vulkan/bin/qrt.exe --gguf-index <model.gguf>            # report on stdout
+build-vulkan/bin/qrt.exe --gguf-index <model.gguf> --require-tensor blk.0.ffn_gate_exps.weight
+```
+
+The report is `#` comment lines and then a CSV table:
+
+```
+# gguf version=3 tensors=753 alignment=32 data_offset=10991392 file_size=22853663008
+# meta arch=qwen35moe block_count=41 nextn=1 expert_count=256 ...
+# account expert_bytes=... expert_layers=41 per_expert_bytes=... dense_bytes=... ...
+name,n_dims,ne0,ne1,ne2,ne3,type,type_name,offset,nbytes
+```
+
+- `offset` is absolute, `nbytes` is the block-aligned size from the type table.
+- The account uses the same definitions as `bench/tools/gguf_dims.py`: names containing
+  `_exps` are expert bytes, `token_embd.weight` is separate, everything else is dense.
+- Opening reads the header only (about 11 MB for the target model, 107 ms); weights are
+  never mapped or read.
+- `--require-tensor` returns exit 2 with a message when the tensor is missing, so callers
+  get an error instead of a null pointer.
+
+Cross-check against gguf-py, the reader `gguf_dims.py` uses:
+
+```
+python bench/tools/gguf_index_check.py [build-vulkan/bin/qrt.exe] [model.gguf]
+```
+
+It compares the 753 tensor rows (name, dims, type id, absolute offset, bytes), the 11
+hparams, and the account, then feeds nine crafted files (bad magic, truncated table,
+out-of-bounds tensor, unknown type, duplicate names, dim overflow, nine dims, oversized
+string, nested array) and requires exit 2 with a message for each.
+
 ## Telemetry
 
 `--telemetry 1 --telemetry-path <file>` writes a CSV with this header:
@@ -73,5 +112,6 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 |---|---|
 | `qrt_config.h/.cpp` | switch table, defaults, parsing, validation, notes |
 | `qrt_telemetry.h/.cpp` | per-pass CSV sink |
-| `qrt_main.cpp` | CLI entry and `--selftest` |
+| `gguf_index.h/.cpp` | GGUF metadata, tensor table, absolute offsets, byte account |
+| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index` |
 | `CMakeLists.txt` | `qrt_core`, `qrt`, `qrt_selftest` |

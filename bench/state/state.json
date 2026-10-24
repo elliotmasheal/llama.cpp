@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-1",
+      "head": "M2-2",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2 starts at M2-1 (GGUF index). M2-0 scaffold is done; M3-1a stays partial on code 0.059"
+      "note": "M2-2 next (vk_dev + allocator + VRAM budget). M2-0/M2-1 are done; M3-1a stays partial on code 0.059"
     },
     {
       "lane": "data",
@@ -437,15 +437,21 @@
       "id": "M2-1",
       "milestone": "M2",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
+      "claimed_at": "2026-10-24T21:05:00",
       "title": "gguf_index：张量表与字节偏移",
       "deps": [
         "M2-0"
       ],
       "resources": [],
       "paths": [
-        "runtime/gguf_index.*"
+        "runtime/gguf_index.*",
+        "runtime/qrt_main.cpp",
+        "runtime/CMakeLists.txt",
+        "runtime/README.md",
+        "bench/tools/gguf_index_check.py"
       ],
+      "note": "extends into the M2-0 scaffold (CLI, CMake target, README) and adds a bench-side checker; M2-0 is done",
       "done_when": "与 gguf_dims.py 的张量表逐项一致；越界与缺张量返回错误而不是 abort"
     },
     {

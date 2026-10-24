@@ -3,6 +3,7 @@
 
 #include "qrt_config.h"
 #include "qrt_telemetry.h"
+#include "gguf_index.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -226,6 +227,8 @@ static int qrt_selftest(void) {
 
 int main(int argc, char ** argv) {
     int print_config = 0;
+    const char * gguf_path = NULL;
+    const char * require_tensor = NULL;
 
     std::vector<char *> args;
     args.push_back(argc > 0 ? argv[0] : lit("qrt"));
@@ -239,6 +242,20 @@ int main(int argc, char ** argv) {
         }
         if (strcmp(argv[i], "--print-config") == 0) {
             print_config = 1;
+            continue;
+        }
+        const int is_index = strcmp(argv[i], "--gguf-index") == 0;
+        const int is_require = strcmp(argv[i], "--require-tensor") == 0;
+        if (is_index || is_require) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: %s needs a value\n", argv[i]);
+                return 2;
+            }
+            if (is_index) {
+                gguf_path = argv[++i];
+            } else {
+                require_tensor = argv[++i];
+            }
             continue;
         }
         args.push_back(argv[i]);
@@ -262,6 +279,32 @@ int main(int argc, char ** argv) {
     if (print_config) {
         qrt_config_print_effective(&cfg, stdout);
         return 0;
+    }
+
+    if (gguf_path != NULL) {
+        qrt_gguf * g = NULL;
+        if (qrt_gguf_open(gguf_path, &g, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            return 2;
+        }
+        if (require_tensor != NULL) {
+            const qrt_gguf_tensor * t = NULL;
+            if (qrt_gguf_require(g, require_tensor, &t, err, sizeof(err)) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                qrt_gguf_close(g);
+                return 2;
+            }
+            printf("tensor=%s offset=%llu nbytes=%llu type=%s\n", t->name,
+                   (unsigned long long) t->offset, (unsigned long long) t->nbytes,
+                   qrt_gguf_type_name(t->type));
+        }
+        qrt_gguf_print_report(g, stdout);
+        qrt_gguf_close(g);
+        return 0;
+    }
+    if (require_tensor != NULL) {
+        fprintf(stderr, "qrt: --require-tensor needs --gguf-index <path>\n");
+        return 2;
     }
 
     if (cfg.telemetry != 0) {

@@ -311,3 +311,22 @@ M1-GATE 的依赖里去掉 M3-1a（它是门后条件，不是门的阻塞项）
   `runtime/CMakeLists.txt`；说明见 `runtime/README.md`。
 - 未做的部分按 design 5.1 顺序排给 M2-1 起：GGUF 索引、Vulkan 设备与预算、权重与专家缓存。
 
+## 18. M2-1 判决：GGUF 索引与 gguf_dims.py 逐项一致（2026-10-24）
+
+| 问题 | 证据 | 判决 |
+|---|---|---|
+| 张量表一致 | `bench/tools/gguf_index_check.py`：753 行的名称、维度、类型 id、绝对偏移、字节数全同（RESULTS 25） | **PASS** |
+| 元数据一致 | 11 个 hparam 全同：arch=qwen35moe、block_count=41、nextn=1、expert=256/top-8、n_embd=2048、ff=512、kv=2x(256+256)、ctx=262144、full_attn_interval=4 | **PASS** |
+| 张量账一致 | expert 20122173440 B（18.740 GiB）、dense 2180153856 B（2.030 GiB）、token_embd 540344320 B、full-attn 10 主 + 1 MTP | **PASS** |
+| 越界与缺张量 | 9 个构造文件全部 exit 2 + 消息、无崩溃；`--require-tensor` 缺张量 exit 2 | **PASS** |
+| 打开成本 | 11 MB 头部 106.6 ms，一次；不 mmap 权重 | 记录 |
+
+- 结构事实（供 M2-3/M5-1 用）：专家张量在 41 个 block 都有（含 MTP blk.40），每专家
+  **1917127.8 B = 1.8284 MiB**；decode 只读 40 个主层（design 2.1）。proto 里的 1916796 B
+  是 1.828 MiB 的取整，差 0.017%，不影响 M1-4b 的结论。
+- 工具注意：gguf-py 的 `ReaderTensor.data_offset` **已是绝对偏移**（再加 `r.data_offset` 会翻倍）。
+  交叉校验脚本按绝对偏移比较；以后写 repack 工具时同样别重复加。
+- 错误策略按 design 9：所有畸形输入（坏 magic、截断、越界、未知类型、重名、维度溢出、9 维、
+  超长字符串、嵌套数组）返回错误字符串与 exit 2，没有 `abort`，也没有 `GGML_ABORT`。
+- 下一任务 M2-2（`vk_dev` + 分配器 + 显存预算）：预算不足时要回退并计数，VRAM tier 可注入。
+

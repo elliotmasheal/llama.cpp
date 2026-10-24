@@ -366,6 +366,8 @@ void qrt_config_print_switches(FILE * f) {
     }
     fprintf(f, "\n  %-22s %-20s %-19s %s\n", "-", "--print-config", "-", "print the effective values and the notes");
     fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--selftest", "-", "check the switches and the telemetry sink");
+    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--gguf-index <path>", "-", "print the GGUF tensor table and account");
+    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--require-tensor <name>", "-", "exit 2 when the tensor is missing");
     fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--help, -h", "-", "this table");
 }
 

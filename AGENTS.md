@@ -75,7 +75,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M2-1 data=M5-1 io=- user=-
+queues: bench=- impl=M2-2 data=M5-1 io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -88,9 +88,11 @@ blockers: none
 - M0 完成：张量账、10K + 128 token 路由 trace、局部性与命中率（`RESULTS.md` 第 1-2、7 节）。
 - M0 完成。**M1 已条件通过（用户 2026-10-24 选 A）**：9 条判据 8 过，唯一缺口 code 的 CPU 0.059
   留作 M3-1a 的硬门（M3-6 卡它，不达走 U-2）。R0 / R1 完成，语料、词表、E、保真、显存预算都已收口。
-- **phase = M2（prefill）**。队列：bench 空（等运行时），impl M2-1，data M5-1，io 等 M5-1，user 空。
+- **phase = M2（prefill）**。队列：bench 空（等运行时），impl M2-2，data M5-1，io 等 M5-1，user 空。
 - **M2-0 完成（2026-10-24）**：`qrt` 脚手架解析 design 第 7 节全部 10 个开关（默认值可读、坏值 exit 2、
   `--selftest` 14 项、ctest 34/34），telemetry CSV 出口已可用；见 `runtime/README.md`、`DECISIONS.md` 第 17 节。
+- **M2-1 完成（2026-10-24）**：`gguf_index` 与 `gguf_dims.py` 逐项一致（753 张量、11 个 hparam、张量账），
+  9 类畸形文件全部返回错误不崩溃；`--gguf-index` 可打印张量表；见 `RESULTS.md` 第 25 节、`DECISIONS.md` 第 18 节。
 - M1 的判据与证据见 `state.json` 的 `decision_gate` 与 `DECISIONS.md` 第 16 节。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。

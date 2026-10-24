@@ -4,7 +4,8 @@
 
 add_library(qrt_core STATIC
     qrt_config.cpp
-    qrt_telemetry.cpp)
+    qrt_telemetry.cpp
+    gguf_index.cpp)
 
 target_include_directories(qrt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(qrt_core PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
