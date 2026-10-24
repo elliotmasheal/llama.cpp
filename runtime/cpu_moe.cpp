@@ -78,10 +78,11 @@ static void gemv_avx2(const uint8_t * w, int rows, int cols,
         __m256 acc_hi[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
         float acc_min = 0.0f;
         for (int b = 0; b < nb; ++b) {
-            struct block_q4_k_local blk;
-            memcpy(&blk, row + (size_t) b * Q4K_BYTES, Q4K_BYTES);
-            if (b + 4 < nb) {
-                __builtin_prefetch(row + (size_t) (b + 4) * Q4K_BYTES, 0, 3);
+            // Read the 144-byte superblock in place: the copy only fed the loop.
+            const struct block_q4_k_local & blk =
+                *(const struct block_q4_k_local *) (row + (size_t) b * Q4K_BYTES);
+            if (b + 8 < nb) {
+                __builtin_prefetch(row + (size_t) (b + 8) * Q4K_BYTES, 0, 3);
             }
             const float d = h2f(blk.d);
             const float dmin = h2f(blk.dmin);
@@ -175,10 +176,11 @@ static void gemv_multi_impl(const uint8_t * wb, int rows, int cols,
             acc_min[t] = 0.0f;
         }
         for (int b = 0; b < nb; ++b) {
-            struct block_q4_k_local blk;
-            memcpy(&blk, row + (size_t) b * Q4K_BYTES, Q4K_BYTES);
-            if (b + 4 < nb) {
-                __builtin_prefetch(row + (size_t) (b + 4) * Q4K_BYTES, 0, 3);
+            // Read the 144-byte superblock in place: the copy only fed the loop.
+            const struct block_q4_k_local & blk =
+                *(const struct block_q4_k_local *) (row + (size_t) b * Q4K_BYTES);
+            if (b + 8 < nb) {
+                __builtin_prefetch(row + (size_t) (b + 8) * Q4K_BYTES, 0, 3);
             }
             const float dv = h2f(blk.d);
             const float dmin = h2f(blk.dmin);
