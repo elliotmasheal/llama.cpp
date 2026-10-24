@@ -576,3 +576,24 @@ ctx 16384；token 数 = prompt_n - 10（模板偏移用 3 个探针实测）。c
   所以 CPU 核的验收以 code 的 0.059 为准。
 - H2D 若能从 10.8 恢复到 12.5，0.059 可给到约 135；H2D 仍是第二条杠杆。
 - M3-1a 的 done_when 已改为 code 0.059 / 技术类 0.090；这是 M1 门之后 M3 的硬前提。
+
+## 18. M1-3a 受限草稿词表（2026-10-24）
+
+口径：模型 tokenizer 只读（mmap，CPU），四份 10K prompt 的 token 流 + 每份的 128 greedy 续写；
+脚本 `bench/tools/build_draft_vocab.py`，工具 `bench/tools/vocab_dump.cpp`；产出
+`bench/vocab/draft-16k.txt`（16384 个 int32，升序）与 `draft-16k.bin`（65536 B，同序），
+SHA-256 见 `bench/vocab/coverage.json`。
+
+| 项 | 值 |
+|---|---|
+| 词表大小 | 16384（33 special + 7659 observed + 8692 按 token id 升序填充） |
+| prompt 覆盖 | 40225 / 40225 = **100%** |
+| generated 覆盖 | 143 / 143 = **100%**（弱证据，见下） |
+| 每 prompt 的生成长度 | prompt10k 128 / chat 1 / code 13 / multi 1（chat/multi 立即 EOG） |
+
+- 该 GGUF **没有 `tokenizer.ggml.scores`**（Qwen BPE 只有 merge 表），所以填充按 token id 升序，
+  这是 merge 优先级的代理，不是似然估计。**E 由 M1-3b 实测，覆盖只是 token-id 代理。**
+- generated 流只有 143 token（chat/multi 第一个 token 就是 EOG），所以它的 100% 覆盖**不能**
+  当作"输出分布已覆盖"的证据；工具、脚本和词表都可复现，E 才是验收。
+- 不包含 243 个未使用的 `[PAD...]`（type 5）；special 全部保留。
+- 用途：M1-3c 的 `--spec-draft-vocab-file` 输入；M1-3b 的 E 测量。

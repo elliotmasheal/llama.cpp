@@ -215,7 +215,7 @@
       "id": "M1-3a",
       "milestone": "M1",
       "lane": "data",
-      "status": "doing",
+      "status": "done",
       "claimed_at": "2026-10-24T16:35:00",
       "title": "受限草稿词表（16K 候选）与生成脚本",
       "deps": [],

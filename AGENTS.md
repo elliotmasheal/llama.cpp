@@ -182,7 +182,7 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 | M1-1 | bench | 补齐 10 个 full-attention 层与 layer 39 的解码路由 | 40 层 x 128 token 都有记录；根因进 DECISIONS |
 | M1-2a | data | 非技术语料：对话 / 代码 / 多语言各 10K | 10002 / 10149 / 9636 token；shingle 97.7-100% |
 | M1-2b | bench | 三类文本局部性复测（技术类已完成） | chat 81.6%、multi 87.3%、**code 66.0%**；U-5 纳入 code，需 CPU 0.059 |
-| M1-3a | data | 受限草稿词表（16K）与生成脚本 | 覆盖生成 token 流 >= 95% |
+| M1-3a | data | 受限草稿词表（16K）与生成脚本 | 16384 ids；prompt 覆盖 100%，generated 143/143（弱） |
 | M1-3c | impl | draft-mtp 受限候选集（16K，默认关闭） | 空集/坏文件回退完整词表并告警，不 abort |
 | M1-3b | bench | 受限词表 MTP 接受率 E | E >= TG_min x 周期（RESULTS 第 9 节周期下 2.73 / 3.16），token 与 greedy 一致 |
 | M1-4a | impl | Vulkan 原型（k=1/2/4/5/8） | 每 pass 的 submit/sync 与计算缓冲可测 |
