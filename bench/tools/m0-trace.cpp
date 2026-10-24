@@ -1,5 +1,8 @@
 // M0: dump per-layer top-k expert ids (ffn_moe_topk) for prompt prefill + greedy decode.
 // Output: int32 header [n_tok, n_layer, k] then layer-major [layer][token][k].
+// Build (MinGW, static libs): g++ -O2 -std=c++17 -fopenmp bench/tools/m0-trace.cpp -Iinclude -Iggml/include
+//   -Wl,--start-group build-vulkan/src/libllama.a build-vulkan/ggml/src/{ggml,ggml-cpu,ggml-base}.a
+//   build-vulkan/ggml/src/ggml-vulkan/ggml-vulkan.a -Wl,--end-group -L<VULKAN_SDK>/Lib -lvulkan-1
 #include "llama.h"
 #include "ggml.h"
 #include "ggml-backend.h"

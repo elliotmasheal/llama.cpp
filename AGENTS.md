@@ -64,7 +64,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M1
 phase_status: in_progress
 decision_gate: M1 open
-queues: bench=- impl=X-1 data=M1-3a io=- user=-
+queues: bench=- impl=X-1 data=M1-3a io=- user=U-5
 last_gate: G-REG unknown (2026-10-23 record, not re-run since 44bd79305)
 blockers: none
 <!-- STATE:END -->
@@ -180,7 +180,7 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 |---|---|---|---|
 | M1-1 | bench | 补齐 10 个 full-attention 层与 layer 39 的解码路由 | 40 层 x 128 token 都有记录；根因进 DECISIONS |
 | M1-2a | data | 非技术语料：对话 / 代码 / 多语言各 10K | 10002 / 10149 / 9636 token；shingle 97.7-100% |
-| M1-2b | bench | 三类文本局部性复测（技术类已完成） | 与 M0 偏差 <= 5 pp 或已解释 |
+| M1-2b | bench | 三类文本局部性复测（技术类已完成） | chat 81.6%（过）、multi 87.3%（+5.7pp）、**code 66.0%（-15.6pp，TG 82-97）** |
 | M1-3a | data | 受限草稿词表（16K）与生成脚本 | 覆盖生成 token 流 >= 95% |
 | M1-3c | impl | draft-mtp 受限候选集（16K，默认关闭） | 空集/坏文件回退完整词表并告警，不 abort |
 | M1-3b | bench | 受限词表 MTP 接受率 E | E >= TG_min x 周期（RESULTS 第 9 节周期下 2.73 / 3.16），token 与 greedy 一致 |

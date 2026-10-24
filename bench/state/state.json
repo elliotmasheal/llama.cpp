@@ -142,12 +142,13 @@
     },
     {
       "lane": "user",
-      "head": null,
+      "head": "U-5",
       "order": [
+        "U-5",
         "M1-GATE",
         "U-2"
       ],
-      "note": "U-1/U-3/U-4 closed; M1-GATE waits for R1/M1-2b/M1-3b/M1-4b"
+      "note": "U-5 (TG text caliber) is the open gate question; U-1/U-3/U-4 closed"
     }
   ],
   "tasks": [
@@ -191,7 +192,7 @@
       "id": "M1-2b",
       "milestone": "M1",
       "lane": "bench",
-      "status": "doing",
+      "status": "partial",
       "claimed_at": "2026-10-24T16:05:00",
       "title": "三类文本的局部性复测（技术类已完成两份）",
       "deps": [
@@ -978,6 +979,17 @@
       "done_when": "k=5、21.9% 缓存下三条腿耗时差 <= 10%；QRT_MISS_SPLIT=auto；固定 0/50/100 仅作对照"
     },
     {
+      "id": "U-5",
+      "milestone": "M1",
+      "lane": "user",
+      "status": "todo",
+      "title": "TG 130 的文本口径：code 是否纳入",
+      "deps": [],
+      "resources": [],
+      "paths": [],
+      "done_when": "写明 code 文本是否纳入 TG 130；不纳入则改 design 1.1/8.2 的口径；纳入则给出 code 的命中率/CPU 核目标并由 M1-GATE 评审"
+    },
+    {
       "id": "M2-6a",
       "milestone": "M2",
       "lane": "impl",
@@ -1003,5 +1015,13 @@
     "detail": "last full record is 2026-10-23 (ctest 32/32, MUL_MAT 2275/2275, MUL_MAT_ID 939/939, FLASH_ATTN_EXT 5332/5332). Commit 44bd79305 changed llama-kv-cells after that record, so the gate is stale. M1 does not touch fork code, so it does not block; rerun before any fork code change."
   },
   "blockers": [],
-  "escalations": []
+  "escalations": [
+    {
+      "id": "U-5",
+      "question": "does the TG 130 target apply to code text? M1-2b: at 21.9% cache, code hits 66% and projects 82-97 tok/s, while chat/multi are 143/136",
+      "needs_by": "M1-GATE",
+      "owner": "user",
+      "note": "a caliber decision (design 1.1/8.2). Excluding code leaves the target as-is; including it needs a much faster CPU expert kernel (~0.05 ms) or a better cache policy"
+    }
+  ]
 }
