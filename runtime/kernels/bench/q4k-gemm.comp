@@ -1,0 +1,150 @@
+#version 450
+// R1c probe: one Q4_K (weights) x Q8_1 (activations) int8 dot per output element, tiled to
+// Q4K_TILE_N rows x Q4K_TILE_M tokens per workgroup. Byte layouts follow
+// ggml/src/ggml-common.h block_q4_K (line 337) and block_q8_1 (line 268), read as 32-bit
+// words so no compiler padding is assumed. Folding of scales, mins and the q8_1 block sum
+// is derived in README.md.
+
+#extension GL_EXT_control_flow_attributes : enable
+#ifdef Q4K_DOT4
+#extension GL_EXT_integer_dot_product : require
+#endif
+
+#include "q4k-tiles.h"
+
+layout(local_size_x = Q4K_WG_INVOCATIONS) in;
+
+layout(binding = 0) readonly  buffer WeightWords { uint w[]; } wt;
+layout(binding = 1) readonly  buffer ActWords    { uint a[]; } ac;
+layout(binding = 2) writeonly buffer Out         { float o[]; } ob;
+
+layout(push_constant) uniform PC {
+    uint n; // rows
+    uint k; // reduction length
+    uint m; // tokens, also the row stride of the output
+} pc;
+
+// Signed dot of four packed int8 lanes. Q4K_DOT4 maps to OpSDot through
+// SPV_KHR_integer_dot_product; otherwise unpack and multiply.
+int q4k_dot4(uint q, uint a) {
+#ifdef Q4K_DOT4
+    return dotPacked4x8EXT(int(q), int(a));
+#else
+    const int p0 = int(q << 24u) >> 24;
+    const int p1 = int(q << 16u) >> 24;
+    const int p2 = int(q <<  8u) >> 24;
+    const int p3 = int(q) >> 24;
+    const int a0 = int(a << 24u) >> 24;
+    const int a1 = int(a << 16u) >> 24;
+    const int a2 = int(a <<  8u) >> 24;
+    const int a3 = int(a) >> 24;
+    return p0 * a0 + p1 * a1 + p2 * a2 + p3 * a3;
+#endif
+}
+
+// Byte i of the 12 packed scale/min bytes stored in three words.
+uint q4k_byte(uvec3 s, uint i) {
+    const uint v = (i < 4u) ? s.x : ((i < 8u) ? s.y : s.z);
+    return (v >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+// 6-bit subblock scale; bit layout of get_scale_min_k4 (ggml/src/ggml-quants.c:880).
+uint q4k_sc(uvec3 s, uint j) {
+    if (j < 4u) {
+        return q4k_byte(s, j) & 63u;
+    }
+    return (q4k_byte(s, j + 4u) & 15u) | ((q4k_byte(s, j - 4u) >> 6u) << 4);
+}
+
+// 6-bit subblock min, same packing as q4k_sc.
+uint q4k_mn(uvec3 s, uint j) {
+    if (j < 4u) {
+        return q4k_byte(s, j + 4u) & 63u;
+    }
+    return (q4k_byte(s, j + 4u) >> 4u) | ((q4k_byte(s, j) >> 6u) << 4);
+}
+
+void main() {
+    const uint nsb  = pc.k / Q4K_QK;
+    const uint lane = gl_LocalInvocationID.x % Q4K_SUBGROUP;
+    const uint sub  = gl_LocalInvocationID.x / Q4K_SUBGROUP;
+
+    const uint row0 = gl_WorkGroupID.x * Q4K_TILE_N + lane;
+    const uint row1 = row0 + Q4K_SUBGROUP;
+    const uint tok0 = gl_WorkGroupID.y * Q4K_TILE_M + sub * Q4K_TOKENS;
+    if (row1 >= pc.n || tok0 + Q4K_TOKENS > pc.m) {
+        return;
+    }
+
+    float acc0[Q4K_TOKENS];
+    float acc1[Q4K_TOKENS];
+    [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
+        acc0[t] = 0.0;
+        acc1[t] = 0.0;
+    }
+
+    const uint w_stride = nsb * Q4K_W_WORDS;
+    const uint a_stride = nsb * 8u * Q4K_A_WORDS;
+    const uint w0_row   = row0 * w_stride;
+    const uint w1_row   = row1 * w_stride;
+    const uint a_tok    = tok0 * a_stride;
+
+    for (uint sb = 0; sb < nsb; ++sb) {
+        const uint b0 = w0_row + sb * Q4K_W_WORDS;
+        const uint b1 = w1_row + sb * Q4K_W_WORDS;
+        const vec2 dm0 = unpackHalf2x16(wt.w[b0]);
+        const vec2 dm1 = unpackHalf2x16(wt.w[b1]);
+        const uvec3 s0 = uvec3(wt.w[b0 + 1u], wt.w[b0 + 2u], wt.w[b0 + 3u]);
+        const uvec3 s1 = uvec3(wt.w[b1 + 1u], wt.w[b1 + 2u], wt.w[b1 + 3u]);
+
+        [[unroll]] for (uint g = 0; g < Q4K_GROUPS; ++g) {
+            // one group is 64 elements: subblock 2g holds the low nibbles of the 32 bytes
+            const uint jl = 2u * g;
+            const uint jh = jl + 1u;
+            const float f0l = dm0.x * float(q4k_sc(s0, jl));
+            const float f0h = dm0.x * float(q4k_sc(s0, jh));
+            const float f1l = dm1.x * float(q4k_sc(s1, jl));
+            const float f1h = dm1.x * float(q4k_sc(s1, jh));
+            const float k0l = dm0.y * float(q4k_mn(s0, jl));
+            const float k0h = dm0.y * float(q4k_mn(s0, jh));
+            const float k1l = dm1.y * float(q4k_mn(s1, jl));
+            const float k1h = dm1.y * float(q4k_mn(s1, jh));
+
+            uint lo0[8], hi0[8], lo1[8], hi1[8];
+            [[unroll]] for (uint i = 0; i < 8u; ++i) {
+                const uint u0 = wt.w[b0 + 4u + 8u * g + i];
+                const uint u1 = wt.w[b1 + 4u + 8u * g + i];
+                lo0[i] = u0 & 0x0F0F0F0Fu;
+                hi0[i] = (u0 >> 4) & 0x0F0F0F0Fu;
+                lo1[i] = u1 & 0x0F0F0F0Fu;
+                hi1[i] = (u1 >> 4) & 0x0F0F0F0Fu;
+            }
+
+            const uint ab = a_tok + (sb * 8u + jl) * Q4K_A_WORDS;
+            [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
+                const uint p = ab + t * a_stride;
+                int i0l = 0, i0h = 0, i1l = 0, i1h = 0;
+                [[unroll]] for (uint i = 0; i < 8u; ++i) {
+                    const uint al = ac.a[p + 1u + i];
+                    const uint ah = ac.a[p + Q4K_A_WORDS + 1u + i];
+                    i0l += q4k_dot4(lo0[i], al);
+                    i0h += q4k_dot4(hi0[i], ah);
+                    i1l += q4k_dot4(lo1[i], al);
+                    i1h += q4k_dot4(hi1[i], ah);
+                }
+                const vec2 hl = unpackHalf2x16(ac.a[p]);
+                const vec2 hh = unpackHalf2x16(ac.a[p + Q4K_A_WORDS]);
+                acc0[t] += f0l * hl.x * float(i0l) - k0l * hl.y;
+                acc0[t] += f0h * hh.x * float(i0h) - k0h * hh.y;
+                acc1[t] += f1l * hl.x * float(i1l) - k1l * hl.y;
+                acc1[t] += f1h * hh.x * float(i1h) - k1h * hh.y;
+            }
+        }
+    }
+
+    [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
+        const uint col = tok0 + t;
+        ob.o[row0 * pc.m + col] = acc0[t];
+        ob.o[row1 * pc.m + col] = acc1[t];
+    }
+}
