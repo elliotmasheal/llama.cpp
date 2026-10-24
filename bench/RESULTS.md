@@ -666,3 +666,31 @@ bench `runtime/cpu_moe_bench.cpp`。合成 Q4_K 权重（真实 144 B 块布局�
   4 线程首轮 0.091 差 1%。**code 的 0.059 未达到**（还差约 1.5x），M3-1a 记 partial。
 - **对 E 的影响**：按 0.090 的 E_min（k=4 2.72、k=5 2.88）与 M1-3b 的 E（2.850 / 3.055），
   E 条件可以过；k=5 的输出保真仍是 M1-GATE 的阻塞项（M1-3d）。
+
+## 21. M1-3d k=5 验证分叉的定位（2026-10-24）
+
+口径：同一 10K prompt（从 M1-3b 日志里提取的 chat 模板原文，`prompt_n=10438`），`llama-server`
+（worktree m1-3c 构建，`b11935-992c2f57a`），`-dev Vulkan1 -c 16384 -b 2048 -fa on --cpu-moe -ngl 99`，
+请求 `temperature=0, top_k=20, top_p=0.95, min_p=0.05, n_probs=20, n_predict=40`；
+两臂：`--spec-type none` 与 `--spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-vocab-file
+bench/vocab/draft-16k.bin`。原始 JSON `bench/raw/m1-3d/{greedy-cli,k5-cli}.json`。
+
+| 位置 | greedy token / lp | greedy margin | k=5 token / lp | k=5 margin |
+|---:|---|---:|---|---:|
+| 24 | ` README` / -0.3416 | 1.654 | 同 | 1.424 |
+| 25 | `/documentation` / -0.4411 | 1.882 | 同 | 1.858 |
+| **26** | **` dump` / -1.4298** | **0.1192** | **` snippet` / -1.5072** | **0.0136** |
+| 27 | ` for` / -0.0142 | 4.380 | 同 | 3.768 |
+
+- 位置 0-25 的 token 完全一致；**同一 token 的 logprob 平均差 0.0030，最大 0.0433（位置 24）**。
+  也就是说 5 宽验证批只把 logits 扰动约 0.003-0.09 nats，但位置 26 本身是近分叉：
+  greedy 的 top-1 只领先 0.119，批验证后 ` dump` 与 ` snippet` 的差缩到 **0.0136 nats**，rank 翻转。
+- **与草稿词表无关**：M1-3b 的 16K 臂与完整词表臂在完全相同的位置分叉、分到同一个 token；
+  这次分叉两侧的候选也都在双方 top-3 里，说明不是接受逻辑错配。
+- **与 k=4 的关系**：k=4 在本 prompt 上 114 token 内没碰到这种近分叉，但它的批宽同样是 4，
+  风险不会消失；margin 分布里 <=0.6 nats 的位置不少（本段 17、36 两处）。
+- 结论：这是 design R9 预判的"批量验证数值顺序"问题，**不是 M1-3c 掩码、也不是接受/回滚缺陷**。
+  任何 k>1 都无法保证 bit-exact 等于逐 token greedy；要么给近分叉定容差，要么放弃 k>1。
+  该口径变更需要用户决定（U-7），agent 不自行放宽判据。
+- 复现命令与解析脚本：`bench/raw/m1-3d/`（`extract_prompt.py`、`analyze.py`、`deltas.py`，
+  原始 JSON 同在；raw 不进 git）。
