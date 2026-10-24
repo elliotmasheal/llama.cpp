@@ -716,3 +716,22 @@ bench/vocab/draft-16k.bin`。原始 JSON `bench/raw/m1-3d/{greedy-cli,k5-cli}.js
 - 结论：CPU 腿模型必须按**多重度分布**算，不能按 t=k 逐个算全量。若运行时对每个 miss 专家
   都跑 k 个 token，CPU 腿会翻倍，E_min 与 TG 投影全部作废。这条约束要写进 M3-2a/M3-1。
 - 本轮仍不满足 code 的 0.059（t=1 最好 0.079），M3-1a 继续 partial。
+
+## 23. M1-3e k=4 保真抽样（2026-10-24，U-7 口径）
+
+口径：`llama-server`（同 §21），两份 prompt（技术类 `prompt10k`、`prompt-code10k`），
+各 128 token，`n_probs=20`；两臂 `--spec-type none` 与 `draft-mtp --spec-draft-n-max 3`（k=4）
++ 16K 词表；请求参数同 §21。原始 JSON `bench/raw/m1-3e/`。
+
+| prompt | prompt tokens | k=4 分叉 | 一致位置 | 最大 logprob 差 | 最紧 greedy margin |
+|---|---:|---:|---:|---:|---:|
+| tech | 10438 | 无 | 128/128 | 0.0808（位置 120） | 0.1192（位置 26） |
+| code | 10160 | 无 | 128/128 | 0.0594（位置 26） | 0.1286（位置 32） |
+
+- 按 U-7（只在 greedy margin < 0.05 的位置允许分叉）：**两段都没有分叉，PASS**。
+- 但批验证的扰动最大到 **0.0808 nats**，比 0.05 的允许量还大；这两段只是没碰到
+  margin 在 0.05-0.08 之间的位置。**余量很薄**，M3-5 必须把分叉率与分叉处 margin 作为必报列。
+- k=5 在同一 prompt 上于 margin 0.1192 处翻到 0.0136（§21），按 U-7 是 fail。
+  因此**验收配置选 k=4**；k=5 只用于速度探索，不能作为保真门。
+- E 的配套：k=4 受限词表 E=2.850；按 CPU 0.118 / 0.090 的 E_min 2.90 / 2.72，
+  CPU 约 0.10 时 E_min 约 2.81，**E 2.850 过线但只余约 1.4%**。

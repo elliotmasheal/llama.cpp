@@ -73,7 +73,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M1
 phase_status: in_progress
 decision_gate: M1 open
-queues: bench=M1-4b impl=X-1 data=M5-1 io=- user=U-7
+queues: bench=M1-4b impl=X-1 data=M5-1 io=- user=M1-GATE
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -87,12 +87,12 @@ blockers: none
 - M1 进行中：M1-1 / M1-2b / M1-3b / M1-3c / M1-3d / M1-4a / M1-4a-run / M1-5 / M1-6 / M1-7 已完成，
   R0 / R1 已完成，语料与词表 M1-2a / M1-3a 已交付；M3-1a 已提前做完（partial，见下）。
   剩 M1-4b（partial，计算缓冲未隔离）、U-7（近分叉判据）、M1-GATE。
-- 队列：bench M1-4b，impl X-1，data M5-1，io 等 M5-1，user 等 U-7。
+- 队列：bench M1-4b，impl X-1，data M5-1，io 等 M5-1，user 等 M1-GATE。
 - M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`（九条），E 门槛用公式而不是常数。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。
-- 未决：**U-7**（近分叉验收判据）。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）、U-4（平衡电源为基准）、
-  U-5（code 纳入 130）、U-6（M3-1a 提前到门内）均已闭环。
+- 未决：无。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）、U-4（平衡电源为基准）、
+  U-5（code 纳入 130）、U-6（M3-1a 提前到门内）、U-7（近分叉 0.05 口径）均已闭环。
 - 目标：TG 可行点 21.9% 缓存（4198 MiB，技术类命中约 79%；chat 81.6 / multi 87.3 / code 66.0）、k=5；
   CPU 核 0.118 时 131（E_min 3.23），到 0.090 时 146（E_min 2.88）。
   **U-5：code 纳入 130**；code 66% 命中 -> 需 CPU **0.059**（目标 0.055），当前 0.118 只到 82。
@@ -109,7 +109,11 @@ blockers: none
   不许对每个 miss 专家都跑满 k 个 token（否则 CPU 腿翻倍）。
 - M1-3d 实测（`RESULTS.md` 第 21 节）：同 prompt 下 greedy 与 k=5 在位置 0-25 完全一致，
   logprob 平均差 0.0030；位置 26 的 top-1 margin 从 0.1192 降到 0.0136 后翻转。
-  **任何 k>1 都无法保证 bit-exact**，验收容差需 U-7 定；E 不受影响。
+- **U-7 已决（用户 2026-10-24）**：greedy top-1 margin < 0.05 nats 的位置允许分叉，其余逐 token 一致。
+- M1-3e 实测（`RESULTS.md` 第 23 节）：k=4 在技术类与 code 两份 prompt x 128 token **无分叉**，
+  最大 logprob 扰动 0.0808、最紧 margin 0.1192/0.1286 -> 按 U-7 **PASS**；k=5 在 0.1192 处翻转 -> fail。
+  **验收配置取 k=4**（E=2.850，CPU 0.10 时 E_min 2.81，余 1.4%）；扰动上限（0.081）大于 0.05，
+  M3-5 必须把分叉率与分叉处 margin 作为必报列。
 - design 6.5 的前提：(a) 受限词表 E（已测，见上）；(b) miss 自适应分配（M3-2a）；
   (c) 每 pass submit+sync < 1 ms（**已测 0.065-0.084**，M1-4b）；(d) q4 KV + 21.9% 缓存塞进 8 GiB
   （U-3 已定，q4 待 M2-6a 过 G-QUAL）；(e) code 的 CPU 核 0.059（M3-1a）。

@@ -16,7 +16,7 @@
       "VRAM budget closes with q4 KV + a 16384-token resident window (21.9% expert cache, RESULTS section 10)",
       "PP feasibility recorded: int8 ALU 8.67 TFLOPS, expert GEMM baseline 3.66 (RESULTS section 14); PP >= 1000 stays a hard floor (user 2026-10-24) and M2-4 must reach 6.0 TFLOPS",
       "code-included TG feasibility: CPU expert <=0.059 ms at 4 threads (target 0.055, ~107 GFLOPS) with H2D 10.8 gives code TG 130; current 0.118 gives 82 (RESULTS section 17)",
-      "speculative output fidelity: the accepted token stream must equal plain greedy, but the user has to choose the near-tie rule (U-7). Measured: two 16K-vs-full k=5 arms fork at position 26 where greedy's margin is 0.119 and the batched pass's is 0.0136; positions 0-25 match with mean logprob delta 0.0030 (RESULTS section 21). Drafters and the M1-3c mask are not involved",
+      "speculative output fidelity under the U-7 rule: divergence is allowed only where greedy's top-1 margin is below 0.05 nats. k=4 passed 2x128 tokens with no fork (max batch perturbation 0.0808, tightest margins 0.1192/0.1286); k=5 forks at a 0.1192 margin and fails (RESULTS sections 21/23)",
       "CPU expert leg: the user moved M3-1a inside the gate (U-6). Technical text needs <=0.090 ms/expert, code needs <=0.059 (target 0.055); the measured E clears 2.72 / 2.88 at 0.090 (RESULTS section 19)"
     ],
     "on_fail": "stop and ask the user: lower the TG target, change the ctx cost, or page the KV (design section 9)"
@@ -107,10 +107,10 @@
       "head": "M1-4b",
       "order": [
         "R1",
-        "M1-4b",
-        "M1-2b"
+        "M1-3e",
+        "M1-4b"
       ],
-      "note": "M1-3b done: 16K E is 2.850 (k=4) / 3.055 (k=5), passes only at CPU 0.090; k=5 diverges from greedy at token 26 (M1-3d). M1-4b partial: compute buffer not isolated. M1-2b partial: code 66.0%."
+      "note": "M1-3e done: k=4 matches greedy for 2x128 tokens under the 0.05-nat rule, but the batch perturbation reaches 0.081 nats. M1-4b keeps the compute buffer open"
     },
     {
       "lane": "impl",
@@ -149,13 +149,12 @@
     },
     {
       "lane": "user",
-      "head": "U-7",
+      "head": "M1-GATE",
       "order": [
-        "U-7",
         "M1-GATE",
         "U-2"
       ],
-      "note": "U-7 needs a decision on the near-tie tolerance before M1-GATE; U-1/U-3/U-4/U-5/U-6 closed"
+      "note": "U-7 closed (0.05-nat rule, k=4 is the acceptance config); M1-GATE waits for M1-4b and the code CPU target"
     }
   ],
   "tasks": [
@@ -333,7 +332,8 @@
         "M1-5",
         "M1-6",
         "M1-7",
-        "R1"
+        "R1",
+        "M1-3e"
       ],
       "resources": [],
       "paths": [],
@@ -1051,14 +1051,14 @@
       "id": "U-7",
       "milestone": "M1",
       "lane": "user",
-      "status": "todo",
+      "status": "done",
       "title": "近分叉验收判据：容差还是 bit-exact",
       "deps": [
         "M1-3d"
       ],
       "resources": [],
       "paths": [],
-      "done_when": "用户决定推测路径的验收口径：(a) 只在 greedy top-1 margin >= X nats 的位置要求逐 token 一致（建议 X=0.05-0.1），并把分叉率与分叉处 margin 列为必报；或 (b) 保持 bit-exact（等价于放弃 k>1）。决定写进 DECISIONS，design 1.2 / R9 由用户改"
+      "done_when": "用户 2026-10-24 定：greedy top-1 margin < 0.05 nats 的位置允许分叉，其余要求逐 token 一致；分叉率与分叉处 margin 必报"
     },
     {
       "id": "U-6",
@@ -1070,6 +1070,26 @@
       "resources": [],
       "paths": [],
       "done_when": "用户 2026-10-24 定：先把 CPU 专家核（M3-1a）做到 0.090/0.059 再评审 M1 门；M3-1a 的 deps 改为 M1-3b，M1-GATE 增加该前置"
+    },
+    {
+      "id": "M1-3e",
+      "milestone": "M1",
+      "lane": "bench",
+      "status": "done",
+      "claimed_at": "2026-10-24T22:20:00",
+      "title": "k=4 交付口径下的 128 token 保真抽样（技术类 + code）",
+      "deps": [
+        "M1-3d"
+      ],
+      "resources": [
+        "host-ram",
+        "machine-quiet",
+        "gpu"
+      ],
+      "paths": [
+        "bench/raw/m1-3e/**"
+      ],
+      "done_when": "按 U-7 的 0.05 nats 口径，两份 prompt x 128 token 的分叉率与分叉处 greedy margin 落表；任一 margin >= 0.05 的分叉即 fail"
     }
   ],
   "last_gate": {
