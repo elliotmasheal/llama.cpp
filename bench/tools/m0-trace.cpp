@@ -42,19 +42,20 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * ud) {
     auto * st = (trace_state *) ud;
     const bool is_argsort = strncmp(t->name, "ffn_moe_argsort-", 16) == 0;
     const bool is_topk    = strncmp(t->name, "ffn_moe_topk-", 13) == 0;
-    if (getenv("M0_DEBUG") && ask && strstr(t->name, "moe") && (strstr(t->name, "-3") || strstr(t->name, "-39"))) {
-        fprintf(stderr, "DBG ask name=%s op=%s ne0=%lld ne1=%lld\n", t->name, ggml_op_name(t->op), (long long) t->ne[0], (long long) t->ne[1]);
-    }
     if (!is_argsort && !is_topk) {
-        return false;
+        // ask=false only reaches here for a tensor that was requested, so keep iterating
+        return !ask;
     }
     if (ask) {
         return true;
     }
+    // The scheduler breaks out of the current split when this returns false
+    // (ggml-backend.cpp: `if (need && !callback_eval(t, false, ...)) break;`),
+    // so every post-compute call must return true or later nodes never run.
     if (is_topk) {
         int tl = atoi(t->name + 13);
         if (tl < 0 || tl >= st->n_layer || t->type != GGML_TYPE_I32 || t->ne[0] != K_USED) {
-            return false;
+            return true;
         }
         auto v = read_rows(t, K_USED);
         if (v.size() == st->last[tl].size()) {
@@ -63,21 +64,21 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * ud) {
                 st->mismatch++;
             }
         }
-        return false;
+        return true;
     }
     int il = atoi(t->name + 16);
     if (il < 0 || il >= st->n_layer) {
-        return false;
+        return true;
     }
     if (t->ne[0] < K_USED || t->type != GGML_TYPE_I32) {
         fprintf(stderr, "unexpected argsort tensor %s type=%d ne0=%lld\n", t->name, (int) t->type, (long long) t->ne[0]);
-        return false;
+        return true;
     }
     auto buf = read_rows(t, K_USED);
     st->last[il] = buf;
     auto & dst = st->ids[il];
     dst.insert(dst.end(), buf.begin(), buf.end());
-    return false;
+    return true;
 }
 
 static void decode_check(int rc, const char * what) {
@@ -125,6 +126,12 @@ int main(int argc, char ** argv) {
     cp.n_threads_batch = 8;
     cp.cb_eval = cb_eval;
     cp.cb_eval_user_data = &st;
+    // M0: keep every op on the CPU backend so the scheduler cannot move a split (and its
+    // ffn_moe_* nodes) away from the eval callback; see the M1 note in the design doc.
+    if (getenv("M0_NO_OFFLOAD")) {
+        cp.op_offload  = false;
+        cp.offload_kqv = false;
+    }
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         fprintf(stderr, "ctx failed\n");

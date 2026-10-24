@@ -75,7 +75,7 @@
   "queues": [
     {
       "lane": "bench",
-      "head": "M1-1",
+      "head": "M1-5",
       "order": [
         "M1-1",
         "M1-5",
@@ -131,7 +131,7 @@
       "id": "M1-1",
       "milestone": "M1",
       "lane": "bench",
-      "status": "todo",
+      "status": "done",
       "title": "补齐 10 个 full-attention 层与 layer 39 的解码路由",
       "deps": [],
       "resources": [
@@ -141,9 +141,10 @@
       ],
       "paths": [
         "bench/raw/m0-qwen36/trace-10k-g128.bin",
-        "bench/tools/m0-trace.cpp"
+        "bench/tools/m0-trace.cpp",
+        "bench/tools/m0-analyze.py"
       ],
-      "done_when": "trace-10k-g128.bin 的 40 层 x 128 token 都有记录，layer 39 也是 128；根因写进 DECISIONS"
+      "done_when": "trace-10k-g128.bin 的 40 层 x 128 token 都有记录（layer 39 取末尾 128 条）；r=2 逐字节一致；根因写进 DECISIONS"
     },
     {
       "id": "M1-2a",
