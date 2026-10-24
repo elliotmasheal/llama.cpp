@@ -12,12 +12,14 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define VK_CHECK(x)                                                                       \
@@ -745,6 +747,120 @@ static void cmd_stream(App & a, uint32_t mib, uint32_t dispatches, bool vec4) {
     vkFreeMemory(a.dev, stream_w.mem, nullptr);
 }
 
+// H2D transfers while N CPU threads read a large host buffer. Both legs pull from host DRAM,
+// so the aggregate rate is what the split-miss path actually gets; summing the two solo rates
+// would overstate it.
+static void cmd_concurrent(App & a, uint32_t host_mib, int threads, uint32_t xfer_mib) {
+    Buf host = make_buf(a, (VkDeviceSize) host_mib * MIB, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    Buf dev  = make_buf(a, (VkDeviceSize) 64 * MIB,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    std::memset(host.map, 0x5a, (size_t) host.size);
+
+    const size_t n_float = (size_t) host_mib * MIB / 4;
+    // the CPU leg must read cached RAM: a host-visible Vulkan buffer here is write-combined and
+    // would report about 0.2 GB/s. The DMA leg still reads DRAM, so contention stays real.
+    std::vector<float> cpu_buf(n_float, 1.0f);
+    const float * base = cpu_buf.data();
+
+    // four accumulators per thread: a single float reduction is not vectorised and would make
+    // the reader look like 0.1 GB/s instead of the memory ceiling
+    auto read_range = [&](size_t begin, size_t end) {
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        size_t j = begin;
+        for (; j + 3 < end; j += 4) {
+            a0 += base[j];
+            a1 += base[j + 1];
+            a2 += base[j + 2];
+            a3 += base[j + 3];
+        }
+        for (; j < end; ++j) { a0 += base[j]; }
+        return a0 + a1 + a2 + a3;
+    };
+
+    volatile double sink = 0.0;
+    double solo = 0.0;
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::thread> th;
+        std::vector<double> part(threads, 0.0);
+        for (int i = 0; i < threads; ++i) {
+            const size_t b = (size_t) i * (n_float / threads);
+            const size_t e = (i + 1 == threads) ? n_float : (size_t) (i + 1) * (n_float / threads);
+            th.emplace_back([&, i, b, e]() { part[i] = read_range(b, e); });
+        }
+        for (auto & t : th) { t.join(); }
+        const double ms = ms_since(t0);
+        double s = 0.0;
+        for (double v : part) { s += v; }
+        sink = s;
+        solo = (double) host_mib / 1024.0 / (ms / 1000.0);
+    }
+
+    // concurrent: readers loop until the transfers finish, so the CPU leg stays loaded the whole time
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> th;
+    std::vector<double> part(threads, 0.0);
+    std::vector<size_t> iters(threads, 0);
+    for (int i = 0; i < threads; ++i) {
+        const size_t b = (size_t) i * (n_float / threads);
+        const size_t e = (i + 1 == threads) ? n_float : (size_t) (i + 1) * (n_float / threads);
+        th.emplace_back([&, i, b, e]() {
+            double acc = 0.0;
+            size_t it = 0;
+            while (!stop.load()) {
+                acc += read_range(b, e);
+                ++it;
+            }
+            part[i] = acc;
+            iters[i] = it;
+        });
+    }
+    const uint32_t ncopy = xfer_mib / 32u;
+    VkCommandBuffer cb = alloc_cb(a, a.pool_c);
+    begin_cb(cb);
+    for (uint32_t i = 0; i < ncopy; ++i) {
+        VkBufferCopy c{0, 0, 32 * MIB};
+        vkCmdCopyBuffer(cb, host.buf, dev.buf, 1, &c);
+    }
+    VK_CHECK(vkEndCommandBuffer(cb));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t val = 0;
+    submit_tl(a, a.qc, a.sem_c, &a.val_c, cb, &val);
+    wait_tl(a, a.sem_c, val);
+    vkQueueWaitIdle(a.qc);
+    const double xfer_ms = ms_since(t0);
+    stop.store(true);
+    for (auto & t : th) { t.join(); }
+    const double ms = ms_since(t0);
+
+    double s = 0.0;
+    size_t total = 0;
+    for (int i = 0; i < threads; ++i) {
+        s += part[i];
+        total += iters[i] * (n_float / threads);
+    }
+    sink += s;
+    const double cpu_gbs = (double) total * 4.0 / 1024.0 / 1024.0 / 1024.0 / (ms / 1000.0);
+    const double h2d_gbs = (double) xfer_mib / 1024.0 / (ms / 1000.0);
+    std::printf("host %u MiB, %d reader threads, %u MiB copied\n", host_mib, threads, xfer_mib);
+    std::printf("  CPU read solo          %.1f GB/s\n", solo);
+    std::printf("  concurrent wall        %.2f ms (transfer alone %.2f ms)\n", ms, xfer_ms);
+    std::printf("  CPU read under H2D     %.1f GB/s\n", cpu_gbs);
+    std::printf("  H2D under CPU read     %.1f GB/s\n", h2d_gbs);
+    std::printf("  aggregate              %.1f GB/s\n", cpu_gbs + h2d_gbs);
+    std::printf("  solo rates summed      %.1f GB/s (H2D solo 14.17)\n", solo + 14.17);
+    (void) sink;
+
+    vkQueueWaitIdle(a.qc);
+    vkDestroyBuffer(a.dev, host.buf, nullptr);
+    vkFreeMemory(a.dev, host.mem, nullptr);
+    vkDestroyBuffer(a.dev, dev.buf, nullptr);
+    vkFreeMemory(a.dev, dev.mem, nullptr);
+}
+
 int main(int argc, char ** argv) {
     App a;
     init(a);
@@ -762,9 +878,14 @@ int main(int argc, char ** argv) {
     } else if (mode == "stream4") {
         cmd_stream(a, argc > 2 ? (uint32_t) std::atoi(argv[2]) : 1024,
                 argc > 3 ? (uint32_t) std::atoi(argv[3]) : 16, true);
+    } else if (mode == "concurrent") {
+        cmd_concurrent(a, argc > 2 ? (uint32_t) std::atoi(argv[2]) : 1024,
+                argc > 3 ? std::atoi(argv[3]) : 4,
+                argc > 4 ? (uint32_t) std::atoi(argv[4]) : 1024);
     } else {
         std::printf("usage: %s info | boundary [iters] | overlap [transfer_mib] [target_ms]"
-                    " | stream [buffer_mib] [dispatches] | stream4 [buffer_mib] [dispatches]\n", argv[0]);
+                    " | stream [buffer_mib] [dispatches] | stream4 [buffer_mib] [dispatches]"
+                    " | concurrent [host_mib] [threads] [xfer_mib]\n", argv[0]);
     }
     return 0;
 }

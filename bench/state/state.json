@@ -75,7 +75,7 @@
   "queues": [
     {
       "lane": "bench",
-      "head": "M1-7",
+      "head": null,
       "order": [
         "M1-1",
         "M1-7",
@@ -774,7 +774,7 @@
       "id": "M1-7",
       "milestone": "M1",
       "lane": "bench",
-      "status": "todo",
+      "status": "done",
       "title": "H2D 与 CPU 读并发时的聚合主机带宽 + 每专家 CPU 代价",
       "deps": [],
       "resources": [
