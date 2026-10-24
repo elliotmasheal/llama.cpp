@@ -5,6 +5,8 @@
 > 本仓库是 `elliotmasheal/llama.cpp` fork，基线是 ggml-org/llama.cpp 的上游 master。
 > `origin` 指向本 fork，未配置 `upstream` remote。**本项目不考虑"能否上游化"，追求小 VRAM 设备下的指定模型的极致性能。**
 > 只有一条主线：`design/qwen36-moe-runtime-design.md`（qwen36 专用 MoE 运行时，里程碑 M0-M5）。
+> 解释、归纳、总结时请简单一些，易于非专业人士阅读，并结合目标给出进度及影响。
+> 时刻谨记本仓库(llama.cpp剪裁+二次优化版)仅供参考，核心目标依然是重写而非优化。
 
 ## 0. 怎么开始
 
@@ -71,9 +73,9 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 
 <!-- STATE:BEGIN -->
 phase: M1
-phase_status: in_progress
+phase_status: blocked
 decision_gate: M1 open
-queues: bench=M1-4b impl=X-1 data=M5-1 io=- user=M1-GATE
+queues: bench=- impl=X-1 data=M5-1 io=- user=M1-GATE
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -84,10 +86,10 @@ blockers: none
 **现状摘要（人读，不参与机器校验）**
 
 - M0 完成：张量账、10K + 128 token 路由 trace、局部性与命中率（`RESULTS.md` 第 1-2、7 节）。
-- M1 进行中：M1-1 / M1-2b / M1-3b / M1-3c / M1-3d / M1-4a / M1-4a-run / M1-5 / M1-6 / M1-7 已完成，
-  R0 / R1 已完成，语料与词表 M1-2a / M1-3a 已交付；M3-1a 已提前做完（partial，见下）。
-  剩 M1-4b（partial，计算缓冲未隔离）、M1-GATE。
-- 队列：bench M1-4b，impl X-1，data M5-1，io 等 M5-1，user 等 M1-GATE。
+- M1 进行中：M1-1 / M1-2b / M1-3b / M1-3c / M1-3d / M1-3e / M1-4a / M1-4a-run / M1-4b / M1-5 / M1-6 / M1-7
+  已完成，R0 / R1 已完成，语料与词表 M1-2a / M1-3a 已交付；M3-1a 已提前做完（partial，见下）。
+  **M1 评审已做：9 条判据 8 过 1 不过（code 的 CPU 0.059），phase_status=blocked，等用户选择。**
+- 队列：bench 空（M1 测量全部完成），impl X-1，data M5-1，io 等 M5-1，user M1-GATE。
 - M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`（九条），E 门槛用公式而不是常数。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。
@@ -105,9 +107,14 @@ blockers: none
   8 线程 0.082-0.084 ms/专家（fork 通用核 0.115-0.118）；中位受持续满载热漂移影响（0.089-0.118）。
   **code 的 0.059 未达到（partial）**；技术类 0.090 在 8 线程达到。E 的 CPU 前提按 ~0.09 满足。
 - **N15 已测（`RESULTS.md` 第 22 节）**：同一权重重读一次时，t=1/2/4/5 的每专家代价 8T 为
-  0.079 / 0.106 / 0.160 / 0.199 ms。k=5 的 miss 专家平均服务 1.70 个 token，期望约 **0.10 ms**，
-  与 design 6.2 的 0.115-0.137 同档；**最坏 t=5 是均值的 2 倍**。运行时必须按多重度算，
-  不许对每个 miss 专家都跑满 k 个 token（否则 CPU 腿翻倍）。
+  0.079 / 0.106 / 0.160 / 0.199 ms。k=4 的 miss 专家平均服务 1.61 个 token，期望约 **0.10 ms**；
+  **最坏 t=4 是均值的 1.6 倍**。运行时必须按多重度算，不许对每个 miss 专家都跑满 k 个 token。
+- M1-4b 实测（`RESULTS.md` 第 24 节）：GPU 腿 -1.0..+5.8%、submit 0.065-0.084 ms 已过；
+  解码计算缓冲按形状推算只有 **9.1 MiB（k=4）**，5.5 的 700-1100 是驱动/prefill 的保守余量。
+  21.9% 缓存 + 9.1 MiB 后仍余 691 MiB；若 M2-2 实测驱动瞬时够小，缓存可到约 25%（命中 +2.6 pp）。
+- **M1 评审（DECISIONS 第 16 节）：8 过 1 不过**。唯一硬缺口是 code 文本的 CPU 专家核
+  （0.079-0.082，需 0.059，差约 1.5x）。等用户在 A（条件通过进 M2）/ B（U-2 降 code 目标）/
+  C（留 M1 继续攻）之间选择。
 - M1-3d 实测（`RESULTS.md` 第 21 节）：同 prompt 下 greedy 与 k=5 在位置 0-25 完全一致，
   logprob 平均差 0.0030；位置 26 的 top-1 margin 从 0.1192 降到 0.0136 后翻转。
 - **U-7 已决（用户 2026-10-24）**：greedy top-1 margin < 0.05 nats 的位置允许分叉，其余逐 token 一致。

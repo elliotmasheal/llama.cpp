@@ -3,11 +3,11 @@
   "track": "qwen36-runtime",
   "updated": "2026-10-24",
   "phase": "M1",
-  "phase_status": "in_progress",
+  "phase_status": "blocked",
   "decision_gate": {
     "id": "M1",
     "open": true,
-    "result": null,
+    "result": "fail",
     "criteria": [
       "E >= 130 x measured cycle at the selected k (design 6.3: k=4 needs 2.90 at CPU 0.118 / 2.72 at 0.090; k=5 needs 3.23 / 2.88). Measured 16K: 2.850 (k=4), 3.055 (k=5), so both pass only at CPU 0.090 (RESULTS section 19)",
       "per-pass submit+sync < 1 ms, and the GPU leg within 10% of the roofline model at k=1/2/4/5/8",
@@ -104,13 +104,13 @@
   "queues": [
     {
       "lane": "bench",
-      "head": "M1-4b",
+      "head": null,
       "order": [
         "R1",
         "M1-3e",
         "M1-4b"
       ],
-      "note": "M1-3e done: k=4 matches greedy for 2x128 tokens under the 0.05-nat rule, but the batch perturbation reaches 0.081 nats. M1-4b keeps the compute buffer open"
+      "note": "M1-3e/M1-4b done; bench is idle until the M1 gate decision (no runnable M1 task left)"
     },
     {
       "lane": "impl",
@@ -154,7 +154,7 @@
         "M1-GATE",
         "U-2"
       ],
-      "note": "U-7 closed (0.05-nat rule, k=4 is the acceptance config); M1-GATE waits for M1-4b and the code CPU target"
+      "note": "review done: 8 of 9 criteria pass; code CPU 0.059 is the only hard gap. Choose A (conditional pass), B (U-2 lower the code TG) or C (stay in M1)"
     }
   ],
   "tasks": [
@@ -271,7 +271,7 @@
       "id": "M1-4b",
       "milestone": "M1",
       "lane": "bench",
-      "status": "partial",
+      "status": "done",
       "title": "周期时间测量（k=1/2/4/5/8，含提交与同步）",
       "deps": [
         "M1-4a-run"
@@ -281,7 +281,8 @@
         "machine-quiet"
       ],
       "paths": [
-        "bench/raw/m1-4b/**"
+        "bench/raw/m1-4b/**",
+        "bench/tools/workspace_plan.py"
       ],
       "done_when": "k=1/2/4/5/8 的 GPU 腿与 roofline 模型偏差 <= 10%（2.17 GB 稠密 + 命中专家字节），每 pass submit+sync < 1 ms；报计算缓冲 MiB 供 5.5 预算；r=2 并写进 RESULTS"
     },
