@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "track": "qwen36-runtime",
   "updated": "2026-10-24",
   "phase": "M1",
@@ -15,54 +15,759 @@
     ],
     "on_fail": "stop and ask the user whether to lower the TG target (design section 9)"
   },
+  "resources": {
+    "gpu": {
+      "cap": 1,
+      "desc": "dGPU and its VRAM: one process at a time"
+    },
+    "host-ram": {
+      "cap": 1,
+      "desc": "a resident 21.28 GiB model plus its KV/state: about 28 GiB free RAM"
+    },
+    "machine-quiet": {
+      "cap": 1,
+      "desc": "anything that perturbs timing or hogs cores: timed runs, full -j8 build, mem/disk probes, repack"
+    },
+    "disk-io": {
+      "cap": 1,
+      "desc": "more than 1 GiB of reads/writes, or any SSD bandwidth measurement"
+    },
+    "trace-bin": {
+      "cap": 1,
+      "desc": "regenerating a routing trace .bin; reading an existing one is shared"
+    },
+    "prompt-file": {
+      "cap": 1,
+      "desc": "editing a file under bench/prompts/; reading is shared"
+    }
+  },
+  "lanes": {
+    "bench": {
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "desc": "runs the model or measures the machine; strictly serialized, one agent, one process at a time"
+    },
+    "impl": {
+      "resources": [
+        "machine-quiet"
+      ],
+      "desc": "writes code and builds it; parallel across agents if paths are disjoint and no bench is running"
+    },
+    "data": {
+      "resources": [],
+      "desc": "pure text and light CPU: prompts, vocab list, GGUF metadata, analysis, docs; never blocks anyone"
+    },
+    "io": {
+      "resources": [
+        "machine-quiet",
+        "disk-io"
+      ],
+      "desc": "repack and large-file verification; exclusive with both bench and builds"
+    },
+    "user": {
+      "resources": [],
+      "desc": "decisions only the user can make; an agent may prepare a one-page choice set, then stop"
+    }
+  },
+  "queues": [
+    {
+      "lane": "bench",
+      "head": "M1-1",
+      "order": [
+        "M1-1",
+        "M1-5",
+        "M1-3b",
+        "M1-2b",
+        "M1-4b"
+      ],
+      "note": "M1-3b/M1-2b/M1-4b wait for their inputs; M1-5 is short and can go first if the GPU is busy"
+    },
+    {
+      "lane": "impl",
+      "head": "M1-4a",
+      "order": [
+        "M1-4a",
+        "X-1",
+        "X-2"
+      ],
+      "note": "M2-* and M3-* implementations stay unassigned until gate M1 passes and U-1 is answered"
+    },
+    {
+      "lane": "data",
+      "head": "M1-6",
+      "order": [
+        "M1-6",
+        "M1-2a",
+        "M1-3a",
+        "M5-1"
+      ],
+      "note": "M1-6 is quick and unblocks the KV budget; M5-1 unblocks the io lane"
+    },
+    {
+      "lane": "io",
+      "head": null,
+      "order": [
+        "M5-2",
+        "M5-4"
+      ],
+      "note": "waiting for M5-1 (repack format)"
+    },
+    {
+      "lane": "user",
+      "head": "U-1",
+      "order": [
+        "U-1",
+        "M1-GATE",
+        "U-2"
+      ],
+      "note": "U-1 blocks every M2 implementation task"
+    }
+  ],
   "tasks": [
     {
       "id": "M1-1",
-      "title": "complete decode-time routing trace for the 10 layers with a gap",
+      "milestone": "M1",
+      "lane": "bench",
       "status": "todo",
-      "blocked_by": [],
-      "done_when": "trace-10k-g128.bin has 128 decode records for all 40 layers, including layers 3,7,...,35 and layer 39; gap root cause written into DECISIONS",
-      "evidence": "bench/raw/m0-qwen36/trace-10k-g128.bin"
+      "title": "补齐 10 个 full-attention 层与 layer 39 的解码路由",
+      "deps": [],
+      "resources": [
+        "host-ram",
+        "machine-quiet",
+        "trace-bin"
+      ],
+      "paths": [
+        "bench/raw/m0-qwen36/trace-10k-g128.bin",
+        "bench/tools/m0-trace.cpp"
+      ],
+      "done_when": "trace-10k-g128.bin 的 40 层 x 128 token 都有记录，layer 39 也是 128；根因写进 DECISIONS"
     },
     {
-      "id": "M1-2",
-      "title": "locality recheck on non-technical text",
+      "id": "M1-2a",
+      "milestone": "M1",
+      "lane": "data",
+      "status": "todo",
+      "title": "非技术语料：对话、代码、多语言各一份 10K prompt",
+      "deps": [],
+      "resources": [
+        "prompt-file"
+      ],
+      "paths": [
+        "bench/prompts/**"
+      ],
+      "done_when": "三份 prompt 就位，token 数用 tokenizer 实测并写进 RESULTS；不得复用技术文档"
+    },
+    {
+      "id": "M1-2b",
+      "milestone": "M1",
+      "lane": "bench",
       "status": "partial",
-      "blocked_by": [],
-      "done_when": "three text classes measured (technical, dialogue/code, multilingual); w=8 unique experts and 25% hit rate reported per class; deviation from M0 <= 5 pp or explained",
-      "evidence": "bench/raw/m0-qwen36/m0-sim-10k.txt, m0-sim-multidoc.txt"
+      "title": "三类文本的局部性复测（技术类已完成两份）",
+      "deps": [
+        "M1-2a"
+      ],
+      "resources": [
+        "host-ram",
+        "machine-quiet",
+        "trace-bin"
+      ],
+      "paths": [
+        "bench/raw/m0-qwen36/trace-*-g128.bin"
+      ],
+      "done_when": "每类文本的 w=8 唯一专家与 25% 命中率与 M0 偏差 <= 5 pp，或偏差已解释；分文本写进 RESULTS"
     },
     {
-      "id": "M1-3",
-      "title": "restricted-vocab MTP acceptance E",
+      "id": "M1-3a",
+      "milestone": "M1",
+      "lane": "data",
       "status": "todo",
-      "blocked_by": [],
-      "done_when": "E measured for the restricted vocab at default depth and n-max 4; accepted tokens match full-vocab greedy; E >= 2.1 / 2.3 or gate fails",
-      "evidence": "bench/raw/m0-qwen36/mtp-*.out"
+      "title": "受限草稿词表（16K 候选）与生成脚本",
+      "deps": [],
+      "resources": [],
+      "paths": [
+        "bench/tools/build_draft_vocab.py"
+      ],
+      "done_when": "脚本可复现地选出 16K token，覆盖验证集 >= 95%；词表与覆盖率先写进 RESULTS 再给 M1-3b 用"
     },
     {
-      "id": "M1-4",
-      "title": "Vulkan prototype cycle time for k in {1,2,4,8}",
+      "id": "M1-3b",
+      "milestone": "M1",
+      "lane": "bench",
       "status": "todo",
-      "blocked_by": [],
-      "done_when": "cycle time per k measured with submit+sync included; deviation from design section 2.6 <= 10%; per-pass overhead < 1 ms",
-      "evidence": "TBD"
+      "title": "受限词表 MTP 接受率 E",
+      "deps": [
+        "M1-3a"
+      ],
+      "resources": [
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/m0-qwen36/mtp-*.out"
+      ],
+      "done_when": "默认深度与 n-max 4 各一份；E >= 2.1 / 2.3 且接受的 token 与完整词表 greedy 一致"
+    },
+    {
+      "id": "M1-4a",
+      "milestone": "M1",
+      "lane": "impl",
+      "status": "todo",
+      "title": "Vulkan 原型：k=1/2/4/8 的预录命令缓冲与计时壳",
+      "deps": [],
+      "resources": [],
+      "paths": [
+        "runtime/proto/**",
+        "CMakeLists.txt"
+      ],
+      "done_when": "能对每层稠密 + 专家读取跑一个 pass（真实权重或等价字节量），输出每 pass 的 submit/sync 时间；不预设运行时归属"
+    },
+    {
+      "id": "M1-4b",
+      "milestone": "M1",
+      "lane": "bench",
+      "status": "todo",
+      "title": "周期时间测量（k=1/2/4/8，含提交与同步）",
+      "deps": [
+        "M1-4a"
+      ],
+      "resources": [
+        "gpu",
+        "machine-quiet"
+      ],
+      "paths": [],
+      "done_when": "与 design 2.6 的偏差 <= 10%，每 pass 开销 < 1 ms；r=2 并写进 RESULTS"
     },
     {
       "id": "M1-5",
-      "title": "re-measure bandwidth on the target machine",
+      "milestone": "M1",
+      "lane": "bench",
       "status": "todo",
-      "blocked_by": [],
-      "done_when": "dense GEMV, H2D and 4-thread CPU read measured with the same method as RESULTS R.5; any deviation > 5% updates the design references",
-      "evidence": "bench/raw/h2d-bw, bench/tools/membw_probe.py"
+      "title": "带宽同口径复测：dense GEMV、H2D、4 线程 CPU 读",
+      "deps": [],
+      "resources": [
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/h2d-bw/**",
+        "bench/tools/membw_probe.py"
+      ],
+      "done_when": "三个读数与 RESULTS 第 5 节偏差 <= 5%，否则更新 RESULTS 并提请注意 design 引用"
+    },
+    {
+      "id": "M1-6",
+      "milestone": "M1",
+      "lane": "data",
+      "status": "todo",
+      "title": "从 GGUF 确认 full-attention 层数与 256K KV 预算",
+      "deps": [],
+      "resources": [],
+      "paths": [
+        "bench/tools/gguf_dims.py"
+      ],
+      "done_when": "给出 full-attention 层数、每 token KV 字节、256K 总字节与显存占比，写进 RESULTS；N6 只剩缓存大小未定"
+    },
+    {
+      "id": "M1-GATE",
+      "milestone": "M1",
+      "lane": "user",
+      "status": "todo",
+      "title": "M1 决策门评审",
+      "deps": [
+        "M1-1",
+        "M1-2b",
+        "M1-3b",
+        "M1-4b",
+        "M1-5",
+        "M1-6"
+      ],
+      "resources": [],
+      "paths": [],
+      "done_when": "design 第 9 节的三条全过则 phase=M2；否则置 blocked 并走 U-2"
+    },
+    {
+      "id": "U-1",
+      "milestone": "M1",
+      "lane": "user",
+      "status": "todo",
+      "title": "用户决定运行时归属：独立运行时还是 fork 内改造（N7）",
+      "deps": [],
+      "resources": [],
+      "paths": [],
+      "done_when": "给出选择并写进 DECISIONS；选 fork 内改造则先改 design 3.3"
+    },
+    {
+      "id": "U-2",
+      "milestone": "M1",
+      "lane": "user",
+      "status": "todo",
+      "title": "若 M1 不过：是否下调 TG 目标",
+      "deps": [
+        "M1-GATE"
+      ],
+      "resources": [],
+      "paths": [],
+      "done_when": "给出新阈值并改 design；agent 不得自行下调"
+    },
+    {
+      "id": "X-1",
+      "milestone": "cross",
+      "lane": "impl",
+      "status": "todo",
+      "title": "新模型质量门工具：参考 logits + KLD + 逐 token 对比",
+      "deps": [],
+      "resources": [],
+      "paths": [
+        "bench/tools/quality/**"
+      ],
+      "done_when": "一条命令输出 PPL | mean KLD | same top p | PASS/FAIL；基线落 bench/raw（不进 git）"
+    },
+    {
+      "id": "X-2",
+      "milestone": "cross",
+      "lane": "impl",
+      "status": "todo",
+      "title": "telemetry CSV 汇总器",
+      "deps": [],
+      "resources": [],
+      "paths": [
+        "bench/tools/summarize_perf.py"
+      ],
+      "done_when": "读每 pass CSV，输出必报列与命中率/H2D/接受率摘要；schema 由 M3-4 定义"
+    },
+    {
+      "id": "M2-0",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "运行时脚手架：CMake target、QRT_* CLI、telemetry 出口",
+      "deps": [
+        "U-1",
+        "M1-GATE"
+      ],
+      "resources": [],
+      "paths": [
+        "runtime/**",
+        "CMakeLists.txt"
+      ],
+      "done_when": "空运行时能解析 design 第 7 节全部开关（默认值可读），失败路径返回可恢复错误"
+    },
+    {
+      "id": "M2-1",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "gguf_index：张量表与字节偏移",
+      "deps": [
+        "M2-0"
+      ],
+      "resources": [],
+      "paths": [
+        "runtime/gguf_index.*"
+      ],
+      "done_when": "与 gguf_dims.py 的张量表逐项一致；越界与缺张量返回错误而不是 abort"
+    },
+    {
+      "id": "M2-2",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "vk_dev + 分配器 + 显存预算",
+      "deps": [
+        "M2-0"
+      ],
+      "resources": [],
+      "paths": [
+        "runtime/vk_dev.*"
+      ],
+      "done_when": "设备/队列/内存类型选择可用，预算不足时回退并计数；VRAM tier 可注入"
+    },
+    {
+      "id": "M2-3",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "weights：稠密常驻 + 专家页表",
+      "deps": [
+        "M2-1",
+        "M2-2",
+        "M5-1"
+      ],
+      "resources": [],
+      "paths": [
+        "runtime/weights.*"
+      ],
+      "done_when": "稠密 2.02 GiB 常驻设备；专家按 [层][专家] 连续偏移可查；未命中走可恢复路径"
+    },
+    {
+      "id": "M2-4",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "Q4_K x Q8_1 int8 点积 GEMM 内核与微基准",
+      "deps": [
+        "M2-2"
+      ],
+      "resources": [],
+      "paths": [
+        "ggml/src/ggml-vulkan/**",
+        "runtime/kernels/**"
+      ],
+      "done_when": "微基准给出 TFLOPS 与对照 FP32 的倍数；不达 design 4.5 的量级则先回 design 重估"
+    },
+    {
+      "id": "M2-5",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "prefill 引擎：层优先分块 + 双缓冲上传",
+      "deps": [
+        "M2-3",
+        "M2-4"
+      ],
+      "resources": [],
+      "paths": [
+        "runtime/prefill.*"
+      ],
+      "done_when": "chunk=512 可跑；上传与计算重叠；chunk 可配且失败可退化"
+    },
+    {
+      "id": "M2-6",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "注意力路径：DeltaNet 递推 + full-attn 批量",
+      "deps": [
+        "M2-2",
+        "M2-4"
+      ],
+      "resources": [],
+      "paths": [
+        "runtime/attn.*"
+      ],
+      "done_when": "k=1 prefill 与参考一致；full-attn 的 KV 只读一次；DeltaNet 状态与串行解码一致"
+    },
+    {
+      "id": "M2-7",
+      "milestone": "M2",
+      "lane": "bench",
+      "status": "todo",
+      "title": "prefill 正确性：logits KLD <= 1e-4",
+      "deps": [
+        "M2-5",
+        "M2-6",
+        "X-1"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/m2/**"
+      ],
+      "done_when": "同一 prompt、k=1 路径的 KLD <= 1e-4，same top p 100%；读数进 RESULTS"
+    },
+    {
+      "id": "M2-8",
+      "milestone": "M2",
+      "lane": "bench",
+      "status": "todo",
+      "title": "PP >= 1000 tok/s（10K prompt + 256K ctx）",
+      "deps": [
+        "M2-7"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/m2/**"
+      ],
+      "done_when": "r=2 均值 >= 1000，status=ok，按 README 必报列落表"
+    },
+    {
+      "id": "M3-0",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "todo",
+      "title": "专家缓存：SLRU + H2D 调度 + 1.84 MiB 槽",
+      "deps": [
+        "M2-3"
+      ],
+      "resources": [],
+      "paths": [
+        "runtime/expert_cache.*"
+      ],
+      "done_when": "命中/未命中可计数；容量不足退化；不出现 abort"
+    },
+    {
+      "id": "M3-1",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "todo",
+      "title": "批量 k 的 MoE 内核与路由",
+      "deps": [
+        "M2-4"
+      ],
+      "resources": [],
+      "paths": [
+        "ggml/src/ggml-vulkan/**",
+        "runtime/moe.*"
+      ],
+      "done_when": "k=1/2/4/8 的 top-8 路由与并集专家计算正确；与 k=1 串行结果一致"
+    },
+    {
+      "id": "M3-2",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "todo",
+      "title": "pass 构建器：每 k 预录命令缓冲，单次提交/同步",
+      "deps": [
+        "M3-1",
+        "M2-5"
+      ],
+      "resources": [],
+      "paths": [
+        "runtime/pass.*"
+      ],
+      "done_when": "每 pass 只回 CPU 一次取 k 个 id；层间只用 barrier；形状与 k 绑定"
+    },
+    {
+      "id": "M3-3",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "todo",
+      "title": "MTP 草稿（受限词表）+ 接受/回滚",
+      "deps": [
+        "M3-2",
+        "M1-3a"
+      ],
+      "resources": [],
+      "paths": [
+        "runtime/spec.*"
+      ],
+      "done_when": "保存 k 份 DeltaNet 状态；接受最长前缀并回滚；第一个不匹配处用验证结果"
+    },
+    {
+      "id": "M3-4",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "todo",
+      "title": "每 pass telemetry：命中、H2D、耗时、接受数",
+      "deps": [
+        "M3-2"
+      ],
+      "resources": [],
+      "paths": [
+        "runtime/telemetry.*"
+      ],
+      "done_when": "CSV schema 固定并与 X-2 对齐；关闭时零开销"
+    },
+    {
+      "id": "M3-5",
+      "milestone": "M3",
+      "lane": "bench",
+      "status": "todo",
+      "title": "decode 正确性：与参考 greedy 逐 token 一致",
+      "deps": [
+        "M3-3",
+        "M3-4",
+        "X-1"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/m3/**"
+      ],
+      "done_when": "10K prompt + 128 token 全同；分叉位置要有解释"
+    },
+    {
+      "id": "M3-6",
+      "milestone": "M3",
+      "lane": "bench",
+      "status": "todo",
+      "title": "TG >= 130 tok/s（单流，greedy，128 token）",
+      "deps": [
+        "M3-5"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/m3/**"
+      ],
+      "done_when": "r=2 均值 >= 130；同时给出 E、accept p、命中率、H2D 字节"
+    },
+    {
+      "id": "M4-1",
+      "milestone": "M4",
+      "lane": "bench",
+      "status": "todo",
+      "title": "专家缓存容量扫描",
+      "deps": [
+        "M3-6"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/m4/**"
+      ],
+      "done_when": "给出 2.5/3.0/3.5 GiB 的 PP/TG/命中率曲线与最优值"
+    },
+    {
+      "id": "M4-2",
+      "milestone": "M4",
+      "lane": "bench",
+      "status": "todo",
+      "title": "草稿词表大小扫描",
+      "deps": [
+        "M3-6",
+        "M1-3b"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/m4/**"
+      ],
+      "done_when": "完整词表与两档受限词表的 TG/E 对照，选中默认值"
+    },
+    {
+      "id": "M4-3",
+      "milestone": "M4",
+      "lane": "bench",
+      "status": "todo",
+      "title": "k=1/2/4/8 扫描",
+      "deps": [
+        "M3-6"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/m4/**"
+      ],
+      "done_when": "每 k 的周期时间、E 与 TG，选中默认 k"
+    },
+    {
+      "id": "M4-4",
+      "milestone": "M4",
+      "lane": "bench",
+      "status": "todo",
+      "title": "30 分钟稳定性与散热",
+      "deps": [
+        "M4-1",
+        "M4-2",
+        "M4-3"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/m4/**"
+      ],
+      "done_when": "TG 波动 <= 10%；给出降频曲线与告警阈值"
+    },
+    {
+      "id": "M4-5",
+      "milestone": "M4",
+      "lane": "data",
+      "status": "todo",
+      "title": "默认值定稿：开关表与 design 反馈",
+      "deps": [
+        "M4-4"
+      ],
+      "resources": [],
+      "paths": [
+        "bench/DECISIONS.md",
+        "bench/RESULTS.md"
+      ],
+      "done_when": "QRT_* 每项都有实测默认值与出处；需要改 design 的部分列成 U 项"
+    },
+    {
+      "id": "M5-1",
+      "milestone": "M5",
+      "lane": "data",
+      "status": "todo",
+      "title": "重组格式与 sidecar 索引规范",
+      "deps": [],
+      "resources": [],
+      "paths": [
+        "runtime/repack/FORMAT.md"
+      ],
+      "done_when": "[层][专家] 连续、对齐、索引字段与校验算法写清；不改任何量化值"
+    },
+    {
+      "id": "M5-2",
+      "milestone": "M5",
+      "lane": "io",
+      "status": "todo",
+      "title": "repack 工具 + 逐专家 SHA-256 校验",
+      "deps": [
+        "M5-1"
+      ],
+      "resources": [
+        "machine-quiet",
+        "disk-io"
+      ],
+      "paths": [
+        "tools/expert-repack/**",
+        "runtime/repack/**"
+      ],
+      "done_when": "重组前后逐专家哈希一致；失败可中断续跑；磁盘占用与耗时写进 RESULTS"
+    },
+    {
+      "id": "M5-3",
+      "milestone": "M5",
+      "lane": "impl",
+      "status": "todo",
+      "title": "回退路径：无重组文件时用原 GGUF",
+      "deps": [
+        "M5-2"
+      ],
+      "resources": [],
+      "paths": [
+        "runtime/repack/**"
+      ],
+      "done_when": "缺少 sidecar 或校验失败时自动回退原 GGUF 并告警，不 abort"
+    },
+    {
+      "id": "M5-4",
+      "milestone": "M5",
+      "lane": "io",
+      "status": "todo",
+      "title": "端到端校验与回滚演练",
+      "deps": [
+        "M5-3"
+      ],
+      "resources": [
+        "machine-quiet",
+        "disk-io"
+      ],
+      "paths": [
+        "bench/raw/m5/**"
+      ],
+      "done_when": "重组/原文件两条路径贪心输出逐 token 一致；删除 sidecar 后能正常启动"
     }
   ],
-  "next": {
-    "task_id": "M1-1",
-    "why": "the 10 full-attention layers are missing from the decode trace, so the U_k and hit-rate inputs of the whole performance model are computed on 30 of 40 layers",
-    "first_step": "reproduce with m0-trace on a 512-token prompt and check whether ffn_moe_topk is a VIEW or a fused node in those layers",
-    "done_when": "see task M1-1"
-  },
   "last_gate": {
     "id": "G-REG",
     "result": "unknown",
@@ -72,9 +777,9 @@
   "blockers": [],
   "escalations": [
     {
-      "id": "N7",
+      "id": "U-1",
       "question": "build the runtime outside ggml/llama.cpp (design as written) or refactor inside the fork",
-      "needs_by": "M2 start",
+      "needs_by": "M2-0",
       "owner": "user",
       "note": "M1 is measurement only, so this does not block M1; choosing the fork requires rewriting design 3.3"
     }

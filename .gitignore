@@ -164,4 +164,5 @@ AGENTS.local.md
 *.spv
 /bench/raw/
 /bench/longctx/
+/bench/state/quiet-*
 

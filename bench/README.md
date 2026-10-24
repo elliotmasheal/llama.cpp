@@ -58,13 +58,15 @@ H2D MiB/token | VRAM peak | RAM peak | status
    否则子进程秒退、日志 0 字节，看起来像"配置错误"。
 9. 改完代码先确认二进制含本次改动（构建时间戳），再做 A/B。
 10. 外部推理进程在 GPU 上时整批数据作废；容量类失败先看 RAM 再怀疑显存。
+11. 编译、repack、第二个模型进程都会扰动计时：跑数前确认 `state_check.py` 的 `quiet` 行是 `free`，
+    跑数期间别人不许构建，规则见 `AGENTS.md` 第 4 节。
 
 ## 4. 目录
 
 ```
 design/           qwen36-moe-runtime-design.md                     规格（只读）
 bench/README.md   RESULTS.md  DECISIONS.md                        三份文档
-bench/state/      state.json                                       机器可读状态
+bench/state/      state.json（任务图/资源）  quiet-*（运行锁，不进 git）
 bench/prompts/    prompt10k.txt (10428 tok)  prompt20k.txt (19758 tok)
                   prompt-multidoc10k.txt (9402 tok)
 bench/env/        power.txt  machine.txt                           口径依赖的机器事实
