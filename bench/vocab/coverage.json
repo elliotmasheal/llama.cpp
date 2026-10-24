@@ -1,0 +1,111 @@
+{
+  "task": "M1-3a",
+  "generated_at": "2026-10-24T16:12:42",
+  "model": "F:\\LLM\\llm\\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "target": 16384,
+  "vocab_size": 16384,
+  "selection": {
+    "special": 33,
+    "observed": 7659,
+    "score_filled": 8692,
+    "observed_distinct_total": 7661,
+    "truncated_observed": false,
+    "fill_order": "token id ascending (BPE merge-priority proxy; no tokenizer.ggml.scores in this GGUF)"
+  },
+  "tokenizer": {
+    "n_vocab": 248320,
+    "model": "gpt2",
+    "pre": "qwen35",
+    "has_scores": false,
+    "eos_token_id": 248046,
+    "bos_token_id": 248044,
+    "add_bos_token": false,
+    "type_counts": {
+      "1": 248044,
+      "3": 27,
+      "4": 6,
+      "5": 243
+    }
+  },
+  "gen_tokens_requested": 128,
+  "gen_notes": {
+    "prompt10k.txt": {
+      "generated": 128,
+      "eog": 0
+    },
+    "prompt-chat10k.txt": {
+      "generated": 1,
+      "eog": 1
+    },
+    "prompt-code10k.txt": {
+      "generated": 13,
+      "eog": 1
+    },
+    "prompt-multi10k.txt": {
+      "generated": 1,
+      "eog": 1
+    }
+  },
+  "prompt_coverage": {
+    "tokens": 40225,
+    "covered": 40225,
+    "fraction": 1.0
+  },
+  "prompt_coverage_per_prompt": {
+    "prompt10k.txt": {
+      "tokens": 10435,
+      "covered": 10435,
+      "fraction": 1.0
+    },
+    "prompt-chat10k.txt": {
+      "tokens": 10003,
+      "covered": 10003,
+      "fraction": 1.0
+    },
+    "prompt-code10k.txt": {
+      "tokens": 10150,
+      "covered": 10150,
+      "fraction": 1.0
+    },
+    "prompt-multi10k.txt": {
+      "tokens": 9637,
+      "covered": 9637,
+      "fraction": 1.0
+    }
+  },
+  "gen_coverage": {
+    "tokens": 143,
+    "covered": 143,
+    "fraction": 1.0
+  },
+  "gen_coverage_per_prompt": {
+    "prompt10k.txt": {
+      "tokens": 128,
+      "covered": 128,
+      "fraction": 1.0
+    },
+    "prompt-chat10k.txt": {
+      "tokens": 1,
+      "covered": 1,
+      "fraction": 1.0
+    },
+    "prompt-code10k.txt": {
+      "tokens": 13,
+      "covered": 13,
+      "fraction": 1.0
+    },
+    "prompt-multi10k.txt": {
+      "tokens": 1,
+      "covered": 1,
+      "fraction": 1.0
+    }
+  },
+  "files": {
+    "draft-16k.txt": {
+      "sha256": "3a2bfd95d1f6d4813957eb16a218569b4c67c1cdd6e726ede3f87043360aa6b0"
+    },
+    "draft-16k.bin": {
+      "sha256": "fc446c30477e8dd3c3309aa03fa90b4a72719fa4de6b7f4e21b435134e323452"
+    }
+  }
+}
