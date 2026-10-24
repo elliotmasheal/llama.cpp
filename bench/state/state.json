@@ -814,8 +814,10 @@
       "id": "M5-2",
       "milestone": "M5",
       "lane": "io",
-      "status": "todo",
+      "status": "partial",
+      "claimed_at": "2026-10-24T23:45:00",
       "title": "repack 工具 + 逐专家 SHA-256 校验",
+      "note": "writer + verifier in tools/expert-repack/repack.cpp; subset 2x4 experts (15.2 MB) verifies 8/8; full run is about 21 GiB and needs user approval; resume not implemented yet",
       "deps": [
         "M5-1"
       ],
