@@ -75,7 +75,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=X-1 data=- io=M5-2 user=-
+queues: bench=- impl=M2-3 data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -99,8 +99,8 @@ blockers: none
 - **M3-1a done（2026-10-24）**：CPU 专家核 0.115-0.118 -> 0.0908 -> 0.0661 -> **0.0575-0.0587**
   （8 线程首轮，门禁口径），code 的 0.059 达到、技术类 0.0665 中位；t=1..5 曲线在 `RESULTS.md` 第 31 节。
   遗留：design 6.2 回填（用户）、逐 token（X-4）。U-2 不再需要。
-- **M5-2 partial（2026-10-24）**：`tools/expert-repack/repack.cpp` 写入器 + 校验器；8 专家子集
-  15.2 MB、`--verify` 8/8 pass；全量约 21 GiB 超 20 GiB 门槛，等用户批准；续跑未实现。
+- **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
+  逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、
   每专家 SHA-256、索引即 journal）；io 队首解到 M5-2。
 - **M2-4 完成（2026-10-24）**：int8 专家 GEMM 3.66 -> **6.08-6.20 TFLOPS（1.68x）**，达到 6.0 硬门；

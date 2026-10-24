@@ -214,15 +214,25 @@ int main(int argc, char ** argv) {
     }
 
     const bool partial = a.resume;
-    const std::string bin_tmp = bin_path + (partial ? ".partial" : ".building");
-    const std::string idx_tmp = idx_path + (partial ? ".partial" : ".building");
+    auto exists = [](const std::string & p) {
+        FILE * f = fopen(p.c_str(), "rb");
+        if (f != nullptr) {
+            fclose(f);
+            return true;
+        }
+        return false;
+    };
+    // Resume prefers the .partial pair; a finished pair is appended to directly.
+    const bool resume_finals = partial && !exists(idx_path + ".partial") && exists(idx_path);
+    const std::string bin_tmp = resume_finals ? bin_path : bin_path + (partial ? ".partial" : ".building");
+    const std::string idx_tmp = resume_finals ? idx_path : idx_path + (partial ? ".partial" : ".building");
     FILE * fin = fopen(a.gguf, "rb");
     if (fin == nullptr) {
         std::fprintf(stderr, "repack: cannot open %s\n", a.gguf);
         qrt_gguf_close(g);
         return 2;
     }
-    FILE * fb = fopen(bin_tmp.c_str(), partial ? "ab" : "wb");
+    FILE * fb = fopen(bin_tmp.c_str(), partial ? "ab+" : "wb+");
     FILE * fi = fopen(idx_tmp.c_str(), partial ? "a" : "w");
     if (fb == nullptr || fi == nullptr) {
         std::fprintf(stderr, "repack: cannot open outputs\n");
@@ -230,7 +240,37 @@ int main(int argc, char ** argv) {
         qrt_gguf_close(g);
         return 2;
     }
-    uint64_t payload = partial ? (uint64_t) ftell(fb) : 0;
+    uint64_t payload = 0;
+    uint32_t last_layer = 0, last_expert = 0;
+    bool have_last = false;
+    if (partial) {
+        FILE * fr = fopen(idx_tmp.c_str(), "r");
+        if (fr != nullptr) {
+            char ln[512];
+            while (fgets(ln, sizeof(ln), fr) != nullptr) {
+                unsigned L2 = 0, E2 = 0;
+                unsigned long long o2 = 0, b2 = 0, g2 = 0, u2 = 0, d2 = 0;
+                char h2[65] = {0};
+                if (ln[0] != '#' &&
+                    sscanf(ln, "%u,%u,%llu,%llu,%llu,%llu,%llu,%64s",
+                           &L2, &E2, &o2, &b2, &g2, &u2, &d2, h2) == 8) {
+                    last_layer = L2;
+                    last_expert = E2;
+                    payload = o2 + b2;
+                    have_last = true;
+                }
+            }
+            fclose(fr);
+        }
+        if (!have_last) {
+            std::fprintf(stderr, "repack: --resume but %s has no complete record\n", idx_tmp.c_str());
+            return 2;
+        }
+        if (XSEEK(fb, 0, SEEK_END) != 0) {
+            std::fprintf(stderr, "repack: cannot seek to the end for --resume\n");
+            return 2;
+        }
+    }
     if (!partial) {
         uint8_t hdr[64];
         memset(hdr, 0, sizeof(hdr));
@@ -277,6 +317,9 @@ int main(int argc, char ** argv) {
             break;
         }
         for (uint32_t e = 0; e < n_exp; ++e) {
+            if (partial && (L < last_layer || (L == last_layer && e <= last_expert))) {
+                continue;
+            }
             std::vector<uint8_t> block;
             Sha256 sha;
             sha_init(&sha);
@@ -313,6 +356,21 @@ int main(int argc, char ** argv) {
             break;
         }
     }
+    {
+        // Whole-payload SHA-256: one extra pass over the bytes just written.
+        Sha256 whole;
+        sha_init(&whole);
+        std::vector<uint8_t> buf(1u << 20);
+        if (XSEEK(fb, 64, SEEK_SET) == 0) {
+            size_t got = 0;
+            while ((got = fread(buf.data(), 1, buf.size(), fb)) > 0) {
+                sha_update(&whole, buf.data(), got);
+            }
+            uint8_t dg[32];
+            sha_final(&whole, dg);
+            std::fprintf(fi, "# payload_sha256=%s\n", hex(dg, 32).c_str());
+        }
+    }
     fflush(fb);
     fclose(fb);
     fclose(fi);
@@ -325,11 +383,15 @@ int main(int argc, char ** argv) {
     std::printf("repack: experts=%u payload_bytes=%llu bin=%s idx=%s\n", done,
                 (unsigned long long) payload, bin_tmp.c_str(), idx_tmp.c_str());
     // The index is renamed last: its presence means the pair is complete.
-    if (std::rename(bin_tmp.c_str(), bin_path.c_str()) != 0 ||
-        std::rename(idx_tmp.c_str(), idx_path.c_str()) != 0) {
-        std::fprintf(stderr, "repack: rename of the finished pair failed\n");
-        qrt_gguf_close(g);
-        return 2;
+    if (!resume_finals) {
+        remove(bin_path.c_str());
+        remove(idx_path.c_str());
+        if (std::rename(bin_tmp.c_str(), bin_path.c_str()) != 0 ||
+            std::rename(idx_tmp.c_str(), idx_path.c_str()) != 0) {
+            std::fprintf(stderr, "repack: rename of the finished pair failed\n");
+            qrt_gguf_close(g);
+            return 2;
+        }
     }
     qrt_gguf_close(g);
     return 0;
