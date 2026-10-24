@@ -14,7 +14,7 @@
       "locality within 5 pp of M0 on non-technical text",
       "two miss legs measured and the cycle recomputed with an adaptive split (RESULTS section 9)",
       "VRAM budget closes with q4 KV + a 16384-token resident window (21.9% expert cache, RESULTS section 10)",
-      "PP feasibility recorded: int8 ALU 8.67 TFLOPS, expert GEMM baseline 3.66 (RESULTS section 14); no PP pass is claimed until M2-4 reaches 6.0"
+      "PP feasibility recorded: int8 ALU 8.67 TFLOPS, expert GEMM baseline 3.66 (RESULTS section 14); PP >= 1000 stays a hard floor (user 2026-10-24) and M2-4 must reach 6.0 TFLOPS"
     ],
     "on_fail": "stop and ask the user: lower the TG target, change the ctx cost, or page the KV (design section 9)"
   },
@@ -105,11 +105,11 @@
         "M1-3b",
         "M1-2b"
       ],
-      "note": "R1 done: vram 156.5, h2d 10.8, cpu 0.115-0.118 (knee 0.090), int8 gemm 3.66 (need 6.0). M1-4a-run holds the machine next"
+      "note": "M1-4b partial: GPU leg -1.0..+5.8%, submit 0.065-0.084 ms; compute buffer not isolated. M1-3b/M1-2b wait for data"
     },
     {
       "lane": "impl",
-      "head": "M1-4a-run",
+      "head": "X-1",
       "order": [
         "M1-4a",
         "M1-4a-run",
@@ -257,7 +257,7 @@
       "id": "M1-4b",
       "milestone": "M1",
       "lane": "bench",
-      "status": "todo",
+      "status": "partial",
       "title": "周期时间测量（k=1/2/4/5/8，含提交与同步）",
       "deps": [
         "M1-4a-run"
@@ -840,7 +840,8 @@
       "id": "M1-4a-run",
       "milestone": "M1",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
+      "claimed_at": "2026-10-24T15:30:00",
       "title": "构建并跑 Vulkan 原型（k=1/2/4/5/8，计时）",
       "deps": [
         "M1-4a"
