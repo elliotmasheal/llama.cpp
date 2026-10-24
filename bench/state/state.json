@@ -118,11 +118,11 @@
         "X-2",
         "X-4"
       ],
-      "note": "M1-4a code is in (c78945692); M1-4a-run waits for R1 to release gpu/machine-quiet"
+      "note": "X-1 needs gpu+host-ram; it waits for M1-2a to finish its tokenizer runs"
     },
     {
       "lane": "data",
-      "head": "M1-2a",
+      "head": "M1-3a",
       "order": [
         "R0",
         "M1-2a",
@@ -174,11 +174,13 @@
       "id": "M1-2a",
       "milestone": "M1",
       "lane": "data",
-      "status": "todo",
+      "status": "doing",
+      "claimed_at": "2026-10-24T15:40:00",
       "title": "非技术语料：对话、代码、多语言各一份 10K prompt",
       "deps": [],
       "resources": [
-        "prompt-file"
+        "prompt-file",
+        "host-ram"
       ],
       "paths": [
         "bench/prompts/**"
