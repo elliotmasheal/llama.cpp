@@ -55,6 +55,8 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 - 运行时不走 fork：fork 只作参考（greedy 基准、接受率口径、硬件探针），内核拷进 `runtime/kernels`。
 - 不改变量化格式；不改变输出：k=1 路径 logits KLD <= 1e-4，推测路径接受的 token 与参考 greedy 一致。
 - 非目标：其他模型 / 量化 / 后端、多用户服务化（design 1.2）。
+- 以实际硬件上限为基准，尽全力优化软件以达到理论上限。
+- 需要考虑不同硬件下的表现，不能仅适配本机。
 
 ## 2. 当前状态
 
@@ -62,7 +64,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M1
 phase_status: in_progress
 decision_gate: M1 open
-queues: bench=- impl=- data=M1-2a io=- user=U-4
+queues: bench=- impl=M1-4a-run data=M1-2a io=- user=-
 last_gate: G-REG unknown (2026-10-23 record, not re-run since 44bd79305)
 blockers: none
 <!-- STATE:END -->
@@ -78,9 +80,9 @@ blockers: none
 - M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`，E 门槛用公式而不是常数。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。
-- 未决：U-4（可选）是否允许一次性能电源方案的显存 A/B；U-1 / U-3 已闭环。
-- 目标：可行点 21.9% 缓存、k=5；CPU 核 0.118 时 TG 131（E_min 3.23，余量 0.3%），
-  到 0.090 时 146（E_min 2.88）；CPU 专家核是达标前提。
+- 未决：无。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）、U-4（平衡电源为基准）均已闭环。
+- 目标：TG 可行点 21.9% 缓存、k=5；CPU 核 0.118 时 131（E_min 3.23），到 0.090 时 146（E_min 2.88）。
+  PP 现状：专家 GEMM 3.66 TFLOPS → 约 610 tok/s，需 6.0（1.64x，M2-4）。
 
 ## 3. 每轮自主循环
 
@@ -188,7 +190,7 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 | M1-6 | data | full-attention 层数与 256K KV 预算 | 10 主层 + 1 nextn；U-3 定 q4_0 + 16K 窗口 |
 | M1-7 | bench | H2D 与 CPU 读并发 + 每专家代价 | 聚合 33.5-41.0 GB/s，0.123-0.137 ms/专家 |
 | R0 | data | roofline 模型与目标推导 | TG_max / PP_max 曲线，0.85 x roofline 的目标值 |
-| R1 | bench | 腿级 roofline 探针 | 显存 156.5（190 不可达）、CPU 0.115-0.118（0.070 不可达，需求 0.090）、H2D 10.8、int8 待测 |
+| R1 | bench | 腿级 roofline 探针 | 显存 156.5（190 不可达）、CPU 0.115-0.118（需求 0.090）、H2D 10.8、int8 3.66（需求 6.0） |
 | M1-GATE | user | 决策门评审 | `decision_gate.criteria` 全过才进 M2 |
 
 **决策门 M1 的通过条件**（以 `state.json` 的 `decision_gate.criteria` 为准）：

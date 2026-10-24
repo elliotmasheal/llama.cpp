@@ -13,7 +13,8 @@
       "per-pass submit+sync < 1 ms, and the GPU leg within 10% of the roofline model at k=1/2/4/5/8",
       "locality within 5 pp of M0 on non-technical text",
       "two miss legs measured and the cycle recomputed with an adaptive split (RESULTS section 9)",
-      "VRAM budget closes with q4 KV + a 16384-token resident window (21.9% expert cache, RESULTS section 10)"
+      "VRAM budget closes with q4 KV + a 16384-token resident window (21.9% expert cache, RESULTS section 10)",
+      "PP feasibility recorded: int8 ALU 8.67 TFLOPS, expert GEMM baseline 3.66 (RESULTS section 14); no PP pass is claimed until M2-4 reaches 6.0"
     ],
     "on_fail": "stop and ask the user: lower the TG target, change the ctx cost, or page the KV (design section 9)"
   },
@@ -29,9 +30,12 @@
       "e_min_now": 3.23,
       "e_min_knee": 2.88,
       "cpu_expert_knee_ms": 0.090,
+      "pp_now_tflops": 3.66,
+      "pp_need_tflops": 6.0,
+      "pp_now_tok_s": 610,
       "pp_min_tflops": 7.06,
       "pp_min_chunk": 1420,
-      "source": "bench/RESULTS.md section 13 (R1b)"
+      "source": "bench/RESULTS.md sections 13-14 (R1b/R1c)"
     }
   },
   "resources": {
@@ -101,11 +105,11 @@
         "M1-3b",
         "M1-2b"
       ],
-      "note": "R1 is running; M1-4b/M1-3b/M1-2b wait for impl/data"
+      "note": "R1 done: vram 156.5, h2d 10.8, cpu 0.115-0.118 (knee 0.090), int8 gemm 3.66 (need 6.0). M1-4a-run holds the machine next"
     },
     {
       "lane": "impl",
-      "head": null,
+      "head": "M1-4a-run",
       "order": [
         "M1-4a",
         "M1-4a-run",
@@ -138,13 +142,12 @@
     },
     {
       "lane": "user",
-      "head": "U-4",
+      "head": null,
       "order": [
-        "U-4",
         "M1-GATE",
         "U-2"
       ],
-      "note": "U-4 (power-plan A/B) is optional; M1-GATE waits for R1/M1-2b/M1-3b/M1-4b"
+      "note": "U-1/U-3/U-4 closed; M1-GATE waits for R1/M1-2b/M1-3b/M1-4b"
     }
   ],
   "tasks": [
@@ -461,7 +464,7 @@
       "paths": [
         "runtime/kernels/**"
       ],
-      "done_when": "微基准给出 TFLOPS 与对照 FP32 的倍数，且满足 R0 的 PP 曲线要求（选定 chunk 下 >= 6 TFLOPS 有效）；不达标先回 design 重估"
+      "done_when": "微基准给出 TFLOPS 与对照 FP32 的倍数，且满足 R0 的 PP 曲线要求（选定 chunk 下 >= 6.0 TFLOPS 有效；R1c 基线 3.66，差 1.64x）；不达标先回 design 重估"
     },
     {
       "id": "M2-5",
@@ -890,7 +893,7 @@
       "id": "R1",
       "milestone": "M1",
       "lane": "bench",
-      "status": "doing",
+      "status": "done",
       "claimed_at": "2026-10-24T14:28:00",
       "title": "腿级 roofline 探针：调优显存读、CPU 专家核、int8 GEMM、并发 H2D",
       "deps": [],
@@ -929,12 +932,46 @@
       "id": "U-4",
       "milestone": "M1",
       "lane": "user",
-      "status": "todo",
-      "title": "是否允许一次性能电源方案的显存带宽 A/B（改口径）",
+      "status": "done",
+      "title": "电源方案以平衡为基准（U-4 关闭：不做性能方案 A/B）",
       "deps": [],
       "resources": [],
       "paths": [],
-      "done_when": "允许/拒绝写进 DECISIONS；允许则改口径并重跑 R1a（read8 16 GiB），按新值重算 roofline"
+      "done_when": "用户 2026-10-24 定：平衡电源为唯一基准；156.5 GB/s 作为本机显存上限，换机器时按新 profile 重算"
+    },
+    {
+      "id": "M3-1a",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "todo",
+      "title": "CPU 专家核：Q4_K + int8，目标 0.090 ms/专家",
+      "deps": [
+        "M2-0"
+      ],
+      "resources": [
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/cpu_moe.*"
+      ],
+      "done_when": "4 线程 distinct 0.090 ms/专家（约 70 GFLOPS）；与参考逐 token 一致；6/8 线程不回退；达不到报差距（R1b 基线 0.115-0.118）"
+    },
+    {
+      "id": "M3-2a",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "todo",
+      "title": "miss_split：H2D 与 CPU 自适应分配",
+      "deps": [
+        "M3-2"
+      ],
+      "resources": [
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/miss_split.*"
+      ],
+      "done_when": "k=5、21.9% 缓存下三条腿耗时差 <= 10%；QRT_MISS_SPLIT=auto；固定 0/50/100 仅作对照"
     },
     {
       "id": "M2-6a",
@@ -962,13 +999,5 @@
     "detail": "last full record is 2026-10-23 (ctest 32/32, MUL_MAT 2275/2275, MUL_MAT_ID 939/939, FLASH_ATTN_EXT 5332/5332). Commit 44bd79305 changed llama-kv-cells after that record, so the gate is stale. M1 does not touch fork code, so it does not block; rerun before any fork code change."
   },
   "blockers": [],
-  "escalations": [
-    {
-      "id": "U-4",
-      "question": "allow one performance-power-plan A/B on the VRAM read probe? 156.5 GB/s equals 97.8% of 128-bit x 10 Gbps, so the balanced plan may be capping the memory clock",
-      "needs_by": "M4-5",
-      "owner": "user",
-      "note": "optional and not blocking M2; if allowed, it changes the power-state caliber and forces a roofline re-run (RESULTS section 12)"
-    }
-  ]
+  "escalations": []
 }

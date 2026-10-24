@@ -1,0 +1,57 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// Raw int8 dot ALU probe: 8 independent accumulator chains, 16 dot4 ops per loop iteration.
+// The point is instruction throughput, not memory: the whole input is 4 KiB and stays in L1.
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer Src { uint v[]; } src;
+layout(binding = 1) writeonly buffer Dst { int v[]; } dst;
+
+layout(push_constant) uniform PC {
+    uint n;     // unused, keeps the common 8-byte push constant layout
+    uint reps;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint a0 = src.v[gid & 255u] ^ gid;
+    uint a1 = src.v[(gid + 31u) & 255u] + gid;
+    uint a2 = src.v[(gid + 63u) & 255u] ^ (gid << 1);
+    uint a3 = src.v[(gid + 95u) & 255u] + (gid << 1);
+    uint a4 = src.v[(gid + 127u) & 255u] ^ (gid << 2);
+    uint a5 = src.v[(gid + 159u) & 255u] + (gid << 2);
+    uint a6 = src.v[(gid + 191u) & 255u] ^ (gid << 3);
+    uint a7 = src.v[(gid + 223u) & 255u] + (gid << 3);
+    uint b0 = src.v[(gid + 17u) & 255u];
+    uint b1 = src.v[(gid + 49u) & 255u];
+    uint b2 = src.v[(gid + 81u) & 255u];
+    uint b3 = src.v[(gid + 113u) & 255u];
+    uint b4 = src.v[(gid + 145u) & 255u];
+    uint b5 = src.v[(gid + 177u) & 255u];
+    uint b6 = src.v[(gid + 209u) & 255u];
+    uint b7 = src.v[(gid + 241u) & 255u];
+    int c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0, c5 = 0, c6 = 0, c7 = 0;
+    for (uint r = 0; r < pc.reps; ++r) {
+        c0 += dotPacked4x8EXT(int(a0), int(b0));
+        c1 += dotPacked4x8EXT(int(a1), int(b1));
+        c2 += dotPacked4x8EXT(int(a2), int(b2));
+        c3 += dotPacked4x8EXT(int(a3), int(b3));
+        c4 += dotPacked4x8EXT(int(a4), int(b4));
+        c5 += dotPacked4x8EXT(int(a5), int(b5));
+        c6 += dotPacked4x8EXT(int(a6), int(b6));
+        c7 += dotPacked4x8EXT(int(a7), int(b7));
+        c0 += dotPacked4x8EXT(int(b0), int(a0));
+        c1 += dotPacked4x8EXT(int(b1), int(a1));
+        c2 += dotPacked4x8EXT(int(b2), int(a2));
+        c3 += dotPacked4x8EXT(int(b3), int(a3));
+        c4 += dotPacked4x8EXT(int(b4), int(a4));
+        c5 += dotPacked4x8EXT(int(b5), int(a5));
+        c6 += dotPacked4x8EXT(int(b6), int(a6));
+        c7 += dotPacked4x8EXT(int(b7), int(a7));
+        a0 ^= 0x01010101u; a1 ^= 0x02020202u; a2 ^= 0x03030303u; a3 ^= 0x04040404u;
+        a4 ^= 0x05050505u; a5 ^= 0x06060606u; a6 ^= 0x07070707u; a7 ^= 0x08080808u;
+        b0 += 0x00010001u; b1 += 0x00020002u; b2 += 0x00030003u; b3 += 0x00040004u;
+        b4 += 0x00050005u; b5 += 0x00060006u; b6 += 0x00070007u; b7 += 0x00080008u;
+    }
+    dst.v[gid & 4095u] = c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7;
+}

@@ -67,6 +67,7 @@ struct App {
     uint32_t fam_compute  = 0;
     uint32_t fam_transfer = 0;
     bool     dedicated_transfer = false;
+    bool     has_dot = false;
     uint32_t compute_ts_bits = 0;
     std::vector<uint32_t> share_fams;
     VkQueue  qc = VK_NULL_HANDLE;
@@ -86,6 +87,7 @@ struct App {
     VkPipeline            pipe_gemv = VK_NULL_HANDLE;
     VkPipeline            pipe_gemv4 = VK_NULL_HANDLE;
     VkPipeline            pipe_read8 = VK_NULL_HANDLE;
+    VkPipeline            pipe_dot4 = VK_NULL_HANDLE;
     VkPipeline            pipe_ids  = VK_NULL_HANDLE;
     VkDescriptorPool      dpool = VK_NULL_HANDLE;
 
@@ -202,7 +204,7 @@ static void submit_fence(App & a, VkQueue q, VkCommandBuffer cb) {
 
 static void init(App & a) {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.apiVersion = VK_API_VERSION_1_2;
+    app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
     VK_CHECK(vkCreateInstance(&ici, nullptr, &a.inst));
@@ -279,11 +281,15 @@ static void init(App & a) {
     std::printf("compute family=%u transfer family=%u dedicated_transfer=%d\n",
             a.fam_compute, a.fam_transfer, (int) a.dedicated_transfer);
 
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12.pNext = &f13;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &f12;
     vkGetPhysicalDeviceFeatures2(a.phys, &f2);
-    std::printf("timelineSemaphore=%d\n", (int) f12.timelineSemaphore);
+    std::printf("timelineSemaphore=%d shaderIntegerDotProduct=%d\n",
+            (int) f12.timelineSemaphore, (int) f13.shaderIntegerDotProduct);
+    a.has_dot = f13.shaderIntegerDotProduct == VK_TRUE;
     if (!f12.timelineSemaphore) {
         std::printf("timeline semaphores are required for this probe\n");
         std::exit(1);
@@ -306,8 +312,11 @@ static void init(App & a) {
         qcis.push_back(q);
     }
 
+    VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    enable13.shaderIntegerDotProduct = a.has_dot ? VK_TRUE : VK_FALSE;
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     enable12.timelineSemaphore = VK_TRUE;
+    enable12.pNext = &enable13;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext                = &enable12;
     dci.queueCreateInfoCount = (uint32_t) qcis.size();
@@ -366,6 +375,13 @@ static void init(App & a) {
     a.pipe_ids  = make_pipeline(a, "ids.spv");
     a.pipe_gemv4 = make_pipeline(a, "gemv4.spv");
     a.pipe_read8 = make_pipeline(a, "read8.spv");
+    if (a.has_dot) {
+        // optional: the ALU probe is only needed for R1c, so a missing .spv must not break other modes
+        std::ifstream f("dot4.spv");
+        if (f.good()) {
+            a.pipe_dot4 = make_pipeline(a, "dot4.spv");
+        }
+    }
 
     VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
@@ -797,6 +813,45 @@ static void cmd_stream8(App & a, uint32_t mib, uint32_t dispatches, uint32_t gro
     vkFreeMemory(a.dev, stream_w.mem, nullptr);
 }
 
+// Raw int8 dot4 throughput: 16 dot4 ops per loop iteration, 4 MAC each. This is the ALU
+// ceiling for the Q4_K GEMM, not the GEMM itself (no dequant, no memory traffic).
+static void cmd_dot4(App & a, uint32_t reps, uint32_t groups) {
+    if (!a.has_dot || a.pipe_dot4 == VK_NULL_HANDLE) {
+        std::printf("dot4 probe unavailable: shaderIntegerDotProduct or dot4.spv missing\n");
+        return;
+    }
+    Buf src = make_buf(a, 4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    uint32_t * p = (uint32_t *) src.map;
+    for (uint32_t i = 0; i < 1024; ++i) {
+        p[i] = 0x01010101u * (i + 1u);
+    }
+    VkDescriptorSet set = make_set(a, src.buf);
+    Work w;
+    w.reps   = reps;
+    w.groups = groups;
+
+    VkCommandBuffer cb = alloc_cb(a, a.pool_c);
+    begin_cb(cb);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, a.pipe_dot4);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, a.pl, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(cb, a.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &w);
+    vkCmdDispatch(cb, groups, 1, 1);
+    VK_CHECK(vkEndCommandBuffer(cb));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t val = 0;
+    submit_tl(a, a.qc, a.sem_c, &a.val_c, cb, &val);
+    wait_tl(a, a.sem_c, val);
+    const double ms = ms_since(t0);
+    const double flop = (double) groups * 256.0 * (double) reps * 16.0 * 4.0 * 2.0;
+    std::printf("dot4 reps=%u groups=%u: %.2f TFLOP in %.2f ms -> %.2f TFLOPS (2 FLOP/MAC)\n",
+            reps, groups, flop / 1e12, ms, flop / (ms / 1000.0) / 1e12);
+    vkQueueWaitIdle(a.qc);
+    vkDestroyBuffer(a.dev, src.buf, nullptr);
+    vkFreeMemory(a.dev, src.mem, nullptr);
+}
+
 // H2D transfers while N CPU threads read a large host buffer. Both legs pull from host DRAM,
 // so the aggregate rate is what the split-miss path actually gets; summing the two solo rates
 // would overstate it.
@@ -938,6 +993,9 @@ int main(int argc, char ** argv) {
         cmd_stream8(a, argc > 2 ? (uint32_t) std::atoi(argv[2]) : 1024,
                 argc > 3 ? (uint32_t) std::atoi(argv[3]) : 1,
                 argc > 4 ? (uint32_t) std::atoi(argv[4]) : 1024);
+    } else if (mode == "dot4") {
+        cmd_dot4(a, argc > 2 ? (uint32_t) std::atoi(argv[2]) : 1000,
+                argc > 3 ? (uint32_t) std::atoi(argv[3]) : 1024);
     } else if (mode == "concurrent") {
         cmd_concurrent(a, argc > 2 ? (uint32_t) std::atoi(argv[2]) : 1024,
                 argc > 3 ? std::atoi(argv[3]) : 4,
@@ -947,6 +1005,7 @@ int main(int argc, char ** argv) {
         std::printf("usage: %s info | boundary [iters] | overlap [transfer_mib] [target_ms]"
                     " | stream [buffer_mib] [dispatches] | stream4 [buffer_mib] [dispatches]"
                     " | read8 [buffer_mib] [dispatches] [groups]"
+                    " | dot4 [reps] [groups]"
                     " | concurrent [host_mib] [threads] [xfer_mib] [chunk_mib]\n", argv[0]);
     }
     return 0;

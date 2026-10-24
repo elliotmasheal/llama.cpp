@@ -473,3 +473,26 @@ miss 数按请求级 `40 x 8 x k x (1 - hit)` 计，与第 9 节一致；模型�
 - CPU 核到 0.090 后 E_min 降到 2.88，余量 12%，M1-3b 才有空间。**所以 CPU 专家核在决策门的
   关键路径上，不是可选的 M3 优化。**
 - 参考实现是 fork 的通用 ggml 核，不是新 runtime；0.090 需要用 Q4_K 反量化 + int8 点积的专用核证明（M3-1）。
+
+## 14. R1c Q4_K x Q8_1 int8 GEMM（2026-10-24）
+
+口径：`runtime/kernels/bench`（独立探针，不链 ggml），形状 m=2048 tokens x n=512 x k=2048
+（一个专家的 gate 矩阵 × 2048 token），Q4_K 权重 + Q8_1 激活，dotPacked4x8EXT（OpSDot），
+reps=32、runs=3（工具内部 3 次取稳态），`--check` 通过（max_rel_l1 6.65e-6 < 1e-4）。
+原始输出 `bench/raw/roofline/R1c-q4k-gemm-dot.out`、`R1c-mulmat-perf.out`、`R1c-mulmatid-perf.out`。
+
+| 探针 | 形状 | TFLOPS |
+|---|---|---:|
+| 本仓库 Q4_K GEMM（dot 路径） | 2048x512x2048 | **3.66** |
+| 同上（portable fallback） | 2048x512x2048 | 0.60 |
+| fork `test-backend-ops` MUL_MAT q4_K | n=512, m=4096, k=14336 | **5.95** |
+| fork `test-backend-ops` MUL_MAT_ID q4_K（MoE） | n_used=8, n=512, m=768, k=2048 | **3.17** |
+| 本仓库 int8 ALU 探针（8 链，无 dequant） | 16 dot4/迭代 | **8.67** |
+
+- **专家形状的 GEMM 是 3.2-3.7 TFLOPS**，与 fork 的 MoE 算子（3.17）一致；dense 大 K（5.95）
+  不能直接搬到专家形状。ALU 上限 8.67，说明指令路径有余量，差距在 tile/activation load/occupancy。
+- **PP 1000 需要 6.0 TFLOPS；当前 3.66 → PP 约 610 tok/s**（1000 x 3.66/6.0）。
+  0.85 x roofline 的 7.06 需要 1.93x。**按现状 PP 1000 不成立，差 1.64x。**
+- 这不是硬件墙：ALU 8.67 与 dense 5.95 都高于 3.66；是**内核效率**问题。M2-4 必须把专家
+  GEMM 做到 6.0（1.64x），否则 PP 目标要由用户下调（U-2 的 PP 分支）。
+- 口径提醒：`w_gbs` 是 L2 速率，不是显存带宽；本探针的 `ms` 是 reps 摊销后的吞吐，不含提交开销。

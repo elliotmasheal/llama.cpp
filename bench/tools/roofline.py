@@ -1,49 +1,64 @@
 """Roofline model: what the hardware allows, what the current software gets.
 
 Usage: python roofline.py
-Constants come from bench/RESULTS.md sections 7-10 and the RX 6700S spec.
+All hardware numbers come from bench/env/hw-6700s.json. Point QRT_HW at another
+profile to model a different machine; nothing below is specific to the 6700S.
 Prints per-leg ceilings, TG(cache, k), PP(chunk, TFLOPS), the VRAM capacity
 curve, and the 0.85 x roofline target next to the 130 / 1000 hard floors.
 """
+import json
+import os
 import sys
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
 GB = 1e9
 
-# hardware ceilings
-# Nominal GDDR6 is 224 GB/s (128-bit x 14 Gbps) but R1a measured 156.1-156.6 GB/s at any ILP,
-# grid or size, so the model uses the observed ceiling. See RESULTS section 12.
-VRAM_SPEC = 156.5 * GB
-PCIE_SPEC = 15.754 * GB         # PCIe 4.0 x8, 128b/130b
-DDR_SPEC = 76.8 * GB            # DDR5-4800, 2 x 64-bit
-FP32_TFLOPS = 7.9               # design 6.4
-VRAM_TOTAL_MIB = 8176
-DESKTOP_MIB = 1000
+_HW_PATH = os.environ.get("QRT_HW") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "env", "hw-6700s.json")
 
-# measured, RESULTS sections 7-10
-VRAM_NOW = 156.5 * GB
-H2D_SOLO = 14.17 * GB
-H2D_NOW = 9.9 * GB              # under CPU read, lower bound of 8.9-11.2
-CPU_EXPERT_NOW = 0.137          # ms per expert, 4 threads
-EXPERT_BYTES = 1.828 * MIB      # gguf_dims.py, 41 layers x 256 experts
-DENSE_BYTES = 2.030 * GIB
-KV_MAIN = 20480                 # bytes per token, 10 full-attn main layers
-KV_Q4 = 6336                  # bytes per token with the nextn layer, q4_0 (U-3)
-GLOP_PER_TOKEN = 6.0
+
+def _load_hw(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except OSError:
+        return {}
+
+
+HW = _load_hw(_HW_PATH)
+
+# hardware ceilings (nominal 224 GB/s on the 6700S is not observable; R1a, RESULTS 12)
+VRAM_SPEC = HW.get("vram_observed_gbs", 156.5) * GB
+PCIE_SPEC = HW.get("pcie_gbs", 15.754) * GB
+DDR_SPEC = HW.get("ddr_gbs", 76.8) * GB
+FP32_TFLOPS = HW.get("fp32_tflops", 7.9)
+INT8_TOPS = HW.get("int8_tops", 0.0)
+VRAM_TOTAL_MIB = HW.get("vram_total_mib", 8176)
+DESKTOP_MIB = HW.get("desktop_mib", 1000)
+
+# measured
+VRAM_NOW = HW.get("vram_observed_gbs", 156.5) * GB
+H2D_SOLO = HW.get("h2d_solo_gbs", 14.17) * GB
+H2D_NOW = HW.get("h2d_now_gbs", 9.9) * GB
+CPU_EXPERT_NOW = HW.get("cpu_expert_now_ms", 0.137)
+EXPERT_BYTES = HW.get("expert_bytes_mib", 1.828) * MIB
+DENSE_BYTES = HW.get("dense_gib", 2.030) * GIB
+KV_Q4 = HW.get("kv_q4_bytes", 6336)
+GLOP_PER_TOKEN = HW.get("gflop_per_token", 6.0)
 HIT = {20: 0.773, 22: 0.789, 25: 0.816, 30: 0.854}   # RESULTS 7; 22% interpolated for U-3
 U = {4: 19.9, 5: 23.5, 8: 31.6}           # unique experts per layer, section 7
 E = {4: 2.84, 5: 3.24, 8: 3.82}           # RESULTS section 3, full vocab
 DRAFT_MIB = 33.0                           # 16K restricted output head per step
 
-# R1 targets and the 0.85 rule
-VRAM_TARGET = 156.5 * GB        # R1a: 190 is not reachable, the observed ceiling is what we get
-H2D_TARGET = 10.8 * GB          # R1a r=2: best concurrent value, 64 MiB chunks
-CPU_EXPERT_TARGET = 0.070
-CPU_EXPERT_MEASURED = 0.118    # R1b: best distinct-expert value at 4 threads (0.115-0.118)
-CPU_EXPERT_REQ = 0.090         # knee: below this the GPU leg binds, 0.070 buys nothing
+# targets and the 0.85 rule
+VRAM_TARGET = HW.get("vram_observed_gbs", 156.5) * GB
+H2D_TARGET = HW.get("h2d_target_gbs", 10.8) * GB
+CPU_EXPERT_TARGET = HW.get("cpu_expert_target_ms", 0.070)
+CPU_EXPERT_MEASURED = HW.get("cpu_expert_measured_ms", 0.118)
+CPU_EXPERT_REQ = HW.get("cpu_expert_knee_ms", 0.090)
 CPU_EXPERT_SPEC = EXPERT_BYTES / DDR_SPEC * 1e3
-ROOFLINE_FRACTION = 0.85
+ROOFLINE_FRACTION = HW.get("roofline_fraction", 0.85)
 TG_MIN = 130.0
 PP_MIN = 1000.0
 
