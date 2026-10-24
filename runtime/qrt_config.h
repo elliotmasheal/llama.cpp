@@ -32,6 +32,7 @@ struct qrt_config {
     int32_t      kv_page_tokens;  // resident KV window
     int32_t      telemetry;       // 0 = off, 1 = one CSV row per pass
     const char * telemetry_path;  // not copied: argv and env live for the process
+    int32_t      vram_tier_mib;   // runtime extension: cap the VRAM budget, 0 = auto
 };
 
 void qrt_config_defaults(qrt_config * cfg);

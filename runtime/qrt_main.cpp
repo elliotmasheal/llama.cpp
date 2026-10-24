@@ -4,6 +4,7 @@
 #include "qrt_config.h"
 #include "qrt_telemetry.h"
 #include "gguf_index.h"
+#include "vk_dev.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,7 +83,7 @@ static int qrt_selftest(void) {
     expect(d.spec_k == 4 && d.draft_vocab == 16384 && d.expert_cache_mib == 4198 &&
            d.miss_split == QRT_MISS_SPLIT_AUTO && d.cache_policy == QRT_CACHE_SLRU &&
            d.prefill_chunk == 2048 && d.kv_precision == QRT_KV_Q4_0 &&
-           d.kv_page_tokens == 16384 && d.telemetry == 0,
+           d.kv_page_tokens == 16384 && d.telemetry == 0 && d.vram_tier_mib == 0,
            "defaults match design section 7");
 
     {
@@ -90,16 +91,16 @@ static int qrt_selftest(void) {
             "--spec-k", "5", "--draft-vocab", "32768", "--expert-cache-mib", "3800",
             "--miss-split", "60", "--cache-policy", "lru", "--prefill-chunk", "1024",
             "--kv-precision", "f16", "--kv-page-tokens", "8192", "--telemetry", "1",
-            "--telemetry-path", "bench/raw/x.csv",
+            "--telemetry-path", "bench/raw/x.csv", "--vram-tier-mib", "6144",
         };
         qrt_config c;
         qrt_config_defaults(&c);
-        const int ok = parse_argv(&c, 20, all, err, sizeof(err)) == 0;
+        const int ok = parse_argv(&c, 22, all, err, sizeof(err)) == 0;
         expect(ok && c.spec_k == 5 && c.draft_vocab == 32768 && c.expert_cache_mib == 3800 &&
                c.miss_split == 60 && c.cache_policy == QRT_CACHE_LRU && c.prefill_chunk == 1024 &&
                c.kv_precision == QRT_KV_F16 && c.kv_page_tokens == 8192 && c.telemetry == 1 &&
-               strcmp(c.telemetry_path, "bench/raw/x.csv") == 0,
-               "all ten switches parse from the CLI");
+               strcmp(c.telemetry_path, "bench/raw/x.csv") == 0 && c.vram_tier_mib == 6144,
+               "all twelve switches parse from the CLI");
     }
 
     {
@@ -132,7 +133,8 @@ static int qrt_selftest(void) {
             { "--expert-cache-mib", "9000" }, { "--miss-split", "101" },
             { "--cache-policy", "foo" }, { "--prefill-chunk", "0" },
             { "--kv-precision", "q8_0" }, { "--kv-page-tokens", "1000" },
-            { "--telemetry", "2" },     { "--nope", "1" },
+            { "--telemetry", "2" },     { "--vram-tier-mib", "40000" },
+            { "--nope", "1" },
         };
         const int n_bad = (int) (sizeof(bad) / sizeof(bad[0]));
         int rejected = 0;
@@ -227,6 +229,8 @@ static int qrt_selftest(void) {
 
 int main(int argc, char ** argv) {
     int print_config = 0;
+    int vk_info = 0;
+    int vk_probe_mib = 0;
     const char * gguf_path = NULL;
     const char * require_tensor = NULL;
 
@@ -242,6 +246,22 @@ int main(int argc, char ** argv) {
         }
         if (strcmp(argv[i], "--print-config") == 0) {
             print_config = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--vk-info") == 0) {
+            vk_info = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--vk-alloc-probe") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --vk-alloc-probe needs a size in MiB\n");
+                return 2;
+            }
+            vk_probe_mib = atoi(argv[++i]);
+            if (vk_probe_mib <= 0) {
+                fprintf(stderr, "qrt: --vk-alloc-probe wants a positive MiB count\n");
+                return 2;
+            }
             continue;
         }
         const int is_index = strcmp(argv[i], "--gguf-index") == 0;
@@ -305,6 +325,51 @@ int main(int argc, char ** argv) {
     if (require_tensor != NULL) {
         fprintf(stderr, "qrt: --require-tensor needs --gguf-index <path>\n");
         return 2;
+    }
+
+    if (vk_info || vk_probe_mib > 0) {
+        qrt_vk_dev * dev = NULL;
+        if (qrt_vk_open((uint32_t) cfg.vram_tier_mib, &dev, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            return 2;
+        }
+        qrt_vk_print_info(dev, stdout);
+        int rc = 0;
+        // RESULTS section 25: the routed_experts total of the target model.
+        const uint64_t expert_store_bytes = 20122173440ull;
+        qrt_vk_plan plan;
+        if (qrt_vk_plan_budget(dev, &cfg, expert_store_bytes, &plan, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            rc = 2;
+        } else {
+            printf("plan dense_mib=%llu cache_mib=%llu kv_mib=%llu compute_mib=%llu "
+                   "draft_mib=%llu total_mib=%llu coverage_pct=%.2f reductions=%u\n",
+                   (unsigned long long) (plan.dense_bytes >> 20),
+                   (unsigned long long) (plan.expert_cache_bytes >> 20),
+                   (unsigned long long) (plan.kv_bytes >> 20),
+                   (unsigned long long) (plan.compute_bytes >> 20),
+                   (unsigned long long) (plan.draft_bytes >> 20),
+                   (unsigned long long) (plan.total_bytes >> 20),
+                   (double) plan.cache_coverage_x100 / 100.0, plan.cache_reductions);
+        }
+        if (vk_probe_mib > 0) {
+            const uint64_t before = dev->budget_bytes;
+            VkBuffer buf = 0;
+            VkDeviceMemory mem = 0;
+            if (qrt_vk_alloc(dev, (uint64_t) vk_probe_mib << 20, QRT_VK_USAGE_STORAGE,
+                             &buf, &mem, err, sizeof(err)) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                rc = 2;
+            } else {
+                qrt_vk_query_budget(dev, err, sizeof(err));
+                printf("probe alloc_mib=%d budget_before_mib=%llu budget_after_mib=%llu\n",
+                       vk_probe_mib, (unsigned long long) (before >> 20),
+                       (unsigned long long) (dev->budget_bytes >> 20));
+                qrt_vk_free(dev, buf, mem);
+            }
+        }
+        qrt_vk_close(dev);
+        return rc;
     }
 
     if (cfg.telemetry != 0) {

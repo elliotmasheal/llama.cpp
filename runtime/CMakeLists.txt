@@ -5,10 +5,21 @@
 add_library(qrt_core STATIC
     qrt_config.cpp
     qrt_telemetry.cpp
-    gguf_index.cpp)
+    gguf_index.cpp
+    vk_dev.cpp)
 
 target_include_directories(qrt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(qrt_core PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+# vk_dev.cpp compiles to a stub when the SDK is absent, so qrt still builds and
+# --vk-info reports why it cannot open a device.
+find_package(Vulkan QUIET)
+if (Vulkan_FOUND)
+    target_compile_definitions(qrt_core PUBLIC QRT_HAVE_VULKAN)
+    target_link_libraries(qrt_core PUBLIC Vulkan::Vulkan)
+else()
+    message(WARNING "Vulkan SDK not found: qrt builds without --vk-info")
+endif()
 
 add_executable(qrt qrt_main.cpp)
 target_link_libraries(qrt PRIVATE qrt_core)

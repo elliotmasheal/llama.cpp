@@ -3,25 +3,28 @@
 This directory holds the runtime that replaces the fork's decode path (design section 3.3).
 It links neither ggml nor llama: the runtime parses the GGUF itself and drives Vulkan directly.
 
-## Status: M2-0 scaffold, M2-1 GGUF index
+## Status: M2-0 scaffold, M2-1 GGUF index, M2-2 Vulkan device and budget
 
 What exists now:
 
-- `qrt_config.*` - the ten switches of design section 7, their design defaults, strict
-  validation, and non-fatal notes for legal-but-costly values.
+- `qrt_config.*` - the ten switches of design section 7 plus two runtime extensions
+  (`--telemetry-path`, `--vram-tier-mib`), their design defaults, strict validation, and
+  non-fatal notes for legal-but-costly values.
 - `qrt_telemetry.*` - a CSV sink with one row per decode pass, holding the columns
   `bench/README.md` section 2 asks for.
 - `gguf_index.*` - read-only GGUF metadata, tensor table and absolute byte offsets, plus
   the byte account `bench/tools/gguf_dims.py` prints. No abort path: malformed files come
   back as an error string.
+- `vk_dev.*` - Vulkan device, compute and transfer queues, memory type selection, the
+  `VK_EXT_memory_budget` query, and the design 5.5 budget planner with a tier cap.
 - `qrt_main.cpp` - the `qrt` binary: `--help`, `--print-config`, `--selftest`,
-  `--gguf-index`, `--require-tensor`.
+  `--gguf-index`, `--require-tensor`, `--vk-info`, `--vk-alloc-probe`.
 - `CMakeLists.txt` - the `qrt_core` library and the `qrt` executable, plus the
   `qrt_selftest` ctest case.
 
-What does not exist yet: the Vulkan device and allocator (M2-2), weights and the expert
-cache (M2-3), kernels (M2-4), prefill (M2-5), decode (M3).
-`runtime/proto/` and `runtime/cpu_moe*` predate the scaffold and keep their own targets.
+What does not exist yet: weights and the expert cache (M2-3), kernels (M2-4), prefill
+(M2-5), decode (M3). `runtime/proto/` and `runtime/cpu_moe*` predate the scaffold and keep
+their own targets.
 
 ## Build
 
@@ -89,6 +92,45 @@ hparams, and the account, then feeds nine crafted files (bad magic, truncated ta
 out-of-bounds tensor, unknown type, duplicate names, dim overflow, nine dims, oversized
 string, nested array) and requires exit 2 with a message for each.
 
+## Vulkan device and VRAM budget
+
+```
+build-vulkan/bin/qrt.exe --vk-info
+build-vulkan/bin/qrt.exe --vk-info --vram-tier-mib 6144
+build-vulkan/bin/qrt.exe --vk-info --vk-alloc-probe 64
+```
+
+`--vk-info` opens the device and prints:
+
+- `device`, `heap_mib` (largest device-local heap), `budget_mib` (usable now),
+  `usage_mib` (from `VK_EXT_memory_budget`), `tier_mib`, and whether the budget extension
+  is present.
+- the compute and transfer queue family indices and the compute family's timestamp bits.
+- allocation counters: `alloc_count`, `alloc_mib`, `alloc_failures`, `cache_reductions`.
+- `plan`: the five buckets of design 5.5, their total, the expert-cache coverage, and how
+  many 256 MiB steps the planner had to give up.
+
+Budget rules:
+
+- With `VK_EXT_memory_budget`, `heapBudget` is used as is; it already accounts for other
+  processes, so the desktop reserve is not subtracted twice. Without it, the planner
+  subtracts a 1000 MiB desktop reserve from the heap.
+- `--vram-tier-mib N` (or `QRT_VRAM_TIER_MIB`) caps the budget, which is how the 4G/6G
+  tiers of `bench/README.md` are simulated. 0 means no cap.
+- Fixed buckets: dense 2079 MiB (RESULTS 25), KV `kv_page_tokens x 6336 B` for q4_0 or
+  `x 22528 B` for f16 (RESULTS 25), compute 700 MiB (design 5.5 lower bound), draft 100 MiB.
+- If the fixed buckets do not fit, the plan fails with a message (exit 2). Otherwise the
+  expert cache takes `min(requested, what is left)`, rounded down to whole MiB, and every
+  256 MiB it had to give up is counted in `reductions`.
+- `qrt_vk_alloc` refuses an allocation larger than the budget and counts every failure in
+  `alloc_failures`; it never aborts, so a caller can shrink the cache and retry.
+- On this driver (WDDM) `heapBudget` does not move after a 64 MiB allocation, so the
+  planner cannot use budget deltas to measure driver overhead. That needs a real
+  allocation of the whole plan (M2-3).
+
+The device opens with Vulkan 1.2 and a timeline semaphore, which is what the single-submit
+pass model of design 4.6 needs later.
+
 ## Telemetry
 
 `--telemetry 1 --telemetry-path <file>` writes a CSV with this header:
@@ -113,5 +155,6 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `qrt_config.h/.cpp` | switch table, defaults, parsing, validation, notes |
 | `qrt_telemetry.h/.cpp` | per-pass CSV sink |
 | `gguf_index.h/.cpp` | GGUF metadata, tensor table, absolute offsets, byte account |
-| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index` |
+| `vk_dev.h/.cpp` | device, queues, memory types, budget planner, allocator |
+| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info` |
 | `CMakeLists.txt` | `qrt_core`, `qrt`, `qrt_selftest` |

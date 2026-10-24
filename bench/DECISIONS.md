@@ -73,6 +73,7 @@
 | `QRT_KV_PAGE_TOKENS` | 16384 | KV 常驻窗口；窗口外页面放主机（U-3） | 已解析；引擎待 M2-6 |
 | `QRT_TELEMETRY` | 0 | 每 pass 记录命中、H2D 字节、耗时、接受数 | 已解析；出口已实现（M2-0） |
 | `QRT_TELEMETRY_PATH` | `qrt-telemetry.csv` | 运行时扩展：sink 路径，不是 design 开关 | 已实现（M2-0） |
+| `QRT_VRAM_TIER_MIB` | 0（auto） | 运行时扩展：把预算压到指定 MiB，模拟 4G/6G 档 | 已实现（M2-2） |
 
 ## 5. 未结项（M1 决策门，按阻塞顺序）
 
@@ -329,4 +330,21 @@ M1-GATE 的依赖里去掉 M3-1a（它是门后条件，不是门的阻塞项）
 - 错误策略按 design 9：所有畸形输入（坏 magic、截断、越界、未知类型、重名、维度溢出、9 维、
   超长字符串、嵌套数组）返回错误字符串与 exit 2，没有 `abort`，也没有 `GGML_ABORT`。
 - 下一任务 M2-2（`vk_dev` + 分配器 + 显存预算）：预算不足时要回退并计数，VRAM tier 可注入。
+
+## 19. M2-2 判决：Vulkan 设备与显存预算（2026-10-24）
+
+| 问题 | 证据 | 判决 |
+|---|---|---|
+| 设备、队列、内存类型 | `qrt --vk-info`：RX 6700S，heap 8176 MiB，专用 compute 族 1、专用 transfer 族 2，timestamp 64 位，`VK_EXT_memory_budget` 可用 | **PASS** |
+| 预算与计划 | heapBudget **7378 MiB**（与 `bench/README.md` 的空闲值一致）；默认计划 2079 + 4198 + 99 + 700 + 100 = **7176 MiB**，覆盖 21.87% | **PASS** |
+| VRAM tier 注入 | `--vram-tier-mib 6144` -> 预算 6144、缓存 3166 MiB（16.49%）、reductions=5；`2048` -> 固定桶 2978 > 预算，exit 2 带消息 | **PASS** |
+| 预算不足回退 | 缓存按 256 MiB 步降并计数；分配超预算或失败计入 `alloc_failures`，不 abort（design 9） | **PASS** |
+| 驱动瞬时（第 15 节的待确认项） | 64 MiB 分配前后 heapBudget 都是 7378 MiB，WDDM 粒度看不出增量 | 该口径**不可用**；留给 M2-3 的真实分配 |
+
+- 结论：design 5.5 的 7176 MiB 在本机可复现，21.9% 缓存仍是可行点；25% 是否可行仍取决于
+  驱动瞬时（第 15 节），不能用 `VK_EXT_memory_budget` 的差值判断。
+- 口径：有 `VK_EXT_memory_budget` 时直接用 heapBudget（已扣其它进程），没有时退回
+  "heap - 1000 MiB 桌面"；两套口径都写在 `runtime/README.md`。
+- 设备以 Vulkan 1.2 + timeline semaphore 打开，这是 design 4.6 单次提交每 pass 的前提。
+- 下一任务 M2-4（int8 点积 GEMM，PP 的 6.0 TFLOPS 硬门）；M2-3 仍等 M5-1/M5-2 的重组格式。
 

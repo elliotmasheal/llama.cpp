@@ -785,3 +785,26 @@ GPU 腿、submit 与 sync 已在第 15 节实测（偏差 -1.0..+5.8%，submit 0
 - 第 1 节的张量账由本节独立复算；第 1 节的 1.84 MiB/专家是 M0 的粗算，精确值 1.8284 MiB
   （差 0.6%，不改第 1 节的口径，也不影响任何字节账）。
 
+## 26. M2-2 设备与显存预算（2026-10-24）
+
+口径：dGPU 空闲、无其它推理进程、平衡电源 + AC；`build-vulkan/bin/qrt.exe --vk-info`
+（Release，MinGW）；只创建设备并读预算，不分配模型缓冲。原始输出 `bench/raw/m2/vk-info.out`，
+`status = ok`。
+
+| 项 | 读数 |
+|---|---|
+| 设备 | AMD Radeon RX 6700S |
+| 最大 device-local heap | 8176 MiB |
+| heapBudget（`VK_EXT_memory_budget`） | **7378 MiB**（与 `bench/README.md` 的空闲值一致） |
+| heapUsage | 0 MiB（WDDM 不报） |
+| 队列族 | compute 1（专用）、transfer 2（专用），compute timestamp 64 位 |
+| 默认计划 | dense 2079 + cache 4198 + KV 99 + compute 700 + draft 100 = **7176 MiB** |
+| 缓存覆盖 | 21.87%（4198 MiB / 20122173440 B） |
+| tier 6144 | 预算 6144，缓存 3166 MiB（16.49%），reductions=5 |
+| tier 2048 | 固定桶 2978 MiB > 预算，exit 2 带消息，不崩溃 |
+| 64 MiB 分配探测 | 分配前后 heapBudget 都是 7378 MiB |
+
+- design 5.5 的 7176 MiB 在本机可复现（DECISIONS 19）；缓存 25% 的可行性仍取决于驱动瞬时，
+  不能用 heapBudget 差值判断（WDDM 粒度太粗）。
+
+

@@ -15,6 +15,7 @@ enum {
     OPT_KV_PAGE_TOKENS,
     OPT_TELEMETRY,
     OPT_TELEMETRY_PATH,
+    OPT_VRAM_TIER_MIB,
     OPT_COUNT,
 };
 
@@ -35,6 +36,7 @@ static const struct qrt_opt_desc OPT_DESC[OPT_COUNT] = {
     { "--kv-page-tokens",   "QRT_KV_PAGE_TOKENS",   "32..1048576 tokens, multiple of 32" },
     { "--telemetry",        "QRT_TELEMETRY",        "0 or 1" },
     { "--telemetry-path",   "QRT_TELEMETRY_PATH",   "a writable file path" },
+    { "--vram-tier-mib",    "QRT_VRAM_TIER_MIB",    "0 = auto, or a VRAM cap in MiB" },
 };
 
 void qrt_config_defaults(qrt_config * cfg) {
@@ -48,6 +50,7 @@ void qrt_config_defaults(qrt_config * cfg) {
     cfg->kv_page_tokens  = 16384;
     cfg->telemetry       = 0;
     cfg->telemetry_path  = "qrt-telemetry.csv";
+    cfg->vram_tier_mib   = 0;
 }
 
 const char * qrt_cache_policy_name(int32_t policy) {
@@ -195,6 +198,12 @@ static int apply_opt(qrt_config * cfg, int opt, const char * value, char * err, 
                 cfg->telemetry_path = value;
             }
             break;
+        case OPT_VRAM_TIER_MIB:
+            ok = parse_int(value, 0, 32768, &v);
+            if (ok == 0) {
+                cfg->vram_tier_mib = v;
+            }
+            break;
         default:
             ok = -1;
             break;
@@ -300,6 +309,10 @@ int qrt_config_validate(const qrt_config * cfg, char * err, size_t err_size) {
         snprintf(err, err_size, "QRT_TELEMETRY_PATH is empty while telemetry is on");
         return -1;
     }
+    if (cfg->vram_tier_mib < 0 || cfg->vram_tier_mib > 32768) {
+        snprintf(err, err_size, "QRT_VRAM_TIER_MIB %d is outside 0..32768", cfg->vram_tier_mib);
+        return -1;
+    }
     return 0;
 }
 
@@ -358,6 +371,7 @@ void qrt_config_print_switches(FILE * f) {
     snprintf(def[OPT_KV_PAGE_TOKENS], 32, "%d", d.kv_page_tokens);
     snprintf(def[OPT_TELEMETRY], 32, "%d", d.telemetry);
     snprintf(def[OPT_TELEMETRY_PATH], 32, "%s", d.telemetry_path);
+    snprintf(def[OPT_VRAM_TIER_MIB], 32, "%d", d.vram_tier_mib);
 
     fprintf(f, "qwen36 runtime switches (design section 7); a CLI flag overrides its QRT_* variable.\n\n");
     fprintf(f, "  %-22s %-20s %-19s %s\n", "environment", "flag", "default", "meaning");
@@ -368,6 +382,8 @@ void qrt_config_print_switches(FILE * f) {
     fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--selftest", "-", "check the switches and the telemetry sink");
     fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--gguf-index <path>", "-", "print the GGUF tensor table and account");
     fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--require-tensor <name>", "-", "exit 2 when the tensor is missing");
+    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--vk-info", "-", "device, memory types and the VRAM plan");
+    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--vk-alloc-probe <mib>", "-", "allocate once and re-read the budget");
     fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--help, -h", "-", "this table");
 }
 
@@ -386,4 +402,5 @@ void qrt_config_print_effective(const qrt_config * cfg, FILE * f) {
     fprintf(f, "kv_page_tokens=%d\n", cfg->kv_page_tokens);
     fprintf(f, "telemetry=%d\n", cfg->telemetry);
     fprintf(f, "telemetry_path=%s\n", cfg->telemetry_path != NULL ? cfg->telemetry_path : "");
+    fprintf(f, "vram_tier_mib=%d\n", cfg->vram_tier_mib);
 }
