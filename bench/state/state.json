@@ -191,7 +191,8 @@
       "id": "M1-2b",
       "milestone": "M1",
       "lane": "bench",
-      "status": "partial",
+      "status": "doing",
+      "claimed_at": "2026-10-24T16:05:00",
       "title": "三类文本的局部性复测（技术类已完成两份）",
       "deps": [
         "M1-2a"
