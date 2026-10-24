@@ -86,7 +86,7 @@ blockers: none
 - M0 完成：张量账、10K + 128 token 路由 trace、局部性与命中率（`RESULTS.md` 第 1-2、7 节）。
 - M1 进行中：M1-1 / M1-2b / M1-3b / M1-3c / M1-3d / M1-4a / M1-4a-run / M1-5 / M1-6 / M1-7 已完成，
   R0 / R1 已完成，语料与词表 M1-2a / M1-3a 已交付；M3-1a 已提前做完（partial，见下）。
-  剩 M1-4b（partial，计算缓冲未隔离）、U-7（近分叉判据）、M1-GATE。
+  剩 M1-4b（partial，计算缓冲未隔离）、M1-GATE。
 - 队列：bench M1-4b，impl X-1，data M5-1，io 等 M5-1，user 等 M1-GATE。
 - M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`（九条），E 门槛用公式而不是常数。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
