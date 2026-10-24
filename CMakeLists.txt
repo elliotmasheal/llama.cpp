@@ -250,6 +250,17 @@ if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
     add_subdirectory(tools/mtmd)
 endif()
 
+# M1-4a Vulkan pass-cost prototype (runtime/proto). It does not link ggml or llama, so it is a
+# separate opt-in target; see runtime/proto/README.md.
+option(LLAMA_BUILD_QRT_PROTO "llama: build the qrt Vulkan pass prototype" OFF)
+if (LLAMA_BUILD_QRT_PROTO)
+    if (GGML_VULKAN)
+        add_subdirectory(runtime/proto)
+    else()
+        message(WARNING "LLAMA_BUILD_QRT_PROTO requires GGML_VULKAN=ON, target qrt_proto not built")
+    endif()
+endif()
+
 #
 # install
 #

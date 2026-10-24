@@ -1,0 +1,31 @@
+#version 450
+// Bandwidth-only reader for one layer slice. Four independent vec4 chains per thread: a single
+// accumulator does not vectorise and would report the ALU rate instead of the DRAM rate.
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer Src { vec4 v[]; } src;
+layout(binding = 1) writeonly buffer Dst { float f[]; } dst;
+
+layout(push_constant) uniform PC {
+    uint base; // first vec4 of this layer's slice
+    uint n;    // vec4 count in the slice
+} pc;
+
+void main() {
+    uint gid    = gl_GlobalInvocationID.x;
+    uint stride = gl_WorkGroupSize.x * gl_NumWorkGroups.x;
+    vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
+
+    uint i = gid;
+    for (; i + 3u * stride < pc.n; i += 4u * stride) {
+        a0 += src.v[pc.base + i];
+        a1 += src.v[pc.base + i + stride];
+        a2 += src.v[pc.base + i + 2u * stride];
+        a3 += src.v[pc.base + i + 3u * stride];
+    }
+    for (; i < pc.n; i += stride) {
+        a0 += src.v[pc.base + i];
+    }
+
+    dst.f[gid & 1023u] = a0.x + a1.y + a2.z + a3.w;
+}
