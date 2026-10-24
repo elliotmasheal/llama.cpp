@@ -52,22 +52,27 @@
 | Vulkan `mul_mat_vec` / `mul_mat_id` 内核 | 复用但需改造 | 要改成批量 k 版本 |
 | GGUF 解析、Vulkan 设备初始化、tokenizer | 是 | design 3.3 |
 
-## 4. 开关表（design 第 7 节，全部未实现）
+## 4. 开关表（design 第 7 节）
 
 登记为准，避免 agent 引用不存在的开关。实现某一行时必须同时做三件事：加 CLI 参数（不能只有 env）、
 把"状态"改成"已实现 + 默认值出处"、在 `RESULTS.md` 补一条目标工况读数。
 
-| 开关 | 计划默认 | 作用 | 状态 |
+**M2-0（2026-10-24）起，全部 10 个开关都可解析、校验、打印默认值**（`qrt --selftest`）；
+默认值按 design v0.4 更正（旧表里的 k=5 / chunk 512 / cache 待定是 v0.1-v0.3 的残留）。
+"引擎"一列指真正消费该开关的模块，仍未实现。
+
+| 开关 | 默认（design v0.4） | 作用 | 状态 |
 |---|---|---|---|
-| `QRT_SPEC_K` | 5 | 推测深度，取 {1,2,4,5,8} | 未实现 |
-| `QRT_DRAFT_VOCAB` | 16384 | 0 = 完整词表（基线，约 125）；16384 = 受限词表 | 未实现，等 M1-3 |
-| `QRT_EXPERT_CACHE_MIB` | 待定 | M1-6：25% 缓存与 8 GiB 互斥；可行角 ctx <= 16K + 20%（约 3838 MiB） | 未实现，默认值由 R0/M4-1 定 |
-| `QRT_MISS_SPLIT` | auto | auto = 让三条腿耗时相等；0 = 全 CPU，100 = 全 H2D | 未实现 |
-| `QRT_CACHE_POLICY` | slru | slru / lru / static（static 仅对照） | 未实现 |
-| `QRT_PREFILL_CHUNK` | 512 | prefill 分块 | 未实现 |
-| `QRT_KV_PRECISION` | q4_0 | kv 精度；q4_0 必须过 G-QUAL，否则回退 f16 | 未实现 |
-| `QRT_KV_PAGE_TOKENS` | 16384 | KV 常驻窗口；窗口外页面放主机（U-3） | 未实现 |
-| `QRT_TELEMETRY` | 0 | 每 pass 记录命中、H2D 字节、耗时、接受数 | 未实现 |
+| `QRT_SPEC_K` | 4 | 推测深度，取 {1,2,4,5,8}；4 是验收配置（U-7） | 已解析；引擎待 M3-0 |
+| `QRT_DRAFT_VOCAB` | 16384 | 0 = 完整词表（基线，约 125）；16384 = 受限词表 | 已解析；引擎待 M3-4 |
+| `QRT_EXPERT_CACHE_MIB` | 4198 | 21.9% 覆盖；计算缓冲超 700 MiB 时下调 | 已解析；引擎待 M3-2 |
+| `QRT_MISS_SPLIT` | auto | auto = 让三条腿耗时相等；0 = 全 CPU，100 = 全 H2D | 已解析；引擎待 M3-2a |
+| `QRT_CACHE_POLICY` | slru | slru / lru / static（static 仅对照） | 已解析；引擎待 M3-2 |
+| `QRT_PREFILL_CHUNK` | 2048 | prefill 分块；PP 1000 需 >= 1420 | 已解析；引擎待 M2-5 |
+| `QRT_KV_PRECISION` | q4_0 | kv 精度；q4_0 必须过 G-QUAL，否则回退 f16 | 已解析；引擎待 M2-6a |
+| `QRT_KV_PAGE_TOKENS` | 16384 | KV 常驻窗口；窗口外页面放主机（U-3） | 已解析；引擎待 M2-6 |
+| `QRT_TELEMETRY` | 0 | 每 pass 记录命中、H2D 字节、耗时、接受数 | 已解析；出口已实现（M2-0） |
+| `QRT_TELEMETRY_PATH` | `qrt-telemetry.csv` | 运行时扩展：sink 路径，不是 design 开关 | 已实现（M2-0） |
 
 ## 5. 未结项（M1 决策门，按阻塞顺序）
 
@@ -289,3 +294,20 @@ TG/PP 目标并改 design 1.1 / 6.3 / 6.5 / 9 / R3；agent 不自行改阈值。
 **用户决定（2026-10-24）：选 A，条件通过。** M1 记为 pass（带条件），phase=M2：
 code 的 TG 130 与 M3-6 以 M3-1a 达到 0.059 为硬门，不达则走 U-2；M2（prefill）先开工。
 M1-GATE 的依赖里去掉 M3-1a（它是门后条件，不是门的阻塞项），并在 `decision_gate.conditions` 留痕。
+
+## 17. M2-0 判决：运行时脚手架（2026-10-24）
+
+| 问题 | 证据 | 判决 |
+|---|---|---|
+| design 第 7 节的 10 个开关都能解析 | `qrt --selftest` 14 项全过：默认值、CLI（10 个）、`--flag=value`、env、CLI>env、10 个坏值、缺值、`validate`、notes、telemetry 往返 | **done** |
+| 默认值可读且与 design 一致 | `qrt --help` 打印 4 / 16384 / 4198 / auto / slru / 2048 / q4_0 / 16384 / 0 | PASS |
+| 失败路径可恢复 | 坏值 exit 2 且提示 `--help`，未分配、未打开任何设备或文件；telemetry 打不开同样 exit 2 | PASS |
+| telemetry 出口 | 13 列 CSV，每 pass 一行，行缓冲 + 每行 flush；关闭时句柄为 NULL，每 pass 只多一次分支 | PASS |
+| 构建与回归 | `cmake --build build-vulkan --target qrt`；ctest **34/34**（33 原有 + `qrt_selftest`） | PASS |
+
+- 扩展：`QRT_TELEMETRY_PATH` 只决定 sink 路径，不是 design 开关；默认 `qrt-telemetry.csv`，
+  测量跑数时指到 `bench/raw/`。
+- 实现位置：`runtime/qrt_config.*`、`runtime/qrt_telemetry.*`、`runtime/qrt_main.cpp`、
+  `runtime/CMakeLists.txt`；说明见 `runtime/README.md`。
+- 未做的部分按 design 5.1 顺序排给 M2-1 起：GGUF 索引、Vulkan 设备与预算、权重与专家缓存。
+

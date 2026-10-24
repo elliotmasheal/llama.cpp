@@ -75,7 +75,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M2-0 data=M5-1 io=- user=-
+queues: bench=- impl=M2-1 data=M5-1 io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -88,7 +88,9 @@ blockers: none
 - M0 完成：张量账、10K + 128 token 路由 trace、局部性与命中率（`RESULTS.md` 第 1-2、7 节）。
 - M0 完成。**M1 已条件通过（用户 2026-10-24 选 A）**：9 条判据 8 过，唯一缺口 code 的 CPU 0.059
   留作 M3-1a 的硬门（M3-6 卡它，不达走 U-2）。R0 / R1 完成，语料、词表、E、保真、显存预算都已收口。
-- **phase = M2（prefill）**。队列：bench 空（等运行时），impl M2-0，data M5-1，io 等 M5-1，user 空。
+- **phase = M2（prefill）**。队列：bench 空（等运行时），impl M2-1，data M5-1，io 等 M5-1，user 空。
+- **M2-0 完成（2026-10-24）**：`qrt` 脚手架解析 design 第 7 节全部 10 个开关（默认值可读、坏值 exit 2、
+  `--selftest` 14 项、ctest 34/34），telemetry CSV 出口已可用；见 `runtime/README.md`、`DECISIONS.md` 第 17 节。
 - M1 的判据与证据见 `state.json` 的 `decision_gate` 与 `DECISIONS.md` 第 16 节。
 - 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
   硬地板 130 / 1000 在用户重设前不变。
@@ -265,7 +267,8 @@ M3-2a miss_split）、M4 调优（M4-1..5）、M5 重组（M5-1..4）、
 - `test-backend-ops -o MUL_MAT_ID -b Vulkan1` = 939/939
 - `test-backend-ops -o MUL_MAT -b Vulkan1` = 2275/2275
 - `test-backend-ops -o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332
-- `ctest --test-dir build-vulkan` = 33/33（M1-3c 实测；2026-10-23 的 32/32 早于 992c2f57a）
+- `ctest --test-dir build-vulkan` = 34/34（M2-0 实测；33 原有 + `qrt_selftest`；M1-3c 时为 33/33，
+  2026-10-23 的 32/32 早于 992c2f57a）
 
 `runtime/` 里的内核不走 G-REG：它们的回归门是 X-4（对照 CPU 参考 + 逐 token）。从 fork 拷代码时，
 先在上面这套门禁上留一次源基线，之后只对拷进 runtime 的版本跑 X-4。

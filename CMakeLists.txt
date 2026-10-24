@@ -261,6 +261,13 @@ if (LLAMA_BUILD_QRT_PROTO)
     endif()
 endif()
 
+# qwen36 MoE runtime (design 5.1). ON by default: this is the fork's main line, and the
+# target links neither ggml nor llama. See runtime/README.md.
+option(LLAMA_BUILD_QRT "llama: build the qwen36 MoE runtime" ON)
+if (LLAMA_BUILD_QRT)
+    add_subdirectory(runtime)
+endif()
+
 #
 # install
 #

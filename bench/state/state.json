@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-0",
+      "head": "M2-1",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2 starts at M2-0 (scaffold + QRT_* CLI). M3-1a stays partial on code 0.059"
+      "note": "M2 starts at M2-1 (GGUF index). M2-0 scaffold is done; M3-1a stays partial on code 0.059"
     },
     {
       "lane": "data",
@@ -419,7 +419,8 @@
       "id": "M2-0",
       "milestone": "M2",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
+      "claimed_at": "2026-10-24T20:46:00",
       "title": "运行时脚手架：CMake target、QRT_* CLI、telemetry 出口",
       "deps": [
         "U-1",
