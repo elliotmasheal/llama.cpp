@@ -36,18 +36,23 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 256 专家 top-8）。硬件：RX 6700S 8 GiB（`-dev Vulkan1`）+ Ryzen 7 6800HS + 40172 MiB RAM，
 笔记本「平衡」电源 + AC 供电。
 
-统一工况：10K prompt，ctx 256K，greedy，单流。
+统一工况：10K prompt，greedy，单流；ctx 256K 的**驻留显存**不成立（`RESULTS.md` 第 10 节），
+口径由 U-3 裁决，裁决前目标工况只要求 10K 使用长度。
 
 | 指标 | 目标 | 口径 | 判定里程碑 |
 |---|---|---|---|
-| PP | >= 1000 tok/s | 10K prompt，ctx 256K，batch 512 | M2 |
+| PP | >= 1000 tok/s | 10K prompt，chunk 由 R0 的 roofline 曲线定 | M2 |
 | TG | >= 130 tok/s | 单流，greedy，10K prompt 之后 128 token | M3 |
 
-**硬约束（M0 实测，运行时绕不过）**
+**目标由硬件推算（用户 2026-10-24 定）**
 
-- 稠密权重每 token 必读 2.17 GB；显存带宽地板 217 GB/s -> 单步前向上限 **100 tok/s**。
-  突破唯一出路是一次前向处理多个 token（MTP 草稿 + k=8 批量验证）。
-- H2D 14.3 GB/s 是硬墙；CPU 4 线程读 40 GB/s；SSD 随机读 0.81 GB/s。
+- 每轮报告两个数：硬地板（130 / 1000）与 **0.85 x 绑定腿 roofline**；后者由 R0 的模型给出，
+  差距分解成具体的优化项，不许用"当前实现就这样"当结论。
+- 硬件极限（不可越）：GDDR6 224 GB/s（128-bit x 14 Gbps）、PCIe 4.0 x8 15.75 GB/s、
+  DDR5-4800 双通道 76.8 GB/s、RDNA2 FP32 7.9 TFLOPS、8176 MiB 显存、SSD 随机读 0.81 GB/s。
+- 当前软件读数（**优化目标，不是约束**）：显存读 156.5 GB/s（70%）、CPU 4 线程读 39-41（52%）、
+  CPU 每专家 0.123-0.137 ms（26-39%）、H2D 并发掉 27%（10.4）。R1 负责逐条逼近硬件上限。
+- 运行时不走 fork：fork 只作参考（greedy 基准、接受率口径、硬件探针），内核拷进 `runtime/kernels`。
 - 不改变量化格式；不改变输出：k=1 路径 logits KLD <= 1e-4，推测路径接受的 token 与参考 greedy 一致。
 - 非目标：其他模型 / 量化 / 后端、多用户服务化（design 1.2）。
 
@@ -57,7 +62,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M1
 phase_status: in_progress
 decision_gate: M1 open
-queues: bench=- impl=M1-4a data=M1-2a io=- user=U-1
+queues: bench=R1 impl=M1-4a data=R0 io=- user=U-3
 last_gate: G-REG unknown (2026-10-23 record, not re-run since 44bd79305)
 blockers: none
 <!-- STATE:END -->
@@ -67,11 +72,13 @@ blockers: none
 
 **现状摘要（人读，不参与机器校验）**
 
-- M0 完成：张量账、10K + 128 token 路由 trace、局部性与命中率模拟（`RESULTS.md` 第 1-2 节）。
-- M1 进行中：bench 队首是 trace 缺口，data 队首是 KV 预算，impl 队首是 Vulkan 计时原型。
-- M1 是**决策门**：受限词表 E 或周期时间不达标就停下问用户是否下调 TG 目标（design 第 9 节）。
-- 已定：完整词表草稿是基线（理论约 125，低于 130）；受限词表是达标手段，其 E 未测。
-- U-1（运行时归属）必须在 M2 开工前由用户回答；M1 不受它阻塞。
+- M0 完成：张量账、10K + 128 token 路由 trace、局部性与命中率（`RESULTS.md` 第 1-2、7 节）。
+- M1 进行中：M1-1 / M1-5 / M1-6 / M1-7 已完成；bench 队首 R1（腿级 roofline 探针），
+  data 队首 R0（roofline 模型），impl 队首 M1-4a（Vulkan 原型），剩 M1-2b / M1-3b / M1-4b。
+- M1 是**决策门**：判据见 `state.json` 的 `decision_gate.criteria`，E 门槛用公式而不是常数。
+- 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
+  硬地板 130 / 1000 在用户重设前不变。
+- 未决：U-3（256K KV 与 8 GiB 互斥，三选一），M2 开工前必须有答案；U-1 已闭环。
 
 ## 3. 每轮自主循环
 
@@ -80,7 +87,7 @@ blockers: none
 0. **preflight**（任一不过就停，不跑数）
    - `python bench/tools/state_check.py` 退出码 0
    - `git status --short` 只剩本轮预期改动；不带着上一轮的半成品开跑
-   - 自己 lane 的队列头没有被别人领走（`state.json` 里该任务不是 doing）
+   - 自己 lane 的队列头没有被别人领走（`state.json` 里该任务不是 doing，或 doing 但 `claimed_at` 在 4 小时内）
    - 没有别人的 quiet 锁（`state_check.py` 的 `quiet` 行是 `free`，或是本轮自己的）
    - 机器条件：平衡电源 + AC、dGPU 上无其它推理进程、空闲 RAM 满足当前臂
 1. **领任务**：取自己 lane 的队首，按第 4 节第 5 条的领用协议改状态；不许跨 lane 抢任务。
@@ -168,21 +175,27 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 | id | lane | 内容 | 验收要点 |
 |---|---|---|---|
 | M1-1 | bench | 补齐 10 个 full-attention 层与 layer 39 的解码路由 | 40 层 x 128 token 都有记录；根因进 DECISIONS |
-| M1-2a | data | 非技术语料：对话 / 代码 / 多语言各 10K | token 实测并写进 RESULTS |
+| M1-2a | data | 非技术语料：对话 / 代码 / 多语言各 10K | token 实测并写进 RESULTS；报唯一 token 比例 |
 | M1-2b | bench | 三类文本局部性复测（技术类已完成） | 与 M0 偏差 <= 5 pp 或已解释 |
-| M1-3a | data | 受限草稿词表（16K）与生成脚本 | 覆盖验证集 >= 95% |
-| M1-3b | bench | 受限词表 MTP 接受率 E | E >= 2.1 / 2.3，tokens 与 greedy 一致 |
-| M1-4a | impl | Vulkan 计时原型（k=1/2/4/8） | 每 pass 的 submit/sync 时间可测 |
-| M1-4b | bench | 周期时间测量 | 与 design 2.6 偏差 <= 10%，开销 < 1 ms |
+| M1-3a | data | 受限草稿词表（16K）与生成脚本 | 覆盖生成 token 流 >= 95% |
+| M1-3c | impl | draft-mtp 受限候选集（16K，默认关闭） | 空集/坏文件回退完整词表并告警，不 abort |
+| M1-3b | bench | 受限词表 MTP 接受率 E | E >= TG_min x 周期（2026-10-24 为 2.72 / 2.85），token 与 greedy 一致 |
+| M1-4a | impl | Vulkan 原型（k=1/2/4/5/8） | 每 pass 的 submit/sync 与计算缓冲可测 |
+| M1-4b | bench | GPU 腿与每 pass 开销 | 与 roofline 偏差 <= 10%，submit+sync < 1 ms，报缓冲 MiB |
 | M1-5 | bench | 带宽同口径复测 | 偏差 <= 5% 或更新 RESULTS |
-| M1-6 | data | full-attention 层数与 256K KV 预算 | 层数、每 token 字节、显存占比 |
-| M1-GATE | user | 决策门评审 | 三条全过才进 M2，否则走 U-2 |
+| M1-6 | data | full-attention 层数与 256K KV 预算 | 10 主层 + 1 nextn，20-22 KiB/token，超预算 1335 MiB |
+| M1-7 | bench | H2D 与 CPU 读并发 + 每专家代价 | 聚合 33.5-41.0 GB/s，0.123-0.137 ms/专家 |
+| R0 | data | roofline 模型与目标推导 | TG_max / PP_max 曲线，0.85 x roofline 的目标值 |
+| R1 | bench | 腿级 roofline 探针 | 显存读 >= 190、CPU <= 0.08、int8 >= 6 TFLOPS、并发 H2D >= 12.5 |
+| M1-GATE | user | 决策门评审 | `decision_gate.criteria` 全过才进 M2 |
 
-**决策门 M1 的通过条件**（design 第 9 节）：M1-1/3b/4b 全过，M1-2b 偏差 <= 5 pp，M1-5 与 M1-6 已回填。
-任一项不过：`phase_status=blocked`，问用户是否下调 TG 目标，不许自行改阈值。
+**决策门 M1 的通过条件**（以 `state.json` 的 `decision_gate.criteria` 为准）：
+E 用公式、GPU 腿对 roofline、两腿并发重算、显存预算收敛、局部性 <= 5 pp。
+任一项不过：`phase_status=blocked`，走 U-2（改 TG）或 U-3（改 ctx/KV），不许自行改阈值。
 
 **门后**：M2 prefill（M2-0..8）、M3 decode（M3-0..6）、M4 调优（M4-1..5）、M5 重组（M5-1..4）、
-横切工具（X-1 质量门、X-2 汇总器）。它们已登记 deps 与路径，未过门前只允许写工具与微基准。
+横切工具（X-1 质量门、X-2 汇总器、X-4 runtime 内核回归）。它们已登记 deps 与路径，
+未过门前只允许写工具与微基准。
 
 ## 6. 门禁
 
@@ -190,7 +203,7 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 |---|---|---|---|---|
 | **G-CONS** | 每轮 | `python bench/tools/state_check.py`；`git diff` 自查 ASCII 与注释规范 | 退出码 0，diff 只含本轮改动 | 不提交 |
 | **G-EVID** | 每轮有读数 | `bench/tools/` 里的统一脚本 | 必报列齐全，`status = ok`，r >= 2，口径头齐全 | 该批作废，重建口径后重跑 |
-| **G-REG** | 改 fork 或复用其中的 ggml 内核 | 见下方六条 | 全部 100% 通过 | 回退改动，记未结项 |
+| **G-REG** | 改 fork 源代码（vendoring 或修 fork 工具） | 见下方六条 | 全部 100% 通过 | 回退改动，记未结项 |
 | **G-QUAL** | 改数值路径、精度、注意力实现 | 逐 token 对比参考实现；k=1 路径另测 logits KLD | token 全同且 KLD <= 1e-4（工具由 X-1 交付） | 不许合入 |
 | **G-DEC** | 里程碑 | design 第 8/9 节 | 阈值全过且证据可复核 | 停，问用户 |
 
@@ -202,6 +215,9 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 - `test-backend-ops -o MUL_MAT -b Vulkan1` = 2275/2275
 - `test-backend-ops -o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332
 - `ctest --test-dir build-vulkan` = 32/32
+
+`runtime/` 里的内核不走 G-REG：它们的回归门是 X-4（对照 CPU 参考 + 逐 token）。从 fork 拷代码时，
+先在上面这套门禁上留一次源基线，之后只对拷进 runtime 的版本跑 X-4。
 
 **门禁纪律**
 

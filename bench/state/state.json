@@ -9,11 +9,19 @@
     "open": true,
     "result": null,
     "criteria": [
-      "restricted-vocab E >= 2.1 at default draft depth, or >= 2.3 at n-max 4",
-      "Vulkan prototype cycle time within 10% of design section 2.6",
-      "locality within 5 pp of M0 on a non-technical prompt"
+      "E >= TG_min x measured cycle at the selected k (2.72 at k=4, 2.85 at k=5 for the 2026-10-24 cycle; recompute after R1 instead of hard-coding)",
+      "per-pass submit+sync < 1 ms, and the GPU leg within 10% of the roofline model at k=1/2/4/5/8",
+      "locality within 5 pp of M0 on non-technical text",
+      "two miss legs measured and the cycle recomputed with an adaptive split (RESULTS section 9)",
+      "VRAM budget closes at some (ctx, cache) point, or U-3 selects the fallback (RESULTS section 10)"
     ],
-    "on_fail": "stop and ask the user whether to lower the TG target (design section 9)"
+    "on_fail": "stop and ask the user: lower the TG target, change the ctx cost, or page the KV (design section 9)"
+  },
+  "targets": {
+    "tg_min": 130,
+    "pp_min": 1000,
+    "rule": "130/1000 are hard floors until the user re-sets them; the design target is 0.85 x the roofline at the binding leg, reported every round by R0",
+    "roofline_fraction": 0.85
   },
   "resources": {
     "gpu": {
@@ -75,37 +83,37 @@
   "queues": [
     {
       "lane": "bench",
-      "head": null,
+      "head": "R1",
       "order": [
-        "M1-1",
-        "M1-7",
-        "M1-5",
+        "R1",
+        "M1-4b",
         "M1-3b",
-        "M1-2b",
-        "M1-4b"
+        "M1-2b"
       ],
-      "note": "M1-3b/M1-2b/M1-4b wait for their inputs; M1-5 is short and can go first if the GPU is busy"
+      "note": "R1 probes each leg against its hardware ceiling; M1-4b/M1-3b/M1-2b follow once impl/data deliver their inputs"
     },
     {
       "lane": "impl",
       "head": "M1-4a",
       "order": [
         "M1-4a",
+        "M1-3c",
         "X-1",
-        "X-2"
+        "X-2",
+        "X-4"
       ],
-      "note": "M2-* and M3-* implementations stay unassigned until gate M1 passes and U-1 is answered"
+      "note": "M2-* and M3-* stay unassigned until gate M1 passes and U-3 is answered"
     },
     {
       "lane": "data",
-      "head": "M1-2a",
+      "head": "R0",
       "order": [
-        "M1-6",
+        "R0",
         "M1-2a",
         "M1-3a",
         "M5-1"
       ],
-      "note": "M1-6 is quick and unblocks the KV budget; M5-1 unblocks the io lane"
+      "note": "R0 turns the measured legs into the roofline model; M5-1 unblocks the io lane"
     },
     {
       "lane": "io",
@@ -118,14 +126,13 @@
     },
     {
       "lane": "user",
-      "head": "U-1",
+      "head": "U-3",
       "order": [
-        "U-1",
         "U-3",
         "M1-GATE",
         "U-2"
       ],
-      "note": "U-1 blocks every M2 implementation task"
+      "note": "U-3 (KV/ctx) blocks every M2 implementation task; U-1 is closed"
     }
   ],
   "tasks": [
@@ -202,37 +209,43 @@
       "status": "todo",
       "title": "受限词表 MTP 接受率 E",
       "deps": [
-        "M1-3a"
+        "M1-3a",
+        "M1-3c"
       ],
       "resources": [
         "host-ram",
-        "machine-quiet"
+        "machine-quiet",
+        "gpu"
       ],
       "paths": [
-        "bench/raw/m0-qwen36/mtp-*.out"
+        "bench/raw/m0-qwen36/mtp-*.out",
+        "bench/tools/mtp_accept.py"
       ],
-      "done_when": "默认深度与 n-max 4 各一份；E >= 2.1 / 2.3 且接受的 token 与完整词表 greedy 一致"
+      "done_when": "默认深度与 n-max 4 各一份；E >= TG_min x 周期（2026-10-24 周期下 2.72 / 2.85，R1 后重算）且接受的 token 与完整词表 greedy 一致；同时报 16K 候选集覆盖率"
     },
     {
       "id": "M1-4a",
       "milestone": "M1",
       "lane": "impl",
       "status": "todo",
-      "title": "Vulkan 原型：k=1/2/4/8 的预录命令缓冲与计时壳",
+      "title": "Vulkan 原型：k=1/2/4/5/8 的预录命令缓冲与计时壳",
       "deps": [],
-      "resources": [],
+      "resources": [
+        "gpu",
+        "machine-quiet"
+      ],
       "paths": [
         "runtime/proto/**",
         "CMakeLists.txt"
       ],
-      "done_when": "能对每层稠密 + 专家读取跑一个 pass（真实权重或等价字节量），输出每 pass 的 submit/sync 时间；不预设运行时归属"
+      "done_when": "能对每层稠密 + 专家读取跑一个 pass（真实 Q4_K 布局或等价字节量），输出 k=1/2/4/5/8 的 submit/sync 时间与计算缓冲 MiB；不预设运行时归属"
     },
     {
       "id": "M1-4b",
       "milestone": "M1",
       "lane": "bench",
       "status": "todo",
-      "title": "周期时间测量（k=1/2/4/8，含提交与同步）",
+      "title": "周期时间测量（k=1/2/4/5/8，含提交与同步）",
       "deps": [
         "M1-4a"
       ],
@@ -240,8 +253,10 @@
         "gpu",
         "machine-quiet"
       ],
-      "paths": [],
-      "done_when": "与 design 2.6 的偏差 <= 10%，每 pass 开销 < 1 ms；r=2 并写进 RESULTS"
+      "paths": [
+        "bench/raw/m1-4b/**"
+      ],
+      "done_when": "k=1/2/4/5/8 的 GPU 腿与 roofline 模型偏差 <= 10%（2.17 GB 稠密 + 命中专家字节），每 pass submit+sync < 1 ms；报计算缓冲 MiB 供 5.5 预算；r=2 并写进 RESULTS"
     },
     {
       "id": "M1-5",
@@ -285,17 +300,19 @@
         "M1-3b",
         "M1-4b",
         "M1-5",
-        "M1-6"
+        "M1-6",
+        "M1-7",
+        "R1"
       ],
       "resources": [],
       "paths": [],
-      "done_when": "design 第 9 节的三条全过则 phase=M2；否则置 blocked 并走 U-2"
+      "done_when": "state.json 的 decision_gate.criteria 全过则 phase=M2；任一不过置 blocked 并走 U-2/U-3，不许自行改阈值"
     },
     {
       "id": "U-1",
       "milestone": "M1",
       "lane": "user",
-      "status": "todo",
+      "status": "done",
       "title": "用户决定运行时归属：独立运行时还是 fork 内改造（N7）",
       "deps": [],
       "resources": [],
@@ -333,7 +350,11 @@
       "status": "todo",
       "title": "新模型质量门工具：参考 logits + KLD + 逐 token 对比",
       "deps": [],
-      "resources": [],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
       "paths": [
         "bench/tools/quality/**"
       ],
@@ -408,7 +429,8 @@
       "deps": [
         "M2-1",
         "M2-2",
-        "M5-1"
+        "M5-1",
+        "M5-2"
       ],
       "resources": [],
       "paths": [
@@ -427,10 +449,9 @@
       ],
       "resources": [],
       "paths": [
-        "ggml/src/ggml-vulkan/**",
         "runtime/kernels/**"
       ],
-      "done_when": "微基准给出 TFLOPS 与对照 FP32 的倍数；不达 design 4.5 的量级则先回 design 重估"
+      "done_when": "微基准给出 TFLOPS 与对照 FP32 的倍数，且满足 R0 的 PP 曲线要求（选定 chunk 下 >= 6 TFLOPS 有效）；不达标先回 design 重估"
     },
     {
       "id": "M2-5",
@@ -530,10 +551,10 @@
       ],
       "resources": [],
       "paths": [
-        "ggml/src/ggml-vulkan/**",
+        "runtime/kernels/**",
         "runtime/moe.*"
       ],
-      "done_when": "k=1/2/4/8 的 top-8 路由与并集专家计算正确；与 k=1 串行结果一致"
+      "done_when": "k=1/2/4/5/8 的 top-8 路由与并集专家计算正确；与 k=1 串行结果一致"
     },
     {
       "id": "M3-2",
@@ -666,7 +687,7 @@
       "milestone": "M4",
       "lane": "bench",
       "status": "todo",
-      "title": "k=1/2/4/8 扫描",
+      "title": "k=1/2/4/5/8 扫描",
       "deps": [
         "M3-6"
       ],
@@ -799,6 +820,77 @@
         "bench/tools/membw_probe.py"
       ],
       "done_when": "H2D 与 4/8 线程 CPU 读同时运行时各自与合计 GB/s 有 r=2 读数；每专家 CPU 代价（ms/专家）在 4/8 线程各测一次；据此判定各半分担投影（RESULTS 第 8 节 133-148）是否成立"
+    },
+    {
+      "id": "M1-3c",
+      "milestone": "M1",
+      "lane": "impl",
+      "status": "todo",
+      "title": "draft-mtp 受限候选集（16K）与接受率口径",
+      "deps": [
+        "M1-3a"
+      ],
+      "resources": [
+        "machine-quiet"
+      ],
+      "paths": [
+        "common/speculative.cpp",
+        "common/speculative.h",
+        "common/arg.cpp"
+      ],
+      "done_when": "--spec-draft-vocab-file 读 16K 候选集并只在该集合内草稿（默认关闭）；空集或坏文件回退完整词表并告警，不 abort；M1-3b 用它测 E"
+    },
+    {
+      "id": "R0",
+      "milestone": "M1",
+      "lane": "data",
+      "status": "todo",
+      "title": "roofline 模型：每条腿的硬件上限与目标推导",
+      "deps": [
+        "M1-6"
+      ],
+      "resources": [],
+      "paths": [
+        "bench/tools/roofline.py"
+      ],
+      "done_when": "给出每条腿的硬件上限/实测/差距性质（硬件极限 vs 当前软件）、TG_max(cache,k,E) 与 PP_max(chunk,TFLOPS) 曲线、0.85 x roofline 的目标值，写进 RESULTS；此后门禁阈值引用它，不再写常数"
+    },
+    {
+      "id": "R1",
+      "milestone": "M1",
+      "lane": "bench",
+      "status": "todo",
+      "title": "腿级 roofline 探针：调优显存读、CPU 专家核、int8 GEMM、并发 H2D",
+      "deps": [],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/tools/vkgate.cpp",
+        "bench/tools/membw_probe.py",
+        "bench/raw/roofline/**"
+      ],
+      "done_when": "显存读 >= 190 GB/s、CPU 专家 <= 0.08 ms/专家（4 线程）、int8 GEMM >= 6 TFLOPS 有效、并发 H2D >= 12.5 GB/s；每项 r=2 并写进 RESULTS；达不到就报差距与原因，不改成目标"
+    },
+    {
+      "id": "X-4",
+      "milestone": "cross",
+      "lane": "impl",
+      "status": "todo",
+      "title": "runtime 内核回归：对照 CPU 参考 + 逐 token",
+      "deps": [
+        "M2-0"
+      ],
+      "resources": [
+        "gpu",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/tests/**"
+      ],
+      "done_when": "一条命令对 runtime/kernels 的每个 kernel 与 CPU 参考比对（误差阈值写进代码），并跑 k=1 逐 token；失败返回非 0"
     }
   ],
   "last_gate": {
@@ -809,13 +901,6 @@
   },
   "blockers": [],
   "escalations": [
-    {
-      "id": "U-1",
-      "question": "build the runtime outside ggml/llama.cpp (design as written) or refactor inside the fork",
-      "needs_by": "M2-0",
-      "owner": "user",
-      "note": "M1 is measurement only, so this does not block M1; choosing the fork requires rewriting design 3.3"
-    },
     {
       "id": "U-3",
       "question": "256K KV needs 5120-5632 MiB of the 7176 MiB usable VRAM, which is incompatible with any expert cache: reduce ctx, page KV to host, or quantize KV",

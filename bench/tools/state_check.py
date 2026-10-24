@@ -17,6 +17,7 @@ import json
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -122,6 +123,19 @@ def validate(st):
                 errors.append("task %s is %s but deps are open: %s" % (tid, t["status"], ", ".join(open_deps)))
 
     doing = [t for t in st["tasks"] if t.get("status") == "doing"]
+    now = time.time()
+    for t in doing:
+        ts = t.get("claimed_at")
+        if not ts:
+            errors.append("task %s is doing but has no claimed_at" % t["id"])
+            continue
+        try:
+            age_h = (now - datetime.fromisoformat(ts).timestamp()) / 3600.0
+        except ValueError:
+            errors.append("task %s has a bad claimed_at: %r" % (t["id"], ts))
+            continue
+        if age_h > 4:
+            errors.append("task %s has been doing for %.1f h; re-claim or release it" % (t["id"], age_h))
     holders = {}
     for t in doing:
         for rid in t.get("resources", []):
@@ -142,8 +156,11 @@ def validate(st):
             errors.append("quiet lock %s is stale (%.0f min); remove it if the holder died" % (quiet[0].name, age_min))
     for i, a in enumerate(doing):
         for b in doing[i + 1:]:
-            if a["lane"] == b["lane"] == "bench" and a.get("resources") == b.get("resources"):
-                errors.append("two bench tasks are running: %s and %s" % (a["id"], b["id"]))
+            if a["lane"] == b["lane"] == "bench":
+                shared = set(a.get("resources", [])) & set(b.get("resources", []))
+                if shared:
+                    errors.append("two bench tasks share %s: %s and %s"
+                                  % (", ".join(sorted(shared)), a["id"], b["id"]))
             for pa in a.get("paths", []):
                 for pb in b.get("paths", []):
                     if paths_overlap(pa, pb):
