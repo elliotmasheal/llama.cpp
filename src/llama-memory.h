@@ -69,6 +69,18 @@ struct llama_memory_context_i {
     virtual bool get_kv_page(int32_t /* il */, struct ggml_tensor ** /* k_table */, struct ggml_tensor ** /* v_table */, int32_t * /* block_size */) const {
         return false;
     }
+
+    // paged K/V: append the copies of cells [0, n_kv) into one contiguous pair and return views of it,
+    // so the long-span matmul attention reads dense rows; false when contiguous or the workspace does not fit
+    virtual bool get_kv_page_dense(
+            struct ggml_context * /* ctx */,
+            struct ggml_cgraph  * /* gf */,
+            int32_t               /* il */,
+            uint32_t              /* n_kv */,
+            struct ggml_tensor ** /* k */,
+            struct ggml_tensor ** /* v */) const {
+        return false;
+    }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

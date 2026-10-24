@@ -283,6 +283,7 @@ llama_context::llama_context(
     cparams.kv_page                 = params.kv_page;
     cparams.kv_block                = params.kv_block 
         ? params.kv_block : 2048;
+    cparams.kv_gather_mib           = params.kv_gather_mib;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -4198,6 +4199,7 @@ llama_context_params llama_context_default_params() {
         /*.fa_chunk_mib                =*/ 256,
         /*.kv_page                     =*/ false,
         /*.kv_block                    =*/ 2048,
+        /*.kv_gather_mib               =*/ 256,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,

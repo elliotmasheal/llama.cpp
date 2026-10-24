@@ -14421,6 +14421,16 @@ bool ggml_vk_can_fuse_rope_set_rows(ggml_backend_vk_context * ctx, const struct 
         return false;
     }
 
+    // paged K/V: the epilogue writes straight into the destination, which for a paged cache is the
+    // address-free anchor instead of the block that the table names (bench/THREE-TIER.md F11)
+    {
+        ggml_tensor * page_tab = nullptr;
+        int32_t       page_bs  = 0;
+        if (ggml_set_rows_get_paged(set_rows, &page_tab, &page_bs)) {
+            return false;
+        }
+    }
+
     if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16) {
         return false;
     }
@@ -14454,6 +14464,15 @@ bool ggml_vk_can_fuse_rms_norm_set_rows(ggml_backend_vk_context * ctx, const str
     const ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * view = cgraph->nodes[node_idx + 1];
     const ggml_tensor * set_rows = cgraph->nodes[node_idx + 2];
+
+    // paged K/V: the fused epilogue cannot resolve the block table, see ggml_vk_can_fuse_rope_set_rows
+    {
+        ggml_tensor * page_tab = nullptr;
+        int32_t       page_bs  = 0;
+        if (ggml_set_rows_get_paged(set_rows, &page_tab, &page_bs)) {
+            return false;
+        }
+    }
 
     // The RMS kernel reads F32 and writes directly to the F32 or F16 SET_ROWS destination.
     if (rms->src[0]->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 ||

@@ -958,6 +958,10 @@ static bool common_moe_plan_impl(
     const int64_t fa_score = cparams_plan.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ? 0 :
         llama_fa_long_kv_reserve_bytes(meas.n_head, meas.n_ubatch, meas.n_ctx, cparams_plan.fa_chunk_mib);
     surplus -= fa_score;
+
+    // the paged prefill gather keeps one dense K/V workspace in device memory (bench/THREE-TIER.md F11)
+    const int64_t kv_gather = cparams_plan.kv_page ? llama_kv_gather_reserve_bytes(cparams_plan.kv_gather_mib) : 0;
+    surplus -= kv_gather;
     for (const int64_t b : geo.expert_bytes) {
         expert_total += b;
         layer_bytes   = std::max(layer_bytes, b);
@@ -1012,6 +1016,10 @@ static bool common_moe_plan_impl(
     if (fa_score > 0) {
         LOG_INF("%s: long cross-chunk prefill keeps %.1f MiB of the surplus for its score buffer (n_head %d, ubatch %u)\n",
                 __func__, (double) fa_score/MiB, meas.n_head, meas.n_ubatch);
+    }
+    if (kv_gather > 0) {
+        LOG_INF("%s: paged prefill gather keeps %.1f MiB of the surplus for its dense K/V workspace\n",
+                __func__, (double) kv_gather/MiB);
     }
 
     if (bank > 0) {

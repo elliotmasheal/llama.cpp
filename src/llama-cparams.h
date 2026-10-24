@@ -41,6 +41,7 @@ struct llama_cparams {
     int32_t fa_chunk_mib;     // cap on the score buffer of the long prefill attention path, 0 = no chunking
     bool kv_page;             // paged K/V: fixed-size blocks + a table of block addresses
     uint32_t kv_block;        // cells per block in paged mode
+    int32_t kv_gather_mib;    // cap on the dense workspace of the paged prefill gather, MiB, 0 = off
     bool flash_attn;
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)

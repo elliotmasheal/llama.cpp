@@ -587,6 +587,7 @@ struct common_params {
     int32_t fa_chunk_mib   = 256;   // cap on the long prefill attention score buffer, 0 = one buffer for the whole span
     bool    kv_page        = false; // paged K/V: fixed-size blocks + a table of block addresses
     int32_t kv_block       = 2048;  // cells per block in paged K/V
+    int32_t kv_gather_mib  = 256;   // cap on the dense workspace of the paged prefill gather, 0 = off
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

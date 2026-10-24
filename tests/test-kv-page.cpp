@@ -172,8 +172,9 @@ int main(int argc, char ** argv) {
     // the scheduler then only allocates the op results and the intermediates
     ggml_context * ctx_in = ggml_init(ip);
 
-    ggml_tensor * k_anchor = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F16, DK, NC);
-    ggml_tensor * v_anchor = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F16, DV, NC);
+    // 3D like the production anchors: [n_embd, cells, n_stream]
+    ggml_tensor * k_anchor = ggml_new_tensor_3d(ctx_in, GGML_TYPE_F16, DK, NC, 1);
+    ggml_tensor * v_anchor = ggml_new_tensor_3d(ctx_in, GGML_TYPE_F16, DV, NC, 1);
     ggml_tensor * k_contig = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F16, DK, NC);
     ggml_tensor * v_contig = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F16, DV, NC);
     ggml_tensor * q        = ggml_new_tensor_3d(ctx_in, GGML_TYPE_F32, HSK, NQ, NH);
@@ -331,6 +332,83 @@ int main(int argc, char ** argv) {
         rc |= compare("flash_attn_ext (contiguous) vs host reference", ref, want);
         ggml_free(ctx);
         ggml_backend_sched_reset(sched);
+    }
+
+    // --- dense gather used by the long-span prefill path (bench/THREE-TIER.md F11) ---
+    // the production path copies each block into one workspace and then reads it as a contiguous cache,
+    // so the workspace must be byte-identical to a contiguous cache and the unused tail must stay zero
+    {
+        ggml_context * ctx_ws = ggml_init(ip);
+
+        ggml_tensor * k_ws = ggml_new_tensor_2d(ctx_ws, GGML_TYPE_F16, DK, NC);
+        ggml_tensor * v_ws = ggml_new_tensor_2d(ctx_ws, GGML_TYPE_F16, DV, NC);
+        if (!ggml_backend_alloc_ctx_tensors(ctx_ws, backend)) {
+            std::printf("cannot allocate the gather workspace\n");
+            return 1;
+        }
+        ggml_backend_buffer_clear(k_ws->buffer, 0);
+
+        ggml_context * ctx = ggml_init(ip);
+
+        const int NGV = NC - 5;   // not a multiple of BS, so the last block is truncated
+        const int nbl = (NGV + BS - 1)/BS;
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        for (int b = 0; b < nbl; ++b) {
+            const int     cell = b*BS;
+            const int64_t n    = std::min(BS, NGV - cell);
+
+            ggml_tensor * sk = k_blk[phys_block(b)];
+            ggml_tensor * sv = v_blk[phys_block(b)];
+
+            ggml_tensor * dk = ggml_view_2d(ctx, k_ws, DK, n, k_ws->nb[1], (size_t) cell*k_ws->nb[1]);
+            ggml_tensor * dv = ggml_view_2d(ctx, v_ws, DV, n, v_ws->nb[1], (size_t) cell*v_ws->nb[1]);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_view_2d(ctx, sk, DK, n, sk->nb[1], 0), dk));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_view_2d(ctx, sv, DV, n, sv->nb[1], 0), dv));
+        }
+
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            std::printf("cannot allocate the gather graph\n");
+            return 1;
+        }
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+            std::printf("gather compute failed\n");
+            return 1;
+        }
+
+        std::vector<uint16_t> got((size_t) DK*NC);
+        std::vector<uint16_t> want((size_t) DK*NC);
+        ggml_backend_tensor_get(k_ws, got.data(), 0, got.size()*sizeof(uint16_t));
+        ggml_backend_tensor_get(k_contig, want.data(), 0, want.size()*sizeof(uint16_t));
+
+        int kbad = 0;
+        for (size_t i = 0; i < (size_t) DK*NGV; ++i) {
+            kbad += got[i] != want[i];
+        }
+        int knonzero = 0;
+        for (size_t i = (size_t) DK*NGV; i < got.size(); ++i) {
+            knonzero += got[i] != 0;
+        }
+        std::printf("gather K: %d/%d halves differ, tail non-zero = %d  %s\n",
+                kbad, DK*NGV, knonzero, kbad == 0 && knonzero == 0 ? "ok" : "FAIL");
+        rc |= kbad == 0 && knonzero == 0 ? 0 : 1;
+
+        got.assign((size_t) DV*NC, 0);
+        want.assign((size_t) DV*NC, 0);
+        ggml_backend_tensor_get(v_ws, got.data(), 0, got.size()*sizeof(uint16_t));
+        ggml_backend_tensor_get(v_contig, want.data(), 0, want.size()*sizeof(uint16_t));
+
+        int vbad = 0;
+        for (size_t i = 0; i < (size_t) DV*NGV; ++i) {
+            vbad += got[i] != want[i];
+        }
+        std::printf("gather V: %d/%d halves differ  %s\n", vbad, DV*NGV, vbad == 0 ? "ok" : "FAIL");
+        rc |= vbad == 0 ? 0 : 1;
+
+        ggml_free(ctx);
+        ggml_backend_sched_reset(sched);
+        ggml_free(ctx_ws);
     }
 
     // --- SET_ROWS through the table ---

@@ -32,7 +32,8 @@ llama_memory_hybrid::llama_memory_hybrid(
     const layer_filter_cb & filter_recr,
                  uint32_t   kv_size_init,
                      bool   kv_page,
-                 uint32_t   kv_block) :
+                 uint32_t   kv_block,
+                   int32_t   kv_gather_mib) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -56,7 +57,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         "",
         kv_size_init,
         kv_page,
-        kv_block
+        kv_block,
+        kv_gather_mib
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -291,6 +293,12 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
 bool llama_memory_hybrid_context::get_kv_page(int32_t il, ggml_tensor ** k_table, ggml_tensor ** v_table, int32_t * block_size) const {
     const auto * attn = get_attn();
     return attn && attn->get_kv_page(il, k_table, v_table, block_size);
+}
+
+bool llama_memory_hybrid_context::get_kv_page_dense(ggml_context * ctx, ggml_cgraph * gf, int32_t il, uint32_t n_kv,
+        ggml_tensor ** k, ggml_tensor ** v) const {
+    const auto * attn = get_attn();
+    return attn && attn->get_kv_page_dense(ctx, gf, il, n_kv, k, v);
 }
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {

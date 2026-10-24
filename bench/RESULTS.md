@@ -568,12 +568,62 @@ vkpage.exe info | table | bench 131072 20 256
    分页模式下所有跨度都留在注意力内核上。代价是 `-fac 256` 带来的 PP 680 用不上（同一档 `-fac 0` 是 458，
    `RESULTS.md` 0.4）。三条候选：(a) 接受回退；(b) 每层每 ubatch 一次 gather（`THREE-TIER.md` F11）；
    (c) 只在 KV 装不下显存时才启用分页。
-   **2026-10-24 决定取 (c)**：分页退化为容量档，全驻显存时保持连续布局、保住 PP 680；
-   F11 的 gather 设计保留但暂不实现，只有将来实测证明容量档也需要 PP 时才启用。
-   落地方式（待做）：`--kv-page auto` 由 `common/fit.cpp` 的预算判决——初始 KV（`kv_size_init`）
-   装得进设备 surplus 就关，装不进就开。
+   **2026-10-24 决定取 (b)**（用户确认），当天已落地并验收（`RESULTS.md` 6.4）：
+   gather 让分页 prefill 的 PP 从 449 回到 530，略高于连续布局的 510。
+   当天早些时候曾记过"取 (c)、gather 暂不实现"，那条作废；(c) 只剩**默认模式选择**的含义——
+   `--kv-page auto` 由 `common/fit.cpp` 的预算判决（初始 KV 装得进设备 surplus 就保持连续布局），
+   **这个 auto 还没实现**，不影响已落地的 gather。
 2. **`SET_ROWS` 的分页变体需要一个独立的 SPIR-V 变体**（`PAGED` 是编译期宏，不是 spec constant），
    并把块表绑到 binding 2、虚拟 dst 步长走 push constant（`param3` 放 `PageBS`）。已落地（见上）。
+
+### 6.4 F11 L0 + L1：分页内存路径打开 + prefill gather（2026-10-24，工作区，未做目标口径矩阵）
+
+本次只验正确性，**没有 256K + 10K 三档矩阵读数**（下面最后一行的 PP 是 bank 0 口径，不能当性能结论）。
+
+三个在实现中发现的事实，按重要性：
+
+1. **分页 `SET_ROWS` 一直被 ROPE/RMS_NORM 的融合旁路**（`ggml-vulkan.cpp:14940` 的 `ROPE_VIEW_SET_ROWS`、
+   `:14902` 的 `RMS_NORM_VIEW_SET_ROWS`）。融合把 rope 的输出直接写进 SET_ROWS 的 dst，也就是分页模式下的
+   256 B 锚，块表根本没被使用：块永远是 0（实测 block0 的 131072 个 half 全 0），注意力读到全 0 的 K/V。
+   `-c 512` 的输出因此与 `off` 不同，而 `-c 8192` 直接 `vk::DeviceLostError`（往 256 B 的锚里写 128 KB+）。
+   **这就是 `RESULTS.md` 6.3 里"SET_ROWS 修好了但输出仍然不同"的真正原因**：6.3 的 SET_ROWS 修复是对的，
+   但它没被执行。修法是给两个融合判据加 paged 检查（`ggml_set_rows_get_paged` 为真就拒绝融合）。
+2. 打开设备 K/V 后，`--kv-page` 的 PPL 与连续布局**完全相同**（`-c 256 --chunks 1`，同一份 256 token 文本）：
+
+   | 臂 | PPL |
+   |---|---:|
+   | `off`（连续） | 2.1676 +/- 0.35231 |
+   | `on`（`--kv-page --kv-block 256`，设备 K/V） | 2.1676 +/- 0.35231 |
+
+3. 长 prompt 逐字一致 + gather 真的触发（4535 token、`-ub 2048`、`-c 8192`、temp 0、`-n 8`）：
+   `off` 与 `on` 生成文本逐字相同；`GGML_KV_PAGE_TRACE` 显示 `gather layer 3: 8192 cells, 4 blocks, workspace 8192 cells`
+   （工作区 4 -> 8 -> 16 MiB 三次增长）。同一批的 PP 是 **120.86（off）对 118.55（on）**，但这一轮
+   planner 判 deficit、bank = 0，注意力被专家上传压住，**不能用来评价 gather**（口径见 `README.md` 3 节）。
+
+4. **目标工况读数（r=2，8176 档，同一 session，桌面占用未清）**。命令 = AGENTS 的统一口径
+   （`-c 262144 -ub 2048 -f prompt10k.txt -ncmoe 41 -lm none`），只把 `-n` 从 64 改成 16：
+
+   | 臂 | PP (r=2) | TG (r=2) | planner bank | 说明 |
+   |---|---:|---:|---:|---|
+   | `off`（连续布局，`-fac 256`） | 509.94 / 508.65 | 17.93 / 18.48 | 2879 MiB | 对照 |
+   | `--kv-page`（默认 gather） | **530.48 / 528.93** | 19.03 / 19.09 | 2847 MiB | 工作区 4 -> 8 -> 16 MiB，gather 在 ubatch 2 起生效 |
+   | `--kv-page --kv-gather-mib 0` | 449.20 / 449.83 | 18.97 / 18.97 | 2879 MiB | paged FA，等于 F11 之前的行为 |
+
+   即 **gather 让分页 prefill 从 449 回到 529（+18%），并稳定高于连续布局的 509（+4%）**；TG 持平。
+   注意这一轮连续布局只有 509 而不是 0.4 的 680（同一档位、同 bank），说明 session 之间有约 25% 的口径漂移，
+   **所以这只作方向性证据，不能替代 L1d 的三档 x r=2 矩阵**（6144/4096 与 host 块臂仍缺）。
+   产物：`bench/raw/f11-20261023/{tgt,final2}-{off,on,nogather}.{out,err}`。
+
+5. **质量门带 `--kv-page` 通过**（`-c 4096 --chunks 2`，同一份 1.89 GiB 基线 logits）：
+   `Mean PPL(Q) 5.798313` 对基线 `5.798292`，`mean KLD -0.000000`、`max KLD 0.000064`、`same top p 100.000%`
+   -> **GATE PASS**。即 paged FA + gather 与连续布局在 logits 上等价（与 B2 的验收强度相同）。
+   产物：`bench/raw/f11-20261023/gate-on.{out,err}`。
+
+门禁：`ctest` 33/33；`FLASH_ATTN_EXT -b Vulkan1` **5332/5332**；`SET_ROWS -b Vulkan1` **319/319**；
+`test-kv-page`（新增 gather 用例，CPU 与 Vulkan 各跑一次）两项全 PASS：
+`gather K: 0/64256 halves differ, tail non-zero = 0`、`gather V: 0/64256 halves differ`。
+
+相关产物：`bench/raw/f11-20261023/`（ppl2-{off,on}、t5-{off,on}、final-{off,on}）。
 
 ## 7. 质量与参考数字
 

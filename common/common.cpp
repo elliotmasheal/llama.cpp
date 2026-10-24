@@ -1761,6 +1761,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.fa_chunk_mib      = params.fa_chunk_mib;
     cparams.kv_page           = params.kv_page;
     cparams.kv_block          = (uint32_t) params.kv_block;
+    cparams.kv_gather_mib     = params.kv_gather_mib;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;

@@ -421,6 +421,11 @@ extern "C" {
         bool kv_page;
         // cells per block, a multiple of 256 (default 2048)
         uint32_t kv_block;
+        // paged K/V: MiB of dense workspace that the long-span prefill path gathers the blocks into.
+        // The query-chunked matmul attention reads the workspace instead of the block table, so paging does
+        // not lose the -fac gain. Grows on demand from the working set; 0 = keep every span on the attention
+        // kernel (bench/THREE-TIER.md F11)
+        int32_t kv_gather_mib;
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device
         bool swa_full;    // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)

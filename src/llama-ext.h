@@ -103,6 +103,10 @@ LLAMA_API llama_moe_geometry llama_model_get_moe_geometry(const struct llama_mod
 // at this configuration, 0 when the path cannot fire; the memory planner keeps this much out of the MoE bank
 LLAMA_API int64_t llama_fa_long_kv_reserve_bytes(int32_t n_head, uint32_t n_ubatch, uint32_t n_ctx, int32_t fa_chunk_mib);
 
+// device bytes of the dense workspace that the paged prefill gather allocates first; it then grows with the
+// working set, so this is what the memory planner has to keep out of the MoE bank (0 when disabled)
+LLAMA_API int64_t llama_kv_gather_reserve_bytes(int32_t kv_gather_mib);
+
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
 // the backend buffers that a state write of this memory would touch - empty caches report none

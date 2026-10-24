@@ -141,7 +141,8 @@
 | `GGML_VK_VRAM_LIMIT_MIB` | 未设 | **显存档位模拟**，见 `README.md` 第 2 节 | 2026-10-23 报告值已验证；各档性能未测 |
 | `-kvg` / `--kv-grow` | **-1（auto）** | K/V 初始 cells：-1 = 按工作集增长（上限 `n_ctx`，设备失败回退 host）、0 = 一次分配 `n_ctx`、>0 = 指定初始 cells | 256K+10K：PP 178.5 -> 477、TG 6.4 -> 13.8、RAM 峰值 -7.2 GiB；`0` 时 PP 239.4（`RESULTS.md` 0.3） |
 | `-fac` / `--fa-chunk-mib` | **256** | 长跨距 prefill 注意力每块 score 的上限；query 维按预算切块，0 = 整段一块（旧行为）。规划器的 score 预留同步取这个值 | 8176 档：0 -> PP 458、64 -> 657、128 -> 673、**256 -> 680**、512 -> 627（`RESULTS.md` 0.4） |
-| `--kv-page` / `--kv-block`（**M1 已进树**，见 `THREE-TIER.md` F10） | off；`--kv-block` 2048 | K/V 改为固定大小块 + 块表：扩容零拷贝、峰值 = 1 块、块级设备/host 放置 | M1（CPU 内核）已验收：逐位相同、33/33；设备路径要等 M2b |
+| `--kv-page` / `--kv-block`（**M1 已进树**，见 `THREE-TIER.md` F10） | off；`--kv-block` 2048 | K/V 改为固定大小块 + 块表：扩容零拷贝、峰值 = 1 块、块级设备/host 放置 | M1（CPU 内核）逐位相同；**M2b 设备路径已打开并验收**（`RESULTS.md` 6.4）：PPL 2.1676 对 2.1676、4535 token 逐字相同、质量门 KLD -0.000000 / top-p 100%、FA 5332/5332、SET_ROWS 319/319、`ctest` 33/33 |
+| `--kv-gather-mib` / `LLAMA_ARG_KV_GATHER_MIB`（F11 L1） | **256**；0 = 关 | 分页 prefill 的稠密 K/V 工作区上限：长跨距注意力先把块 gather 进工作区，再走 `-fac` 的 chunked matmul；按工作集 2 倍增长，失败退回分页 FA 并计数 | 正确性已验收：gather 与连续布局逐字节相同（`test-kv-page`，CPU+Vulkan）；10.5K 口径仅需 21 MiB。目标口径 PP 待矩阵 |
 | `GGML_SCHED_TRACE` / `GGML_MOE_COPY_TRACE` / `GGML_VK_TIME_COPIES` / `GGML_VK_MEMORY_LOGGER` / `GGML_VK_PERF_LOGGER` | 关 | 诊断；PERF_LOGGER 拖慢 decode 2.6x | 只看占比 |
 | `GGML_VK_FA_TRACE` | 未设 | 每个不同的 FA 形状打一行（path/Br/Bc/D_split/sparse/dequant_kv），F10 M0b 用它定案 | 诊断，只打几种形状 |
 | `GGML_SCHED_HW_SIGNAL` / `_HW_PIPELINE` / `_HW_NOWAIT`、`GGML_MOE_CACHE_MAX_FULL` / `_LRU_DIV`、`LLAMA_ROUTING_DIAG` | 已回退，不在树里 | 见第 3 节 | - |
@@ -159,6 +160,12 @@
 - 预取要求：单 GPU、专家在 pinned host buft（`-lm none`）、后端暴露 proc address；任一不满足打 warning 退回。
 - 容量不足目前是 **abort 而不是退化**：`GGML_ABORT` 在 `llama-moe-cache.cpp` 的 :128、:1910、:2013、:2045、:1740。
   :1910 还把正确性绑在调度器分片启发式上。**小显存路线必须先把它们改成回退**，否则 4G/6G 档一跑就崩。
+- **分页 `SET_ROWS` 不得进 ROPE/RMS_NORM 的融合**（2026-10-24 定位，`RESULTS.md` 6.4）。融合把 rope 输出
+  直接写进 SET_ROWS 的 dst，分页下那是 256 B 的锚而不是块：块永远为 0，`-c 512` 输出错、`-c 8192` 触发
+  `DeviceLostError`。两个判据（`ggml_vk_can_fuse_rope_set_rows`、`ggml_vk_can_fuse_rms_norm_set_rows`）
+  已经加了 `ggml_set_rows_get_paged` 检查。**以后任何"把 SET_ROWS 融合进前一个 kernel"的优化都要过这条门**。
+- 分页 prefill 的 gather 是**纯拷贝**：块的 cell 布局与连续缓存同构（`[n_embd, BS]`，`nb[1] = row_size(n_embd)`），
+  每块一条 `ggml_cpy` 即可，不要为此新增 op 或 shader。工作区与 `-fac` 的 score 缓冲是两笔预算，不能互相替代。
 - `llama_context` 析构里 `wait_promotion()` 必须在后端释放之前调用。
 - `llama_moe_cache_is_host_weight()` 只看 buffer 是不是 host，lazy 张量会被当成 host 专家但因非 pinned 而关掉预取。
 - hybrid worker 的 `ggml_context` 必须含 `ggml_graph_overhead_custom`，否则 `register_hybrid` SIGSEGV。
@@ -244,9 +251,13 @@
         重复读 K/V（`ggml-vulkan.cpp:8332-8345` 的 gqa 合并只对 `N <= 8` 生效，prefill 的 `gqa_ratio = 1`）。
         M2a（B-lite，gather 之后喂 FA）的验证目的已由 L0 与 `test-kv-page` 覆盖，不再单独做；
         它的 `ggml_cpy` 机制并入 F11 L1，但目标是 matmul 而不是 FA。
-        **2026-10-24 更正**：上面的 (b) 与用户当天的选择冲突，最终取 **(c)**——分页先当容量档，
-        `--kv-page auto` 由 fit 预算判决（初始 KV 装得进设备 surplus 就保持连续布局），
-        因此 F11 的 gather 暂不实现，`!paged` 是分页模式下的唯一路径。两条记录都保留，以便回溯。
+        **2026-10-24 已落地**（L0 + L1，`RESULTS.md` 6.4）：设备 K/V 打开（PPL 与连续布局相同、4535 token 逐字相同）、
+        `--kv-gather-mib` 默认 256 的稠密工作区 + 逐块 `ggml_cpy` 进树、`test-kv-page` 新增 gather 用例。
+        剩余是目标口径的 PP/TG 矩阵（本轮 planner 判 deficit、bank 0，测不出 gather 的收益）。
+        **2026-10-24 更正**：当天早些时候写过"取 (c)、gather 暂不实现"，随后用户确认 (b)，已按 (b) 落地
+        （`RESULTS.md` 6.4：paged + gather 530.48 对连续 509.94、对 paged FA 449.20）。
+        (c) 保留的含义只剩**默认模式选择**：`--kv-page auto` 由 fit 预算决定初始是否开分页，**该 auto 未实现**；
+        它不再影响 `!paged` 这个兜底条件的作用域。
     上下文压缩（agent / 多轮）是 M5 的延伸，**已决定不做**：丢中间段会让输出偏离预期，
     三条硬约束仍留在 `THREE-TIER.md` F10 9.5 供将来参考：
     (a) hybrid 的 `seq_rm` 删不了头部（recurrent 只支持全删与尾回滚，`src/llama-memory-recurrent.cpp:184-232`），
@@ -263,6 +274,9 @@
 15. **P1，4096 档 bank 仍是 0**：`-fac 256` 之后 score 预留只有 256 MiB，surplus 仍然不够（`RESULTS.md` 0.4 读数 6）。
     这一档要么论证"0 就是最优"，要么继续查设备 compute 的其它归属（0.2 表 A 的 +1134 MiB 已在 A 里按工作集收掉，
     剩下的固定项还没拆）。
+16. **P2，`--kv-page auto`**：按 `common/fit.cpp` 的预算（初始 KV 装不装得进设备 surplus）决定默认开不开分页。
+    现在只能手工 `--kv-page`。分页在 F11 L1 之后不再牺牲 prefill PP，所以这条只是默认值的便利，
+    不是正确性问题；它取代了 2026-10-24 早上"分页只当容量档"的用法。
 
 新增行为（F7 的 offload 开关、F8 的分块开关）落地时必须进第 4 节开关表，默认值由目标口径实测决定；
 `-kvg/--kv-grow` 已按此规则登记（默认 -1，实测见 `RESULTS.md` 0.3）。

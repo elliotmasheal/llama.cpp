@@ -2449,6 +2449,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_BLOCK"));
     add_opt(common_arg(
+        {"--kv-gather-mib"}, "N",
+        "MiB of dense workspace that the paged prefill path gathers the K/V blocks into: the long-span\n"
+        "attention reads the workspace instead of the block table, so paging keeps the -fac gain\n"
+        "0 keeps every span on the attention kernel (default: 256, only used with --kv-page)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kv_gather_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KV_GATHER_MIB"));
+    add_opt(common_arg(
         {"-fac", "--fa-chunk-mib"}, "N",
         "cap in MiB on the score buffer of the long prefill attention path: the query dimension is split to stay under it\n"
         "0 keeps one buffer for the whole span (default: 256)",

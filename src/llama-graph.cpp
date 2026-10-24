@@ -141,6 +141,16 @@ int64_t llama_fa_long_kv_reserve_bytes(int32_t n_head, uint32_t n_ubatch, uint32
     return std::min(max, (int64_t) n_ctx * n_ubatch * n_head * (int64_t) sizeof(float));
 }
 
+// the dense workspace of the paged prefill gather starts small and grows with the working set, so the planner
+// only has to keep room for its first size (bench/THREE-TIER.md F11)
+int64_t llama_kv_gather_reserve_bytes(int32_t kv_gather_mib) {
+    if (kv_gather_mib <= 0) {
+        return 0;
+    }
+
+    return std::min<int64_t>((int64_t) kv_gather_mib << 20, (int64_t) 32 << 20);
+}
+
 // number of token rows of the mixed path, a non-mixed ubatch is sized for the worst case
 static int64_t llm_graph_n_tok_rows(const llama_ubatch & ubatch) {
     if (!ubatch.is_mixed()) {
@@ -3063,10 +3073,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              int64_t   n_kv_max,
                float   kq_scale,
                  int   il) const {
-    const bool v_trans = v->nb[1] > v->nb[2];
-
-    // paged K/V: the long-span matmul path reads K/V as matrices and cannot resolve blocks, so a
-    // paged cache keeps every span on the attention kernel
+    // paged K/V: the long-span matmul path reads K/V as matrices and cannot resolve blocks, so a paged cache
+    // gathers the used cells into a dense workspace first and reads that instead (bench/THREE-TIER.md F11)
     ggml_tensor * k_table = nullptr;
     ggml_tensor * v_table = nullptr;
     int32_t       page_bs = 0;
@@ -3074,6 +3082,28 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
+
+    // the long-span criterion, evaluated on the cache views for the paged path because the gather has to run
+    // before the permute below; the contiguous path keeps evaluating it after the permute, as it always did
+    const int64_t fa_score_max = llama_fa_long_kv_score_max_bytes();
+    const int64_t n_tok_q_raw  = q->ne[2]/n_stream;
+    const int64_t n_tok_kv_raw = k->ne[2];
+    const bool    span_ok_raw  = fa_score_max > 0 && kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
+                                 n_tok_q_raw >= 512 && n_tok_kv_raw > n_tok_q_raw + n_tok_q_raw/2;
+
+    bool dense = !paged;
+    if (paged && span_ok_raw) {
+        ggml_tensor * kd = nullptr;
+        ggml_tensor * vd = nullptr;
+
+        if (mctx->get_kv_page_dense(ctx0, gf, il, (uint32_t) n_tok_kv_raw, &kd, &vd)) {
+            k = kd;
+            v = vd;
+            dense = true;
+        }
+    }
+
+    const bool v_trans = v->nb[1] > v->nb[2];
 
     // the stream dim steps over one stream's worth of dim-2 (tokens): (ne[2]/n_stream) rows of stride nb[2].
     // q->nb[3]/n_stream only equals that for a contiguous q; nope-only MLA (glm5-next) passes a permuted
@@ -3088,10 +3118,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     // FA is limited to 8 rows per K/V read for hsk > 128 on AMD, so a long cross-chunk span runs at
     // ~1 TFLOPS against 4 for the matmul path. Decode and short spans keep FA (bench/RESULTS.md 2.2).
-    const int64_t fa_score_max = llama_fa_long_kv_score_max_bytes();
     const int64_t n_tok_q  = q->ne[1];
     const int64_t n_tok_kv = k->ne[1];
-    const bool fa_span = !paged && fa_score_max > 0 && kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
+    const bool fa_span = paged ? (span_ok_raw && dense) :
+                         fa_score_max > 0 && kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
                          n_tok_q >= 512 && n_tok_kv > n_tok_q + n_tok_q / 2;
     // the score buffer is n_kv x n_head x 4B per query row, so the query dim is what the budget splits
     const int64_t score_row = n_tok_kv * q->ne[2] * (int64_t) sizeof(float);

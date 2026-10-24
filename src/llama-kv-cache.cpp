@@ -82,7 +82,8 @@ llama_kv_cache::llama_kv_cache(
              const char *   name_tag,
                  uint32_t   kv_size_init,
                      bool   kv_page,
-                 uint32_t   kv_block) :
+                 uint32_t   kv_block,
+                   int32_t   kv_gather_mib) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -128,15 +129,18 @@ llama_kv_cache::llama_kv_cache(
             else if (n_stream != 1)     why = "more than one stream";
             else if (kv_block < 256 || (kv_block % 256) != 0) why = "block size is not a multiple of 256";
             else if (offload) {
-                // the kernels are in place but the model-level Vulkan path still diverges from the
-                // contiguous layout, so device K/V stays off until that is resolved (RESULTS 6.3)
+                // the block kernels address memory by device address, so the backend has to expose one
                 for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
                     if (!hparams.has_kv(il)) {
                         continue;
                     }
                     auto * dev = model.dev_layer(il);
                     if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                        why = "device K/V is not verified yet";
+                        auto * reg = ggml_backend_dev_backend_reg(dev);
+                        auto fn = reg ? ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_buffer_get_device_address") : nullptr;
+                        if (!fn) {
+                            why = "the device cannot expose buffer device addresses";
+                        }
                     }
                     break;
                 }
@@ -148,7 +152,8 @@ llama_kv_cache::llama_kv_cache(
             kv_page = false;
         }
 
-        this->kv_page = kv_page;
+        this->kv_page        = kv_page;
+        this->kv_gather_mib  = kv_page ? kv_gather_mib : 0;
 
         if (kv_page) {
             this->kv_block_size = kv_block;
@@ -1363,6 +1368,26 @@ void llama_kv_cache::init_pages(uint32_t cells) {
     const uint32_t n_blocks_max = kv_size_max / kv_block_size;
     const size_t   n_layer_kv   = layers.size();
 
+    // the dense workspace is one K/V pair for all layers, so every layer must have the same widths
+    page_dense_ok = true;
+    for (size_t i = 1; i < n_layer_kv && page_dense_ok; ++i) {
+        page_dense_ok = layers[i].k->ne[0] == layers[0].k->ne[0] &&
+                        layers[i].v->ne[0] == layers[0].v->ne[0] &&
+                        layers[i].k->type  == layers[0].k->type  &&
+                        layers[i].v->type  == layers[0].v->type;
+    }
+
+    if (!page_dense_ok) {
+        LLAMA_LOG_WARN("%s: paged prefill gather disabled: the layers have different K/V layouts\n", __func__);
+    }
+    if (page_dense_ok && kv_gather_mib > 0) {
+        const size_t row = ggml_row_size(layers[0].k->type, layers[0].k->ne[0]) +
+                           ggml_row_size(layers[0].v->type, layers[0].v->ne[0]);
+        LLAMA_LOG_INFO("%s: paged prefill gather: up to %d MiB (%u cells), %s\n", __func__,
+                kv_gather_mib, (uint32_t) (((int64_t) kv_gather_mib << 20) / (int64_t) row),
+                page_buft ? ggml_backend_buft_name(page_buft) : "cpu");
+    }
+
     page_anchor_buf.reset(ggml_backend_buft_alloc_buffer(page_buft, 256));
     if (!page_anchor_buf) {
         throw std::runtime_error("failed to allocate the kv page anchor buffer");
@@ -1543,9 +1568,161 @@ bool llama_kv_cache::ensure_blocks(uint32_t n_extra) {
     return true;
 }
 
+// paged prefill gather (bench/THREE-TIER.md F11): the workspace is reused by every layer, so it is one
+// allocation sized by the working set. Growth happens at ensure_capacity time, where the previous graph has
+// been submitted, the same point where realloc_cache replaces the contiguous buffers.
+bool llama_kv_cache::ensure_dense_workspace(uint32_t cells) {
+    if (!kv_page || !page_dense_ok || kv_gather_mib <= 0 || layers.empty()) {
+        return false;
+    }
+
+    // get_n_kv pads the shared range to 256 cells, so the workspace has to cover the padded range
+    cells = std::min((cells + 255)/256*256, kv_size_max);
+
+    if (cells <= page_dense_cells) {
+        return false;
+    }
+
+    const auto & l0 = layers.front();
+
+    const size_t row_k = ggml_row_size(l0.k->type, l0.k->ne[0]);
+    const size_t row_v = ggml_row_size(l0.v->type, l0.v->ne[0]);
+    const uint32_t cap_cells = (uint32_t) (((int64_t) kv_gather_mib << 20) / (int64_t) (row_k + row_v));
+
+    if (cap_cells < cells) {
+        if (!page_dense_warned) {
+            page_dense_warned = true;
+            LLAMA_LOG_WARN("%s: %u cells need %.2f MiB of dense K/V, the cap is %d MiB; "
+                    "the long-span prefill stays on the attention kernel\n", __func__,
+                    cells, (double) cells*(row_k + row_v)/1024.0/1024.0, kv_gather_mib);
+        }
+        return false;
+    }
+
+    const uint32_t want = std::min(cap_cells, std::max(cells, 2*page_dense_cells));
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ size_t(4*ggml_tensor_overhead()),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * tk = ggml_new_tensor_2d(ctx, l0.k->type, l0.k->ne[0], (int64_t) want);
+    ggml_tensor * tv = ggml_new_tensor_2d(ctx, l0.v->type, l0.v->ne[0], (int64_t) want);
+    ggml_format_name(tk, "cache_gather_k");
+    ggml_format_name(tv, "cache_gather_v");
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, page_buft);
+
+    if (!buf) {
+        ggml_free(ctx);
+
+        if (!page_dense_warned) {
+            page_dense_warned = true;
+            LLAMA_LOG_WARN("%s: no room for %.2f MiB of dense K/V; the long-span prefill stays on the attention kernel\n",
+                    __func__, (double) want*(row_k + row_v)/1024.0/1024.0);
+        }
+
+        return false;
+    }
+
+    ggml_backend_buffer_clear(buf, 0);
+
+    // drop the old workspace only after the new one is in place
+    page_dense_buf.reset();
+    page_dense_ctx.reset();
+
+    page_dense_ctx.reset(ctx);
+    page_dense_buf.reset(buf);
+    page_dense_k = tk;
+    page_dense_v = tv;
+    page_dense_cells = want;
+
+    LLAMA_LOG_INFO("%s: dense K/V for the prefill gather grown to %u cells (%.2f MiB)\n",
+            __func__, want, (double) want*(row_k + row_v)/1024.0/1024.0);
+
+    return true;
+}
+
+// paged prefill gather: blocks cover consecutive cells, so each block is one plain copy into the workspace.
+// The matmul attention then reads rows exactly like it does on a contiguous cache, which keeps the -fac gain.
+bool llama_kv_cache::build_paged_dense(
+        ggml_context * ctx, ggml_cgraph * gf, int32_t il, uint32_t n_kv,
+        ggml_tensor ** k, ggml_tensor ** v) const {
+    if (!kv_page || !page_dense_ok || n_kv == 0 || n_kv > page_dense_cells ||
+        page_dense_k == nullptr || page_dense_v == nullptr) {
+        return false;
+    }
+
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return false;
+    }
+
+    const int32_t ikv = it->second;
+    if (ikv < 0 || (size_t) ikv >= layers.size()) {
+        return false;
+    }
+
+    const uint32_t n_blocks = (n_kv + kv_block_size - 1)/kv_block_size;
+    if (n_blocks > page_blocks.size()) {
+        return false;
+    }
+
+    const size_t row_k = page_dense_k->nb[1];
+    const size_t row_v = page_dense_v->nb[1];
+
+    for (uint32_t b = 0; b < n_blocks; ++b) {
+        const uint32_t cell = b*kv_block_size;
+        const int64_t  n    = (int64_t) std::min<uint32_t>(kv_block_size, n_kv - cell);
+
+        ggml_tensor * sk = page_blocks[b].k[ikv];
+        ggml_tensor * sv = page_blocks[b].v[ikv];
+
+        ggml_tensor * dk = ggml_view_2d(ctx, page_dense_k, page_dense_k->ne[0], n, row_k, (size_t) cell*row_k);
+        ggml_tensor * dv = ggml_view_2d(ctx, page_dense_v, page_dense_v->ne[0], n, row_v, (size_t) cell*row_v);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_view_2d(ctx, sk, sk->ne[0], n, sk->nb[1], 0), dk));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_view_2d(ctx, sv, sv->ne[0], n, sv->nb[1], 0), dv));
+    }
+
+    // views shaped like get_k/get_v, over the workspace instead of the anchor
+    const int64_t  n_embd_k = layers[ikv].k->ne[0];
+    const int64_t  n_embd_v = layers[ikv].v->ne[0];
+    const uint32_t ns       = 1;   // paged mode requires a single stream
+
+    static const bool trace = getenv("GGML_KV_PAGE_TRACE") != nullptr;
+    if (trace) {
+        LLAMA_LOG_INFO("%s: gather layer %d: %u cells, %u blocks, workspace %u cells\n",
+                __func__, il, n_kv, n_blocks, page_dense_cells);
+    }
+
+    *k = ggml_view_4d(ctx, page_dense_k,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
+            ggml_row_size(page_dense_k->type, hparams.n_embd_head_k(il)),
+            ggml_row_size(page_dense_k->type, n_embd_k),
+            ggml_row_size(page_dense_k->type, n_embd_k)*n_kv,
+            0);
+    *v = ggml_view_4d(ctx, page_dense_v,
+            hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
+            ggml_row_size(page_dense_v->type, hparams.n_embd_head_v(il)),
+            ggml_row_size(page_dense_v->type, n_embd_v),
+            ggml_row_size(page_dense_v->type, n_embd_v)*n_kv,
+            0);
+
+    return true;
+}
+
 bool llama_kv_cache::ensure_capacity(uint32_t n_extra) {
     if (kv_page) {
-        return ensure_blocks(n_extra);
+        const bool grew = ensure_blocks(n_extra);
+        const bool dense = ensure_dense_workspace(used_max() + n_extra);
+        return grew || dense;
     }
 
     if (hparams.no_alloc || other != nullptr) {
@@ -3489,6 +3666,11 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 bool llama_kv_cache_context::get_kv_page(int32_t il, ggml_tensor ** k_table, ggml_tensor ** v_table, int32_t * block_size) const {
     return kv->get_kv_page(il, k_table, v_table, block_size);
+}
+
+bool llama_kv_cache_context::get_kv_page_dense(ggml_context * ctx, ggml_cgraph * gf, int32_t il, uint32_t n_kv,
+        ggml_tensor ** k, ggml_tensor ** v) const {
+    return kv->build_paged_dense(ctx, gf, il, n_kv, k, v);
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {

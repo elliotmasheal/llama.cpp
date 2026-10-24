@@ -119,7 +119,8 @@ public:
                      uint32_t   kv_size_init = 0,
         // paged K/V: fixed-size blocks addressed through a table (bench/THREE-TIER.md F10)
                          bool   kv_page = false,
-                     uint32_t   kv_block = 2048);
+                     uint32_t   kv_block = 2048,
+                    int32_t   kv_gather_mib = 256);
 
     ~llama_kv_cache() = default;
 
@@ -178,6 +179,11 @@ public:
 
     // paged K/V: the two tables of one layer, false when the cache is contiguous
     bool get_kv_page(int32_t il, ggml_tensor ** k_table, ggml_tensor ** v_table, int32_t * block_size) const;
+
+    // paged K/V: append the copies of cells [0, n_kv) into the dense workspace and return views of it,
+    // shaped like get_k/get_v; false when the cache is contiguous, disabled, or the workspace does not fit
+    bool build_paged_dense(ggml_context * ctx, ggml_cgraph * gf, int32_t il, uint32_t n_kv,
+                           ggml_tensor ** k, ggml_tensor ** v) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -397,6 +403,20 @@ private:
     std::vector<kv_block> page_blocks;
     ggml_backend_buffer_type_t page_buft = nullptr;   // buffer type of the anchors and of new blocks
 
+    // paged K/V: one dense K/V pair that the long-span matmul attention reads instead of the block table.
+    // It grows with the working set, never past kv_gather_mib, and a failure to grow only costs this path (F11)
+    int32_t                 kv_gather_mib = 0;
+    bool                    page_dense_ok = false;   // uniform F16 K/V widths and gather enabled
+    bool                    page_dense_warned = false;
+    ggml_context_ptr        page_dense_ctx;
+    ggml_backend_buffer_ptr page_dense_buf;
+    ggml_tensor *           page_dense_k = nullptr;  // [n_embd_k_gqa, page_dense_cells]
+    ggml_tensor *           page_dense_v = nullptr;
+    uint32_t                page_dense_cells = 0;
+
+    // grow the dense workspace so that `cells` cells fit; false when it does not fit under the cap
+    bool ensure_dense_workspace(uint32_t cells);
+
     // allocate the anchors, the address table and the first blocks; called from the ctor
     void init_pages(uint32_t cells);
 
@@ -464,6 +484,10 @@ public:
 
     // paged K/V: the two tables of one layer, false when the cache is contiguous
     bool get_kv_page(int32_t il, ggml_tensor ** k_table, ggml_tensor ** v_table, int32_t * block_size) const override;
+
+    // paged K/V: dense views of cells [0, n_kv) for the long-span matmul path
+    bool get_kv_page_dense(ggml_context * ctx, ggml_cgraph * gf, int32_t il, uint32_t n_kv,
+                           ggml_tensor ** k, ggml_tensor ** v) const override;
 
     //
     // llama_kv_cache_context specific API

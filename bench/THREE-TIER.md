@@ -682,11 +682,11 @@ M2b 融合 FA（Vulkan）
 - **进行中（2026-10-24）**：FA 与 SET_ROWS 的分页内核都已进树，算子级在 CPU 与 Vulkan 上都逐位正确
   （`tests/test-kv-page.cpp`，两种后端；表以 I64 张量挂在 `src[5]/src[6]` 与 `src[3]`）。
   非分页门禁 `FLASH_ATTN_EXT -b Vulkan1` 5332/5332 不变。
-- **模型级 Vulkan 路径仍不对**（同文本 PPL 4.1412 对 6.0684），所以设备 K/V 仍被守卫挡下
-  （`kv-page disabled: device K/V is not verified yet`）。已排除项与下一步见 `RESULTS.md` 6.3。
-- **2026-10-24 决定**：分页先当容量档——`--kv-page auto` 用 `common/fit.cpp` 的预算判决，
-  初始 KV 装得进设备 surplus 就保持连续布局（保住 PP 680），装不进才开分页。
-  因此长跨距 matmul 路径的 gather（`F11`）**暂不实现**，保留设计。
+- **模型级 Vulkan 路径**：曾经的 PPL 4.1412 对 6.0684 已定位为 ROPE/RMS_NORM 融合旁路分页 SET_ROWS
+  （`RESULTS.md` 6.4 第 1 条），关掉融合后 PPL 与连续布局相同、质量门 KLD 0。设备 K/V 的守卫已改成
+  "后端必须能给出 device address"，`--kv-page` 在 Vulkan 上直接可用。
+- **gather（F11 L1）已实现**；`--kv-page auto`（按 fit 预算决定默认开不开分页）仍未实现，
+  它是"容量档也要 PP"之外的另一件事，见 `DECISIONS.md` 第 6 节。
 
 - 分页 SET_ROWS 变体；`flash_attn.comp` 的 f16 读取改表（5.2）；分页模式强制 FA_SCALAR（RDNA2 本来就走它）。
 - 门禁（AGENTS 第 3 节）：`MUL_MAT_ID` CPU 945/945、`MUL_MAT_ID_MASK` CPU 4/4、`MUL_MAT_ID` Vulkan 939/939、
@@ -749,11 +749,11 @@ F6 已于 2026-10-23 落地（`bash bench/tools/quality-gate.sh`），所以 9.5
 
 混合精度分层仍是唯一能改变 TG 屋顶线的选项（屋顶线见 `RESULTS.md` 第 5 节），但它的前提是 F6 + repack KLD = 0。
 
-## F11 分页 KV 的 prefill 路径：块 -> 稠密工作区 -> 现有 chunked matmul（**设计，未实测**，P0）
+## F11 分页 KV 的 prefill 路径：块 -> 稠密工作区 -> 现有 chunked matmul（**L0 + L1 已落地**，P0）
 
-> **2026-10-24 状态**：`RESULTS.md` 6.3 记下了当天的决定——分页先按容量档推进（选项 c：
-> 只有 KV 装不下显存时才启用分页，全驻显存保持连续布局），因此 F11 的 gather **暂不实现**。
-> 本节保留为将来"容量档也要 PP"时的方案与成本模型。
+> **2026-10-24 状态**：用户确认取 (b)，gather 已实现并验收（`RESULTS.md` 6.4）。当天早些时候曾记过
+> "先按容量档推进（选项 c）、gather 暂不实现"，那条已被本轮落地取代；(c) 只剩**默认模式选择**这一个含义：
+> `--kv-page auto` 由 `common/fit.cpp` 的预算判决，初始 KV 装得进设备就保持连续布局。它还没有实现。
 
 
 ### 0. 结论先行
@@ -785,7 +785,14 @@ F6 已于 2026-10-23 落地（`bash bench/tools/quality-gate.sh`），所以 9.5
 
 ### 2. 设计
 
-#### L0 前置：SET_ROWS 分页变体（已在工作区，只差验收）
+#### L0 前置：SET_ROWS 分页变体（**已落地并验收，2026-10-24，`RESULTS.md` 6.4**）
+
+- 落地时挖出真正的根因：分页 SET_ROWS **被执行了，但结果被 ROPE/RMS_NORM 的融合旁路**（`ROPE_VIEW_SET_ROWS`、
+  `RMS_NORM_VIEW_SET_ROWS`）。融合直接把 rope 输出写进 SET_ROWS 的 dst，即 256 B 的锚，块永远是 0；
+  `-c 512` 因此输出不同，`-c 8192` 直接 device lost。两个融合判据已加 paged 检查。
+- 验收结果：`--kv-page` 与 `off` 的 PPL 完全相同（2.1676 对 2.1676）、4535 token 逐字相同、
+  `FLASH_ATTN_EXT` 5332/5332、`SET_ROWS` 319/319、`ctest` 33/33。
+- 设备 K/V 的守卫已从"未验证"改成"后端必须能给出 device address"，`--kv-page` 在 Vulkan 上直接可用。
 
 - `copy_to_quant.comp` 的 `PAGED` 分支（:18-26、:336-342）把 `dst_idx` 换成
   `data_qtab[cell / BS]` + `(cell % BS)` 行内偏移；`pipeline_set_rows_paged` 在
@@ -795,7 +802,15 @@ F6 已于 2026-10-23 落地（`bash bench/tools/quality-gate.sh`），所以 9.5
 - 验收：`-c 512 --kv-page` 输出与 `off` 逐字相同；`tests/test-kv-page.cpp` 补一条 Vulkan 后端用例；
   `FLASH_ATTN_EXT -b Vulkan1` 5332/5332 不变；`ctest` 34/34。
 
-#### L1 主线：块 -> 稠密工作区 -> chunked matmul
+#### L1 主线：块 -> 稠密工作区 -> chunked matmul（**代码已落地，2026-10-24；性能待目标口径矩阵**）
+
+- 落地形态与设计一致：`--kv-gather-mib`（默认 256，0 = 关）、工作区按工作集 2 倍增长、
+  每层每块一条 `ggml_cpy`、`llama_memory_context_i::get_kv_page_dense()` 在 `build_attn_mha` 里接上。
+  正确性见 `RESULTS.md` 6.4：gather 与连续布局**逐字节相同**（`test-kv-page`，CPU 与 Vulkan 各一遍），
+  4535 token 的生成文本与 `off` 逐字相同。
+- 目标工况读数（r=2，8176 档，`RESULTS.md` 6.4 第 4 条）：连续 509.3、**paged + gather 529.7**、
+  paged + `--kv-gather-mib 0` 449.5，TG 三者持平。即 gather 把分页 prefill 拉回并高于连续布局约 4%。
+- 还没测的：256K + 10K 的 6144/4096 两档（L1d），以及 host 块占比 > 0 的臂。
 
 (a) 工作区（KV cache 持有）
 
@@ -850,9 +865,32 @@ F6 已于 2026-10-23 落地（`bash bench/tools/quality-gate.sh`），所以 9.5
   对 PP 680（10.5K / 680 = 15.4 s）是 **0.05%**；dispatch 120 条/ubatch（约 2-4 ms）同量级。
 - 对照：现有 matmul 路径的 score 流量是 6 chunk x 262 MiB（写+读）x 10 层 = 31 GiB/ubatch；
   gather 是它的 1/70。
-- 重拷的 N^2 上限：总量约 `5 x N^2` 字节；N = 32K 是 5.4 GB（32 ms），N = 64K 是 21.5 GB（128 ms，
-  对 96 s 的 prefill 是 0.13%）。所以**不需要增量 gather**，也不需要在跨 ubatch 保留工作区。
+- 重拷的 N^2 上限：读写各 `5 x N^2` 字节，合计 `10 x N^2`；N = 32K 是 10.7 GB（64 ms），
+  N = 64K 是 43 GB（256 ms，对 96 s 的 prefill 是 0.26%）。所以**不需要增量 gather**，
+  也不需要在跨 ubatch 保留工作区。
 - host 块：gather 每层只读一次 host，见第 5 节。
+
+#### 3.1 长 prompt 下的三个区间（回答"会不会劣化"）
+
+判据来自 `-fac 256` 的 `chunk_q >= 64`，不是人为设的阈值：
+
+| 区间 | 走哪条 | 相对今天的 paged 模式 | 相对连续布局同 n_kv |
+|---|---|---|---|
+| `n_kv <= 3072`（`n_tok_kv <= 1.5 n_tok_q`） | FA，不 gather | 不变 | 不变（FA 不看布局） |
+| `3072 < n_kv <= 65536` | gather + chunked matmul | **PP 从 458 回到约 680 的量级**，gather 0.05%-0.26% | 平价（长 n_kv 的 score 税两边都付） |
+| `n_kv > 65536` | paged FA，不 gather | **不变**（今天就是这条路） | 不变；但 host 块的 256x PCIe 仍在，要 L2(b) |
+
+- 中间的窗口内**不会劣化**：gather 的读写是 `2 x KV 字节/层/ubatch`，而它替掉的是 FA 的
+  `n_q/Br = 256 x KV 字节`（第 5 节）；即使不看 FA，它相对 matmul 路径自身 6-32 个 chunk 的 score 流量也只有 1/70。
+- 窗口外**也不劣化**：不 gather 就不动数据，行为与今天的 paged FA 完全一致。代价是那一档拿不到 L1 的收益，
+  这一条写进 L2(b) 的触发条件，不当成已解决。窗口外 + host 块的量级（估算，供 L2(b) 立项用）：
+  `n_kv = 128K`、20% host 时 FA 每 ubatch 约 131 GiB PCIe -> 9 s，而 compute-bound 约 6.8 s（PP 300）；
+  `n_kv = 256K` 同比例约 18 s/ubatch。也就是说**真正 10 万 token 以上的 prompt + 块落 host，L1 只能覆盖前 64K**，
+  剩下的必须靠 L2(b) 或调大 `-fac`。目标口径（256K ctx + 10K prompt，`n_kv` 最多 10.5K）不涉及这一段。
+- 唯一新增的常驻是工作区（10.5K 21 MiB、64K 128 MiB）。它按 2 倍增长，**增长失败只退回 FA，不会去挤 bank**
+  （`ggml_backend_vk_buffer_type_alloc_buffer` 返回 nullptr，`ggml-vulkan.cpp:13315`）。
+- 想把这个窗口推长只有两条：调大 `-fac`（score 缓冲同步变大，`RESULTS.md` 0.4 里 512 在 8176 档已经更慢），
+  或者 L2(b) 的 KV 分块 + LSE。都不作为默认。
 
 ### 4. 与业界四条路径的对照（为什么只取第 2 条）
 
@@ -877,20 +915,37 @@ F6 已于 2026-10-23 落地（`bash bench/tools/quality-gate.sh`），所以 9.5
 即 100% host 时 FA 路径每 ubatch 要 3.8 s（10 层 x 377 ms），gather 后 14 ms。
 所以**F10 M4 的 host 块必须和 L1 同批验收**，否则那一档的 prefill 数字没有意义。
 
+#### 5.1 L1 之后分页还剩哪些收益
+
+| 收益 | L1 之后 | 依据 |
+|---|---|---|
+| 块级 device/host 放置，单块失败不粘整棵 cache | **保留，且这是分页唯一不可替代的收益** | 连续布局的 `host_fallback` 是 cache 级标志（`src/llama-kv-cache.h:283`），一次失败整棵 KV 落 host |
+| 扩容零拷贝、峰值 = 1 块 | **保留** | `-kvg` 的 2 倍增长要 D2D 拷已用前缀（10K 臂 `reallocs` 3 次，`RESULTS.md` 0.3） |
+| prefill PP | 从"分页 = 放弃 `-fac`"变成与连续布局平价 | 3.1 的窗口 |
+| decode TG | 约 -1% 的固定税（每 32 cell 查一次表，M0d 在 DRAM 规模 +0.4%~0.9%） | `RESULTS.md` 6.1 |
+| host 块的 decode PCIe | 不变，按字节线性（容量档的固有代价，F10 M4 已接受） | 9.1 的成本模型 |
+
+- 结论：分页现在**没有速度理由**，只有容量理由。所以默认策略应是"全驻显存保持连续布局（`--kv-page off`），
+  只有工作集装不下连续布局时才开分页"。这与第 4 节否决 `RESULTS.md` 6.3 的候选 (c) 不矛盾：
+  (c) 是拿"只在 host 块 > 0 时启用"当 prefill 的替代方案；L1 是让分页在任何时候都不掉 PP 的前提，
+  有了它，"按容量开分页"才是纯收益的选择。
+
 ### 6. 里程碑与验收
 
-| 里程碑 | 内容 | 验收 |
+| 里程碑 | 内容 | 状态 |
 |---|---|---|
-| L0 | SET_ROWS 分页收尾（已在工作区） | `-c 512` 逐字；`ctest` 34/34；FA 5332/5332 |
-| L1a | 工作区 + 逐块 cpy + `get_kv_page_dense` | 单测：块表乱序时工作区与连续布局逐字节相同；锚不被写坏 |
-| L1b | 图切换 + 判据 + 开关 | 256K + 10K，四臂（off / paged / paged+gather / 连续 + `-fac 256`）x 三档 x r=2 |
-| L1c | 预算 + 文档 | fit 日志一行；`RESULTS.md` 新表；`DECISIONS.md` 开关表 |
-| L2a | 分页 MUL_MAT（可选） | `MUL_MAT` 2275/2275 + 质量门 |
+| L0 | SET_ROWS 分页 + 关掉 ROPE/RMS_NORM 对分页 SET_ROWS 的融合；打开设备 K/V | **完成**（`RESULTS.md` 6.4） |
+| L1a | 工作区 + 逐块 cpy + `get_kv_page_dense` | **完成**：单测逐字节相同（CPU + Vulkan） |
+| L1b | 图切换 + 判据 + 开关 | **完成**：4535 token 逐字相同 |
+| L1c | 预算 + 文档 | **完成**：fit 扣 32 MiB、开关表已登记 |
+| L1d | 目标口径矩阵：三臂（off / paged + gather / paged + `--kv-gather-mib 0`）x 三档 x r=2 | **部分**：8176 档 r=1 已有（530.48 / 509.94 / 449.20）；6144/4096 与 r=2 待做 |
+| L2a | 分页 MUL_MAT（可选） | 未开始，等 L1d 的读数 |
 
 L1 验收线：
 
-- 数值：gather 是纯拷贝，`--kv-page` 与 `off` 在 `temp 0` 下输出**逐字相同**；
-  质量门 `KLD -0.000000` / top-p 100%（与 B2 的验收口径一致，`RESULTS.md` 7.1）。
+- 数值：**已达成**。gather 与连续布局逐字节相同（`test-kv-page`，CPU + Vulkan）；
+  `--kv-page` 与 `off` 的 PPL 相同（2.1676）、4535 token 输出逐字相同；
+  质量门带 `--kv-page` 通过：`mean KLD -0.000000`、`same top p 100.000%`（`RESULTS.md` 6.4 第 5 条）。
 - 性能：paged + gather 的 PP >= 连续布局 `-fac 256` 的 95%（8176 档目标 646 以上）；
   TG 不退步（decode 不走 gather）；三档 `status = ok`；`reallocs` / `hit %` / 工作区 MiB 进表。
 - 4096 档若 bank 仍为 0，只要求不退化（这一档分页本来就是容量档）。
@@ -910,6 +965,6 @@ L1 验收线：
 
 ### 8. 需要确认的决定
 
-1. 顺序：L1 先行，L2 视测量（建议是）。
-2. 工作区 cap 默认 256 MiB、初始 32 MiB（建议是）。
-3. host 块与 L1 同批进 F10 M4 验收（建议是）。
+1. ~~顺序：L1 先行，L2 视测量~~ **已按此执行**（L0 + L1 已落地）。
+2. ~~工作区 cap 默认 256 MiB、初始 32 MiB~~ **已按此落地**：`--kv-gather-mib` 默认 256，fit 扣 32 MiB。
+3. host 块与 L1 同批进 F10 M4 验收：**仍待做**，和 L1d 的矩阵一起。

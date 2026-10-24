@@ -44,7 +44,8 @@ public:
                  uint32_t   kv_size_init = 0,
                             /* paged attention K/V (bench/THREE-TIER.md F10) */
                       bool   kv_page = false,
-                 uint32_t   kv_block = 2048);
+                 uint32_t   kv_block = 2048,
+                   int32_t   kv_gather_mib = 256);
 
     ~llama_memory_hybrid() = default;
 
@@ -130,6 +131,9 @@ public:
 
     // paged K/V lives in the attention cache, the recurrent state is never paged
     bool get_kv_page(int32_t il, ggml_tensor ** k_table, ggml_tensor ** v_table, int32_t * block_size) const override;
+
+    bool get_kv_page_dense(ggml_context * ctx, ggml_cgraph * gf, int32_t il, uint32_t n_kv,
+                           ggml_tensor ** k, ggml_tensor ** v) const override;
 
     //
     // llama_memory_hybrid_context
