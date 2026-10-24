@@ -73,7 +73,7 @@ bench/prompts/    prompt10k.txt (10428 tok)  prompt20k.txt (19758 tok)
                   prompt-multidoc10k.txt (9402 tok)
 bench/env/        power.txt  machine.txt                           口径依赖的机器事实
 bench/tools/      state_check.py（状态一致性）  m0-trace.cpp  m0-sim.py  m0-analyze.py（路由探针）
-                  membw_probe.py（带宽）  gguf_dims.py（张量账）  ssd_probe.py（SSD 能力）
+                  membw_probe.py（带宽）  gguf_dims.py（张量账 + KV）  roofline.py（目标推导）  ssd_probe.py（SSD 能力）
 bench/raw/        每次跑的 .out/.err/.bin 产物（不入库）
 ```
 

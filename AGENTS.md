@@ -62,7 +62,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M1
 phase_status: in_progress
 decision_gate: M1 open
-queues: bench=R1 impl=M1-4a data=R0 io=- user=U-3
+queues: bench=R1 impl=M1-4a data=M1-2a io=- user=U-3
 last_gate: G-REG unknown (2026-10-23 record, not re-run since 44bd79305)
 blockers: none
 <!-- STATE:END -->
@@ -179,7 +179,7 @@ python bench/tools/state_check.py --lane bench    # 只看一条 lane
 | M1-2b | bench | 三类文本局部性复测（技术类已完成） | 与 M0 偏差 <= 5 pp 或已解释 |
 | M1-3a | data | 受限草稿词表（16K）与生成脚本 | 覆盖生成 token 流 >= 95% |
 | M1-3c | impl | draft-mtp 受限候选集（16K，默认关闭） | 空集/坏文件回退完整词表并告警，不 abort |
-| M1-3b | bench | 受限词表 MTP 接受率 E | E >= TG_min x 周期（2026-10-24 为 2.72 / 2.85），token 与 greedy 一致 |
+| M1-3b | bench | 受限词表 MTP 接受率 E | E >= TG_min x 周期（RESULTS 第 9 节周期下 2.73 / 3.16），token 与 greedy 一致 |
 | M1-4a | impl | Vulkan 原型（k=1/2/4/5/8） | 每 pass 的 submit/sync 与计算缓冲可测 |
 | M1-4b | bench | GPU 腿与每 pass 开销 | 与 roofline 偏差 <= 10%，submit+sync < 1 ms，报缓冲 MiB |
 | M1-5 | bench | 带宽同口径复测 | 偏差 <= 5% 或更新 RESULTS |

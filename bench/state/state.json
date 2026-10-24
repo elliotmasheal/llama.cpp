@@ -9,7 +9,7 @@
     "open": true,
     "result": null,
     "criteria": [
-      "E >= TG_min x measured cycle at the selected k (2.72 at k=4, 2.85 at k=5 for the 2026-10-24 cycle; recompute after R1 instead of hard-coding)",
+      "E >= TG_min x measured cycle at the selected k (2.73 at k=4, 3.16 at k=5 for the RESULTS section 9 cycle; recompute after R1 instead of hard-coding)",
       "per-pass submit+sync < 1 ms, and the GPU leg within 10% of the roofline model at k=1/2/4/5/8",
       "locality within 5 pp of M0 on non-technical text",
       "two miss legs measured and the cycle recomputed with an adaptive split (RESULTS section 9)",
@@ -21,7 +21,14 @@
     "tg_min": 130,
     "pp_min": 1000,
     "rule": "130/1000 are hard floors until the user re-sets them; the design target is 0.85 x the roofline at the binding leg, reported every round by R0",
-    "roofline_fraction": 0.85
+    "roofline_fraction": 0.85,
+    "derived_2026_10_24": {
+      "tg_hardware": 180,
+      "tg_r1": 151,
+      "pp_min_tflops": 7.06,
+      "pp_min_chunk": 1420,
+      "source": "bench/RESULTS.md section 11"
+    }
   },
   "resources": {
     "gpu": {
@@ -106,7 +113,7 @@
     },
     {
       "lane": "data",
-      "head": "R0",
+      "head": "M1-2a",
       "order": [
         "R0",
         "M1-2a",
@@ -844,7 +851,8 @@
       "id": "R0",
       "milestone": "M1",
       "lane": "data",
-      "status": "todo",
+      "status": "done",
+      "claimed_at": "2026-10-24T14:05:00",
       "title": "roofline 模型：每条腿的硬件上限与目标推导",
       "deps": [
         "M1-6"
