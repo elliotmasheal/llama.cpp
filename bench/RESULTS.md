@@ -1872,3 +1872,27 @@ xnorm 为 N(0,1)，RX 6700S，平衡+AC，`qrt --deltanet-check`。
 - **下一步（性能，不改数值）**：把 alpha/beta 投影改走 q8_0 稠密 GEMM（k=2048 已满足 256 对齐，
   n=32 需要按 64 行补齐）或改成 4 lane/head + LDS 归约；两者都能把这条腿压到 1 ms/层量级。
   在修好之前不建议把它计入 PP 预算。
+
+## 60. M2-6c：权重表 bug 根因定位并修好（不绕开），gnorm 读回 loader 自己的缓冲（2026-10-25）
+
+口径：layer 0，tokens=64，真实权重，RX 6700S，平衡+AC，`qrt --deltanet-check`，exit 0。
+
+**根因（两个同族 bug，都是"表没跟着长"）**
+1. **释放表比分配表短**：`qrt_dn_weights` 的 `mem[]` 随权重增加而扩容（到 6 条），
+   但 `qrt_dn_weights_free` 里仍写死 `const VkBuffer bufs[5]`，而循环条件是 `i < w->count`。
+   count 到 6 时循环读了表外元素，拿一个垃圾 `VkBuffer` 去释放 —— 正是 `0xC0000005`，
+   而且发生在**加载成功之后**，所以表现为"读都成功、下一步就崩"。
+2. **宿主访问器漏了 `case 5`**：`qrt_dn_weights_host(w, 5)` 返回 NULL，双精度参考直接把 NULL
+   当数组指针读 —— 第二轮崩溃的真因（日志里 `norm_host = 0` 就是证据）。
+
+**修法（一处容量、三处使用、两处守卫）**
+- 新增 `#define QRT_DN_MAX_WEIGHTS 8`：分配表 `mem[]`、释放表 `bufs[]`、两个循环共用同一容量；
+- 每次分配前 `if (w->count >= QRT_DN_MAX_WEIGHTS)` 直接报错（表满不再静默越界）；
+- 访问器补齐 `case 5`（`h_norm`）。
+
+**结果**：`ssm_norm` 回到权重加载器自己的第 6 个缓冲（上一轮"另开缓冲"的绕行已废弃），
+gnorm 直接读 `w->ssm_norm`。四项全 PASS：prep 6.20e-08 / 6.08e-08 / 5.12e-08，
+gate 1.37e-08 / 1.19e-07，gnorm 5.76e-08，递推 1.48e-07（状态与串行逐位相同），exit 0。
+
+**方法论**：崩溃在"加载成功之后"，前三次尝试都去查新功能的 pipeline/描述符，全是错方向。
+真正有效的是 ① 无缓冲 stdout ② 逐语句插桩 ③ 把分配表和释放表并排看。
