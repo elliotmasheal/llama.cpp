@@ -67,6 +67,11 @@ int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size
 int qrt_dn_set_recur(qrt_deltanet * dn, int cols);
 double qrt_dn_last_ms(const qrt_deltanet * dn);
 
+// Pass mode (design 4.6): the four legs append to the caller's command buffer and each
+// inserts a compute barrier after itself; the caller submits once.
+int qrt_dn_attach(qrt_deltanet * dn, VkCommandBuffer cmd, char * err, size_t err_size);
+void qrt_dn_detach(qrt_deltanet * dn);
+
 // Double precision serial reference of the same recurrence, for the gate.
 // state is updated in place; y must hold tokens * d_inner floats.
 void qrt_dn_recur_cpu(const qrt_dn_shapes * sh, uint32_t tokens,

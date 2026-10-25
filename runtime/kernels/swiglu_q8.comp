@@ -7,6 +7,8 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 
+#include "common.glsl"
+
 layout(local_size_x = 64) in;
 
 layout(binding = 0) readonly  buffer Gate { float g[]; } gt;
@@ -52,7 +54,7 @@ void main() {
     }
 
     const float d = amax * (1.0 / 127.0);
-    const uint dh = packHalf2x16(vec2(d, 0.0)) & 0xFFFFu;
+    const uint dh = qrt_f32_to_f16_rne(d);
     ds.s[pc.dsbase + blk] = dh | ((uint(sum + 32768) & 0xFFFFu) << 16);
 
     const uint o = pc.qsbase + blk * 2u;

@@ -1425,8 +1425,12 @@ int main(int argc, char ** argv) {
     const char * norm_gguf_check = NULL;
     const char * norm_tensor = "blk.3.attn_norm.weight";
     const char * layer_gguf_check = NULL;
+    const char * layer_store = NULL;
     int layer_index = 3;
     int layer_tokens = 256;
+    int layer_ffn = 1;
+    int layer_pass = 1;
+    int dn_recur = 1;
     const char * moe_prefix = NULL;
     int moe_layer = 0;
     int moe_expert = 0;
@@ -1600,6 +1604,62 @@ int main(int argc, char ** argv) {
             layer_tokens = atoi(argv[++i]);
             if (layer_tokens < 64) {
                 fprintf(stderr, "qrt: --layer-tokens wants at least 64\n");
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--layer-store") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --layer-store needs the repack prefix\n");
+                return 2;
+            }
+            layer_store = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--layer-ffn") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --layer-ffn wants on or off\n");
+                return 2;
+            }
+            const char * v = argv[++i];
+            if (strcmp(v, "on") == 0) {
+                layer_ffn = 1;
+            } else if (strcmp(v, "off") == 0) {
+                layer_ffn = 0;
+            } else {
+                fprintf(stderr, "qrt: --layer-ffn wants on or off, not '%s'\n", v);
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--layer-pass") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --layer-pass wants on or off\n");
+                return 2;
+            }
+            const char * v = argv[++i];
+            if (strcmp(v, "on") == 0) {
+                layer_pass = 1;
+            } else if (strcmp(v, "off") == 0) {
+                layer_pass = 0;
+            } else {
+                fprintf(stderr, "qrt: --layer-pass wants on or off, not '%s'\n", v);
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--dn-recur") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --dn-recur wants serial or cols\n");
+                return 2;
+            }
+            const char * v = argv[++i];
+            if (strcmp(v, "serial") == 0) {
+                dn_recur = 0;
+            } else if (strcmp(v, "cols") == 0) {
+                dn_recur = 1;
+            } else {
+                fprintf(stderr, "qrt: --dn-recur wants serial or cols, not '%s'\n", v);
                 return 2;
             }
             continue;
@@ -1888,8 +1948,13 @@ int main(int argc, char ** argv) {
                                  prefill_group_kib, prefill_readers, prefill_chunks);
     }
     if (layer_gguf_check != NULL) {
-        return qrt_layer_check(layer_gguf_check, (uint32_t) layer_index, (uint32_t) layer_tokens,
-                               g_spv_dir);
+        qrt_layer_cfg lcfg;
+        memset(&lcfg, 0, sizeof(lcfg));
+        lcfg.ffn = layer_ffn && layer_store != NULL ? 1 : 0;
+        lcfg.single_submit = layer_pass;
+        lcfg.dn_recur = dn_recur;
+        return qrt_layer_check(layer_gguf_check, layer_store, (uint32_t) layer_index,
+                               (uint32_t) layer_tokens, &lcfg, g_spv_dir);
     }
     if (norm_gguf_check != NULL) {
         return qrt_norm_check(&cfg, norm_gguf_check, norm_tensor, dense_tensor,

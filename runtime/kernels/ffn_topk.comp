@@ -1,0 +1,76 @@
+#version 450
+
+// Softmax + top-k of one token's router logits (M2-6 FFN half). One workgroup per token:
+// max and sum stride the 256 experts, then the selection walks the top-k entries serially
+// so ties break on the lower id, which is what ggml's argsort_top_k does on this data.
+// The weights are normalised by the selected sum, clamped to the f16 minimum like
+// build_moe_ffn's norm_w branch.
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer L { float logits[]; };  // [tokens][n]
+layout(binding = 1) writeonly buffer I { uint  ids[]; };      // [tokens][topk]
+layout(binding = 2) writeonly buffer W { float wts[]; };      // [tokens][topk]
+
+layout(push_constant) uniform pc {
+    uint  n;        // experts, at most 256
+    uint  topk;
+    uint  tokens;
+    float scale;    // expert_weights_scale, 1.0 when the model does not set one
+} p;
+
+shared float v[256];
+shared uint  taken[256];
+shared float red[256];
+
+void main() {
+    const uint t = gl_WorkGroupID.x;
+    const uint i = gl_LocalInvocationIndex;
+    v[i] = i < p.n ? logits[t * p.n + i] : -3.0e38;
+    taken[i] = 0u;
+    barrier();
+    red[i] = v[i];
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (i < s && red[i + s] > red[i]) {
+            red[i] = red[i + s];
+        }
+        barrier();
+    }
+    const float mx = red[0];
+    float e = i < p.n ? exp(v[i] - mx) : 0.0;
+    red[i] = e;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (i < s) {
+            red[i] += red[i + s];
+        }
+        barrier();
+    }
+    const float sum = red[0];
+    if (i == 0u) {
+        float picked = 0.0;
+        float probs[8];
+        uint  sel[8];
+        for (uint k = 0u; k < p.topk; ++k) {
+            float best = -3.0e38;
+            uint  bi = 0u;
+            for (uint j = 0u; j < p.n; ++j) {
+                if (taken[j] == 0u && v[j] > best) {
+                    best = v[j];
+                    bi = j;
+                }
+            }
+            taken[bi] = 1u;
+            sel[k] = bi;
+            probs[k] = sum > 0.0 ? exp(best - mx) / sum : 0.0;
+            picked += probs[k];
+        }
+        // f16's smallest normal, the clamp build_moe_ffn applies to the weight sum.
+        const float denom = max(picked, 6.103515625e-5);
+        for (uint k = 0u; k < p.topk; ++k) {
+            ids[t * p.topk + k] = sel[k];
+            wts[t * p.topk + k] = probs[k] / denom * p.scale;
+        }
+    }
+}

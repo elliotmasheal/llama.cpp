@@ -45,4 +45,48 @@ uint qrt_sm_min(uvec3 s, uint j) {
     return (qrt_sm_byte(s, j + 4u) >> 4u) | ((qrt_sm_byte(s, j) >> 6u) << 4);
 }
 
+// fp32 -> binary16 with round-to-nearest-even. packHalf2x16 lowers to round-toward-zero on
+// this driver, and any f16 a later kernel reads must round the way ggml's conversion does
+// (DECISIONS 64.1).
+uint qrt_f32_to_f16_rne(float f) {
+    const uint x    = floatBitsToUint(f);
+    const uint sign = (x >> 16) & 0x8000u;
+    const uint mag  = x & 0x7FFFFFFFu;
+    if (mag >= 0x7F800000u) {
+        return sign | (mag > 0x7F800000u ? 0x7E00u : 0x7C00u);
+    }
+    if (mag >= 0x47800000u) {
+        return sign | 0x7C00u;
+    }
+    if (mag < 0x38800000u) {
+        if (mag < 0x33000000u) {
+            return sign;
+        }
+        const uint shift = 126u - (mag >> 23);
+        const uint mant  = (mag & 0x7FFFFFu) | 0x800000u;
+        uint q = mant >> shift;
+        const uint rem  = mant & ((1u << shift) - 1u);
+        const uint hstep = 1u << (shift - 1u);
+        if (rem > hstep || (rem == hstep && (q & 1u) != 0u)) {
+            q++;
+        }
+        return sign | q;
+    }
+    uint mant = mag & 0x7FFFFFu;
+    uint exp  = ((mag >> 23) - 127u) + 15u;
+    const uint rem = mant & 0x1FFFu;
+    mant >>= 13;
+    if (rem > 0x1000u || (rem == 0x1000u && (mant & 1u) != 0u)) {
+        mant++;
+        if (mant == 0x400u) {
+            mant = 0u;
+            exp++;
+            if (exp >= 31u) {
+                return sign | 0x7C00u;
+            }
+        }
+    }
+    return sign | (exp << 10u) | mant;
+}
+
 #endif

@@ -1,0 +1,56 @@
+#version 450
+
+// Router / shared-expert gate of the FFN half (M2-6): out[t][r] = dot(w[r], x[t]) on f32
+// weights. The shape is small (256 experts or 1 gate row over 2048), so the workgroup
+// keeps an 8-row x 32-token tile and streams k in 64-wide steps through shared memory.
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer X { float x[]; };   // [tokens][k]
+layout(binding = 1) readonly  buffer W { float w[]; };   // [n][k]
+layout(binding = 2) writeonly buffer O { float o[]; };   // [tokens][n]
+
+layout(push_constant) uniform pc {
+    uint n;
+    uint k;
+    uint tokens;
+    uint xbase;    // first float of token 0 in x
+    uint obase;    // first float of row 0 in o
+} p;
+
+// 65-float rows: with a 64-float stride every lane of a warp would hit the same shared
+// bank on xt[lane][i], which turned the router into a 32-way conflict.
+shared float wt[8][65];
+shared float xt[32][65];
+
+void main() {
+    const uint lane = gl_LocalInvocationIndex % 32u;
+    const uint row  = gl_LocalInvocationIndex / 32u;
+    const uint row0 = gl_WorkGroupID.x * 8u;
+    const uint tok0 = gl_WorkGroupID.y * 32u;
+    float acc = 0.0;
+    for (uint k0 = 0; k0 < p.k; k0 += 64u) {
+        for (uint i = gl_LocalInvocationIndex; i < 512u; i += 256u) {
+            const uint r = i / 64u;
+            const uint c = i % 64u;
+            const uint gr = row0 + r;
+            wt[r][c] = gr < p.n ? w[gr * p.k + k0 + c] : 0.0;
+        }
+        for (uint i = gl_LocalInvocationIndex; i < 2048u; i += 256u) {
+            const uint t = i / 64u;
+            const uint c = i % 64u;
+            const uint gt = tok0 + t;
+            xt[t][c] = gt < p.tokens ? x[p.xbase + gt * p.k + k0 + c] : 0.0;
+        }
+        barrier();
+        for (uint i = 0; i < 64u; ++i) {
+            acc += wt[row][i] * xt[lane][i];
+        }
+        barrier();
+    }
+    const uint gr = row0 + row;
+    const uint gt = tok0 + lane;
+    if (gr < p.n && gt < p.tokens) {
+        o[p.obase + gt * p.n + gr] = acc;
+    }
+}

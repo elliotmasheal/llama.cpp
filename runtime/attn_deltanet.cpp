@@ -170,6 +170,7 @@ struct qrt_deltanet {
     VkCommandPool         cmd_pool;
     VkCommandBuffer       cmd;
     VkFence               fence;
+    VkCommandBuffer       ext;      // set by attach: the layer pass records into it
     double                last_ms;
     double                layer_ms;
 };
@@ -516,17 +517,35 @@ int qrt_dn_set_recur(qrt_deltanet * dn, int cols) {
     return 0;
 }
 
+int qrt_dn_attach(qrt_deltanet * dn, VkCommandBuffer cmd, char * err, size_t err_size) {
+    if (dn == NULL || cmd == VK_NULL_HANDLE) {
+        return fail(err, err_size, "the DeltaNet legs need a pass command buffer");
+    }
+    dn->ext = cmd;
+    return 0;
+}
+
+void qrt_dn_detach(qrt_deltanet * dn) {
+    if (dn != NULL) {
+        dn->ext = VK_NULL_HANDLE;
+    }
+}
+
+// Pass mode (design 4.6): a leg appends to the caller's command buffer and inserts the
+// barrier the next leg needs; on its own it keeps the begin/submit/wait shape.
+static VkCommandBuffer dn_leg_begin(qrt_deltanet * dn, const char * what, char * err,
+                                    size_t err_size);
+static int dn_leg_end(qrt_deltanet * dn, VkCommandBuffer cmd, const char * what, double t0,
+                      char * err, size_t err_size);
+
 int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size) {
     if (tokens == 0 || tokens > dn->max_tokens) {
         return fail(err, err_size, "chunk of %u tokens does not fit %u", tokens, dn->max_tokens);
     }
-    VkCommandBufferBeginInfo bi;
-    memset(&bi, 0, sizeof(bi));
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VkResult r = vkBeginCommandBuffer(dn->cmd, &bi);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkBeginCommandBuffer (deltanet)", r);
+    const double t0 = now_ms();
+    VkCommandBuffer cmd = dn_leg_begin(dn, "vkBeginCommandBuffer (deltanet)", err, err_size);
+    if (cmd == VK_NULL_HANDLE) {
+        return -1;
     }
     struct {
         uint32_t n_tokens;
@@ -540,40 +559,20 @@ int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size
     pcs.kq_ch    = dn->sh.qk_ch;
     pcs.k_ratio  = dn->sh.n_v_heads / dn->sh.n_k_heads;
     pcs.qscale   = 1.0f / sqrtf((float) dn->sh.head_dim);
-    vkCmdBindPipeline(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->recur_cols ? dn->pipe_cols : dn->pipe);
-    vkCmdBindDescriptorSets(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->recur_cols ? dn->pipe_cols : dn->pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
                             &dn->set, 0, nullptr);
-    vkCmdPushConstants(dn->cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
+    vkCmdPushConstants(cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
     // serial: one workgroup per (v-head, column group), the group count follows the
     // device's subgroup size which that shader is specialized on; cols: 32 columns per
     // workgroup with a thread owning 32 rows of one column
     if (dn->recur_cols) {
-        vkCmdDispatch(dn->cmd, dn->sh.n_v_heads, dn->sh.head_dim / 32u, 1);
+        vkCmdDispatch(cmd, dn->sh.n_v_heads, dn->sh.head_dim / 32u, 1);
     } else {
         const uint32_t cols_per_wg = 128u / dn->subgroup;
-        vkCmdDispatch(dn->cmd, dn->sh.n_v_heads, dn->sh.head_dim / cols_per_wg, 1);
+        vkCmdDispatch(cmd, dn->sh.n_v_heads, dn->sh.head_dim / cols_per_wg, 1);
     }
-    r = vkEndCommandBuffer(dn->cmd);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkEndCommandBuffer (deltanet)", r);
-    }
-    VkSubmitInfo si;
-    memset(&si, 0, sizeof(si));
-    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers    = &dn->cmd;
-    const double t0 = now_ms();
-    r = vkQueueSubmit(dn->dev->compute_queue, 1, &si, dn->fence);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkQueueSubmit (deltanet)", r);
-    }
-    r = vkWaitForFences(dn->dev->device, 1, &dn->fence, VK_TRUE, UINT64_MAX);
-    dn->last_ms = now_ms() - t0;
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkWaitForFences (deltanet)", r);
-    }
-    return vkResetFences(dn->dev->device, 1, &dn->fence) == VK_SUCCESS ? 0
-             : fail(err, err_size, "vkResetFences (deltanet) failed");
+    return dn_leg_end(dn, cmd, "deltanet", t0, err, err_size);
 }
 
 // Every device buffer a layer weight can own lives in one table, and the same table is
@@ -812,6 +811,53 @@ void qrt_dn_weights_free(qrt_vk_dev * dev, qrt_dn_weights * w) {
     free(w);
 }
 
+// Pass mode (design 4.6): a leg appends to the caller's command buffer and inserts the
+// barrier the next leg needs; on its own it keeps the begin/submit/wait shape.
+static VkCommandBuffer dn_leg_begin(qrt_deltanet * dn, const char * what, char * err,
+                                    size_t err_size) {
+    if (dn->ext != VK_NULL_HANDLE) {
+        return dn->ext;
+    }
+    VkCommandBufferBeginInfo bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    const VkResult r = vkBeginCommandBuffer(dn->cmd, &bi);
+    if (r != VK_SUCCESS) {
+        vk_fail(err, err_size, what, r);
+        return VK_NULL_HANDLE;
+    }
+    return dn->cmd;
+}
+
+static int dn_leg_end(qrt_deltanet * dn, VkCommandBuffer cmd, const char * what, double t0,
+                      char * err, size_t err_size) {
+    if (dn->ext != VK_NULL_HANDLE) {
+        qrt_vk_cmd_record_barrier(cmd);
+        return 0;
+    }
+    VkResult r = vkEndCommandBuffer(cmd);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, what, r);
+    }
+    VkSubmitInfo si;
+    memset(&si, 0, sizeof(si));
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &cmd;
+    r = vkQueueSubmit(dn->dev->compute_queue, 1, &si, dn->fence);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, what, r);
+    }
+    r = vkWaitForFences(dn->dev->device, 1, &dn->fence, VK_TRUE, UINT64_MAX);
+    dn->last_ms = now_ms() - t0;
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, what, r);
+    }
+    return vkResetFences(dn->dev->device, 1, &dn->fence) == VK_SUCCESS ? 0
+             : fail(err, err_size, "%s: vkResetFences failed", what);
+}
+
 int qrt_dn_prep_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
                     float l2_eps, char * err, size_t err_size) {
     if (tokens == 0 || tokens > dn->max_tokens) {
@@ -838,13 +884,11 @@ int qrt_dn_prep_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens
     }
     vkUpdateDescriptorSets(dn->dev->device, 6, wr, 0, nullptr);
 
-    VkCommandBufferBeginInfo bi;
-    memset(&bi, 0, sizeof(bi));
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VkResult r = vkBeginCommandBuffer(dn->cmd, &bi);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkBeginCommandBuffer (deltanet prep)", r);
+    const double t0 = now_ms();
+    VkCommandBuffer cmd = dn_leg_begin(dn, "vkBeginCommandBuffer (deltanet prep)", err,
+                                       err_size);
+    if (cmd == VK_NULL_HANDLE) {
+        return -1;
     }
     struct {
         uint32_t n_tokens;
@@ -864,32 +908,12 @@ int qrt_dn_prep_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens
     pcs.qbase    = 0;
     pcs.kbase    = 0;
     pcs.l2_eps   = l2_eps;    // eps / head_dim, the caller passes attention eps / head_dim
-    vkCmdBindPipeline(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->prep_pipe);
-    vkCmdBindDescriptorSets(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->prep_pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
                             &dn->prep_set, 0, nullptr);
-    vkCmdPushConstants(dn->cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
-    vkCmdDispatch(dn->cmd, dn->sh.conv_ch / dn->sh.head_dim, tokens, 1);
-    r = vkEndCommandBuffer(dn->cmd);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkEndCommandBuffer (deltanet prep)", r);
-    }
-    VkSubmitInfo si;
-    memset(&si, 0, sizeof(si));
-    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers    = &dn->cmd;
-    const double t0 = now_ms();
-    r = vkQueueSubmit(dn->dev->compute_queue, 1, &si, dn->fence);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkQueueSubmit (deltanet prep)", r);
-    }
-    r = vkWaitForFences(dn->dev->device, 1, &dn->fence, VK_TRUE, UINT64_MAX);
-    dn->last_ms = now_ms() - t0;
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkWaitForFences (deltanet prep)", r);
-    }
-    return vkResetFences(dn->dev->device, 1, &dn->fence) == VK_SUCCESS ? 0
-             : fail(err, err_size, "vkResetFences (deltanet prep) failed");
+    vkCmdPushConstants(cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
+    vkCmdDispatch(cmd, dn->sh.conv_ch / dn->sh.head_dim, tokens, 1);
+    return dn_leg_end(dn, cmd, "deltanet prep", t0, err, err_size);
 }
 
 int qrt_dn_gate_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
@@ -918,44 +942,22 @@ int qrt_dn_gate_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens
     }
     vkUpdateDescriptorSets(dn->dev->device, 7, wr, 0, nullptr);
 
-    VkCommandBufferBeginInfo bi;
-    memset(&bi, 0, sizeof(bi));
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VkResult r = vkBeginCommandBuffer(dn->cmd, &bi);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkBeginCommandBuffer (deltanet gate)", r);
+    const double t0 = now_ms();
+    VkCommandBuffer cmd = dn_leg_begin(dn, "vkBeginCommandBuffer (deltanet gate)", err,
+                                       err_size);
+    if (cmd == VK_NULL_HANDLE) {
+        return -1;
     }
     struct { uint32_t n_embd; uint32_t heads; uint32_t xbase; } pcs;
     pcs.n_embd = dn->sh.n_embd;
     pcs.heads  = dn->sh.n_v_heads;
     pcs.xbase  = 0;
-    vkCmdBindPipeline(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->gate_pipe);
-    vkCmdBindDescriptorSets(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->gate_pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
                             &dn->gate_set, 0, nullptr);
-    vkCmdPushConstants(dn->cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
-    vkCmdDispatch(dn->cmd, tokens, 1, 1);
-    r = vkEndCommandBuffer(dn->cmd);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkEndCommandBuffer (deltanet gate)", r);
-    }
-    VkSubmitInfo si;
-    memset(&si, 0, sizeof(si));
-    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers    = &dn->cmd;
-    const double t0 = now_ms();
-    r = vkQueueSubmit(dn->dev->compute_queue, 1, &si, dn->fence);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkQueueSubmit (deltanet gate)", r);
-    }
-    r = vkWaitForFences(dn->dev->device, 1, &dn->fence, VK_TRUE, UINT64_MAX);
-    dn->last_ms = now_ms() - t0;
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkWaitForFences (deltanet gate)", r);
-    }
-    return vkResetFences(dn->dev->device, 1, &dn->fence) == VK_SUCCESS ? 0
-             : fail(err, err_size, "vkResetFences (deltanet gate) failed");
+    vkCmdPushConstants(cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
+    vkCmdDispatch(cmd, tokens, 1, 1);
+    return dn_leg_end(dn, cmd, "deltanet gate", t0, err, err_size);
 }
 
 int qrt_dn_layer_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
@@ -1001,45 +1003,23 @@ int qrt_dn_gnorm_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t token
     }
     vkUpdateDescriptorSets(dn->dev->device, 4, wr, 0, nullptr);
 
-    VkCommandBufferBeginInfo bi;
-    memset(&bi, 0, sizeof(bi));
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VkResult r = vkBeginCommandBuffer(dn->cmd, &bi);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkBeginCommandBuffer (deltanet gnorm)", r);
+    const double t0 = now_ms();
+    VkCommandBuffer cmd = dn_leg_begin(dn, "vkBeginCommandBuffer (deltanet gnorm)", err,
+                                       err_size);
+    if (cmd == VK_NULL_HANDLE) {
+        return -1;
     }
     struct { uint32_t head_dim; uint32_t m; float eps; } pcs;
     pcs.head_dim = dn->sh.head_dim;
     pcs.m        = tokens;
     pcs.eps      = dn->eps;
-    vkCmdBindPipeline(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->gnorm_pipe);
-    vkCmdBindDescriptorSets(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->gnorm_pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
                             &dn->gnorm_set, 0, nullptr);
-    vkCmdPushConstants(dn->cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
+    vkCmdPushConstants(cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
     // one workgroup per token; the shader walks the heads four at a time
-    vkCmdDispatch(dn->cmd, tokens, 1, 1);
-    r = vkEndCommandBuffer(dn->cmd);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkEndCommandBuffer (deltanet gnorm)", r);
-    }
-    VkSubmitInfo si;
-    memset(&si, 0, sizeof(si));
-    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers    = &dn->cmd;
-    const double t0 = now_ms();
-    r = vkQueueSubmit(dn->dev->compute_queue, 1, &si, dn->fence);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkQueueSubmit (deltanet gnorm)", r);
-    }
-    r = vkWaitForFences(dn->dev->device, 1, &dn->fence, VK_TRUE, UINT64_MAX);
-    dn->last_ms = now_ms() - t0;
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkWaitForFences (deltanet gnorm)", r);
-    }
-    return vkResetFences(dn->dev->device, 1, &dn->fence) == VK_SUCCESS ? 0
-             : fail(err, err_size, "vkResetFences (deltanet gnorm) failed");
+    vkCmdDispatch(cmd, tokens, 1, 1);
+    return dn_leg_end(dn, cmd, "deltanet gnorm", t0, err, err_size);
 }
 
 #endif // QRT_HAVE_VULKAN

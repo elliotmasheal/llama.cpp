@@ -1,0 +1,38 @@
+#version 450
+
+// Weighted accumulate of one expert's output into the token rows (M2-6 FFN half):
+// acc[token][c] += weight * o[row][c]. The down GEMM writes a scratch block of this
+// expert's rows; the table row carries the token it came from and the router weight, and
+// a padding row has weight 0 so it is skipped.
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer O   { float o[]; };     // [cap][E] this expert
+layout(binding = 1) buffer           ACC { float acc[]; };  // [tokens][E]
+layout(binding = 2) readonly buffer  TAB { uint  tok[]; };  // [rows]
+layout(binding = 3) readonly buffer  WGT { float wt[]; };   // [rows]
+
+layout(push_constant) uniform pc {
+    uint ebase;     // first row of this expert in the table
+    uint rows;      // rows of the scratch (padded block)
+    uint n;         // E, channels
+    uint wbase;     // first float of row 0 in o
+} p;
+
+void main() {
+    const uint row = gl_WorkGroupID.y;
+    const uint c   = gl_WorkGroupID.x * 256u + gl_LocalInvocationIndex;
+    if (c >= p.n || row >= p.rows) {
+        return;
+    }
+    const uint r = p.ebase + row;
+    const float w = wt[r];
+    if (w == 0.0) {
+        return;
+    }
+    const uint t = tok[r];
+    if (t == 0xffffffffu) {
+        return;
+    }
+    acc[t * p.n + c] += w * o[p.wbase + row * p.n + c];
+}

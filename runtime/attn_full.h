@@ -73,6 +73,10 @@ uint64_t                qrt_full_kv_bytes(const qrt_full * f);
 // Step 1: per-head RMS norm of Q and K, IMRoPE on both, V copied as is. Writes q,
 // kcache[pos0 .. pos0+tokens) and vcache[pos0 .. pos0+tokens).
 int qrt_full_qk(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t err_size);
+// Pass mode (design 4.6): qk and attn append to the caller's command buffer; qk leaves a
+// compute barrier behind for the attention kernel. The caller submits once.
+int qrt_full_attach(qrt_full * f, VkCommandBuffer cmd, char * err, size_t err_size);
+void qrt_full_detach(qrt_full * f);
 
 // Step 2: causal attention of the chunk against kcache/vcache[0 .. pos0+tokens),
 // one head per workgroup, tiles of queries and keys, online softmax; the output is

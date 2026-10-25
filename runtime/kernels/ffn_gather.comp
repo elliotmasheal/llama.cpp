@@ -1,0 +1,34 @@
+#version 450
+
+// Gathers one routed token's Q8_1 planes into an expert's padded row block (M2-6 FFN
+// half). Rows are laid out expert by expert, so the GEMM reads a contiguous plane and the
+// accumulate step finds the token through the same table. A padding row copies zeroes,
+// which keeps the GEMM arithmetic valid without a branch inside it.
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly  buffer SRC_QS { uint qs[]; };   // [tokens][k/4] words
+layout(binding = 1) readonly  buffer SRC_DS { uint ds[]; };   // [tokens][k/32] words
+layout(binding = 2) writeonly buffer DST_QS { uint dq[]; };   // [rows][k/4]
+layout(binding = 3) writeonly buffer DST_DS { uint dd[]; };   // [rows][k/32]
+layout(binding = 4) readonly  buffer TAB { uint tok[]; };     // [rows], 0xffffffff = pad
+
+layout(push_constant) uniform pc {
+    uint k;       // row length
+    uint rows;
+} p;
+
+void main() {
+    const uint r  = gl_WorkGroupID.x;
+    const uint k4 = p.k / 4u;
+    const uint kd = p.k / 32u;
+    const uint t  = tok[r];
+    const bool pad = t == 0xffffffffu;
+    for (uint i = gl_LocalInvocationIndex; i < k4; i += 128u) {
+        dq[r * k4 + i] = pad ? 0u : qs[t * k4 + i];
+    }
+    for (uint i = gl_LocalInvocationIndex; i < kd; i += 128u) {
+        // delta 0 in the low half, sum(q) + 32768 = 32768 in the high half
+        dd[r * kd + i] = pad ? 0x80000000u : ds[t * kd + i];
+    }
+}

@@ -157,6 +157,7 @@ struct qrt_gemm {
     VkFence         fence[2];
     uint32_t        cur;        // ring the record calls append to
     int             pending[2]; // submitted and not waited yet
+    VkCommandBuffer ext;        // set by attach: the caller's pass records into it
     uint32_t        dispatches;
 };
 
@@ -422,12 +423,44 @@ int alloc_set(qrt_gemm * g, const VkBuffer * bufs, VkDescriptorSet * out, char *
 
 uint32_t qrt_gemm_rings(void) { return 2; }
 
+int qrt_gemm_attach(qrt_gemm * g, uint32_t ring, VkCommandBuffer cmd, char * err,
+                    size_t err_size) {
+    if (g == NULL || cmd == VK_NULL_HANDLE) {
+        return fail(err, err_size, "the GEMM needs a context and a command buffer to attach");
+    }
+    if (ring > 1) {
+        return fail(err, err_size, "ring %u is outside the two command rings", ring);
+    }
+    if (g->pending[ring]) {
+        if (qrt_gemm_wait(g, ring, err, err_size) != 0) {
+            return -1;
+        }
+    }
+    const VkResult pr = vkResetDescriptorPool(g->dev->device, g->pool[ring], 0);
+    if (pr != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkResetDescriptorPool (gemm)", pr);
+    }
+    g->sets_used[ring] = 0;
+    g->cur = ring;
+    g->ext = cmd;
+    return 0;
+}
+
+void qrt_gemm_detach(qrt_gemm * g) {
+    if (g != NULL) {
+        g->ext = VK_NULL_HANDLE;
+    }
+}
+
 int qrt_gemm_begin(qrt_gemm * g, uint32_t ring, char * err, size_t err_size) {
     if (g == NULL) {
         return fail(err, err_size, "no GEMM context");
     }
     if (ring > 1) {
         return fail(err, err_size, "ring %u is outside the two command rings", ring);
+    }
+    if (g->ext != VK_NULL_HANDLE) {
+        return fail(err, err_size, "ring %u is attached to a pass; use qrt_gemm_attach", ring);
     }
     if (g->pending[ring]) {
         // The pool and the command buffer of this ring are still being read by the GPU.
@@ -474,14 +507,15 @@ int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t er
             return -1;
         }
     }
-    vkCmdBindPipeline(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_pipe[a->type]);
-    vkCmdBindDescriptorSets(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_layout, 0, 1,
+    VkCommandBuffer cmd = g->ext != VK_NULL_HANDLE ? g->ext : g->cmd[g->cur];
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_pipe[a->type]);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_layout, 0, 1,
                             &set, 0, nullptr);
     const uint32_t pc[7] = { a->n, a->k, a->m, a->wbase, a->obase, a->abase,
                              a->token_major != 0 ? 1u : 0u };
-    vkCmdPushConstants(g->cmd[g->cur], g->gemm_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+    vkCmdPushConstants(cmd, g->gemm_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(pc), pc);
-    vkCmdDispatch(g->cmd[g->cur], a->n / Q4K_TILE_N, a->m / Q4K_TILE_M, 1);
+    vkCmdDispatch(cmd, a->n / Q4K_TILE_N, a->m / Q4K_TILE_M, 1);
     ++g->dispatches;
     return 0;
 }
@@ -504,13 +538,14 @@ int qrt_gemm_record_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer ou
         }
     }
     const uint32_t nk32 = hid / 32;
-    vkCmdBindPipeline(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_pipe);
-    vkCmdBindDescriptorSets(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_layout, 0, 1,
+    VkCommandBuffer cmd = g->ext != VK_NULL_HANDLE ? g->ext : g->cmd[g->cur];
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_layout, 0, 1,
                             &set, 0, nullptr);
     const uint32_t pc[5] = { m, nk32, hid, qsbase, dsbase };
-    vkCmdPushConstants(g->cmd[g->cur], g->swiglu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+    vkCmdPushConstants(cmd, g->swiglu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(pc), pc);
-    vkCmdDispatch(g->cmd[g->cur], (m * nk32 + 63u) / 64u, 1, 1);
+    vkCmdDispatch(cmd, (m * nk32 + 63u) / 64u, 1, 1);
     ++g->dispatches;
     return 0;
 }
@@ -519,12 +554,13 @@ int qrt_gemm_record_barrier(qrt_gemm * g, char * err, size_t err_size) {
     if (g == NULL) {
         return fail(err, err_size, "no GEMM context");
     }
+    VkCommandBuffer cmd = g->ext != VK_NULL_HANDLE ? g->ext : g->cmd[g->cur];
     VkMemoryBarrier mb;
     memset(&mb, 0, sizeof(mb));
     mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(g->cmd[g->cur], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     return 0;
 }
@@ -532,6 +568,9 @@ int qrt_gemm_record_barrier(qrt_gemm * g, char * err, size_t err_size) {
 int qrt_gemm_submit_nowait(qrt_gemm * g, char * err, size_t err_size) {
     if (g == NULL) {
         return fail(err, err_size, "no GEMM context");
+    }
+    if (g->ext != VK_NULL_HANDLE) {
+        return fail(err, err_size, "the GEMM is attached to a pass; the pass submits");
     }
     const uint32_t ring = g->cur;
     VkResult r = vkEndCommandBuffer(g->cmd[ring]);
@@ -622,5 +661,14 @@ int qrt_gemm_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs, V
     snprintf(err, err_size, "this build has no Vulkan");
     return -1;
 }
+
+int qrt_gemm_attach(qrt_gemm * g, uint32_t ring, VkCommandBuffer cmd, char * err,
+                    size_t err_size) {
+    (void) g; (void) ring; (void) cmd;
+    snprintf(err, err_size, "this build has no Vulkan");
+    return -1;
+}
+
+void qrt_gemm_detach(qrt_gemm * g) { (void) g; }
 
 #endif // QRT_HAVE_VULKAN

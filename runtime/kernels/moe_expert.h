@@ -60,3 +60,8 @@ struct qrt_moe_check_result {
 int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer,
                   uint32_t expert, uint32_t rows, qrt_moe_check_result * out, char * err,
                   size_t err_size);
+
+// One row of a K-quant matrix times Q8_1 planes, double precision, in the same dequant
+// order the kernels and --moe-check use. The FFN check reuses it so the two agree.
+void qrt_moe_ref_row(const void * w_row, qrt_quant type, const unsigned char * a_qs,
+                     const uint32_t * a_ds, uint32_t k, uint32_t tokens, double * out);

@@ -68,6 +68,11 @@ int qrt_gemm_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs, V
 // Two command rings so one layer can be computed while the next is recorded.
 uint32_t qrt_gemm_rings(void);
 int qrt_gemm_begin(qrt_gemm * g, uint32_t ring, char * err, size_t err_size);
+// Pass mode (design 4.6): record into a command buffer the caller owns. attach waits the
+// ring and resets its set pool; record/submit stay with the caller afterwards.
+int qrt_gemm_attach(qrt_gemm * g, uint32_t ring, VkCommandBuffer cmd, char * err,
+                    size_t err_size);
+void qrt_gemm_detach(qrt_gemm * g);
 int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t err_size);
 // The plane bases let one buffer hold every expert's swiglu output of a layer: qs is
 // counted in uvec4, ds in words.

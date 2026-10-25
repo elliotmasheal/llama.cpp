@@ -1,7 +1,7 @@
 {
   "schema": 3,
   "track": "qwen36-runtime",
-  "updated": "2026-10-25",
+  "updated": "2026-10-25 18:30",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -145,11 +145,11 @@
         "M4-3",
         "M4-4"
       ],
-      "note": "M1 measurements are closed. M2-7/M2-8 wait for the runtime (M2-5/M2-6)"
+      "note": "M2-7 needs M2-6a (KV precision) before the 256K-context KLD run"
     },
     {
       "lane": "impl",
-      "head": "M2-6",
+      "head": "M2-6a",
       "order": [
         "M2-0",
         "M2-1",
@@ -165,7 +165,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6d is done; M2-6 (the layer chain) is the head and needs the rmsnorm+Q8_1 kernel first"
+      "note": "M2-6 is done; M2-6a (q4_0 KV + 16K resident window) is next, then M3-1/M3-2"
     },
     {
       "lane": "data",
@@ -576,7 +576,7 @@
       "id": "M2-6",
       "milestone": "M2",
       "lane": "impl",
-      "status": "partial",
+      "status": "done",
       "title": "注意力路径：DeltaNet 递推 + full-attn 批量",
       "deps": [
         "M2-6b",
@@ -589,7 +589,7 @@
       ],
       "done_when": "k=1 prefill 与参考一致；full-attn 的 KV 只读一次；DeltaNet 状态与串行解码一致；M2-6b/6c/6d 全部 done",
       "claimed_at": "2026-10-25T17:28:29",
-      "note": "partial 2026-10-25: the attention half of a layer runs end to end in runtime/layer.* (norm -> q8_0 projections -> DeltaNet four legs or full qk+attn -> Q8_1 of the attention output -> output projection -> residual add -> post norm) with no host round trip; 10K cost is 8.7 us/token for a DeltaNet layer and 31.3 us/token for a full-attn layer, 6.0-6.2 s over 41 layers. --layer-check compares every stage against one CPU double chain and passes on four layers at 512 tokens: norm 3.9e-08, projections 1.2e-07 to 9.7e-06, attention 4.4-5.3e-07, output projection 1.6-1.8e-07, residual 3.3-4.1e-08, post norm 6.0-6.4e-08. The 1e-3 projection discrepancy of the first run was the check itself: its hand-written f16 decoder got subnormals wrong by 2x (exponent 102+k instead of 103+k), fixed; the kernels were right all along. Still open for M2-6: the FFN half (shared expert + routed MoE) is not part of this chain, multi-chunk KV append per layer is not exercised here, and the whole-layer submit count is 1 command buffer per module call rather than one per layer. RESULTS 72, DECISIONS 67"
+      "note": "done 2026-10-25: the layer chain now covers the whole block, not just the attention half. runtime/ffn.* adds the router, softmax+top-8, the sigmoid-gated shared expert and the routed experts read from the repacked store; runtime/layer.* records a layer into one shared command buffer (qrt_vk_cmd) so a layer costs two submits (attention half + router, then the FFN) instead of about twelve, and the router top-k is the one host round trip because the expert GEMM grids depend on it. All stages pass against one CPU double chain on four layers at 512 and 1024 tokens: norm 3.9e-08, projections 1.9e-06..9.9e-06, attention 4.4e-07..5.8e-07, output projection 1.6e-07..1.9e-07, residual 3.3e-08..4.1e-08, post norm 6.0e-08..6.6e-08, router logits 6.9e-07 with 512/512 ids, shared gate 6.5e-07, shared expert 5.9e-08, routed MoE 5.9e-06..1.6e-05, layer output 1.4e-07..4.6e-07. At 10K a DeltaNet layer is 95 + 93 ms and a full layer 326 + 95 ms (attention half + FFN), projecting about 1010 tok/s over 41 layers if the 464 MiB expert read per layer is overlapped the way M2-5 does. Three defects came out of the stitching: the K-quant GEMM had no token-major output (the expert path read it transposed, rel_L1 1.09 until the shaders learned the flag), swiglu_q8 used the truncating packHalf2x16 for its f16 delta (4.8e-04 -> 5.9e-08 with the shared RNE helper), and the router had a 32-way shared-memory bank conflict (route 92 -> 16..24 ms at 10K). Open: moe_expert batch path still records gate/up row-major for swiglu (RESULTS 73.4), the router tile, GPU-side grouping, and the whole-model KLD of M2-7. RESULTS 73, DECISIONS 70"
     },
     {
       "id": "M2-7",

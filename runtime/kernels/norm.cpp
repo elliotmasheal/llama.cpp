@@ -16,6 +16,7 @@
 #ifdef QRT_HAVE_VULKAN
 
 #define QRT_NORM_RINGS 2
+#define QRT_NORM_SETS_PER_RING 64
 
 namespace {
 
@@ -90,9 +91,12 @@ struct qrt_norm_pc {
     uint32_t do_out;
 };
 
+void write_set(qrt_vk_dev * dev, VkDescriptorSet set, VkBuffer * bufs, uint32_t n);
+
 struct qrt_norm_ring {
-    VkDescriptorSet set;
-    VkCommandPool   pool;
+    VkDescriptorPool pool;     // reset by attach/record: one set per dispatch (DECISIONS 65.2)
+    uint32_t        sets_used;
+    VkCommandPool   cmd_pool;
     VkCommandBuffer cmd;
     VkFence         fence;
     int             busy;
@@ -102,11 +106,40 @@ struct qrt_norm {
     qrt_vk_dev *      dev;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout  layout;
-    VkDescriptorPool  pool;
     VkPipeline        pipe;
     qrt_norm_ring     ring[QRT_NORM_RINGS];
+    VkCommandBuffer   ext;       // set by attach: the pass records into it
     double            last_ms;
 };
+
+namespace {
+
+// One set per dispatch: a command buffer only references the set object, so rewriting a
+// set would change every dispatch already recorded with it (DECISIONS 65.2).
+int alloc_set(qrt_norm * n, uint32_t ring, const VkBuffer * bufs, VkDescriptorSet * out,
+              char * err, size_t err_size) {
+    const uint32_t slots = QRT_NORM_SETS_PER_RING;
+    if (n->ring[ring].sets_used >= slots) {
+        return fail(err, err_size, "norm ring %u already holds %u dispatches", ring, slots);
+    }
+    VkDescriptorSetAllocateInfo dsai;
+    memset(&dsai, 0, sizeof(dsai));
+    dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool     = n->ring[ring].pool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts        = &n->dsl;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    const VkResult r = vkAllocateDescriptorSets(n->dev->device, &dsai, &set);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkAllocateDescriptorSets (norm)", r);
+    }
+    write_set(n->dev, set, (VkBuffer *) bufs, 5);
+    ++n->ring[ring].sets_used;
+    *out = set;
+    return 0;
+}
+
+} // namespace
 
 uint32_t qrt_norm_rings(void) { return QRT_NORM_RINGS; }
 
@@ -193,43 +226,33 @@ int qrt_norm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_norm ** out,
     VkDescriptorPoolSize psize;
     memset(&psize, 0, sizeof(psize));
     psize.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    psize.descriptorCount = 5 * QRT_NORM_RINGS;
+    psize.descriptorCount = 5 * QRT_NORM_SETS_PER_RING;
     VkDescriptorPoolCreateInfo dpci;
     memset(&dpci, 0, sizeof(dpci));
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets       = QRT_NORM_RINGS;
+    dpci.maxSets       = QRT_NORM_SETS_PER_RING;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes    = &psize;
-    if (vkCreateDescriptorPool(dev->device, &dpci, nullptr, &n->pool) != VK_SUCCESS) {
-        qrt_norm_close(dev, n);
-        return fail(err, err_size, "vkCreateDescriptorPool (norm) failed");
-    }
 
     for (uint32_t i = 0; i < QRT_NORM_RINGS; ++i) {
         qrt_norm_ring * g = &n->ring[i];
-        VkDescriptorSetAllocateInfo dsai;
-        memset(&dsai, 0, sizeof(dsai));
-        dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsai.descriptorPool     = n->pool;
-        dsai.descriptorSetCount = 1;
-        dsai.pSetLayouts        = &n->dsl;
-        if (vkAllocateDescriptorSets(dev->device, &dsai, &g->set) != VK_SUCCESS) {
+        if (vkCreateDescriptorPool(dev->device, &dpci, nullptr, &g->pool) != VK_SUCCESS) {
             qrt_norm_close(dev, n);
-            return fail(err, err_size, "vkAllocateDescriptorSets (norm) failed");
+            return fail(err, err_size, "vkCreateDescriptorPool (norm) failed");
         }
         VkCommandPoolCreateInfo cpi;
         memset(&cpi, 0, sizeof(cpi));
         cpi.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         cpi.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         cpi.queueFamilyIndex = dev->compute_family;
-        if (vkCreateCommandPool(dev->device, &cpi, nullptr, &g->pool) != VK_SUCCESS) {
+        if (vkCreateCommandPool(dev->device, &cpi, nullptr, &g->cmd_pool) != VK_SUCCESS) {
             qrt_norm_close(dev, n);
             return fail(err, err_size, "vkCreateCommandPool (norm) failed");
         }
         VkCommandBufferAllocateInfo cbai;
         memset(&cbai, 0, sizeof(cbai));
         cbai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cbai.commandPool        = g->pool;
+        cbai.commandPool        = g->cmd_pool;
         cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cbai.commandBufferCount = 1;
         if (vkAllocateCommandBuffers(dev->device, &cbai, &g->cmd) != VK_SUCCESS) {
@@ -257,19 +280,22 @@ void qrt_norm_close(qrt_vk_dev * dev, qrt_norm * n) {
             if (n->ring[i].fence != VK_NULL_HANDLE) {
                 vkDestroyFence(dev->device, n->ring[i].fence, nullptr);
             }
+            if (n->ring[i].cmd_pool != VK_NULL_HANDLE) {
+                vkDestroyCommandPool(dev->device, n->ring[i].cmd_pool, nullptr);
+            }
             if (n->ring[i].pool != VK_NULL_HANDLE) {
-                vkDestroyCommandPool(dev->device, n->ring[i].pool, nullptr);
+                vkDestroyDescriptorPool(dev->device, n->ring[i].pool, nullptr);
             }
         }
         if (n->pipe != VK_NULL_HANDLE)   vkDestroyPipeline(dev->device, n->pipe, nullptr);
-        if (n->pool != VK_NULL_HANDLE)   vkDestroyDescriptorPool(dev->device, n->pool, nullptr);
         if (n->layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(dev->device, n->layout, nullptr);
         if (n->dsl != VK_NULL_HANDLE)    vkDestroyDescriptorSetLayout(dev->device, n->dsl, nullptr);
     }
     free(n);
 }
 
-static void write_set(qrt_vk_dev * dev, VkDescriptorSet set, VkBuffer * bufs, uint32_t n) {
+// write_set stays a plain helper: the set it fills is always a fresh one.
+void write_set(qrt_vk_dev * dev, VkDescriptorSet set, VkBuffer * bufs, uint32_t n) {
     VkDescriptorBufferInfo info[5];
     VkWriteDescriptorSet wr[5];
     memset(info, 0, sizeof(info));
@@ -286,6 +312,33 @@ static void write_set(qrt_vk_dev * dev, VkDescriptorSet set, VkBuffer * bufs, ui
         wr[i].pBufferInfo     = &info[i];
     }
     vkUpdateDescriptorSets(dev->device, n, wr, 0, nullptr);
+}
+
+int qrt_norm_attach(qrt_norm * n, uint32_t ring, VkCommandBuffer cmd, char * err,
+                    size_t err_size) {
+    if (n == NULL || cmd == VK_NULL_HANDLE) {
+        return fail(err, err_size, "norm attach needs the module and a command buffer");
+    }
+    if (ring >= QRT_NORM_RINGS) {
+        return fail(err, err_size, "norm ring %u is above the %u that exist", ring,
+                    (uint32_t) QRT_NORM_RINGS);
+    }
+    if (qrt_norm_wait(n, ring, err, err_size) != 0) {
+        return -1;
+    }
+    const VkResult r = vkResetDescriptorPool(n->dev->device, n->ring[ring].pool, 0);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkResetDescriptorPool (norm)", r);
+    }
+    n->ring[ring].sets_used = 0;
+    n->ext = cmd;
+    return 0;
+}
+
+void qrt_norm_detach(qrt_norm * n) {
+    if (n != NULL) {
+        n->ext = VK_NULL_HANDLE;
+    }
 }
 
 int qrt_norm_record(qrt_norm * n, uint32_t ring, const qrt_norm_args * a,
@@ -309,22 +362,33 @@ int qrt_norm_record(qrt_norm * n, uint32_t ring, const qrt_norm_args * a,
         return fail(err, err_size, "norm quant needs the qs and ds planes");
     }
     qrt_norm_ring * g = &n->ring[ring];
-    if (g->busy) {
-        return fail(err, err_size, "norm ring %u is still in flight; wait before recording",
-                    ring);
-    }
+    VkCommandBuffer cmd = n->ext != VK_NULL_HANDLE ? n->ext : g->cmd;
     VkBuffer bufs[5] = { a->x, a->w, a->no_out != 0 ? a->x : a->out,
                          a->quant != 0 ? a->qs : a->out,
                          a->quant != 0 ? a->ds : a->out };
-    write_set(n->dev, g->set, bufs, 5);
-
-    VkCommandBufferBeginInfo bi;
-    memset(&bi, 0, sizeof(bi));
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VkResult r = vkBeginCommandBuffer(g->cmd, &bi);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkBeginCommandBuffer (norm)", r);
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (n->ext == VK_NULL_HANDLE) {
+        // One-shot: the ring was waited, so its pool can be handed back and refilled.
+        if (g->busy) {
+            return fail(err, err_size, "norm ring %u is still in flight; wait before recording",
+                        ring);
+        }
+        const VkResult pr = vkResetDescriptorPool(n->dev->device, g->pool, 0);
+        if (pr != VK_SUCCESS) {
+            return vk_fail(err, err_size, "vkResetDescriptorPool (norm)", pr);
+        }
+        g->sets_used = 0;
+        VkCommandBufferBeginInfo bi;
+        memset(&bi, 0, sizeof(bi));
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        const VkResult r = vkBeginCommandBuffer(g->cmd, &bi);
+        if (r != VK_SUCCESS) {
+            return vk_fail(err, err_size, "vkBeginCommandBuffer (norm)", r);
+        }
+    }
+    if (alloc_set(n, ring, bufs, &set, err, err_size) != 0) {
+        return -1;
     }
     qrt_norm_pc pc;
     memset(&pc, 0, sizeof(pc));
@@ -337,14 +401,16 @@ int qrt_norm_record(qrt_norm * n, uint32_t ring, const qrt_norm_args * a,
     pc.do_quant = a->quant != 0 ? 1u : 0u;
     pc.do_norm  = a->no_norm != 0 ? 0u : 1u;
     pc.do_out   = a->no_out != 0 ? 0u : 1u;
-    vkCmdBindPipeline(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, n->pipe);
-    vkCmdBindDescriptorSets(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, n->layout, 0, 1, &g->set,
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, n->pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, n->layout, 0, 1, &set,
                             0, nullptr);
-    vkCmdPushConstants(g->cmd, n->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(g->cmd, a->tokens, 1, 1);
-    r = vkEndCommandBuffer(g->cmd);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkEndCommandBuffer (norm)", r);
+    vkCmdPushConstants(cmd, n->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cmd, a->tokens, 1, 1);
+    if (n->ext == VK_NULL_HANDLE) {
+        const VkResult r = vkEndCommandBuffer(g->cmd);
+        if (r != VK_SUCCESS) {
+            return vk_fail(err, err_size, "vkEndCommandBuffer (norm)", r);
+        }
     }
     return 0;
 }
@@ -352,6 +418,10 @@ int qrt_norm_record(qrt_norm * n, uint32_t ring, const qrt_norm_args * a,
 int qrt_norm_submit(qrt_norm * n, uint32_t ring, char * err, size_t err_size) {
     if (n == NULL || ring >= QRT_NORM_RINGS) {
         return fail(err, err_size, "norm submit ring %u does not exist", ring);
+    }
+    if (n->ext != VK_NULL_HANDLE) {
+        return fail(err, err_size, "norm ring %u is attached to a pass; the pass submits",
+                    ring);
     }
     qrt_norm_ring * g = &n->ring[ring];
     VkSubmitInfo si;
@@ -424,6 +494,11 @@ int qrt_norm_run(qrt_norm *, const qrt_norm_args *, char * err, size_t err_size)
     snprintf(err, err_size, "this build has no Vulkan SDK");
     return -1;
 }
+int qrt_norm_attach(qrt_norm *, uint32_t, VkCommandBuffer, char * err, size_t err_size) {
+    snprintf(err, err_size, "this build has no Vulkan SDK");
+    return -1;
+}
+void qrt_norm_detach(qrt_norm *) {}
 
 #endif  // QRT_HAVE_VULKAN
 

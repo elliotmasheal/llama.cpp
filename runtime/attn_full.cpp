@@ -225,6 +225,7 @@ struct qrt_full {
     VkCommandPool         cmd_pool;
     VkCommandBuffer       cmd;
     VkFence               fence;
+    VkCommandBuffer       ext;    // set by attach: the layer pass records into it
 };
 
 int qrt_full_shapes_from_gguf(const qrt_gguf_hparams * hp, qrt_full_shapes * out,
@@ -433,8 +434,13 @@ uint64_t qrt_full_kv_bytes(const qrt_full * f) {
     return (uint64_t) f->sh.n_kv * f->n_ctx * f->sh.head_dim * 2;   // one plane
 }
 
-static int submit_and_wait(qrt_full * f, char * err, size_t err_size) {
-    const VkResult r = vkEndCommandBuffer(f->cmd);
+static int submit_and_wait(qrt_full * f, VkCommandBuffer cmd, char * err, size_t err_size) {
+    if (f->ext != VK_NULL_HANDLE) {
+        // qk writes the KV cache the attention kernel reads: order the two dispatches.
+        qrt_vk_cmd_record_barrier(cmd);
+        return 0;
+    }
+    const VkResult r = vkEndCommandBuffer(cmd);
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkEndCommandBuffer (full attention)", r);
     }
@@ -442,7 +448,7 @@ static int submit_and_wait(qrt_full * f, char * err, size_t err_size) {
     memset(&si, 0, sizeof(si));
     si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
-    si.pCommandBuffers    = &f->cmd;
+    si.pCommandBuffers    = &cmd;
     const double t0 = now_ms();
     VkResult rs = vkQueueSubmit(f->dev->compute_queue, 1, &si, f->fence);
     if (rs != VK_SUCCESS) {
@@ -457,16 +463,34 @@ static int submit_and_wait(qrt_full * f, char * err, size_t err_size) {
              : fail(err, err_size, "vkResetFences (full attention) failed");
 }
 
-static int begin_cmd(qrt_full * f, char * err, size_t err_size) {
+static VkCommandBuffer begin_cmd(qrt_full * f, char * err, size_t err_size) {
+    if (f->ext != VK_NULL_HANDLE) {
+        return f->ext;
+    }
     VkCommandBufferBeginInfo bi;
     memset(&bi, 0, sizeof(bi));
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     const VkResult r = vkBeginCommandBuffer(f->cmd, &bi);
     if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkBeginCommandBuffer (full attention)", r);
+        vk_fail(err, err_size, "vkBeginCommandBuffer (full attention)", r);
+        return VK_NULL_HANDLE;
     }
+    return f->cmd;
+}
+
+int qrt_full_attach(qrt_full * f, VkCommandBuffer cmd, char * err, size_t err_size) {
+    if (f == NULL || cmd == VK_NULL_HANDLE) {
+        return fail(err, err_size, "full attention needs a pass command buffer");
+    }
+    f->ext = cmd;
     return 0;
+}
+
+void qrt_full_detach(qrt_full * f) {
+    if (f != NULL) {
+        f->ext = VK_NULL_HANDLE;
+    }
 }
 
 int qrt_full_qk(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t err_size) {
@@ -477,9 +501,10 @@ int qrt_full_qk(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t
         return fail(err, err_size, "positions %u..%u are past the %u token KV cache",
                     pos0, pos0 + tokens, f->n_ctx);
     }
-    if (begin_cmd(f, err, err_size) != 0) {
+    if (begin_cmd(f, err, err_size) == VK_NULL_HANDLE) {
         return -1;
     }
+    VkCommandBuffer cmd = f->ext != VK_NULL_HANDLE ? f->ext : f->cmd;
     struct {
         uint32_t pos0;
         uint32_t tokens;
@@ -498,13 +523,13 @@ int qrt_full_qk(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t
     pc.eps        = f->sh.eps;
     pc.freq_base  = f->sh.freq_base;
     pc.freq_scale = f->sh.freq_scale;
-    vkCmdBindPipeline(f->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->qk_pipe);
-    vkCmdBindDescriptorSets(f->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->qk_layout, 0, 1,
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->qk_pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->qk_layout, 0, 1,
                             &f->qk_set, 0, nullptr);
-    vkCmdPushConstants(f->cmd, f->qk_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdPushConstants(cmd, f->qk_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     // one workgroup per token: a warp owns one head's norm and rope
-    vkCmdDispatch(f->cmd, tokens, 1, 1);
-    return submit_and_wait(f, err, err_size);
+    vkCmdDispatch(cmd, tokens, 1, 1);
+    return submit_and_wait(f, cmd, err, err_size);
 }
 
 int qrt_full_attn(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t err_size) {
@@ -515,7 +540,7 @@ int qrt_full_attn(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size
         return fail(err, err_size, "positions %u..%u are past the %u token KV cache",
                     pos0, pos0 + tokens, f->n_ctx);
     }
-    if (begin_cmd(f, err, err_size) != 0) {
+    if (begin_cmd(f, err, err_size) == VK_NULL_HANDLE) {
         return -1;
     }
     struct {
@@ -530,12 +555,13 @@ int qrt_full_attn(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size
     pc.kv_cap   = f->n_ctx;
     pc.qg_ch    = f->sh.qg_ch;
     pc.kq_scale = f->sh.kq_scale;
-    vkCmdBindPipeline(f->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->attn_pipe);
-    vkCmdBindDescriptorSets(f->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->attn_layout, 0, 1,
+    VkCommandBuffer cmd = f->ext != VK_NULL_HANDLE ? f->ext : f->cmd;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->attn_pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->attn_layout, 0, 1,
                             &f->attn_set, 0, nullptr);
-    vkCmdPushConstants(f->cmd, f->attn_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdPushConstants(cmd, f->attn_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     // one workgroup per (query tile of 32, query head)
-    vkCmdDispatch(f->cmd, (tokens + 63u) / 64u, f->sh.n_head, 1);
+    vkCmdDispatch(cmd, (tokens + 63u) / 64u, f->sh.n_head, 1);
 
     // the account the "KV read once" claim is checked against: every query tile scans
     // the KV tiles up to its own diagonal
@@ -546,7 +572,7 @@ int qrt_full_attn(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size
     }
     f->last_kv_reads = tiles * f->sh.n_head * 32ull * f->sh.head_dim * 2ull * 2ull;
 
-    return submit_and_wait(f, err, err_size);
+    return submit_and_wait(f, cmd, err, err_size);
 }
 
 // ---------------------------------------------------------------- references
@@ -770,6 +796,12 @@ int qrt_full_attn(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size
     snprintf(err, err_size, "full attention needs a Vulkan build");
     return -1;
 }
+int qrt_full_attach(qrt_full * f, VkCommandBuffer cmd, char * err, size_t err_size) {
+    (void) f; (void) cmd;
+    snprintf(err, err_size, "full attention needs a Vulkan build");
+    return -1;
+}
+void qrt_full_detach(qrt_full * f) { (void) f; }
 void qrt_full_qk_cpu(const qrt_full_shapes * sh, uint32_t pos0, uint32_t tokens,
                      const float * qg, const float * kin, const float * vin,
                      const float * q_norm_w, const float * k_norm_w,

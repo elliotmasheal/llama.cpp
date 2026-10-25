@@ -38,9 +38,8 @@ int qrt_norm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_norm ** out,
                   char * err, size_t err_size);
 void qrt_norm_close(qrt_vk_dev * dev, qrt_norm * n);
 
-// Two command rings so a caller can record the next chunk while the current one runs.
-// A ring's descriptor set is rewritten on every record, so only record into a ring whose
-// previous submission has been waited for.
+// Two command rings so a caller can record the next chunk while the current one runs. A
+// module records into a caller-owned pass buffer when attached; on its own it submits.
 uint32_t qrt_norm_rings(void);
 int qrt_norm_record(qrt_norm * n, uint32_t ring, const qrt_norm_args * a,
                     char * err, size_t err_size);
@@ -49,6 +48,12 @@ int qrt_norm_wait(qrt_norm * n, uint32_t ring, char * err, size_t err_size);
 // record + submit + wait on ring 0: the one-shot path the checks use.
 int qrt_norm_run(qrt_norm * n, const qrt_norm_args * a, char * err, size_t err_size);
 double qrt_norm_last_ms(const qrt_norm * n);
+
+// Pass mode (design 4.6): record into a command buffer the caller owns. attach waits the
+// ring and resets its set pool; record then appends to cmd, the caller submits and waits.
+int qrt_norm_attach(qrt_norm * n, uint32_t ring, VkCommandBuffer cmd, char * err,
+                    size_t err_size);
+void qrt_norm_detach(qrt_norm * n);
 
 // Double precision reference of the same two steps, for the gate. qs_out holds
 // tokens * (k/32) blocks of 32 int8; ds_out holds tokens * (k/32) words with the same

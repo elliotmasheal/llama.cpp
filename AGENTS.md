@@ -43,14 +43,14 @@ RX 6700S 8 GiB（`-dev Vulkan1`）+ Ryzen 7 6800HS + 40172 MiB RAM，平衡电�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M2-6 data=- io=- user=-
+queues: bench=- impl=M2-6a data=- io=- user=-
 last_gate: G-REG unknown (2026-10-23)
 blockers: none
 <!-- STATE:END -->
 
 `queues` 只写任务 id；"为什么是它、做到什么算完"在 `state.json`。
 本节摘要最多 3 行：历史与读数只在 `RESULTS.md` / `DECISIONS.md`，`--lint` 会拦 dated bullet 与任务表。
-焦点：M2-6 整层链路，用 `--brief M2-6` 看必读清单。
+焦点：M2-6a 的 q4_0 KV 与常驻窗口分页；层链（含 FFN、两次合并提交）已 closed，见 `RESULTS` `m2-6-ffn-two-submits`。
 
 ## 4. 铁律
 

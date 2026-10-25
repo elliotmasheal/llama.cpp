@@ -16,17 +16,17 @@ What exists now:
   the byte account `bench/tools/gguf_dims.py` prints. No abort path: malformed files come
   back as an error string. Tensor bytes are streamed later through the same handle.
 - `vk_dev.*` - Vulkan device, compute and transfer queues, memory type selection, the
-  `VK_EXT_memory_budget` query, the design 5.5 budget planner with a tier cap, and the
-  staging buffer with the H2D/D2H copy path.
+  `VK_EXT_memory_budget` query, the design 5.5 budget planner with a tier cap, the
+  staging buffer with the H2D/D2H copy path, and the pass command-buffer recorder
+  (`qrt_vk_cmd`) the layer chain submits once per half.
 - `weights.*` - the repacked expert store: `.idx` page table, per-expert byte ranges, reads.
 - `qrt_main.cpp` - the `qrt` binary: `--help`, `--print-config`, `--selftest`,
   `--gguf-index`, `--require-tensor`, `--vk-info`, `--vk-alloc-probe`, `--vk-io-check`.
 - `CMakeLists.txt` - the `qrt_core` library and the `qrt` executable, plus the
   `qrt_selftest` ctest case.
 
-What does not exist yet: the dense residency and the expert cache (M2-3, in progress),
-kernels (M2-4), prefill (M2-5), decode (M3). `runtime/proto/` and `runtime/cpu_moe*` predate
-the scaffold and keep their own targets.
+What does not exist yet: decode (M3), the expert cache (M3-0) and GPU-side routing. The
+layer chain and the prefill scheduler both run; they are not wired to each other yet.
 
 ## Build
 
@@ -293,31 +293,40 @@ build-vulkan/bin/qrt.exe --norm-check <gguf> --norm-tensor blk.0.attn_norm.weigh
 
 ## Layer chain (M2-6)
 
-`
+```
 build-vulkan/bin/qrt.exe --layer-check <gguf> --layer 3 --layer-tokens 256
 build-vulkan/bin/qrt.exe --layer-check <gguf> --layer 0 --layer-tokens 10240
-`
+build-vulkan/bin/qrt.exe --layer-check <gguf> --layer 3 --layer-tokens 512 --layer-store <prefix>
+```
 
-- 
-untime/layer.* runs one transformer block's attention half in the order the model runs it:
-  input RMS norm, the q8_0 projections, the attention path (qrt_dn_layer_run for a DeltaNet
-  layer, qrt_full_qk + qrt_full_attn otherwise), the Q8_1 packing of the attention output,
-  the output projection, the residual add and the post-attention norm. The FFN half belongs to
-  the expert leg (M2-5) and the shared expert, so the chain stops at the post norm.
-- No stage goes through the host: every buffer is the next stage's input. layer_add.comp is
-  the residual add; the projections write 	oken_major output because the attention modules
-  read [token][channel] and a transpose would cost 0.3-0.7 GB per layer at 10K.
-- --layer-check compares each stage against one CPU double chain. The reference for a stage is
-  fed the *device's* previous stage output, so the check validates the wiring; each kernel keeps
-  its own check. For a full-attention layer the reference reads the device's f16 KV cache and
-  dequantises it, so the f16 storage error is shared instead of landing in the gate.
-- Cost at 10K: 8.7 us per token for a DeltaNet layer, 31.3 us for a full-attention layer,
-  6.0-6.2 s for the 41 layers.
-- QRT_LAYER_STOP_PROJ=1 stops after the projections; it exists to bisect the open 1e-3
-  projection discrepancy (RESULTS 72.4) and changes nothing by default.
-- Still missing for M2-6: the FFN half (shared expert + routed MoE) is not part of this chain,
-  and a layer costs one submit per module call instead of one per layer.
-
+- `runtime/layer.*` runs one transformer block in the order the model runs it: input RMS norm,
+  the q8_0 projections, the attention path (`qrt_dn_layer_run` for a DeltaNet layer,
+  `qrt_full_qk` + `qrt_full_attn` otherwise), the Q8_1 packing of the attention output, the
+  output projection, the residual add, the post-attention norm, and with `--layer-store` the
+  FFN half (`runtime/ffn.*`: router, top-k, gated shared expert, routed experts from the
+  repacked store) plus the final residual add. The projections write token-major output because
+  the attention modules read [token][channel] and a transpose would cost 0.3-0.7 GB per layer
+  at 10K.
+- `--layer-pass on` (default) records the layer into a shared command buffer (`qrt_vk_cmd` in
+  `vk_dev.*`): one submit for the attention half and the router, one for the FFN. The router's
+  top-k has to reach the host before the expert GEMM grids can be recorded, so the FFN costs a
+  second submit (DECISIONS 68). `--layer-pass off` keeps the module-by-module path as the A/B.
+- `--layer-ffn on|off` (default on when `--layer-store` is given), `--dn-recur serial|cols`
+  (default cols, the 32-column recurrence from RESULTS 63).
+- `--layer-check` compares each stage against one CPU double chain. The reference for a stage
+  is fed the *device's* previous stage output, so the check validates the wiring; each kernel
+  keeps its own check. For a full-attention layer the reference reads the device's f16 KV cache
+  and dequantises it, so the f16 storage error is shared instead of landing in the gate. The
+  FFN reference covers the router and the shared expert over the first 64 tokens and the routed
+  experts over their pairs, and reuses the K-quant dequant order of `--moe-check`.
+- Cost at 10K (two submits, the expert store read counted apart): 95 ms attention + 93 ms FFN
+  for a DeltaNet layer, 328 + 94 ms for a full-attention layer. The 464 MiB expert read per
+  layer is host work the prefill scheduler overlaps (M2-5).
+- QRT_LAYER_STOP_PROJ=1 stops after the projections; it bisects the projection readings of
+  RESULTS 72 and changes nothing by default.
+- Still missing for M2-6: the router tile is far from its roofline (the activation tile is
+  re-read once per row block), and GPU-side grouping plus indirect dispatch is what a true
+  one-submit layer needs.
 ## Telemetry## Telemetry
 
 `--telemetry 1 --telemetry-path <file>` writes a CSV with this header:
@@ -350,6 +359,7 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `kernels/norm.h/.cpp` | RMS norm + Q8_1 activation pack (M2-6), the dense GEMM's activation leg |
 | `kernels/q4k_gemm.*` | Q4_K x Q8_1 int8 GEMM and swiglu+Q8_1 kernels, one submit per call |
 | `kernels/moe_expert.*` | one expert's gate/up/swiglu/down as a prefill compute callback |
-| `layer.h/.cpp` | one layer chain: norm, projections, attention path, output projection, residual, post norm (M2-6) |
+| `layer.h/.cpp` | one layer chain: norm, projections, attention path, output projection, residual, post norm, FFN half, one pass submit (M2-6) |
+| `ffn.h/.cpp` | FFN half: router, top-k, gated shared expert, routed experts, weighted accumulate (M2-6) |
 | `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check`, `--dense-check`, `--prefill-check`, `--moe-check`, `--dense-gemm-check`, `--norm-check`, `--layer-check` |
 | `CMakeLists.txt` | `qrt_core`, `qrt`, `qrt_selftest` |

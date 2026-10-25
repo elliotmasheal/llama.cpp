@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <vector>
+
 #ifdef QRT_HAVE_VULKAN
 
 namespace {
@@ -423,7 +425,7 @@ int qrt_moe_wait(void * user, uint32_t ring, char * err, size_t err_size) {
 // Q8_1 activation, in double, folded exactly like the kernels claim to fold it.
 static void ref_gemm_row(const unsigned char * w, qrt_quant type, const unsigned char * a_qs,
                          const uint32_t * a_ds, uint32_t n_row, uint32_t k, uint32_t m_tok,
-                         float * out) {
+                         double * out) {
     const size_t block = qrt_gemm_block_bytes(type);
     const uint32_t nsb = k / 256;
     const uint32_t nk32 = k / 32;
@@ -497,8 +499,15 @@ static void ref_gemm_row(const unsigned char * w, qrt_quant type, const unsigned
                 }
             }
         }
-        out[tok] = (float) acc;
+        out[tok] = acc;
     }
+}
+
+// One row of a K-quant matrix times Q8_1 planes, in double: the FFN check shares the
+// dequant order with --moe-check instead of keeping a third copy of it.
+void qrt_moe_ref_row(const void * w_row, qrt_quant type, const unsigned char * a_qs,
+                     const uint32_t * a_ds, uint32_t k, uint32_t tokens, double * out) {
+    ref_gemm_row((const unsigned char *) w_row, type, a_qs, a_ds, 0, k, tokens, out);
 }
 
 struct check_arm {
@@ -527,8 +536,12 @@ static int check_one(qrt_vk_dev * dev, qrt_moe * m, check_arm * arm, const unsig
     if (qrt_vk_download(dev, stg, arm->args.out, (uint64_t) arm->args.obase * 4, arm->gpu,
                         (uint64_t) t * arm->args.n * 4, err, err_size) == 0) {
         for (uint32_t row = 0; row < arm->rows; ++row) {
+            std::vector<double> ref_row(t);
             ref_gemm_row(arm->host, arm->type, a_qs, a_ds, row, arm->args.k, t,
-                         arm->want + (size_t) row * t);
+                         ref_row.data());
+            for (uint32_t tok = 0; tok < t; ++tok) {
+                arm->want[(size_t) row * t + tok] = (float) ref_row[tok];
+            }
         }
         double num = 0.0;
         double den = 0.0;

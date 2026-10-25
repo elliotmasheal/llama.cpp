@@ -6,9 +6,11 @@
 
 #include "attn_deltanet.h"
 #include "attn_full.h"
+#include "ffn.h"
 #include "gguf_index.h"
 #include "kernels/gemm.h"
 #include "kernels/norm.h"
+#include "weights.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -187,6 +189,7 @@ struct qrt_layer_proj {
 struct qrt_layer {
     qrt_vk_dev *    dev;
     qrt_layer_info  info;
+    qrt_layer_cfg   cfg;
     uint32_t        layer;
     float           eps;
     float           l2_eps;
@@ -195,7 +198,9 @@ struct qrt_layer {
     qrt_deltanet *  dn;
     qrt_dn_weights * dnw;
     qrt_full *      full;
+    qrt_ffn *       ffn;
     qrt_vk_staging * stg;
+    qrt_vk_cmd *    pass;
     qrt_dn_shapes   dsh;
     qrt_full_shapes fsh;
 
@@ -203,15 +208,14 @@ struct qrt_layer {
     qrt_layer_proj  proj[4];
     VkBuffer        proj_out[4];
 
-    VkBuffer        x, norm_out, xnorm, attn_src, attn_out, xpost;
-    VkDeviceMemory  x_mem, norm_mem, xnorm_mem, out_mem, post_mem;
+    VkBuffer        x, norm_out, xnorm, attn_src, attn_out, xpost, xout;
+    VkDeviceMemory  x_mem, norm_mem, xnorm_mem, out_mem, post_mem, xout_mem;
     VkBuffer        qs, ds, p2_qs, p2_ds, norm_w, post_w;
     VkDeviceMemory  qs_mem, ds_mem, p2qs_mem, p2ds_mem, nw_mem, pw_mem;
 
     VkDescriptorSetLayout add_dsl;
     VkPipelineLayout add_layout;
     VkDescriptorPool add_pool;
-    VkDescriptorSet  add_set;
     VkPipeline       add_pipe;
     VkCommandPool    add_cmd_pool;
     VkCommandBuffer  add_cmd;
@@ -220,13 +224,50 @@ struct qrt_layer {
     // host copies the check's reference needs
     std::vector<float> h_x, h_norm, h_post, h_qnw, h_knw;
     double             last_ms;
+    double             pass1_ms;
+    double             group_ms;
+    double             pass2_ms;
+    uint32_t           submits;
+    uint32_t           dispatches;
 };
 
 uint32_t qrt_layer_rings(void) { return 1; }
 
 const qrt_layer_info * qrt_layer_shape(const qrt_layer * l) { return l != NULL ? &l->info : NULL; }
 double qrt_layer_last_ms(const qrt_layer * l) { return l != NULL ? l->last_ms : 0.0; }
+double qrt_layer_pass1_ms(const qrt_layer * l) { return l != NULL ? l->pass1_ms : 0.0; }
+double qrt_layer_group_ms(const qrt_layer * l) { return l != NULL ? l->group_ms : 0.0; }
+double qrt_layer_pass2_ms(const qrt_layer * l) { return l != NULL ? l->pass2_ms : 0.0; }
+uint32_t qrt_layer_submits(const qrt_layer * l) { return l != NULL ? l->submits : 0; }
+uint32_t qrt_layer_dispatches(const qrt_layer * l) {
+    if (l == NULL) {
+        return 0;
+    }
+    return l->dispatches + (l->ffn != NULL ? qrt_ffn_dispatches(l->ffn) : 0);
+}
+uint32_t qrt_layer_experts(const qrt_layer * l) {
+    return l != NULL && l->ffn != NULL ? qrt_ffn_experts_used(l->ffn) : 0;
+}
+uint32_t qrt_layer_rows(const qrt_layer * l) {
+    return l != NULL && l->ffn != NULL ? qrt_ffn_rows(l->ffn) : 0;
+}
+uint64_t qrt_layer_store_bytes(const qrt_layer * l) {
+    return l != NULL && l->ffn != NULL ? qrt_ffn_store_bytes(l->ffn) : 0;
+}
+uint64_t qrt_layer_plane_bytes(const qrt_layer * l) {
+    return l != NULL && l->ffn != NULL ? qrt_ffn_planes_bytes(l->ffn) : 0;
+}
+const qrt_ffn_bufs * qrt_layer_ffn_bufs(const qrt_layer * l) {
+    return l != NULL && l->ffn != NULL ? qrt_ffn_buffers(l->ffn) : NULL;
+}
+qrt_ffn * qrt_layer_ffn(qrt_layer * l) { return l != NULL ? l->ffn : NULL; }
 VkBuffer qrt_layer_x(const qrt_layer * l) { return l != NULL ? l->x : VK_NULL_HANDLE; }
+VkBuffer qrt_layer_out(const qrt_layer * l) {
+    if (l == NULL) {
+        return VK_NULL_HANDLE;
+    }
+    return l->ffn != NULL ? l->xout : l->x;
+}
 VkBuffer qrt_layer_xnorm(const qrt_layer * l) { return l != NULL ? l->norm_out : VK_NULL_HANDLE; }
 VkBuffer qrt_layer_attn_out(const qrt_layer * l) { return l != NULL ? l->attn_out : VK_NULL_HANDLE; }
 VkBuffer qrt_layer_post_norm(const qrt_layer * l) { return l != NULL ? l->xpost : VK_NULL_HANDLE; }
@@ -335,24 +376,15 @@ static int add_pipeline_open(qrt_layer * l, const char * spv_dir, char * err, si
     VkDescriptorPoolSize psize;
     memset(&psize, 0, sizeof(psize));
     psize.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    psize.descriptorCount = 4;
+    psize.descriptorCount = 3 * 8;
     VkDescriptorPoolCreateInfo dpci;
     memset(&dpci, 0, sizeof(dpci));
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets       = 4;
+    dpci.maxSets       = 8;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes    = &psize;
     if (vkCreateDescriptorPool(dev->device, &dpci, nullptr, &l->add_pool) != VK_SUCCESS) {
         return fail(err, err_size, "vkCreateDescriptorPool (layer add) failed");
-    }
-    VkDescriptorSetAllocateInfo dsai;
-    memset(&dsai, 0, sizeof(dsai));
-    dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsai.descriptorPool     = l->add_pool;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts        = &l->add_dsl;
-    if (vkAllocateDescriptorSets(dev->device, &dsai, &l->add_set) != VK_SUCCESS) {
-        return fail(err, err_size, "vkAllocateDescriptorSets (layer add) failed");
     }
     VkCommandPoolCreateInfo cpi;
     memset(&cpi, 0, sizeof(cpi));
@@ -387,18 +419,44 @@ static int add_run(qrt_layer * l, uint32_t count, VkBuffer a, VkBuffer b, VkBuff
     VkWriteDescriptorSet wr[3];
     memset(info, 0, sizeof(info));
     memset(wr, 0, sizeof(wr));
+    // One set per record, from the pool the last wait left free (DECISIONS 65.2).
+    const VkResult pr = vkResetDescriptorPool(l->dev->device, l->add_pool, 0);
+    if (pr != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkResetDescriptorPool (layer add)", pr);
+    }
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo dsai;
+    memset(&dsai, 0, sizeof(dsai));
+    dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool     = l->add_pool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts        = &l->add_dsl;
+    if (vkAllocateDescriptorSets(l->dev->device, &dsai, &set) != VK_SUCCESS) {
+        return fail(err, err_size, "vkAllocateDescriptorSets (layer add) failed");
+    }
     for (uint32_t i = 0; i < 3; ++i) {
         info[i].buffer        = bufs[i];
         info[i].offset        = 0;
         info[i].range         = VK_WHOLE_SIZE;
         wr[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet          = l->add_set;
+        wr[i].dstSet          = set;
         wr[i].dstBinding      = i;
         wr[i].descriptorCount = 1;
         wr[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         wr[i].pBufferInfo     = &info[i];
     }
     vkUpdateDescriptorSets(l->dev->device, 3, wr, 0, nullptr);
+    if (l->pass != NULL) {
+        VkCommandBuffer cmd = qrt_vk_cmd_buffer(l->pass, 0);
+        const uint32_t pc[4] = { count, 0, 0, 0 };
+        ++l->dispatches;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, l->add_pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, l->add_layout, 0, 1, &set,
+                                0, nullptr);
+        vkCmdPushConstants(cmd, l->add_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(cmd, (count + 127u) / 128u, 1, 1);
+        return 0;
+    }
     VkCommandBufferBeginInfo bi;
     memset(&bi, 0, sizeof(bi));
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -410,7 +468,7 @@ static int add_run(qrt_layer * l, uint32_t count, VkBuffer a, VkBuffer b, VkBuff
     const uint32_t pc[4] = { count, 0, 0, 0 };
     vkCmdBindPipeline(l->add_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, l->add_pipe);
     vkCmdBindDescriptorSets(l->add_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, l->add_layout, 0, 1,
-                            &l->add_set, 0, nullptr);
+                            &set, 0, nullptr);
     vkCmdPushConstants(l->add_cmd, l->add_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
     vkCmdDispatch(l->add_cmd, (count + 127u) / 128u, 1, 1);
     r = vkEndCommandBuffer(l->add_cmd);
@@ -441,8 +499,9 @@ static int alloc_f32(qrt_layer * l, uint64_t floats, VkBuffer * buf, VkDeviceMem
                         QRT_VK_USAGE_TRANSFER_DST, buf, mem, err, err_size);
 }
 
-int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer, uint32_t tokens,
-                   const char * spv_dir, qrt_layer ** out, char * err, size_t err_size) {
+int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_prefix,
+                   uint32_t layer, uint32_t tokens, const char * spv_dir,
+                   const qrt_layer_cfg * cfg, qrt_layer ** out, char * err, size_t err_size) {
     *out = NULL;
     if (dev == NULL || gguf_path == NULL || spv_dir == NULL || tokens == 0) {
         return fail(err, err_size, "the layer chain needs a device, GGUF, SPIR-V and tokens");
@@ -462,6 +521,13 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer, uin
     l->dev = dev;
     l->layer = layer;
     l->info.tokens = tokens;
+    if (cfg != NULL) {
+        l->cfg = *cfg;
+    } else {
+        l->cfg.ffn = 0;
+        l->cfg.single_submit = 1;
+        l->cfg.dn_recur = 1;
+    }
     char name[128];
     snprintf(name, sizeof(name), "blk.%u.attn_qkv.weight", layer);
     l->info.linear = qrt_gguf_find(g, name) != NULL ? 1 : 0;
@@ -489,7 +555,8 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer, uin
     l->eps = 1e-6f;
 
     if (qrt_gemm_open(dev, spv_dir, &l->gemm, err, err_size) != 0 ||
-        qrt_norm_open(dev, spv_dir, &l->nrm, err, err_size) != 0) {
+        qrt_norm_open(dev, spv_dir, &l->nrm, err, err_size) != 0 ||
+        qrt_vk_cmd_create(dev, 2, &l->pass, err, err_size) != 0) {
         qrt_layer_close(dev, l);
         qrt_gguf_close(g);
         return -1;
@@ -509,6 +576,11 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer, uin
             qrt_layer_close(dev, l);
             qrt_gguf_close(g);
             return -1;
+        }
+        if (qrt_dn_set_recur(l->dn, l->cfg.dn_recur ? 1 : 0) != 0) {
+            qrt_layer_close(dev, l);
+            qrt_gguf_close(g);
+            return fail(err, err_size, "the 32-column DeltaNet kernel is not in '%s'", spv_dir);
         }
         l->info.inter = dsh.d_inner;
         l->dsh = dsh;
@@ -623,7 +695,8 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer, uin
     // Every activation buffer this chain touches.
     if (alloc_f32(l, (uint64_t) T * E, &l->x, &l->x_mem, err, err_size) != 0 ||
         alloc_f32(l, (uint64_t) T * E, &l->attn_out, &l->out_mem, err, err_size) != 0 ||
-        alloc_f32(l, (uint64_t) T * E, &l->xpost, &l->post_mem, err, err_size) != 0) {
+        alloc_f32(l, (uint64_t) T * E, &l->xpost, &l->post_mem, err, err_size) != 0 ||
+        alloc_f32(l, (uint64_t) T * E, &l->xout, &l->xout_mem, err, err_size) != 0) {
         qrt_layer_close(dev, l);
         return -1;
     }
@@ -671,6 +744,42 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer, uin
             return -1;
         }
     }
+
+    // The FFN half: gated shared expert, router and the routed experts from the store.
+    if (l->cfg.ffn) {
+        if (store_prefix == NULL) {
+            qrt_layer_close(dev, l);
+            return fail(err, err_size, "the FFN half needs the repacked expert store");
+        }
+        qrt_gguf * hg = NULL;
+        if (qrt_gguf_open(gguf_path, &hg, err, err_size) != 0) {
+            qrt_layer_close(dev, l);
+            return -1;
+        }
+        const qrt_gguf_hparams hp = *qrt_gguf_hparams_of(hg);
+        qrt_gguf_close(hg);
+        if (hp.expert_count <= 0 || hp.expert_used_count <= 0 || hp.expert_ff <= 0) {
+            qrt_layer_close(dev, l);
+            return fail(err, err_size, "the FFN half needs expert_count / used / ff, got %d/%d/%d",
+                        hp.expert_count, hp.expert_used_count, hp.expert_ff);
+        }
+        qrt_ffn_cfg fc;
+        memset(&fc, 0, sizeof(fc));
+        fc.tokens   = T;
+        fc.n_embd   = E;
+        fc.n_expert = (uint32_t) hp.expert_count;
+        fc.top_k    = (uint32_t) hp.expert_used_count;
+        fc.ffn      = (uint32_t) hp.expert_ff;
+        fc.scale    = 1.0f;
+        if (qrt_ffn_open(dev, gguf_path, store_prefix, spv_dir, layer, &fc, &l->ffn, err,
+                         err_size) != 0) {
+            qrt_layer_close(dev, l);
+            return -1;
+        }
+        l->info.n_expert = fc.n_expert;
+        l->info.top_k    = fc.top_k;
+        l->info.ffn      = fc.ffn;
+    }
     *out = l;
     return 0;
 }
@@ -685,11 +794,12 @@ void qrt_layer_close(qrt_vk_dev * dev, qrt_layer * l) {
                 qrt_vk_free(dev, l->proj[i].buf, l->proj[i].mem);
             }
         }
-        const VkBuffer bufs[9] = { l->x, l->xnorm, l->attn_out, l->xpost, l->qs, l->ds,
-                                   l->p2_qs, l->p2_ds, l->norm_w };
-        VkDeviceMemory mems[9] = { l->x_mem, l->xnorm_mem, l->out_mem, l->post_mem, l->qs_mem,
-                                   l->ds_mem, l->p2qs_mem, l->p2ds_mem, l->nw_mem };
-        for (uint32_t i = 0; i < 9; ++i) {
+        const VkBuffer bufs[10] = { l->x, l->xnorm, l->attn_out, l->xpost, l->qs, l->ds,
+                                    l->p2_qs, l->p2_ds, l->norm_w, l->xout };
+        VkDeviceMemory mems[10] = { l->x_mem, l->xnorm_mem, l->out_mem, l->post_mem,
+                                    l->qs_mem, l->ds_mem, l->p2qs_mem, l->p2ds_mem,
+                                    l->nw_mem, l->xout_mem };
+        for (uint32_t i = 0; i < 10; ++i) {
             if (mems[i] != VK_NULL_HANDLE) {
                 qrt_vk_free(dev, bufs[i], mems[i]);
             }
@@ -704,6 +814,8 @@ void qrt_layer_close(qrt_vk_dev * dev, qrt_layer * l) {
         qrt_vk_staging_destroy(dev, l->stg);
         qrt_norm_close(dev, l->nrm);
         qrt_gemm_close(dev, l->gemm);
+        qrt_vk_cmd_destroy(dev, l->pass);
+        qrt_ffn_close(dev, l->ffn);
         qrt_dn_weights_free(dev, l->dnw);
         qrt_dn_close(dev, l->dn);
         qrt_full_close(dev, l->full);
@@ -718,6 +830,14 @@ int qrt_layer_set_input(qrt_layer * l, const float * x, char * err, size_t err_s
     const uint64_t bytes = (uint64_t) l->info.tokens * l->info.n_embd * 4;
     l->h_x.assign(x, x + (size_t) (bytes / 4));
     return qrt_vk_upload(l->dev, l->stg, l->x, 0, x, bytes, err, err_size);
+}
+
+// Every stage of the layer reads what the stage before it wrote: in pass mode those are
+// dispatches of one command buffer, so each boundary needs its own memory barrier.
+static void stage_barrier(qrt_layer * l) {
+    if (l->pass != NULL) {
+        qrt_vk_cmd_record_barrier(qrt_vk_cmd_buffer(l->pass, 0));
+    }
 }
 
 static int layer_norm(qrt_layer * l, VkBuffer src, VkBuffer w, VkBuffer out, VkBuffer qs,
@@ -735,6 +855,11 @@ static int layer_norm(qrt_layer * l, VkBuffer src, VkBuffer w, VkBuffer out, VkB
     na.quant = 1;
     na.no_norm = no_norm;
     na.no_out = out == VK_NULL_HANDLE ? 1 : 0;
+    if (l->pass != NULL) {
+        // pass mode: the record goes into the layer's command buffer
+        ++l->dispatches;
+        return qrt_norm_record(l->nrm, 0, &na, err, err_size);
+    }
     return qrt_norm_run(l->nrm, &na, err, err_size);
 }
 
@@ -751,31 +876,32 @@ static int layer_gemm(qrt_layer * l, uint32_t which, VkBuffer planes_qs, VkBuffe
     ga.m = l->info.tokens;
     ga.type = QRT_QUANT_Q8_0;
     ga.token_major = 1;
+    if (l->pass != NULL) {
+        ++l->dispatches;
+        return qrt_gemm_record(l->gemm, &ga, err, err_size);
+    }
     return qrt_gemm_dispatch(l->gemm, &ga, err, err_size);
 }
 
-int qrt_layer_run(qrt_layer * l, char * err, size_t err_size) {
-    if (l == NULL) {
-        return fail(err, err_size, "no layer");
-    }
-    const double t0 = now_ms();
+// The attention half in the order the model runs it, recorded into the layer's pass.
+static int layer_attention_half(qrt_layer * l, char * err, size_t err_size) {
     const uint32_t T = l->info.tokens;
     const uint32_t E = l->info.n_embd;
     const uint32_t last = l->n_proj - 1;
-
     // 1. input norm; DeltaNet's gate reads the f32 row, so norm_out points at its buffer
     if (layer_norm(l, l->x, l->norm_w, l->norm_out, l->qs, l->ds, E, 0, err, err_size) != 0) {
         return -1;
     }
+    stage_barrier(l);
     // 2. the projections that eat the normed row
     for (uint32_t i = 0; i < last; ++i) {
         if (layer_gemm(l, i, l->qs, l->ds, l->proj_out[i], E, err, err_size) != 0) {
             return -1;
         }
     }
+    stage_barrier(l);
     // 3. the attention path
     if (getenv("QRT_LAYER_STOP_PROJ") != NULL) {
-        l->last_ms = now_ms() - t0;
         return 0;
     }
     if (l->info.linear) {
@@ -788,21 +914,135 @@ int qrt_layer_run(qrt_layer * l, char * err, size_t err_size) {
             return -1;
         }
     }
+    stage_barrier(l);
     // 4. quantise the attention output: the output projection eats planes, not a row
     if (layer_norm(l, l->attn_src, l->norm_w, VK_NULL_HANDLE, l->p2_qs, l->p2_ds, l->info.inter,
                    1, err, err_size) != 0) {
         return -1;
     }
+    stage_barrier(l);
     // 5. output projection, 6. residual add
-    if (layer_gemm(l, last, l->p2_qs, l->p2_ds, l->attn_out, l->info.inter, err, err_size) != 0 ||
-        add_run(l, T * E, l->x, l->attn_out, l->x, err, err_size) != 0) {
+    if (layer_gemm(l, last, l->p2_qs, l->p2_ds, l->attn_out, l->info.inter, err, err_size) != 0) {
         return -1;
     }
-    // 7. post-attention norm, which is what the FFN half will read
+    stage_barrier(l);
+    if (add_run(l, T * E, l->x, l->attn_out, l->x, err, err_size) != 0) {
+        return -1;
+    }
+    stage_barrier(l);
+    // 7. post-attention norm, and its Q8_1 planes, which is what the FFN half reads
     if (layer_norm(l, l->x, l->post_w, l->xpost, l->qs, l->ds, E, 0, err, err_size) != 0) {
         return -1;
     }
+    stage_barrier(l);
+    return 0;
+}
+
+// Two merged submits per layer: the attention half and the router in the first, the FFN
+// with the layer's experts in the second. The split is structural: the router's top-k has
+// to reach the host before the expert GEMM grids can be recorded (DECISIONS 68).
+static int layer_run_pass(qrt_layer * l, char * err, size_t err_size) {
+    const uint32_t ring = 0;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    const double t0 = now_ms();
+    l->submits = 0;
+    l->dispatches = 0;
+
+    if (qrt_vk_cmd_begin(l->pass, ring, err, err_size) != 0) {
+        return -1;
+    }
+    cmd = qrt_vk_cmd_buffer(l->pass, ring);
+    if (qrt_norm_attach(l->nrm, ring, cmd, err, err_size) != 0 ||
+        qrt_gemm_attach(l->gemm, ring, cmd, err, err_size) != 0) {
+        return -1;
+    }
+    if (l->info.linear) {
+        if (qrt_dn_attach(l->dn, cmd, err, err_size) != 0) {
+            return -1;
+        }
+    } else {
+        if (qrt_full_attach(l->full, cmd, err, err_size) != 0) {
+            return -1;
+        }
+    }
+    if (layer_attention_half(l, err, err_size) != 0) {
+        return -1;
+    }
+    if (l->ffn != NULL) {
+        qrt_ffn_in in;
+        memset(&in, 0, sizeof(in));
+        in.x = l->x;
+        in.xnorm = l->xpost;
+        in.x_qs = l->qs;
+        in.x_ds = l->ds;
+        in.out = l->xout;
+        if (qrt_ffn_begin(l->ffn, ring, cmd, err, err_size) != 0 ||
+            qrt_ffn_route(l->ffn, &in, err, err_size) != 0) {
+            return -1;
+        }
+    }
+    if (qrt_vk_cmd_submit(l->pass, ring, err, err_size) != 0 ||
+        qrt_vk_cmd_wait(l->pass, ring, err, err_size) != 0) {
+        return -1;
+    }
+    ++l->submits;
+    l->pass1_ms = now_ms() - t0;
+
+    if (l->ffn != NULL) {
+        const double tg = now_ms();
+        if (qrt_ffn_group(l->ffn, err, err_size) != 0) {
+            return -1;
+        }
+        l->group_ms = now_ms() - tg;
+        const double t2 = now_ms();
+        if (qrt_vk_cmd_begin(l->pass, ring, err, err_size) != 0) {
+            return -1;
+        }
+        cmd = qrt_vk_cmd_buffer(l->pass, ring);
+        if (qrt_ffn_begin(l->ffn, ring, cmd, err, err_size) != 0 ||
+            qrt_ffn_experts(l->ffn, err, err_size) != 0) {
+            return -1;
+        }
+        if (qrt_vk_cmd_submit(l->pass, ring, err, err_size) != 0 ||
+            qrt_vk_cmd_wait(l->pass, ring, err, err_size) != 0) {
+            return -1;
+        }
+        ++l->submits;
+        l->pass2_ms = now_ms() - t2;
+    }
+    qrt_norm_detach(l->nrm);
+    qrt_gemm_detach(l->gemm);
+    qrt_dn_detach(l->dn);
+    qrt_full_detach(l->full);
     l->last_ms = now_ms() - t0;
+    return 0;
+}
+
+int qrt_layer_run(qrt_layer * l, char * err, size_t err_size) {
+    if (l == NULL) {
+        return fail(err, err_size, "no layer");
+    }
+    l->pass1_ms = l->pass2_ms = 0.0;
+    l->group_ms = 0.0;
+    if (l->cfg.single_submit) {
+        return layer_run_pass(l, err, err_size);
+    }
+    // The module-by-module path: one submit per leg, kept as the switch's fallback and as
+    // the A/B for the merged pass.
+    qrt_vk_cmd * pass = l->pass;
+    l->pass = NULL;
+    const double t0 = now_ms();
+    const int rc = layer_attention_half(l, err, err_size);
+    l->pass = pass;
+    l->submits = 1;
+    l->pass1_ms = now_ms() - t0;
+    l->last_ms = l->pass1_ms;
+    if (rc != 0) {
+        return -1;
+    }
+    if (l->ffn != NULL) {
+        return fail(err, err_size, "the FFN half needs the merged pass (--layer-pass on)");
+    }
     return 0;
 }
 
@@ -883,8 +1123,8 @@ int download(qrt_layer * l, VkBuffer src, void * dst, uint64_t bytes, char * err
 
 } // namespace
 
-int qrt_layer_check(const char * gguf_path, uint32_t layer, uint32_t tokens,
-                    const char * spv_dir) {
+int qrt_layer_check(const char * gguf_path, const char * store_prefix, uint32_t layer,
+                    uint32_t tokens, const qrt_layer_cfg * cfg, const char * spv_dir) {
     char err[QRT_ERR_SIZE] = {0};
     qrt_vk_dev * dev = NULL;
     if (qrt_vk_open(0, &dev, err, sizeof(err)) != 0) {
@@ -892,7 +1132,8 @@ int qrt_layer_check(const char * gguf_path, uint32_t layer, uint32_t tokens,
         return 2;
     }
     qrt_layer * l = NULL;
-    if (qrt_layer_open(dev, gguf_path, layer, tokens, spv_dir, &l, err, sizeof(err)) != 0) {
+    if (qrt_layer_open(dev, gguf_path, store_prefix, layer, tokens, spv_dir, cfg, &l, err,
+                       sizeof(err)) != 0) {
         fprintf(stderr, "qrt: %s\n", err);
         qrt_vk_close(dev);
         return 2;
@@ -900,8 +1141,10 @@ int qrt_layer_check(const char * gguf_path, uint32_t layer, uint32_t tokens,
     const qrt_layer_info info = *qrt_layer_shape(l);
     const uint32_t E = info.n_embd;
     const uint32_t T = info.tokens;
-    printf("layer_info layer=%u linear=%d n_embd=%u tokens=%u inter=%u projections=%u\n",
-           layer, info.linear, E, T, info.inter, l->n_proj);
+    printf("layer_info layer=%u linear=%d n_embd=%u tokens=%u inter=%u projections=%u "
+           "ffn=%d experts=%u top_k=%u single_submit=%d\n",
+           layer, info.linear, E, T, info.inter, l->n_proj, l->ffn != NULL, info.n_expert,
+           info.top_k, l->cfg.single_submit);
 
     std::vector<float> x((size_t) T * E);
     uint32_t seed = 0x5EED1234u;
@@ -943,6 +1186,12 @@ int qrt_layer_check(const char * gguf_path, uint32_t layer, uint32_t tokens,
     }
     printf("layer_perf layer=%u tokens=%u ms=%.3f min_ms=%.3f us_per_token=%.3f\n", layer, T, med,
            min_ms, med * 1000.0 / (double) T);
+    printf("layer_stages ms_pass1=%.3f ms_group=%.3f ms_pass2=%.3f submits=%u "
+           "dispatches=%u experts=%u rows=%u store_mib=%.1f planes_mib=%.1f\n",
+           qrt_layer_pass1_ms(l), qrt_layer_group_ms(l), qrt_layer_pass2_ms(l),
+           qrt_layer_submits(l), qrt_layer_dispatches(l), qrt_layer_experts(l),
+           qrt_layer_rows(l), (double) qrt_layer_store_bytes(l) / (1024.0 * 1024.0),
+           (double) qrt_layer_plane_bytes(l) / (1024.0 * 1024.0));
 
     if (T > 1024) {
         printf("layer_chain skipped tokens=%u (the CPU reference is capped at 1024)\n", T);
@@ -1134,6 +1383,91 @@ int qrt_layer_check(const char * gguf_path, uint32_t layer, uint32_t tokens,
     const double r_post = rel_l1_of(g_post.data(), ref_post.data(), g_post.size());
     printf("layer_postnorm rel_l1=%.3e verdict=%s\n", r_post, r_post <= 1e-6 ? "PASS" : "FAIL");
     fails += r_post <= 1e-6 ? 0 : 1;
+
+    // ---- the FFN half: router, shared expert, routed experts, final residual ----
+    if (l->ffn != NULL) {
+        const uint32_t ref = T < 64u ? T : 64u;
+        const qrt_ffn_bufs * fb = qrt_layer_ffn_bufs(l);
+        std::vector<float> g_logits((size_t) ref * info.n_expert);
+        std::vector<uint32_t> g_ids((size_t) ref * info.top_k);
+        std::vector<float> g_wts((size_t) ref * info.top_k);
+        std::vector<float> g_sgate(ref), g_shexp((size_t) ref * E), g_moe((size_t) ref * E);
+        std::vector<float> g_xall((size_t) T * E);
+        int rc = download(l, fb->logits, g_logits.data(), g_logits.size() * 4, err,
+                          sizeof(err));
+        rc = rc == 0 ? download(l, fb->ids, g_ids.data(), g_ids.size() * 4, err, sizeof(err))
+                     : rc;
+        rc = rc == 0 ? download(l, fb->weights, g_wts.data(), g_wts.size() * 4, err,
+                                sizeof(err)) : rc;
+        rc = rc == 0 ? download(l, fb->sgate, g_sgate.data(), g_sgate.size() * 4, err,
+                                sizeof(err)) : rc;
+        rc = rc == 0 ? download(l, fb->shexp, g_shexp.data(), g_shexp.size() * 4, err,
+                                sizeof(err)) : rc;
+        rc = rc == 0 ? download(l, fb->moe, g_moe.data(), g_moe.size() * 4, err,
+                                sizeof(err)) : rc;
+        rc = rc == 0 ? download(l, qrt_layer_out(l), g_xall.data(), g_xall.size() * 4, err,
+                                sizeof(err)) : rc;
+        if (rc != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            qrt_layer_close(dev, l);
+            qrt_vk_close(dev);
+            return 2;
+        }
+        std::vector<float> ref_logits((size_t) ref * info.n_expert);
+        std::vector<uint32_t> ref_ids((size_t) ref * info.top_k);
+        std::vector<float> ref_wts((size_t) ref * info.top_k);
+        std::vector<float> ref_sgate(ref), ref_shexp((size_t) ref * E);
+        std::vector<float> ref_moe((size_t) ref * E);
+        if (qrt_ffn_ref_cpu(qrt_layer_ffn(l), g_post.data(), ref, ref_logits.data(),
+                            ref_ids.data(), ref_wts.data(), ref_sgate.data(),
+                            ref_shexp.data(), ref_moe.data(), err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            qrt_layer_close(dev, l);
+            qrt_vk_close(dev);
+            return 2;
+        }
+        uint32_t id_hits = 0;
+        for (size_t i = 0; i < ref_ids.size(); ++i) {
+            id_hits += g_ids[i] == ref_ids[i] ? 1u : 0u;
+        }
+        const double r_log = rel_l1_of(g_logits.data(), ref_logits.data(), g_logits.size());
+        printf("layer_router logits_rel_l1=%.3e ids_match=%u/%zu weights_rel_l1=%.3e "
+               "verdict=%s\n", r_log, id_hits, ref_ids.size(),
+               rel_l1_of(g_wts.data(), ref_wts.data(), g_wts.size()),
+               (r_log <= 1e-5 && id_hits == ref_ids.size()) ? "PASS" : "FAIL");
+        fails += (r_log <= 1e-5 && id_hits == ref_ids.size()) ? 0 : 1;
+        const double r_w = rel_l1_of(g_wts.data(), ref_wts.data(), g_wts.size());
+        fails += r_w <= 1e-5 ? 0 : 1;
+        const double r_sg = rel_l1_of(g_sgate.data(), ref_sgate.data(), g_sgate.size());
+        printf("layer_sgate rel_l1=%.3e verdict=%s\n", r_sg, r_sg <= 1e-6 ? "PASS" : "FAIL");
+        fails += r_sg <= 1e-6 ? 0 : 1;
+        const double r_sh = rel_l1_of(g_shexp.data(), ref_shexp.data(), g_shexp.size());
+        printf("layer_shexp tokens=%u rel_l1=%.3e verdict=%s\n", ref, r_sh,
+               r_sh <= 5e-5 ? "PASS" : "FAIL");
+        fails += r_sh <= 5e-5 ? 0 : 1;
+        const double r_moe = rel_l1_of(g_moe.data(), ref_moe.data(), g_moe.size());
+        printf("layer_moe tokens=%u pairs=%u experts=%u rel_l1=%.3e verdict=%s\n", ref,
+               qrt_layer_rows(l) > 0 ? ref * info.top_k : 0, qrt_layer_experts(l), r_moe,
+               r_moe <= 5e-5 ? "PASS" : "FAIL");
+        fails += r_moe <= 5e-5 ? 0 : 1;
+        // the layer output: x + moe + shexp * sigmoid(gate), composed from the reference
+        double num = 0.0, den = 0.0;
+        for (uint32_t t = 0; t < ref; ++t) {
+            const float s = 1.0f / (1.0f + expf(-ref_sgate[t]));
+            for (uint32_t c = 0; c < E; ++c) {
+                const double want = (double) g_x[(size_t) t * E + c] +
+                                    (double) ref_moe[(size_t) t * E + c] +
+                                    (double) ref_shexp[(size_t) t * E + c] * (double) s;
+                const double got = g_xall[(size_t) t * E + c];
+                num += fabs(got - want);
+                den += fabs(want);
+            }
+        }
+        const double r_layer = den > 0.0 ? num / den : num;
+        printf("layer_ffn_out tokens=%u rel_l1=%.3e verdict=%s\n", ref, r_layer,
+               r_layer <= 1e-4 ? "PASS" : "FAIL");
+        fails += r_layer <= 1e-4 ? 0 : 1;
+    }
     printf("layer_check layer=%u linear=%d tokens=%u fails=%d open=%d verdict=%s\n", layer,
            info.linear, T, fails, open, fails == 0 ? (open == 0 ? "PASS" : "PASS_OPEN") : "FAIL");
 

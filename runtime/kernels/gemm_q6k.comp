@@ -26,7 +26,8 @@ layout(push_constant) uniform PC {
     uint m;
     uint wbase;   // byte offset of row 0 for this type
     uint obase;
-    uint abase;
+    uint abase;  // first activation block (token 0, reduction block 0)
+    uint token_major; // 0 = [row][token], 1 = [token][row] (the layer chain)
 } pc;
 
 const uint BLOCK  = QRT_BLOCK_Q6K;   // 210 bytes
@@ -139,7 +140,8 @@ void main() {
 
     [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
         [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
-            ob.o[pc.obase + row[r] * pc.m + tok0 + t] = acc[r][t];
+            ob.o[pc.token_major != 0u ? pc.obase + (tok0 + t) * pc.n + row[r]
+                                 : pc.obase + row[r] * pc.m + tok0 + t] = acc[r][t];
         }
     }
 }

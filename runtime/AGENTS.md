@@ -17,7 +17,7 @@
 | `--gguf-index` | 张量表与 hparam 与 `gguf_dims.py` 一致；畸形文件返回错误不崩溃 |
 | `--dense-gemm-check` | 稠密 Q8_0 GEMM 对 CPU 双精度；含"两个 dispatch 写不同输出"用例 |
 | `--dn-weights-verify` | 六个 DeltaNet 权重缓冲加载时回读逐字节比对 |
-| `--layer-check` | 一层的逐阶段对 CPU 双精度（norm / 投影 / 注意力 / 残差 / post norm） |
+| `--layer-check` | 一层的逐阶段对 CPU 双精度（norm / 投影 / 注意力 / 残差 / post norm / router / 共享专家 / 路由 MoE / 层输出） |
 | `--prefill-check` | 专家腿与层优先调度；预热 pass 之后才计时 |
 
 ## 3. 已踩过的坑（写代码前读一遍，别再复现）

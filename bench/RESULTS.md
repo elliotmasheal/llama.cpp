@@ -2469,3 +2469,117 @@ norm(x, attn_norm) -> 投影（attn_qkv+attn_gate（DeltaNet）或 attn_q/attn_k
 **先怀疑检查自己的参考实现**。手写 f16 解码必须有次正规数用例；本项目里这类解码现在有两份
 （qrt_main 的 f16_to_f32_local 与 layer.cpp 的 f16_to_f32），后者曾错了两周（本轮才发现，
 因为它只在"含次正规 delta 的矩阵"上暴露）。
+
+## 73. M2-6 第五块：共享专家 + 路由 MoE 接进层链，整层两次合并提交（2026-10-25）
+<!-- slug: m2-6-ffn-two-submits -->
+
+口径：`qrt --layer-check <gguf> --layer N --layer-tokens M --layer-store <repack 前缀>`，
+真实 GGUF + 20.2 GB 重组专家库；参考是同一串的 CPU 双精度（norm -> Q8_1 -> dense 参考 ->
+注意力 CPU 参考 -> 输出投影 -> 残差 -> post norm -> 路由/共享专家/路由专家 -> 最终残差）；
+路由与共享专家的参考覆盖前 64 个 token，路由专家覆盖这些 token 的 512 个 pair；层数
+0/3（512、1024、10240）与 0/3/4/7（512）；RX 6700S，平衡电源 + AC，exit 0。
+
+### 73.1 结构
+
+- **共用记录接口**：`vk_dev.*` 新增 `qrt_vk_cmd`（2 个 ring 的命令缓冲 + fence + barrier，
+  含 `vkCmdFillBuffer` 的 TRANSFER->COMPUTE barrier）。norm / gemm / DeltaNet / full-attn /
+  add 各加 `*_attach(cmd)`：等待自己的 ring、重置自己的描述符池，之后只往调用方的缓冲里录
+  dispatch。每个 dispatch 一个 descriptor set（DECISIONS 65.2 在 norm 上也补齐了）。
+- **一层两次提交**：A = norm -> 投影 -> 注意力 -> 注意力输出的 Q8_1 -> 输出投影 -> 残差 ->
+  post norm -> router -> top-8；B = gather -> 共享专家（gate/up/swiglu/down）-> 每专家
+  gate/up/swiglu/down + 加权累加 -> `out = x + moe + shexp * sigmoid(gate)`。两次之间是
+  host：回读 ids/weights、按专家分组、读本层 256 个专家块并上传。
+- **为什么不是一次**：专家 GEMM 的 grid 在录命令时就要定（m = 该专家补齐到 32 的行数），
+  而 m 来自路由结果；路由结果要回 host 才能决定读哪几个专家块（层优先 prefill 的读法）。
+  真正的单次要 GPU 侧分组 + `vkCmdDispatchIndirect` + 本层 256 专家常驻（464 MiB），与
+  M2-5 的流式专家模型冲突，留给 M3/M4。见 DECISIONS 68。
+- FFN 的数据流：一次 gather 把每个 token 的 Q8_1 平面复制到它所属专家的补齐行块；每专家
+  三 GEMM + swiglu + 一次加权累加；补齐行是零平面 + 权重 0，所以不会污染结果。
+- 新开关：`--layer-store <prefix>`（没有它 FFN 关闭）、`--layer-ffn on|off`、
+  `--layer-pass on|off`（off = 每模块一次 submit 的旧路径，做 A/B）、`--dn-recur serial|cols`。
+
+### 73.2 正确性（512 token，四层两种类型）
+
+| 阶段 | layer 0（DeltaNet） | layer 4（DeltaNet） | layer 3（full） | layer 7（full） | 门 |
+|---|---:|---:|---:|---:|---|
+| norm 行 | 3.911e-08 | 3.921e-08 | 3.914e-08 | 3.906e-08 | 1e-6 |
+| 投影 | 9.651e-06 / 9.850e-06 | 同左 | 2.072e-06 / 1.936e-06 / 1.874e-06 | 同左 | 5e-5 |
+| 注意力本体 | 5.309e-07 | 4.433e-07 | 5.794e-07 | 4.429e-07 | 1e-4 |
+| 输出投影 | 1.770e-07 | 1.744e-07 | 1.896e-07 | 1.641e-07 | 1e-5 |
+| 残差（注意力） | 4.116e-08 | 3.296e-08 | 4.105e-08 | 3.714e-08 | 1e-6 |
+| post norm | 6.357e-08 | 5.961e-08 | 6.647e-08 | 6.395e-08 | 1e-6 |
+| router logits / ids | 7.064e-07 / 512:512 | 6.877e-07 / 512:512 | 6.958e-07 / 512:512 | 6.850e-07 / 512:512 | 1e-5 / 全中 |
+| router 权重 | 9.857e-07 | 1.150e-06 | 1.210e-06 | 1.006e-06 | 1e-5 |
+| 共享专家门（sigmoid 前） | 5.914e-07 | 6.551e-07 | 6.502e-07 | 6.658e-07 | 1e-6 |
+| 共享专家（q8_0 三矩阵） | 5.799e-08 | 5.896e-08 | 5.903e-08 | 8.704e-06 | 5e-5 |
+| 路由 MoE（512 pair） | 1.588e-05 | 5.876e-06 | 1.252e-05 | 8.272e-06 | 5e-5 |
+| 层输出（含最终残差） | 1.407e-07 | 1.412e-07 | 2.561e-07 | 4.641e-07 | 1e-4 |
+
+- 四层全部阶段 PASS。1024 token 复读同样全过（layer 0：router 7.094e-07、MoE 5.223e-06、
+  层输出 2.534e-07；layer 3：1.252e-05 / 2.561e-07），128/256 token 也全过。
+- 路由 MoE 的 1e-5 量级不是布局问题：它是 f32 累加对双精度参考在 2048 长归约上的正常差
+  （与投影同口径）。布局/配对错时是 1.0e+00 量级（见 73.4）。
+- `--layer-pass off`（每模块一次 submit）与 `--layer-pass on` 的 rel_L1 逐位相同，
+  `--dn-recur serial|cols` 两种变体都过（3.815e-07 / 3.977e-07）。
+
+### 73.3 速度（r=3 中位，专家库读取单列）
+
+| 层 | tokens | pass1（注意力+router） | group（读库+上传） | pass2（FFN） | 合计 ms | us/token | dispatch |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0 DeltaNet | 512 | 5.4 | 101-108 | 32 | **145.3** | 283.7 | 1286 |
+| 3 full | 512 | 4.6 | 102 | 32 | **146.3** | 285.7 | 1252 |
+| 0 DeltaNet | 1024 | 17.7 | 101 | 35 | **152.6** | 149.1 | - |
+| 3 full | 1024 | 17.6 | 100 | 35 | **153.1** | 149.5 | - |
+| 0 DeltaNet | 10240 | 94.9 | 107 | 93.0 | **296.2** | 28.9 | 1296 |
+| 3 full | 10240 | 326.4 | 109 | 95.1 | **529.6** | 51.7 | 1297 |
+
+（原始产物 `bench/raw/m2-6-ffn-final/`，另有一批 `bench/raw/m2-6-ffn/`。）
+
+- 同口径的注意力前半段（不开 FFN，`--layer-pass on`）在 10K 是 **80.8 ms**（DeltaNet）与
+  **313.3 ms**（full）；`--layer-pass off`（每模块一次 submit）是 85.5 / 317.6 ms。即合并提交
+  对 DeltaNet 层省 **5%**、full 层基本持平（注意力本体占 98%，提交开销本来就被淹没了）。
+  512 token 时合并提交的价值更大：一层从 12 次 submit 降到 2 次。
+- FFN 的 GPU 部分是 93-95 ms/层（10K，256 个专家、85952 行 = 81920 pair + 4.9% 补齐），
+  即 **515 GFLOP / 95 ms = 5.4 TFLOPS**（int8 roofline 15.8 的 34%）。
+- 41 层推算（专家读取被 M2-5 的双缓冲重叠时）：30 x (94.9+93.0) + 11 x (326.4+95.1)
+  = **10.3 s -> 约 1010 tok/s**；不重叠则再加 41 x 0.11 s = 4.5 s（约 700 tok/s）。
+  这是 M2-8 要证的数，本轮只给层级的分解。
+- 每层固定成本：464.0 MiB 专家库读 + H2D（100-110 ms，4.4-4.9 GB/s），平面缓冲 33.0 MiB
+  （512）/ 246.8 MiB（10K）。层链的 planes 与专家槽都在 VRAM，8 GiB 下未触到预算。
+- 会话间差：同一二进制 512 token 三次 140.2 / 145.3 / 146.3 ms（4%），10K 三次
+  296.0 / 296.2 / 538.3-529.6 ms（full 层 1.6%）；表里用 `-final` 那批，其余批次留在
+  `bench/raw/` 供复核。
+
+### 73.4 本轮抓到的三个缺陷（都是"单测全绿、串联才红"）
+
+1. **K-quant GEMM 没有 token-major 输出**。`gemm_q4k/q5k/q6k.comp` 只会写 `[row][token]`，
+   而 `swiglu_q8.comp` 读的是 `[token][row]`。第一次串起来 `layer_moe` 是 **1.09 / 1.33**
+   （比"全零"还差），而 `--moe-check`（行主序参考）、`--dense-gemm-check`、prefill 的
+   计时腿全绿。修法：三个内核加 `token_major` push 常量（与 dense q8k 一致），
+   `--moe-check` 的读数不变（它走默认 0）。**同一个缺陷也存在于 `moe_expert` 的批处理路径**
+   （它录 gate/up 时用默认行主序，再交给 swiglu），只是 `--prefill-check` 只计时不校验输出，
+   所以没暴露——列为未结项（DECISIONS 68.4）。
+2. **`swiglu_q8.comp` 的 f16 delta 用 `packHalf2x16`（向零取整）**：共享专家 4.793e-04，
+   `--moe-check` 不经过 swiglu 所以看不出来。按 DECISIONS 64.1 把 RNE 位运算移到
+   `kernels/common.glsl`（`qrt_f32_to_f16_rne`）并用它之后 **5.9e-08**。
+3. **router 核的共享内存 bank 冲突**：`shared float xt[32][64]` 的 64 字步长让一个 warp 的
+   32 条 lane 全落在同一个 bank（32 路冲突），10K 时 route 段 92 ms。改成 `[32][65]`
+   （以及 `wt[8][65]`）之后 **16-24 ms**（两次会话间 6% 的时钟差）。剩下的 ~16 ms 是
+   x tile 每个 row block 重读一次（2.7 GB 流量），下一步要么加大行 tile，要么让一个
+   workgroup 扫完 256 行。
+
+### 73.5 复读发现：RESULTS 72 的 512 token 读数在本机不可复现
+
+基线（`git stash` 后同构建、同参数、同层）复测 512 token：norm 3.914e-08、投影
+**2.072e-06 / 1.936e-06 / 1.874e-06**、注意力 **5.794e-07**、输出投影 1.896e-07、残差
+4.105e-08、post norm 6.647e-08。RESULTS 72 记的是 1.256e-07 / 1.265e-07 / 4.429e-07，
+norm 与残差一致。差的是"f32 累加 vs 双精度"那一档，所有门都过；**以本轮读数为准，
+72 的表格作废为历史读数**（不删原文，加此说明）。查询原因（时钟/驱动/机器状态）留 M4
+的性能复现性条目。
+
+### 73.6 未做
+
+- router tile（~16 ms/层 @10K，10.7 GFLOP 只跑到 0.7 TFLOPS）。
+- GPU 侧分组 + indirect dispatch（真·一次提交的前提）与 kv 的 q4_0 / 分页（M2-6a）。
+- 多 chunk 的 KV append 在层链里没有复现（`--fullattn-check` 的 pos0=512 append 用例覆盖了内核）。
+- M2-7 的整模型 KLD（本轮的参考是单层 CPU 链，不是端到端 logits）。

@@ -1738,3 +1738,55 @@ vs 单侧偏小），"成比例且单侧偏小"就是精度/解码问题的指�
 - 1.84 MiB（摊平值 1 917 128 B）**只保留为摊平估算口径**（"专家每 token 读取 0.62 GB"这类估算用它），
   不得用于分配。
 - 状态：design 5.1（第 116-118 行）与 5.3（第 314、326 行）已按此写好，本条目作为判决回链。
+
+## 70. M2-6 判决：层链接上共享专家与路由 MoE，一层两次合并提交（2026-10-25）
+<!-- slug: m2-6-two-submits -->
+
+**采纳**：`runtime/ffn.*`（router + top-k + 门控共享专家 + 路由专家 + 加权累加）接进
+`runtime/layer.*`；`vk_dev` 增加 `qrt_vk_cmd`（一层一个命令缓冲），norm / gemm / DeltaNet /
+full-attn / add 全部学会"只录不提交"，因此一层从 **12 次左右的 submit 变成 2 次**（A：注意力
+半段 + router；B：FFN 半段）。512 token 四层（0/3/4/7）逐阶段对 CPU 双精度全过；10K 下
+DeltaNet 层 296 ms、full 层 538 ms（含 107-110 ms 的专家库读，M2-5 会把它重叠掉），其中 FFN
+的 GPU 部分 93-95 ms（5.4 TFLOPS int8）。见 `RESULTS.md#m2-6-ffn-two-submits`。
+
+### 70.1 为什么是两次而不是一次
+
+专家 GEMM 的 grid（m = 该专家被路由到的 token 数补齐到 32）必须在**录命令时**确定，而 m
+来自 top-8；层优先 prefill 又要先知道 top-8 才能决定读哪几个专家块。所以 ids 必须回 host
+一次（design 5.2 的 `PassPlan::route_ids` 本来就是"GPU 写、CPU 读"）。一次提交的前提是：
+本层 256 个专家全部常驻（464 MiB）+ GPU 侧分组 + `vkCmdDispatchIndirect` 的 m，这条与 M2-5
+的流式专家模型（20.2 GB 库、16 MiB 槽）冲突，不在本轮范围。
+
+### 70.2 开关表（新增）
+
+| 开关 | 默认 | 含义 |
+|---|---|---|
+| `--layer-store <prefix>` | 无 | 重组专家库前缀；没有它 FFN 半段关闭（只跑注意力） |
+| `--layer-ffn on\|off` | on | 有库时是否接 FFN 半段；off 用于把层链退回到 M2-6 第四块 |
+| `--layer-pass on\|off` | on | on = 一层一个命令缓冲（两次 submit）；off = 每模块自己 submit（旧路径，A/B 用） |
+| `--dn-recur serial\|cols` | cols | DeltaNet 递推变体（DECISIONS 61 的遗留：CLI 现在补齐） |
+
+四个都是 check 入口的开关，不进 design 第 7 节；默认值不改变任何模型行为（`--layer-check`
+不是默认路径），所以不需要 L-MODEL。
+
+### 70.3 门禁
+
+- **L-KERN pass**：四层 x 全部阶段（norm、投影、注意力、输出投影、残差、post norm、
+  router logits/ids/权重、共享专家门、共享专家、路由 MoE、层输出）。门槛与 RESULTS 72
+  同口径（f32 累加对双精度：norm/残差/postnorm 1e-6，投影/MoE 5e-5，注意力 1e-4），
+  实测 1.4e-07..1.6e-05。`--moe-check`/`--dense-gemm-check`/`--norm-check`/
+  `--deltanet-check`/`--fullattn-check`/`--prefill-check`/`--selftest` 全 exit 0，
+  `--moe-check` 读数与 RESULTS 71 逐位相同（1.607e-07 / 2.590e-07）。
+- **L-MODEL n/a**：没有让它成为默认路径（整模型 KLD 是 M2-7）。
+- **G-REG n/a**：只动 `runtime/`。
+- 逐位可复现：`--layer-pass on/off` 的 rel_L1 逐位相同。
+
+### 70.4 未结项
+
+1. **`moe_expert` 的批处理路径有同一个 token-major 缺陷**（RESULTS 73.4 第 1 条）：
+   `qrt_moe_compute_batch` 录 gate/up 时用默认行主序，而 swiglu 读 token-major。
+   `--prefill-check` 只计时不校验输出，所以没红。修它要给 `qrt_moe_check` 的参考也换布局，
+   留给下一次动 M2-5 的人；在那之前 prefill 的专家 leg **不能用于正确性**。
+2. router tile 的 16 ms/层（10K）：x tile 每个 row block 重读一次（2.7 GB）。
+3. 真·一次提交：GPU 侧分组 + indirect dispatch + 本层专家常驻（M3/M4）。
+4. 专家槽 464 MiB/层要由 M2-5 的双缓冲重叠掉；本轮的层检查是串行量到的。

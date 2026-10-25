@@ -16,6 +16,7 @@ add_library(qrt_core STATIC
     kernels/norm.cpp
     kernels/moe_expert.cpp
     layer.cpp
+    ffn.cpp
     vk_dev.cpp)
 
 target_include_directories(qrt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -95,8 +96,9 @@ if(Vulkan_GLSLC_EXECUTABLE)
     endforeach()
     add_custom_command(
         OUTPUT  ${_qrt_swiglu_spv}
-        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O ${_qrt_kernels}/swiglu_q8.comp -o ${_qrt_swiglu_spv}
-        DEPENDS ${_qrt_kernels}/swiglu_q8.comp
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1 -I${_qrt_kernels}
+                ${_qrt_kernels}/swiglu_q8.comp -o ${_qrt_swiglu_spv}
+        DEPENDS ${_qrt_kernels}/swiglu_q8.comp ${_qrt_kernels}/common.glsl
         COMMENT "Compiling kernels/swiglu_q8.comp"
         VERBATIM)
     # RMS norm + Q8_1 pack (M2-6): the activation leg the dense GEMM reads.
@@ -117,6 +119,20 @@ if(Vulkan_GLSLC_EXECUTABLE)
         DEPENDS ${_qrt_kernels}/layer_add.comp
         COMMENT "Compiling kernels/layer_add.comp"
         VERBATIM)
+    # The FFN half (M2-6): router, top-k, the routed gather, the weighted accumulate and
+    # the final residual add.
+    set(_qrt_ffn_spv "")
+    foreach(_k IN ITEMS router topk gather accum out)
+        set(_spv "${CMAKE_CURRENT_BINARY_DIR}/ffn_${_k}.spv")
+        add_custom_command(
+            OUTPUT  ${_spv}
+            COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1
+                    ${_qrt_kernels}/ffn_${_k}.comp -o ${_spv}
+            DEPENDS ${_qrt_kernels}/ffn_${_k}.comp
+            COMMENT "Compiling kernels/ffn_${_k}.comp"
+            VERBATIM)
+        list(APPEND _qrt_ffn_spv ${_spv})
+    endforeach()
     # The DeltaNet recurrence (M2-6c) keeps the 128x128 state in registers and
     # reduces within 32-lane subgroups, so it needs SPIR-V 1.3 (Vulkan 1.1).
     set(_qrt_deltanet_spv "${CMAKE_CURRENT_BINARY_DIR}/deltanet_recur.spv")
@@ -183,7 +199,8 @@ if(Vulkan_GLSLC_EXECUTABLE)
                       ${_qrt_norm_spv} ${_qrt_layer_add_spv} ${_qrt_deltanet_spv}
                       ${_qrt_dn_cols_spv}
                       ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv}
-                      ${_qrt_dn_gnorm_spv} ${_qrt_full_qk_spv} ${_qrt_full_attn_spv})
+                      ${_qrt_dn_gnorm_spv} ${_qrt_full_qk_spv} ${_qrt_full_attn_spv}
+                      ${_qrt_ffn_spv})
 endif()
 
 add_executable(qrt qrt_main.cpp)
@@ -202,11 +219,11 @@ if(TARGET qrt_shaders)
                 ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_norm_spv}
                 ${_qrt_layer_add_spv} ${_qrt_deltanet_spv}
                 ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv}
-                ${_qrt_full_qk_spv} ${_qrt_full_attn_spv} $<TARGET_FILE_DIR:qrt>
+                ${_qrt_full_qk_spv} ${_qrt_full_attn_spv} ${_qrt_ffn_spv} $<TARGET_FILE_DIR:qrt>
         DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_norm_spv}
                 ${_qrt_layer_add_spv} ${_qrt_deltanet_spv}
                 ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv}
-                ${_qrt_full_qk_spv} ${_qrt_full_attn_spv}
+                ${_qrt_full_qk_spv} ${_qrt_full_attn_spv} ${_qrt_ffn_spv}
         COMMENT "Copying the runtime shaders next to qrt")
     add_dependencies(qrt qrt_spv_copy)
 endif()
