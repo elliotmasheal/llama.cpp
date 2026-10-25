@@ -2,9 +2,13 @@
 // Q8_0 x Q8_1 dense GEMM, LDS staged. The activation panel of the workgroup is copied
 // into shared memory once per K-panel, so the 32 lanes stop re-reading the same token
 // bytes from L2 (the previous kernel read them once per lane), and each lane holds a
-// 4 row x 8 token register tile so one weight word feeds 8 tokens and one activation
+// 4 row x TOKENS register tile so one weight word feeds TOKENS tokens and one activation
 // word feeds 4 rows. Weights stay in registers: every row belongs to one lane, so
 // staging them would buy nothing.
+//
+// TOKENS controls how many tokens one weight read serves, so it is the knob that sets
+// the weight traffic (weight bytes x m / TILE_M). It was 8 (32 tokens per workgroup) in
+// RESULTS 46-50; the sweep here is the same kernel with 16 (64 tokens).
 //
 // Weights are the prepared layout [k int8][k/8 bytes of f16 deltas] per row (see
 // qrt_gemm_q8k_prepare), which keeps every load 4-byte aligned.
@@ -76,9 +80,11 @@ void main() {
 
     for (uint k0 = 0; k0 < pc.k; k0 += KSTEP) {
         // One thread per (token, 32-element block): load the quants and the delta.
-        {
-            const uint t = tid / panel_blocks;
-            const uint b = tid % panel_blocks;
+        // The trip count follows TILE_M * panel_blocks, so a bigger token tile loops
+        // instead of needing more threads.
+        for (uint tt = tid; tt < TILE_M * panel_blocks; tt += THREADS) {
+            const uint t = tt / panel_blocks;
+            const uint b = tt % panel_blocks;
             const uint ab = pc.abase + (tok0 + t) * nk32 + k0 / 32u + b;
             const uvec4 lo = aq.aq[ab * 2u];
             const uvec4 hi = aq.aq[ab * 2u + 1u];

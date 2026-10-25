@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-6c",
+      "head": "M2-6b",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6c step 2 (prep chain + gated norm) is the head; its step 1 kernel is in and verified (RESULTS 52). M2-6d (full-attn) and M2-6a (q4 KV) follow, X-2 still waits for M3-4"
+      "note": "M2-6b is the head again: step 6 showed the dense GEMM is instruction bound, so D-1 (inner-loop shape from the expert kernel) is the next single-variable change. M2-6c step 2 and M2-6d/6a follow; X-2 waits for M3-4"
     },
     {
       "lane": "data",
@@ -1170,18 +1170,22 @@
       "id": "M2-6b",
       "milestone": "M2",
       "lane": "impl",
-      "status": "todo",
+      "status": "partial",
       "title": "Q8_0 x Q8_1 GEMM：稠密投影（30.9 TFLOP，PP 的最大一条腿）",
       "deps": [],
       "resources": [
         "gpu"
       ],
       "paths": [
-        "runtime/kernels/q8k_gemm.*"
+        "runtime/kernels/q8k_gemm.*",
+        "runtime/kernels/gemm_q8k.comp",
+        "runtime/kernels/gemm.cpp",
+        "runtime/kernels/gemm.h",
+        "runtime/CMakeLists.txt",
+        "runtime/qrt_main.cpp"
       ],
       "done_when": "q8_0 权重 x q8_1 激活的 GEMM 对 CPU 参考 rel_L1 <= 1e-5；在 N=8192/K=2048/M=10240 的形状上 >= 5 TFLOPS；与 K-quant GEMM 共用记录/提交接口",
-      "claimed_at": "2026-10-25T18:00:00",
-      "note": "Q8_0 dense GEMM: correct at 1.297e-7 and 2.64 TFLOPS on the dense working set (3.50 when it fits L2). Four optimisations tried: aligned plane repacking +23%, group_m swizzle worse, tile shapes no effect, LDS staging with a 4x8 register tile no effect (RESULTS 46-50, DECISIONS 43-46). The cap is the q8_0 bit width; PP with this kernel is about 706-780 tok/s, so PP 1000 needs a numerics decision (dense requantisation, which the user rejected) and the user call"
+      "note": "step 6 done 2026-10-25: the wall is not weight bandwidth. Measured 3.10-3.40 TFLOPS across M=512..10240 on attn_q (k=2048,n=8192), 2.23-2.31 on attn_output (k=4096), 4.34 with weights resident in L2; implied weight rate only 39-59 GB/s of the 156.5 available, and halving the weight traffic (TOKENS 8 -> 16) left the rate unchanged at 3.37. So it is instruction-issue bound: 2.5 MACs per instruction against a ~17 TFLOPS ceiling is 19%, and the same dot4 reaches 6.08-6.20 in the Q4_K expert kernel. Next step D-1: copy the expert inner shape (uvec4 weight reads, 2 rows per lane, deeper K panel) and target 5 TFLOPS; D-2 measures the dot4 issue rate if that is not enough. Numerics unchanged (still q8_0 x Q8_1). RESULTS 53, DECISIONS 49"
     },
     {
       "id": "M2-6c",
