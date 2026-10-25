@@ -2230,8 +2230,8 @@ qkv/xnorm/z 随机（投影输出由调用方给），递推用 cols 变体，�
 
 ## 69. M2-6 整层串联第一块：rmsnorm + Q8_1 量化进运行时，稠密投影链达标（2026-10-25）
 
-口径：真实 GGUF 权重，qrt --norm-check <gguf>；layer 3 的 ttn_norm.weight（f32, k=2048）
-与 ttn_q.weight（q8_0, k=2048, n=8192）；输入 x 是确定性 [-1,1) 伪随机；eps 1e-6；
+口径：真实 GGUF 权重，qrt --norm-check <gguf>；layer 3 的 attn_norm.weight（f32, k=2048）
+与 attn_q.weight（q8_0, k=2048, n=8192）；输入 x 是确定性 [-1,1) 伪随机；eps 1e-6；
 参考实现是**同一串**（rmsnorm -> Q8_1 量化 -> int8 dot）的 CPU 双精度；
 RX 6700S，平衡电源 + AC；r=2，两次读数**逐位相同**，exit 0。
 
@@ -2260,7 +2260,7 @@ RX 6700S，平衡电源 + AC；r=2，两次读数**逐位相同**，exit 0。
 
 第一版用 packHalf2x16(vec2(d,0.0)) 写 delta，结果 **326917 / 655360 个 ds 字不同**，
 每个样本都是**低 1 个 half ULP**（0x226e vs 0x226f、0x22f8 vs 0x22f9）——单向差 1 ULP
-正是"向零取整"的指纹：本驱动把 packHalf2x16 降成 _cvt_pkrtz（round toward zero），
+正是"向零取整"的指纹：本驱动把 packHalf2x16 降成 v_cvt_pkrtz（round toward zero），
 而 ggml 的 quantize_row_q8_1 用 C 的 f16 转换（round-to-nearest-even）。
 改成显式 RNE 位运算后 **326917 -> 38**（剩下的就是 69.1 的真数值差）。
 这条进 DECISIONS 64.1 当纪律：**数值关键的 f16 不许用 packHalf2x16**。
@@ -2272,8 +2272,8 @@ RX 6700S，平衡电源 + AC；r=2，两次读数**逐位相同**，exit 0。
 | 512 | 0.194 | 0.379 | 49.3 | 1.351 | 1.545 |
 | **10240** | **1.372-1.717** | **0.134-0.168** | **111-140** | **25.35-25.86** | **26.72-27.58** |
 
-- 每 token 每层搬 9.125 KiB（x 读 8 + out 写 8 + qs 1 + ds 0.125 的 KB 级账，见 69.3 的 gbs 口径）。
-  10240 token 是 190.8 MB，1.37 ms 即 **139 GB/s**，接近显存实测读上限 156.5 的 89%。
+- 每 token 每层搬 18.7 KiB（x 读 8 + out 写 8 + qs 2 + ds 0.25，即每元素 9.125 B）。
+  10240 token 是 191.4 MB，1.37 ms 即 **139 GB/s**，接近显存实测读上限 156.5 的 89%。
 - 512 token 只有 49 GB/s：**启动开销主导**（1 次 submit+wait 约 0.065-0.084 ms，
   占 0.194 ms 的三分之一以上）。整层串联时它必须和其它核放进同一个命令缓冲。
 - 预算影响：模型每层 2 个 norm 站点，41 层 x 2 x 1.5 ms 约 **0.12 s**，占 PP 反算 9.73 s 的 1.2%；
@@ -2287,3 +2287,54 @@ RX 6700S，平衡电源 + AC；r=2，两次读数**逐位相同**，exit 0。
    qrt_gemm 已有 ring，几何上缺的是"把别的模块的 dispatch 录进同一个 ring"）。
 2. **conv 权重缺陷**（DECISIONS 63.4）仍开着，整层串联前必须收口（先做加载后回读校验和）。
 3. 层内 RMS 的另一种精度（f16 权重）不在本轮范围：权重是 f32，照读。
+
+## 70. M2-6 第二块：conv 权重缺陷定位到根因（上传读了被覆盖的临时向量）+ 加载时回读校验（2026-10-25）
+
+口径：`qrt --deltanet-check <gguf> --deltanet-layer 0 --deltanet-tokens 512/1024`，真实权重，
+check 里那句"重传 conv 权重"的补丁**已删除**；r=2，平衡电源 + AC，exit 0。
+
+### 70.1 根因（不是别名，也不是时序）
+
+`qrt_dn_weights_load()` 里 conv 的上传语句是：
+
+```
+qrt_vk_upload(dev, stg, w->conv_w, 0, buf.data(), bytes, ...)   // bytes = 128 KiB
+```
+
+`bytes` 是 conv 的字节数（8192 x 4 个 float = 128 KiB），但 `buf` 是**同一个临时向量**，
+后面读 gate 权重的循环反复复用它，最后留在里面的是 `ssm_norm`（head_dim = 128 个 float = 512 B）。
+于是这行从**512 字节的堆块读 128 KiB**：越界读 + 上传垃圾。这也解释了为什么在
+`weights_load` 里补 `qrt_vk_staging_wait` 完全没用（DECISIONS 63.4 记的两次失败尝试）。
+
+修法：conv 从自己的 host 副本 `w->h_conv` 上传，六个权重复用**一个** staging 缓冲
+（取 max(conv 128 KiB, gate 512 B)），只差传一次 `bytes`。
+
+### 70.2 读数（补丁删掉之后）
+
+| 口径 | tokens | y（递推输出）rel_L1 | gnorm 输出 rel_L1 | ms | us/token | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| 68 修复前（靠 check 重传） | 512 | 5.79e-07 | 4.95e-07 | 3.54-3.67 | 6.92-7.17（含首轮） | PASS |
+| **本轮** | 512 | **5.788e-07** | **4.951e-07** | **2.377** | **4.64** | PASS |
+| 68 修复前（靠 check 重传） | 1024 | 8.27e-07 | 6.88e-07 | 4.11 | 4.02 | PASS |
+| **本轮** | 1024 | **8.274e-07** | **6.881e-07** | **4.391** | **4.29** | PASS |
+
+- 正确性**逐位相同**（同一参考、同一输入），说明修复没有改变算术，只是把真权重放进了缓冲。
+- 512 token 的两次读数（6.92-7.17 vs 4.64）是首轮/冷缓存效应，取第二次为准；
+  1024 与 512 的 us/token 现在是 4.29 / 4.64，和 RESULTS 68 的 4.94-5.19 同量级或更好。
+- `dn_weights layer=0 buffers=6 readback_mismatch=0` 打印在每层权重加载之后。
+
+### 70.3 新增的防线
+
+`qrt_dn_weights_verify()`：把六个权重缓冲**全部回读**，逐字节和 host 副本比对；
+不匹配就报"哪个缓冲、差多少字节"并返回 -1。`qrt_dn_weights_load()` 成功前自动调用它，
+所以同类错误**在加载时**就变成一条错误信息，而不是等整层跑完看出 1e-1 的 rel_L1。
+check 里那句注释也换成了"no conv re-upload here：weights_load 已经回读校验"。
+
+### 70.4 下一步（顺带发现的第二个结构性问题）
+
+`qrt_gemm_record()` 用**两个固定 descriptor set** 并按"缓冲指针变了就重写"的方式复用
+（`pick_set`）。同一命令缓冲里录两次 out 不同的 GEMM（MoE 的 gate/up 就是这种形状），
+按 Vulkan 规范第二次重写会改变**两次 dispatch** 看到的绑定；本驱动看起来在 bind 时
+给 set 拍了快照，所以 `--moe-check` 仍然过。**这是靠驱动实现细节吃饭**，换硬件就会错。
+整层串联前必须先改成"每次 dispatch 一个 set"（池 + 每次 begin 重置），见 DECISIONS 65.3。
+

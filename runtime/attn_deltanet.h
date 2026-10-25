@@ -84,6 +84,12 @@ int qrt_dn_weights_load(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer
                         const qrt_dn_shapes * sh, qrt_dn_weights ** out, char * err, size_t err_size);
 void qrt_dn_weights_free(qrt_vk_dev * dev, qrt_dn_weights * w);
 VkBuffer qrt_dn_weights_conv(const qrt_dn_weights * w);
+// Reads every weight buffer back and compares it with the host copy; weights_load calls
+// it, so a broken upload fails the load instead of surfacing as wrong logits later. The
+// conv matrix made this necessary: it was uploaded from a scratch vector the gate weights
+// had already overwritten (DECISIONS 65, RESULTS 70).
+int qrt_dn_weights_verify(qrt_vk_dev * dev, const qrt_dn_weights * w,
+                          char * err, size_t err_size);
 // host copies for the double precision references: 0 conv, 1 alpha, 2 beta, 3 dt, 4 a
 const float * qrt_dn_weights_host(const qrt_dn_weights * w, uint32_t which);
 

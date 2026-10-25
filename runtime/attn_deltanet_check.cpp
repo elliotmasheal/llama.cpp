@@ -531,6 +531,8 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
                 fprintf(stderr, "qrt: %s\n", err);
                 break;
             }
+            // weights_load already read all six buffers back and compared them with the host
+            printf("dn_weights layer=%u buffers=6 readback_mismatch=0\n", layer);
             const float l2_eps = 1e-6f / (float) sh.head_dim;
             std::vector<float> qkv((size_t) tokens * sh.conv_ch);
             for (size_t i = 0; i < qkv.size(); ++i) {
@@ -545,12 +547,9 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
                 zv[i] = (float) rng.gauss();
             }
             std::vector<float> cst((size_t) (sh.conv_taps - 1) * sh.conv_ch, 0.0f);
-            // the conv weight is re-uploaded here on purpose: after weights_load the buffer
-            // does not reliably hold the real weights (it does only when the caller uploads
-            // it, as the standalone prep block does). Open item in DECISIONS 63.4.
-            if (qrt_vk_upload(dev, stg, qrt_dn_weights_conv(gw), 0, qrt_dn_weights_host(gw, 0),
-                              (uint64_t) sh.conv_taps * sh.conv_ch * 4, err, sizeof(err)) != 0 ||
-                qrt_vk_upload(dev, stg, b->qkv, 0, qkv.data(), qkv.size() * 4, err, sizeof(err)) != 0 ||
+            // no conv re-upload here: weights_load verifies every buffer against its host
+            // copy, so a broken upload fails the load (DECISIONS 65)
+            if (qrt_vk_upload(dev, stg, b->qkv, 0, qkv.data(), qkv.size() * 4, err, sizeof(err)) != 0 ||
                 qrt_vk_upload(dev, stg, b->conv_state, 0, cst.data(), cst.size() * 4, err, sizeof(err)) != 0 ||
                 qrt_vk_upload(dev, stg, b->norm, 0, xnorm.data(), xnorm.size() * 4, err, sizeof(err)) != 0 ||
                 qrt_vk_upload(dev, stg, b->z, 0, zv.data(), zv.size() * 4, err, sizeof(err)) != 0) {

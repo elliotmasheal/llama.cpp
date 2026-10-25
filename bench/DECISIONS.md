@@ -1225,7 +1225,7 @@ qrt_dn_open 阶段以 0xC0000005 退出，**连 dn_device 一行都没输出**�
 
 **首要怀疑**（下次直接从这条查起）：描述符池被恰好用满——maxSets=4、descriptorCount=32，
 而每个 set 声明 8 个 binding，4 个 set 正好 32；但 prep/gate/gnorm 只写 4-7 个，
-kAllocateDescriptorSets 一旦失败，后续 kCmdBindDescriptorSets 拿到的就是空句柄，
+vkAllocateDescriptorSets 一旦失败，后续 vkCmdBindDescriptorSets 拿到的就是空句柄，
 表现为崩溃而不是报错。修法：池子按 DN_BINDINGS * 8 留余量，每个 set 都写满 8 个（未用的绑同一个哑缓冲）。
 
 **纪律**：本轮按新规约第 1 次失败即回滚到最后一个绿提交（313767f9d），未留半成品；
@@ -1595,7 +1595,7 @@ untime/kernels/norm.{h,cpp} + kernels/qrt_norm.comp，把 M2-6c 留下的
 
 第一版用 packHalf2x16(vec2(d,0.0)) 写 Q8_1 的 delta，**326917 / 655360 个字比参考低 1 个 half ULP**
 （样本全部单向：0x226e vs 0x226f 等）。单向 1 ULP 是"向零取整"的指纹：本驱动把 packHalf2x16
-降成 **_cvt_pkrtz（round toward zero）**，而 ggml 的 quantize_row_q8_1 走 C 的 f16 转换
+降成 **v_cvt_pkrtz（round toward zero）**，而 ggml 的 quantize_row_q8_1 走 C 的 f16 转换
 （**round-to-nearest-even**）。换成 shader 里显式的 RNE 位运算后降到 **38 / 655360**（5.8e-05），
 剩下的都是 fp32 归约 vs 双精度参考的真数值差。
 
@@ -1603,7 +1603,7 @@ untime/kernels/norm.{h,cpp} + kernels/qrt_norm.comp，把 M2-6c 留下的
   **G-QUAL 的 1e-4 级门禁会因此变红**，所以这不是"无所谓的舍入"。
 - 规则：
 untime/ 里凡是"要写进权重/平面、会被别的核算术消费"的 f16 转换，都用显式 RNE
-  （kernels/qrt_norm.comp 的 32_to_f16_rne、kernels/norm.cpp 的 32_to_f16）；
+  （kernels/qrt_norm.comp 的 f32_to_f16_rne、kernels/norm.cpp 的 f32_to_f16）；
   packHalf2x16 只允许出现在纯展示/不参与门禁的地方。本条已进已证伪表的相邻条目。
 
 ### 64.2 本轮边界
@@ -1612,6 +1612,40 @@ untime/ 里凡是"要写进权重/平面、会被别的核算术消费"的 f16 �
   M2-6 状态保持 partial。
 - 下一步顺序（按依赖）：(1) 收口 conv 权重缺陷（加载后回读校验和，先证明是别名还是时序）；
   (2) 共用记录接口，把 norm/GEMM/注意力录进一条命令缓冲（现在一层 4-5 次 submit，
-  每次 0.065-0.084 ms，512 token 时能占满三分之一）；(3) 整层串到 lk.3（full-attn）与
-  lk.0（DeltaNet）各一条，**每层输出对 CPU 参考**（63.4 的方法论）。
+  每次 0.065-0.084 ms，512 token 时能占满三分之一）；(3) 整层串到 blk.3（full-attn）与
+  blk.0（DeltaNet）各一条，**每层输出对 CPU 参考**（63.4 的方法论）。
 - 不改任何默认开关：本轮没有新增 QRT_* 行为开关，--norm-check 只是 check 入口。
+
+## 65. M2-6 判决：conv 权重缺陷按根因修复，权重上传改成加载时回读校验（2026-10-25）
+
+**采纳**：`qrt_dn_weights_load()` 里 conv 的上传改成读自己的 host 副本 `w->h_conv`，
+六个权重复用一个 staging 缓冲；新增 `qrt_dn_weights_verify()`，把六个缓冲全部回读、
+逐字节对 host 副本，`weights_load` 成功前自动调用。check 里"重传 conv 权重"的补丁删除。
+512 token y **5.788e-07** / gnorm **4.951e-07**、1024 token **8.274e-07 / 6.881e-07**，
+与修复前逐位相同；`readback_mismatch=0`。见 `RESULTS.md` 70。
+
+**根因（不是别名、不是时序）**：上传语句 `qrt_vk_upload(..., w->conv_w, 0, buf.data(), bytes)`
+里 `bytes` 是 conv 的 128 KiB，而 `buf` 这个临时向量已被后面的 gate 权重循环覆盖，
+里面只剩 `ssm_norm`（128 个 float = 512 B）——**从 512 B 的堆块读 128 KiB**。
+DECISIONS 63.4 猜的 (a) 分配器别名 / (b) staging 时序都不对，所以补 `staging_wait` 无效。
+
+### 65.1 规则
+
+- 上传**大于 4 KiB** 的常量权重时，源向量必须按名字独立持有（`h_conv` 这种），
+  不许复用跨循环的临时向量；`bytes` 和源数据必须来自同一个对象。
+- 载入类函数**自己回读校验**，不留"调用方记得重传"这种约定。六个缓冲 128 KiB+，
+  回读一次约 1 ms，换掉的是"整层跑完才发现权重是垃圾"。
+- 这条和 63.4 的方法论配对：**串联抓缺陷，回读定根因**。以后再遇到"分段绿、串联红"，
+  先加回读，再谈时序。
+
+### 65.2 未结项（本轮发现，下轮先做）
+
+`qrt_gemm_record()` 只有**两个固定 descriptor set**，靠 `pick_set` 在"缓冲指针变了"时重写。
+同一命令缓冲里录两次 out 不同的 GEMM（MoE 的 gate/up 正是这个形状），按规范第二次重写会
+**同时改掉两次 dispatch** 的绑定；本驱动似乎是在 bind 时给 set 拍了快照，所以 `--moe-check`
+一直 PASS。**这是依赖驱动实现细节**，与"考虑不同硬件"的目标冲突。
+计划：descriptor 池 + 每次 `begin` 重置、每次 `record` 分配并写一个新 set
+（预填时每层最多 4 x 专家数 个 set，池按 2048 配）；`swiglu` 同样处理。
+判据：`--moe-check`、`--dense-gemm-check` 读数不变，且新增"同一命令缓冲两个 GEMM 各写自己的输出"
+的检查项通过。
+

@@ -212,6 +212,12 @@ blockers: none
   **本驱动 `packHalf2x16` 是向零取整**（326917 个字低 1 ULP），改显式 RNE 后降到 38；
   纪律入 `DECISIONS` 64.1。下一步：整层命令缓冲 + conv 权重缺陷收口
   （`RESULTS.md` 第 69 节、`DECISIONS.md` 第 64 节）。
+- **M2-6 第二块（2026-10-25）**：conv 权重缺陷按**根因**修好——上传读了被 gate 循环覆盖的临时向量
+  （512 B 堆块读 128 KiB），不是别名也不是时序；新增 `qrt_dn_weights_verify()`，六个权重缓冲
+  **加载时全部回读逐字节比对**，check 里"重传 conv 权重"的补丁删除后整层仍
+  **y 5.79e-07 / gnorm 4.95e-07（512 token）、8.27e-07 / 6.88e-07（1024）**，与修复前逐位相同。
+  顺带发现 `qrt_gemm_record` 的**两个固定 descriptor set 在同一命令缓冲里会互相覆盖**（规范层面错，
+  本驱动靠 bind 快照蒙过），列为下轮先做的结构性修复。见 `RESULTS.md` 第 70 节、`DECISIONS.md` 第 65 节。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、

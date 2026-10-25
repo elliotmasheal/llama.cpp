@@ -560,8 +560,8 @@
         "runtime/attn.*"
       ],
       "done_when": "k=1 prefill 与参考一致；full-attn 的 KV 只读一次；DeltaNet 状态与串行解码一致；M2-6b/6c/6d 全部 done",
-      "claimed_at": "2026-10-25T16:27:06",
-      "note": "running 2026-10-25: the three slices are done (6b q8_0 dense GEMM 12.89 TFLOPS, 6c DeltaNet 4.94-5.19 us/token chained, 6d full-attn 3.18 TFLOPS). First piece of the cement landed: kernels/norm.* + qrt_norm.comp do rmsnorm plus the Q8_1 pack in the gemm.h layout, checked as a chain against one double reference (row 3.93e-08, planes 80/655360 blocks off by 1, GEMM on the device planes 1.25e-07) at 1.37-1.72 ms per 10K layer, 13.4 TFLOPS for the projection it feeds. It also closed a real defect: packHalf2x16 is v_cvt_pkrtz on this driver (326917 deltas one half ULP low), fixed with an explicit RNE conversion (RESULTS 69, DECISIONS 64/64.1). Still open: one command buffer per layer (norm and GEMM submit separately today), the conv weight buffer defect from 63.4, and the per-layer chain against a CPU reference for blk.0 and blk.3"
+      "claimed_at": "2026-10-25T16:35:45",
+      "note": "running 2026-10-25: the three slices are done (6b 12.89 TFLOPS dense, 6c DeltaNet chained, 6d full-attn 3.18 TFLOPS). Landed so far: kernels/norm.* + qrt_norm.comp (rmsnorm plus the Q8_1 pack in the gemm.h layout, row 3.93e-08 / planes 80 of 655360 / chained GEMM 1.25e-07, 1.37-1.72 ms per 10K layer) and the conv weight defect closed by root cause: the upload read 128 KiB from a 512-byte scratch vector, now it reads h_conv and weights_load verifies all six buffers by read-back (RESULTS 69/70, DECISIONS 64/65). Open before the chain: qrt_gemm_record keeps two fixed descriptor sets and rewrites them inside one command buffer, which is wrong per spec and only works because this driver snapshots at bind (DECISIONS 65.2); then one command buffer per layer and the per-layer chain against a CPU reference for blk.0 and blk.3"
     },
     {
       "id": "M2-7",

@@ -690,42 +690,93 @@ int qrt_dn_weights_load(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer
         return -1;
     }
     {
-        qrt_vk_staging * gstg = NULL;
-        if (qrt_vk_staging_create(dev, w->h_alpha.size() * 4, &gstg, err, err_size) != 0) {
-            qrt_dn_weights_free(dev, w);
-            return -1;
-        }
+        qrt_vk_staging * stg = NULL;
         const VkBuffer dsts[5] = { w->alpha_w, w->beta_w, w->dt, w->a, w->ssm_norm };
         const std::vector<float> * srcs[5] = { &w->h_alpha, &w->h_beta, &w->h_dt, &w->h_a,
                                                &w->h_norm };
+        uint64_t gate_bytes = 0;
+        for (uint32_t i = 0; i < 5; ++i) {
+            const uint64_t b = srcs[i]->size() * 4;
+            if (b > gate_bytes) {
+                gate_bytes = b;
+            }
+        }
+        // One staging buffer for all six weights. The conv upload reads h_conv, not the `buf`
+        // scratch: the gate loop above leaves the last gate weight in `buf`, so uploading
+        // `bytes` from it read past the end of a 512-byte vector and the conv matrix landed
+        // undefined (DECISIONS 65).
+        if (qrt_vk_staging_create(dev, bytes > gate_bytes ? bytes : gate_bytes, &stg, err,
+                                  err_size) != 0) {
+            qrt_dn_weights_free(dev, w);
+            return -1;
+        }
+        grc = qrt_vk_upload(dev, stg, w->conv_w, 0, w->h_conv.data(), bytes, err, err_size);
         for (uint32_t i = 0; i < 5 && grc == 0; ++i) {
-            grc = qrt_vk_upload(dev, gstg, dsts[i], 0, srcs[i]->data(), srcs[i]->size() * 4,
+            grc = qrt_vk_upload(dev, stg, dsts[i], 0, srcs[i]->data(), srcs[i]->size() * 4,
                                 err, err_size);
         }
         // the staging buffer must outlive the copy: destroying it right after the submit
-        // left the conv weight undefined, which only showed up when the four legs were
-        // chained (RESULTS 68)
-        if (qrt_vk_staging_wait(dev, gstg, err, err_size) != 0) {
+        // left a weight undefined, which only showed up when the four legs were chained
+        // (RESULTS 68)
+        if (grc == 0 && qrt_vk_staging_wait(dev, stg, err, err_size) != 0) {
             grc = -1;
         }
-        qrt_vk_staging_destroy(dev, gstg);
+        qrt_vk_staging_destroy(dev, stg);
         if (grc != 0) {
             qrt_dn_weights_free(dev, w);
             return -1;
         }
     }
-    qrt_vk_staging * stg = NULL;
-    if (qrt_vk_staging_create(dev, bytes, &stg, err, err_size) != 0 ||
-        qrt_vk_upload(dev, stg, w->conv_w, 0, buf.data(), bytes, err, err_size) != 0 ||
-        qrt_vk_staging_wait(dev, stg, err, err_size) != 0) {
-        qrt_vk_staging_destroy(dev, stg);
-        qrt_vk_free(dev, w->conv_w, w->mem[0]);
-        free(w);
+    if (qrt_dn_weights_verify(dev, w, err, err_size) != 0) {
+        qrt_dn_weights_free(dev, w);
         return -1;
     }
-    qrt_vk_staging_destroy(dev, stg);
     *out = w;
     return 0;
+}
+
+int qrt_dn_weights_verify(qrt_vk_dev * dev, const qrt_dn_weights * w,
+                          char * err, size_t err_size) {
+    if (dev == NULL || w == NULL) {
+        snprintf(err, err_size, "no device or weights to verify");
+        return -1;
+    }
+    const VkBuffer bufs[6] = { w->conv_w, w->alpha_w, w->beta_w, w->dt, w->a, w->ssm_norm };
+    const std::vector<float> * srcs[6] = { &w->h_conv, &w->h_alpha, &w->h_beta, &w->h_dt,
+                                           &w->h_a, &w->h_norm };
+    static const char * names[6] = { "ssm_conv1d", "ssm_alpha", "ssm_beta", "ssm_dt", "ssm_a",
+                                     "ssm_norm" };
+    uint64_t widest = 0;
+    for (uint32_t i = 0; i < 6; ++i) {
+        const uint64_t b = srcs[i]->size() * 4;
+        if (b > widest) {
+            widest = b;
+        }
+    }
+    qrt_vk_staging * stg = NULL;
+    if (qrt_vk_staging_create(dev, widest, &stg, err, err_size) != 0) {
+        return -1;
+    }
+    std::vector<unsigned char> got((size_t) widest);
+    int rc = 0;
+    for (uint32_t i = 0; i < 6 && rc == 0; ++i) {
+        const uint64_t b = srcs[i]->size() * 4;
+        if (qrt_vk_download(dev, stg, bufs[i], 0, got.data(), b, err, err_size) != 0) {
+            rc = -1;
+            break;
+        }
+        uint64_t bad = 0;
+        for (uint64_t j = 0; j < b; ++j) {
+            bad += got[(size_t) j] != ((const unsigned char *) srcs[i]->data())[j] ? 1u : 0u;
+        }
+        if (bad != 0) {
+            snprintf(err, err_size, "%s read-back differs in %llu of %llu bytes", names[i],
+                     (unsigned long long) bad, (unsigned long long) b);
+            rc = -1;
+        }
+    }
+    qrt_vk_staging_destroy(dev, stg);
+    return rc;
 }
 
 VkBuffer qrt_dn_weights_conv(const qrt_dn_weights * w) {

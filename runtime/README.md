@@ -256,6 +256,10 @@ build-vulkan/bin/qrt.exe --deltanet-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL.
   `ssm_a`/`ssm_dt` for the decay.
 - Speed: 1.23-1.26 us per token for the recurrence, i.e. 0.38 s for the 30 linear layers of a
   10K prompt against 1.35 s for the whole attention budget (RESULTS 63, DECISIONS 61).
+- `qrt_dn_weights_load()` reads every weight buffer back and compares it with the host copy
+  before returning; a mismatch names the buffer and the byte count. The conv matrix needed
+  this: it was uploaded from a scratch vector the gate weights had already overwritten, a
+  128 KiB read out of a 512-byte allocation (RESULTS 70, DECISIONS 65).
 - **The lane group must not be hard coded to 32.** This device reports subgroup size 64;
   assuming 32 reduces across 64 lanes, which is silently wrong (rel_L1 1.036) rather than a
   crash. `qrt_vk_dev` now carries `subgroup_size` and `has_subgroup_arithmetic`, the value is
