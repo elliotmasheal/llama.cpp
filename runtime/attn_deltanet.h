@@ -96,6 +96,13 @@ int qrt_dn_gate_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens
 // gnorm: out = rms_norm(y, eps) * ssm_norm * silu(z)
 int qrt_dn_gnorm_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
                      char * err, size_t err_size);
+// The four legs in sequence for one linear-attention layer: prep -> gate -> recur ->
+// gnorm. The caller fills qkv, xnorm and z (the projection outputs) beforehand, which
+// is exactly what the layer chain will hand over; this exists so the pieces are also
+// checked in the order the model runs them.
+int qrt_dn_layer_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
+                     float l2_eps, char * err, size_t err_size);
+double qrt_dn_layer_ms(const qrt_deltanet * dn);
 
 void qrt_dn_gnorm_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * y,
                       const float * z, const float * norm_w, float eps, float * out);

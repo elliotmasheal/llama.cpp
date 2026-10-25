@@ -76,7 +76,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M2-6d data=- io=- user=-
+queues: bench=- impl=M2-6 data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -198,18 +198,14 @@ blockers: none
   见 `RESULTS.md` 第 63 节、`DECISIONS.md` 第 61 节。队列头 -> **M2-6d（full-attn 批量）**。
   遗留（给 M2-6 整层串联）：递推变体开关目前只有 C API（`qrt_dn_set_recur`），要补
   `--dn-recur serial|cols`；整层 q8_0 投影串联未做。
-- **M2-6d partial（2026-10-25）**：full-attn 两半都通了且正确——qk norm+IMRoPE+f16 KV 追加
-  对双精度参考 **5e-07**（10K 的第二 chunk 追加不动第一段，IMRoPE 与 NEOX theta 差 0）；
-  flash 因果注意力 + 在线 softmax + sigmoid 门 **1.2-2.4e-06**（含 10K 按最长因果范围抽 8 行）。
-  **性能已抬两轮**：10K 时 **3.18 TFLOPS / 270.5 ms 每层**（1.60 → 1.99 → 3.18，累计 2.0x），
-  11 层 2.98 s；各腿加和 = 专家 2.98 + 稠密 2.4 + DeltaNet 1.37 + 注意力 2.98 = 9.73 s
-  → **PP 反算约 1052**（首过 1000；还没算整层串联的调度损失）。**用户已裁定不再把
-  "每层 KV 只读一次"当判据**（反推 50 GB/s，DRAM 156），只作成本列。
-  关键一刀是 **head_dim 两趟 128 维分段**（部分点积留寄存器 → K 半 tile 8.4 KiB → key tile
-  16→32，score 装载/FMA 1.25→0.50）；**跨 workgroup 拆 dim 已判定不成立**（两半点积要经
-  全局内存合并）。**f16 打包算术已用探针关闭**（9.1e-04 vs 门 1e-4）。已证伪：8 维展开、
-  Bkv=32+全局 V、Q 读 vec4、2 行 x 2 键 tile。见 `RESULTS.md` 第 64-67 节、
-  `DECISIONS.md` 第 62-63 节。
+- **M2-6d done / M2-6 开始（2026-10-25）**：**DeltaNet 四段串起来了**——prep→gate→recur→gnorm
+  一条命令，对"同一串"CPU 双精度 5.8e-07（y）/ 4.9e-07（输出），每 token **4.94-5.19 us**，
+  30 层 10K **1.52-1.59 s**。**M2-6d 记 done**（注意力 3.18 TFLOPS、PP 反算 1052）。
+  串联**抓到一个真实缺陷**：`weights_load` 之后 conv 权重缓冲不一定是真权重（分段测试自己又传了一遍
+  所以蒙住），显式重传即恢复；补 staging_wait 没修好，根因（分配器别名 vs 时序）留给 M2-6 收口——
+  **不许当已知无害绕过**（每层都要用这块权重）。教训：**分段全绿 ≠ 串联全绿，串联本身是一个测试**。
+  下一步（M2-6 整模型调度）**先补 rmsnorm + Q8_1 激活量化内核**（q8_0 GEMM 要预量化的 qs/ds 平面，
+  现在只有 check 在 host 上做）。见 `RESULTS.md` 第 68 节、`DECISIONS.md` 第 63.4 节。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、

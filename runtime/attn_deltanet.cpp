@@ -171,6 +171,7 @@ struct qrt_deltanet {
     VkCommandBuffer       cmd;
     VkFence               fence;
     double                last_ms;
+    double                layer_ms;
 };
 
 namespace {
@@ -501,6 +502,7 @@ void qrt_dn_close(qrt_vk_dev * dev, qrt_deltanet * dn) {
 const qrt_dn_shapes * qrt_dn_shapes_of(const qrt_deltanet * dn) { return &dn->sh; }
 const qrt_dn_bufs *   qrt_dn_buffers(const qrt_deltanet * dn) { return &dn->bufs; }
 double                qrt_dn_last_ms(const qrt_deltanet * dn) { return dn->last_ms; }
+double                qrt_dn_layer_ms(const qrt_deltanet * dn) { return dn->layer_ms; }
 
 uint64_t qrt_dn_state_bytes(const qrt_deltanet * dn) {
     return (uint64_t) dn->sh.n_v_heads * dn->sh.head_dim * dn->sh.head_dim * 4;
@@ -700,6 +702,12 @@ int qrt_dn_weights_load(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer
             grc = qrt_vk_upload(dev, gstg, dsts[i], 0, srcs[i]->data(), srcs[i]->size() * 4,
                                 err, err_size);
         }
+        // the staging buffer must outlive the copy: destroying it right after the submit
+        // left the conv weight undefined, which only showed up when the four legs were
+        // chained (RESULTS 68)
+        if (qrt_vk_staging_wait(dev, gstg, err, err_size) != 0) {
+            grc = -1;
+        }
         qrt_vk_staging_destroy(dev, gstg);
         if (grc != 0) {
             qrt_dn_weights_free(dev, w);
@@ -708,7 +716,8 @@ int qrt_dn_weights_load(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer
     }
     qrt_vk_staging * stg = NULL;
     if (qrt_vk_staging_create(dev, bytes, &stg, err, err_size) != 0 ||
-        qrt_vk_upload(dev, stg, w->conv_w, 0, buf.data(), bytes, err, err_size) != 0) {
+        qrt_vk_upload(dev, stg, w->conv_w, 0, buf.data(), bytes, err, err_size) != 0 ||
+        qrt_vk_staging_wait(dev, stg, err, err_size) != 0) {
         qrt_vk_staging_destroy(dev, stg);
         qrt_vk_free(dev, w->conv_w, w->mem[0]);
         free(w);
@@ -896,6 +905,25 @@ int qrt_dn_gate_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens
     }
     return vkResetFences(dn->dev->device, 1, &dn->fence) == VK_SUCCESS ? 0
              : fail(err, err_size, "vkResetFences (deltanet gate) failed");
+}
+
+int qrt_dn_layer_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
+                     float l2_eps, char * err, size_t err_size) {
+    const double t0 = now_ms();
+    if (qrt_dn_prep_run(dn, w, tokens, l2_eps, err, err_size) != 0) {
+        return -1;
+    }
+    if (qrt_dn_gate_run(dn, w, tokens, err, err_size) != 0) {
+        return -1;
+    }
+    if (qrt_dn_recur(dn, tokens, err, err_size) != 0) {
+        return -1;
+    }
+    if (qrt_dn_gnorm_run(dn, w, tokens, err, err_size) != 0) {
+        return -1;
+    }
+    dn->layer_ms = now_ms() - t0;
+    return 0;
 }
 
 int qrt_dn_gnorm_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,

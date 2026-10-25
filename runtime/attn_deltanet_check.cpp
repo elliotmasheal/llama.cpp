@@ -524,6 +524,86 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
             }
         }
 
+        // 5d) the four legs in sequence: one linear-attention layer as the model runs it
+        {
+            qrt_dn_weights * gw = NULL;
+            if (qrt_dn_weights_load(dev, gguf_path, layer, &sh, &gw, err, sizeof(err)) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            const float l2_eps = 1e-6f / (float) sh.head_dim;
+            std::vector<float> qkv((size_t) tokens * sh.conv_ch);
+            for (size_t i = 0; i < qkv.size(); ++i) {
+                qkv[i] = (float) rng.gauss();
+            }
+            std::vector<float> xnorm((size_t) tokens * sh.n_embd);
+            for (size_t i = 0; i < xnorm.size(); ++i) {
+                xnorm[i] = (float) rng.gauss();
+            }
+            std::vector<float> zv((size_t) sh.d_inner * tokens);
+            for (size_t i = 0; i < zv.size(); ++i) {
+                zv[i] = (float) rng.gauss();
+            }
+            std::vector<float> cst((size_t) (sh.conv_taps - 1) * sh.conv_ch, 0.0f);
+            // the conv weight is re-uploaded here on purpose: after weights_load the buffer
+            // does not reliably hold the real weights (it does only when the caller uploads
+            // it, as the standalone prep block does). Open item in DECISIONS 63.4.
+            if (qrt_vk_upload(dev, stg, qrt_dn_weights_conv(gw), 0, qrt_dn_weights_host(gw, 0),
+                              (uint64_t) sh.conv_taps * sh.conv_ch * 4, err, sizeof(err)) != 0 ||
+                qrt_vk_upload(dev, stg, b->qkv, 0, qkv.data(), qkv.size() * 4, err, sizeof(err)) != 0 ||
+                qrt_vk_upload(dev, stg, b->conv_state, 0, cst.data(), cst.size() * 4, err, sizeof(err)) != 0 ||
+                qrt_vk_upload(dev, stg, b->norm, 0, xnorm.data(), xnorm.size() * 4, err, sizeof(err)) != 0 ||
+                qrt_vk_upload(dev, stg, b->z, 0, zv.data(), zv.size() * 4, err, sizeof(err)) != 0) {
+                qrt_dn_weights_free(dev, gw);
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            std::vector<float> zero_state_g((size_t) st_floats, 0.0f);
+            if (qrt_vk_upload(dev, stg, b->state_in, 0, zero_state_g.data(), st_bytes,
+                              err, sizeof(err)) != 0 ||
+                qrt_dn_layer_run(dn, gw, tokens, l2_eps, err, sizeof(err)) != 0) {
+                qrt_dn_weights_free(dev, gw);
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            const double layer_ms = qrt_dn_layer_ms(dn);
+            std::vector<float> og((size_t) tokens * sh.d_inner, 0.0f);
+            std::vector<float> ychain((size_t) tokens * sh.d_inner, 0.0f);
+            if (qrt_vk_download(dev, stg, b->gnorm, 0, og.data(), og.size() * 4, err, sizeof(err)) != 0 ||
+                qrt_vk_download(dev, stg, b->y, 0, ychain.data(), ychain.size() * 4, err, sizeof(err)) != 0) {
+                qrt_dn_weights_free(dev, gw);
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            // the reference is the same chain, one double precision piece after another
+            std::vector<float> qr((size_t) tokens * sh.qk_ch), kr(qr.size()), vr((size_t) tokens * sh.d_inner);
+            std::vector<float> csto((size_t) (sh.conv_taps - 1) * sh.conv_ch, 0.0f);
+            std::vector<float> drows((size_t) tokens * sh.n_v_heads), brows(drows.size());
+            std::vector<double> stc((size_t) st_floats, 0.0);
+            std::vector<float> yref((size_t) tokens * sh.d_inner), oref((size_t) tokens * sh.d_inner);
+            qrt_dn_prep_cpu(&sh, tokens, qkv.data(), qrt_dn_weights_host(gw, 0), cst.data(), l2_eps,
+                            qr.data(), kr.data(), vr.data(), csto.data());
+            qrt_dn_gate_cpu(&sh, tokens, xnorm.data(), qrt_dn_weights_host(gw, 1),
+                            qrt_dn_weights_host(gw, 2), qrt_dn_weights_host(gw, 3),
+                            qrt_dn_weights_host(gw, 4), drows.data(), brows.data());
+            qrt_dn_recur_cpu(&sh, tokens, qr.data(), kr.data(), vr.data(), drows.data(), brows.data(),
+                             stc.data(), yref.data());
+            qrt_dn_gnorm_cpu(&sh, tokens, yref.data(), zv.data(), qrt_dn_weights_host(gw, 5), 1e-6f,
+                             oref.data());
+            double my = 0.0, mo = 0.0;
+            const double ry = rel_l1(ychain.data(), yref.data(), yref.size(), &my);
+            const double ro = rel_l1(og.data(), oref.data(), oref.size(), &mo);
+            qrt_dn_weights_free(dev, gw);
+            const double us_per_token = layer_ms * 1000.0 / (double) tokens;
+            printf("dn_layer tokens=%u y_rel_l1=%.3e out_rel_l1=%.3e ms=%.3f us_per_token=%.2f "
+                   "layers30_10k_ms=%.0f verdict=%s\n", tokens, ry, ro, layer_ms, us_per_token,
+                   us_per_token * 10240.0 * 30.0 / 1000.0,
+                   (ry <= 1e-4 && ro <= 1e-4) ? "PASS" : "FAIL");
+            if (!(ry <= 1e-4 && ro <= 1e-4)) {
+                break;
+            }
+        }
+
         // 4) timing at the chunk the prefill scheduler would use, for both variants
         double us_per_token[2] = { 0.0, 0.0 };
         int time_fail = 0;

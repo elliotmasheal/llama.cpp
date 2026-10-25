@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "track": "qwen36-runtime",
-  "updated": "2026-10-25T15:57:09+08:00",
+  "updated": "2026-10-25T16:05:51+08:00",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-6d",
+      "head": "M2-6",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6d is partial: correctness gates pass, the attention kernel needs the tile work listed in DECISIONS 63; M2-6a and M2-7 follow"
+      "note": "M2-6d is done; M2-6 (the layer chain) is the head and needs the rmsnorm+Q8_1 kernel first"
     },
     {
       "lane": "data",
@@ -548,7 +548,7 @@
       "id": "M2-6",
       "milestone": "M2",
       "lane": "impl",
-      "status": "todo",
+      "status": "partial",
       "title": "注意力路径：DeltaNet 递推 + full-attn 批量",
       "deps": [
         "M2-6b",
@@ -561,7 +561,7 @@
       ],
       "done_when": "k=1 prefill 与参考一致；full-attn 的 KV 只读一次；DeltaNet 状态与串行解码一致；M2-6b/6c/6d 全部 done",
       "claimed_at": "2026-10-25T16:30:00",
-      "note": "umbrella: done when the three kernel slices below are in and the full-attention KV is read once per layer. The shape account is in bench/tools/attn_account.py and RESULTS 45: dense projections 50% of the prompt FLOPs, attention body 15%"
+      "note": "running 2026-10-25: the three slices are done (6b q8_0 dense GEMM 12.89 TFLOPS, 6c DeltaNet 4.94-5.19 us/token chained, 6d full-attn 3.18 TFLOPS). The cement is the layer chain: for each layer rmsnorm -> projections (q8_0 GEMM) -> linear or full attention path -> post norm -> shared expert + routed MoE -> residual. It needs one missing piece first: an rmsnorm + Q8_1 activation quantize kernel, because the q8_0 GEMM takes pre-quantized qs/ds planes and today only the checks build those on the host. The chain must be verified per layer against a CPU reference, not only per kernel (DECISIONS 63.4). Also open: the conv weight buffer defect from 63.4"
     },
     {
       "id": "M2-7",
@@ -1213,7 +1213,7 @@
       "id": "M2-6d",
       "milestone": "M2",
       "lane": "impl",
-      "status": "partial",
+      "status": "done",
       "title": "full-attn 批量：per-head RMS norm + IMRoPE + flash 因果注意力 + sigmoid 门",
       "deps": [],
       "resources": [
@@ -1229,7 +1229,7 @@
         "bench/DECISIONS.md"
       ],
       "done_when": "10K 因果注意力对 CPU 参考 rel_L1 <= 1e-4；KV 只读一次（每层一次 K/V 读）；IMRoPE 的 sections/freq 与参考一致",
-      "note": "partial 2026-10-25: correct, and the attention body is now 3.18 TFLOPS at 10K (270.5 ms/layer) by walking head_dim in two 128-dim passes inside one workgroup: the partial dots stay in registers, so the K tile holds half the dims and the key tile goes from 16 to 32; V is staged 8 keys at a time. Summing the legs (experts 2.98 + dense 2.4 + DeltaNet 1.37 + attention 2.98 = 9.73 s) puts PP at about 1052 tok/s, the first time the sum is over 1000. Cross-workgroup dim splitting was rejected with the reason recorded (the two partial dots would have to be summed through global memory per score block). f16 packed arithmetic stays closed (probe 9.1e-04 against the 1e-4 gate). Next candidates: Bkv 40 (28.4 KiB of shared memory, loads/FMA 0.50 -> 0.45) and Bq 128 with 512 threads. RESULTS 64-67, DECISIONS 62/63/63.1/63.2/63.3"
+      "note": "done 2026-10-25: per-head RMS norm + IMRoPE + f16 KV append and the flash causal attention with the sigmoid gate, both against double precision references (5e-07 and 1.2-2.4e-06, the 10K case on the longest causal rows). Attention body 3.18 TFLOPS at 10K (270 ms/layer) after the two-128-dim-pass rewrite; summing the measured legs gives PP about 1052. f16 packed arithmetic is closed by measurement (1.0e-03 against a 1e-4 gate), cross-workgroup dim splitting is rejected for the reason in DECISIONS 63.3, and the 'KV read once per layer' criterion was dropped by the user (DECISIONS 63.1). Performance tuning left for M4: Bkv 40 and Bq 128 with 512 threads. RESULTS 64-68, DECISIONS 62-63.4"
     }
   ],
   "last_gate": {
