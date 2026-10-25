@@ -15,8 +15,9 @@ enum qrt_cache_policy {
 };
 
 enum qrt_kv_precision {
-    QRT_KV_Q4_0 = 0,
-    QRT_KV_F16  = 1,
+    QRT_KV_F16  = 0,
+    QRT_KV_Q8_0 = 1,
+    QRT_KV_Q4_0 = 2,
 };
 
 enum { QRT_MISS_SPLIT_AUTO = -1, QRT_ERR_SIZE = 256 };
@@ -28,7 +29,8 @@ struct qrt_config {
     int32_t      miss_split;      // QRT_MISS_SPLIT_AUTO, or the H2D share in percent
     int32_t      cache_policy;    // enum qrt_cache_policy
     int32_t      prefill_chunk;
-    int32_t      kv_precision;    // enum qrt_kv_precision
+    int32_t      kv_k;            // enum qrt_kv_precision, K cache (U-10: independent)
+    int32_t      kv_v;            // enum qrt_kv_precision, V cache
     int32_t      kv_page_tokens;  // resident KV window
     int32_t      telemetry;       // 0 = off, 1 = one CSV row per pass
     const char * telemetry_path;  // not copied: argv and env live for the process
@@ -52,6 +54,9 @@ void qrt_config_print_effective(const qrt_config * cfg, FILE * f);
 
 const char * qrt_cache_policy_name(int32_t policy);
 const char * qrt_kv_precision_name(int32_t precision);
+// Bytes one KV head row takes for this precision: [scales][quantised channels], both
+// 4-byte aligned; f16 is [head_dim f16]. 0 when the precision is not one of the three.
+uint32_t qrt_kv_row_bytes(int32_t precision, uint32_t head_dim);
 
 // Switch table accessors, in the order of design section 7.
 int qrt_config_switch_count(void);

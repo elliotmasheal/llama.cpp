@@ -78,7 +78,10 @@ const qrt_ffn_bufs * qrt_ffn_buffers(const qrt_ffn * f);
 // the shared expert for ref_tokens, and the routed experts for the pairs that start in
 // those tokens. out is x + moe + shexp*sigmoid(gate) for ref_tokens * n_embd floats; the
 // other outputs may be NULL. Kept in the module so the check and the kernel read the same
-// host copies of the weights.
-int qrt_ffn_ref_cpu(qrt_ffn * f, const float * xpost, uint32_t ref_tokens, float * logits,
+// host copies of the weights. xpost_qs/xpost_ds are the DEVICE's Q8_1 planes of xpost
+// when the caller has them: using them keeps the quantiser's 0.5 boundary decisions out of
+// the gate, which is what the output projection stage already does.
+int qrt_ffn_ref_cpu(qrt_ffn * f, const float * xpost, const signed char * xpost_qs,
+                    const uint32_t * xpost_ds, uint32_t ref_tokens, float * logits,
                     uint32_t * ids, float * weights, float * sgate, float * shexp,
                     float * moe, char * err, size_t err_size);

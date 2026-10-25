@@ -25,6 +25,8 @@ struct qrt_layer_cfg {
     int ffn;             // 1 = include the shared expert and the routed MoE
     int single_submit;   // 1 = record the whole layer into one pass buffer
     int dn_recur;        // 1 = the 32-column DeltaNet recurrence (RESULTS 63)
+    int32_t kv_k;        // enum qrt_kv_precision for the full-attention cache
+    int32_t kv_v;
 };
 
 struct qrt_layer_info {

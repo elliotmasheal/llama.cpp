@@ -5,6 +5,7 @@
 #include "attn_full.h"
 
 #include "gguf_index.h"
+#include "qrt_config.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -105,7 +106,7 @@ int make_pipeline(qrt_vk_dev * dev, VkPipelineLayout layout, const char * spv_di
     if (mod == VK_NULL_HANDLE) {
         return -1;
     }
-    VkSpecializationMapEntry sme[4];
+    VkSpecializationMapEntry sme[8];
     memset(sme, 0, sizeof(sme));
     for (uint32_t i = 0; i < n_spec; ++i) {
         sme[i].constantID = i;
@@ -208,6 +209,10 @@ struct qrt_full {
     qrt_full_shapes sh;
     uint32_t        max_tokens;
     uint32_t        n_ctx;
+    int32_t         kv_k;
+    int32_t         kv_v;
+    uint32_t        k_row;   // bytes of one K row, head_dim channels
+    uint32_t        v_row;
     qrt_full_bufs   bufs;
     VkDeviceMemory  mem[FULL_BUFFER_COUNT];
     double          last_ms;
@@ -227,6 +232,36 @@ struct qrt_full {
     VkFence               fence;
     VkCommandBuffer       ext;    // set by attach: the layer pass records into it
 };
+
+int qrt_kv_row_layout_of(int32_t type, uint32_t head_dim, qrt_kv_row_layout * out) {
+    if (out == NULL || head_dim == 0 || (head_dim % 32) != 0) {
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    out->type   = type;
+    out->blocks = head_dim / 32;
+    switch (type) {
+        case QRT_KV_F16:
+            out->row_bytes   = head_dim * 2;
+            out->scale_bytes = 0;
+            out->data_offset = 0;
+            break;
+        case QRT_KV_Q8_0:
+            out->scale_bytes = out->blocks * 2;
+            out->data_offset = out->scale_bytes;
+            out->row_bytes   = out->scale_bytes + head_dim;
+            break;
+        case QRT_KV_Q4_0:
+            out->scale_bytes = out->blocks * 2;
+            out->data_offset = out->scale_bytes;
+            out->row_bytes   = out->scale_bytes + head_dim / 2;
+            break;
+        default:
+            return -1;
+    }
+    // the kernels index the row as 32-bit words
+    return (out->row_bytes % 4u) == 0 ? 0 : -1;
+}
 
 int qrt_full_shapes_from_gguf(const qrt_gguf_hparams * hp, qrt_full_shapes * out,
                               char * err, size_t err_size) {
@@ -259,8 +294,8 @@ int qrt_full_shapes_from_gguf(const qrt_gguf_hparams * hp, qrt_full_shapes * out
 }
 
 int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes * sh,
-                  uint32_t max_tokens, uint32_t n_ctx, qrt_full ** out,
-                  char * err, size_t err_size) {
+                  uint32_t max_tokens, uint32_t n_ctx, int32_t kv_k, int32_t kv_v,
+                  qrt_full ** out, char * err, size_t err_size) {
     *out = NULL;
     if (dev == NULL || spv_dir == NULL || sh == NULL || max_tokens == 0 || n_ctx == 0) {
         return fail(err, err_size, "full attention needs a device, SPIR-V, tokens and a ctx");
@@ -273,6 +308,12 @@ int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes 
         return fail(err, err_size, "the KV cache holds %u tokens, the chunk is %u",
                     n_ctx, max_tokens);
     }
+    qrt_kv_row_layout klay, vlay;
+    if (qrt_kv_row_layout_of(kv_k, sh->head_dim, &klay) != 0 ||
+        qrt_kv_row_layout_of(kv_v, sh->head_dim, &vlay) != 0) {
+        return fail(err, err_size, "KV precision K=%d V=%d has no row layout at head_dim %u",
+                    kv_k, kv_v, sh->head_dim);
+    }
     qrt_full * f = (qrt_full *) calloc(1, sizeof(qrt_full));
     if (f == NULL) {
         return fail(err, err_size, "out of memory for full attention");
@@ -281,15 +322,20 @@ int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes 
     f->sh = *sh;
     f->max_tokens = max_tokens;
     f->n_ctx = n_ctx;
+    f->kv_k = kv_k;
+    f->kv_v = kv_v;
+    f->k_row = klay.row_bytes;
+    f->v_row = vlay.row_bytes;
 
     const uint64_t qg_bytes = (uint64_t) max_tokens * sh->qg_ch * 4;
     const uint64_t kvi_bytes = (uint64_t) max_tokens * sh->kv_ch * 4;
     const uint64_t q_bytes  = (uint64_t) max_tokens * sh->n_head * sh->head_dim * 4;
-    const uint64_t kv_bytes = (uint64_t) sh->n_kv * n_ctx * sh->head_dim * 2;
+    const uint64_t k_bytes  = (uint64_t) sh->n_kv * n_ctx * f->k_row;
+    const uint64_t v_bytes  = (uint64_t) sh->n_kv * n_ctx * f->v_row;
     const uint64_t w_bytes  = (uint64_t) sh->head_dim * 4;
     struct slot { VkBuffer * b; uint64_t bytes; } slots[FULL_BUFFER_COUNT] = {
         { &f->bufs.qg, qg_bytes }, { &f->bufs.kin, kvi_bytes }, { &f->bufs.vin, kvi_bytes },
-        { &f->bufs.q, q_bytes }, { &f->bufs.kcache, kv_bytes }, { &f->bufs.vcache, kv_bytes },
+        { &f->bufs.q, q_bytes }, { &f->bufs.kcache, k_bytes }, { &f->bufs.vcache, v_bytes },
         { &f->bufs.out, q_bytes }, { &f->bufs.q_norm_w, w_bytes }, { &f->bufs.k_norm_w, w_bytes },
     };
     for (uint32_t i = 0; i < FULL_BUFFER_COUNT; ++i) {
@@ -301,7 +347,7 @@ int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes 
     }
 
     if (make_set_layout(dev, 8, &f->qk_dsl, err, err_size) != 0 ||
-        make_layout(dev, f->qk_dsl, 8 * sizeof(uint32_t), &f->qk_layout, err, err_size) != 0) {
+        make_layout(dev, f->qk_dsl, 10 * sizeof(uint32_t), &f->qk_layout, err, err_size) != 0) {
         qrt_full_close(dev, f);
         return -1;
     }
@@ -314,17 +360,19 @@ int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes 
                     "this device has %u", props.limits.maxComputeSharedMemorySize);
     }
     if (make_set_layout(dev, 5, &f->attn_dsl, err, err_size) != 0 ||
-        make_layout(dev, f->attn_dsl, 5 * sizeof(uint32_t), &f->attn_layout, err, err_size) != 0) {
+        make_layout(dev, f->attn_dsl, 7 * sizeof(uint32_t), &f->attn_layout, err, err_size) != 0) {
         qrt_full_close(dev, f);
         return -1;
     }
-    if (make_pipeline(dev, f->attn_layout, spv_dir, "attn_full_attn.spv", NULL, 0, &f->attn_pipe,
-                      err, err_size) != 0) {
+    const uint32_t attn_spec[2] = { (uint32_t) f->kv_k, (uint32_t) f->kv_v };
+    if (make_pipeline(dev, f->attn_layout, spv_dir, "attn_full_attn.spv", attn_spec, 2,
+                      &f->attn_pipe, err, err_size) != 0) {
         qrt_full_close(dev, f);
         return -1;
     }
-    const uint32_t spec[4] = { sh->head_dim, sh->n_rot, sh->n_head, sh->n_kv };
-    if (make_pipeline(dev, f->qk_layout, spv_dir, "attn_full_qk.spv", spec, 4, &f->qk_pipe,
+    const uint32_t spec[6] = { sh->head_dim, sh->n_rot, sh->n_head, sh->n_kv,
+                               (uint32_t) f->kv_k, (uint32_t) f->kv_v };
+    if (make_pipeline(dev, f->qk_layout, spv_dir, "attn_full_qk.spv", spec, 6, &f->qk_pipe,
                       err, err_size) != 0) {
         qrt_full_close(dev, f);
         return -1;
@@ -427,11 +475,21 @@ void qrt_full_close(qrt_vk_dev * dev, qrt_full * f) {
 
 const qrt_full_shapes * qrt_full_shapes_of(const qrt_full * f) { return &f->sh; }
 const qrt_full_bufs *   qrt_full_buffers(const qrt_full * f) { return &f->bufs; }
+int32_t                 qrt_full_kv_k(const qrt_full * f) { return f->kv_k; }
+int32_t                 qrt_full_kv_v(const qrt_full * f) { return f->kv_v; }
 double                  qrt_full_last_ms(const qrt_full * f) { return f->last_ms; }
 uint64_t                qrt_full_last_kv_reads(const qrt_full * f) { return f->last_kv_reads; }
 
 uint64_t qrt_full_kv_bytes(const qrt_full * f) {
-    return (uint64_t) f->sh.n_kv * f->n_ctx * f->sh.head_dim * 2;   // one plane
+    return (uint64_t) f->sh.n_kv * f->n_ctx * f->k_row;
+}
+
+uint64_t qrt_full_v_bytes(const qrt_full * f) {
+    return (uint64_t) f->sh.n_kv * f->n_ctx * f->v_row;
+}
+
+uint32_t qrt_full_kv_row_bytes(const qrt_full * f, int is_v) {
+    return is_v ? f->v_row : f->k_row;
 }
 
 static int submit_and_wait(qrt_full * f, VkCommandBuffer cmd, char * err, size_t err_size) {
@@ -511,6 +569,8 @@ int qrt_full_qk(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t
         uint32_t qg_ch;
         uint32_t kv_ch;
         uint32_t kv_cap;
+        uint32_t k_stride_w;
+        uint32_t v_stride_w;
         float    eps;
         float    freq_base;
         float    freq_scale;
@@ -520,6 +580,8 @@ int qrt_full_qk(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t
     pc.qg_ch      = f->sh.qg_ch;
     pc.kv_ch      = f->sh.kv_ch;
     pc.kv_cap     = f->n_ctx;
+    pc.k_stride_w = f->k_row / 4u;
+    pc.v_stride_w = f->v_row / 4u;
     pc.eps        = f->sh.eps;
     pc.freq_base  = f->sh.freq_base;
     pc.freq_scale = f->sh.freq_scale;
@@ -548,13 +610,17 @@ int qrt_full_attn(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size
         uint32_t tokens;
         uint32_t kv_cap;
         uint32_t qg_ch;
+        uint32_t k_stride_w;
+        uint32_t v_stride_w;
         float    kq_scale;
     } pc;
-    pc.pos0     = pos0;
-    pc.tokens   = tokens;
-    pc.kv_cap   = f->n_ctx;
-    pc.qg_ch    = f->sh.qg_ch;
-    pc.kq_scale = f->sh.kq_scale;
+    pc.pos0       = pos0;
+    pc.tokens     = tokens;
+    pc.kv_cap     = f->n_ctx;
+    pc.qg_ch      = f->sh.qg_ch;
+    pc.k_stride_w = f->k_row / 4u;
+    pc.v_stride_w = f->v_row / 4u;
+    pc.kq_scale   = f->sh.kq_scale;
     VkCommandBuffer cmd = f->ext != VK_NULL_HANDLE ? f->ext : f->cmd;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->attn_pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->attn_layout, 0, 1,
@@ -570,7 +636,7 @@ int qrt_full_attn(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size
         const uint32_t rows = tokens - q0 < 64u ? tokens - q0 : 64u;
         tiles += (pos0 + q0 + rows + 31u) / 32u;
     }
-    f->last_kv_reads = tiles * f->sh.n_head * 32ull * f->sh.head_dim * 2ull * 2ull;
+    f->last_kv_reads = tiles * f->sh.n_head * 32ull * (uint64_t) (f->k_row + f->v_row);
 
     return submit_and_wait(f, cmd, err, err_size);
 }
@@ -676,6 +742,64 @@ static float as_f16(float x) {
     return f16_to_f32(h);
 }
 
+// packHalf2x16 on this driver lowers to v_cvt_pkrtz: the mantissa is truncated, not
+// rounded. The dequantised KV tile is staged with it (it never leaves the kernel), so the
+// check mirrors the same conversion.
+static float as_f16_trunc(float x) {
+    uint32_t u;
+    memcpy(&u, &x, 4);
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    const int32_t expo = (int32_t) ((u >> 23) & 0xffu) - 127;
+    const uint32_t man = u & 0x7fffffu;
+    if (expo > 15) {
+        return sign ? -65504.0f : 65504.0f;
+    }
+    if (expo < -24) {
+        return sign ? -0.0f : 0.0f;
+    }
+    if (expo < -14) {
+        const uint32_t m = (man | 0x800000u) >> (uint32_t) (-expo - 14);
+        return f16_to_f32(sign | (m >> 13));
+    }
+    return f16_to_f32(sign | ((uint32_t) (expo + 15) << 10) | (man >> 13));
+}
+
+void qrt_full_kv_unpack(const qrt_kv_row_layout * lay, uint32_t head_dim, uint32_t n_kv,
+                        uint32_t n_ctx, uint32_t pos0, uint32_t tokens, uint32_t row_stride,
+                        const void * plane, int round_mode, float * out) {
+    const uint8_t * base = (const uint8_t *) plane;
+    for (uint32_t h = 0; h < n_kv; ++h) {
+        for (uint32_t t = 0; t < tokens; ++t) {
+            const uint8_t * row = base + ((size_t) h * n_ctx + pos0 + t) * lay->row_bytes;
+            float * dst = out + ((size_t) h * row_stride + t) * head_dim;
+            if (lay->type == QRT_KV_F16) {
+                for (uint32_t i = 0; i < head_dim; ++i) {
+                    const uint32_t bits = (uint32_t) row[2 * i] | ((uint32_t) row[2 * i + 1] << 8);
+                    dst[i] = f16_to_f32(bits);
+                }
+                continue;
+            }
+            const uint8_t * qs = row + lay->data_offset;
+            for (uint32_t b = 0; b < lay->blocks; ++b) {
+                const uint32_t sbits = (uint32_t) row[2 * b] | ((uint32_t) row[2 * b + 1] << 8);
+                const float d = f16_to_f32(sbits);
+                for (uint32_t i = 0; i < 32; ++i) {
+                    float v;
+                    if (lay->type == QRT_KV_Q8_0) {
+                        v = (float) ((int8_t) qs[b * 32 + i]) * d;
+                    } else {
+                        const uint8_t byte = qs[b * 16 + (i >> 1)];
+                        const uint32_t q = (i & 1u) ? (uint32_t) (byte >> 4) : (uint32_t) (byte & 0xFu);
+                        v = ((float) q - 8.0f) * d;
+                    }
+                    dst[b * 32 + i] = round_mode == 1 ? as_f16(v)
+                                    : (round_mode == 2 ? as_f16_trunc(v) : v);
+                }
+            }
+        }
+    }
+}
+
 // Chunked f16 dot: eight products summed in f16, each chunk added to the f32 sum. That is
 // the best a packed-half kernel (V_PK_FMA_F16 in f16, or f16 dot2) can do without f32
 // accumulate, and it is what decides whether the numerics allow the fast path at all.
@@ -774,16 +898,32 @@ int qrt_full_shapes_from_gguf(const qrt_gguf_hparams * hp, qrt_full_shapes * out
     return -1;
 }
 int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes * sh,
-                  uint32_t max_tokens, uint32_t n_ctx, qrt_full ** out,
-                  char * err, size_t err_size) {
+                  uint32_t max_tokens, uint32_t n_ctx, int32_t kv_k, int32_t kv_v,
+                  qrt_full ** out, char * err, size_t err_size) {
     (void) dev; (void) spv_dir; (void) sh; (void) max_tokens; (void) n_ctx; (void) out;
+    (void) kv_k; (void) kv_v;
     snprintf(err, err_size, "full attention needs a Vulkan build");
     return -1;
 }
 void qrt_full_close(qrt_vk_dev * dev, qrt_full * f) { (void) dev; (void) f; }
 const qrt_full_shapes * qrt_full_shapes_of(const qrt_full * f) { (void) f; return NULL; }
 const qrt_full_bufs *   qrt_full_buffers(const qrt_full * f) { (void) f; return NULL; }
+int32_t                 qrt_full_kv_k(const qrt_full * f) { (void) f; return 0; }
+int32_t                 qrt_full_kv_v(const qrt_full * f) { (void) f; return 0; }
 uint64_t                qrt_full_kv_bytes(const qrt_full * f) { (void) f; return 0; }
+uint64_t                qrt_full_v_bytes(const qrt_full * f) { (void) f; return 0; }
+uint32_t                qrt_full_kv_row_bytes(const qrt_full * f, int is_v) {
+    (void) f; (void) is_v; return 0;
+}
+int qrt_kv_row_layout_of(int32_t type, uint32_t head_dim, qrt_kv_row_layout * out) {
+    (void) type; (void) head_dim; (void) out; return -1;
+}
+void qrt_full_kv_unpack(const qrt_kv_row_layout * lay, uint32_t head_dim, uint32_t n_kv,
+                        uint32_t n_ctx, uint32_t pos0, uint32_t tokens, uint32_t row_stride,
+                        const void * plane, int round_mode, float * out) {
+    (void) lay; (void) head_dim; (void) n_kv; (void) n_ctx; (void) pos0; (void) tokens;
+    (void) row_stride; (void) plane; (void) round_mode; (void) out;
+}
 double                  qrt_full_last_ms(const qrt_full * f) { (void) f; return 0.0; }
 uint64_t                qrt_full_last_kv_reads(const qrt_full * f) { (void) f; return 0; }
 int qrt_full_qk(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t err_size) {

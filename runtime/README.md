@@ -56,7 +56,7 @@ Precedence: CLI flag > `QRT_*` environment variable > design default. A flag tak
 value either as `--flag value` or `--flag=value`; the last occurrence wins.
 
 Notes are not errors. Values that are legal but change the design's cost model (for
-example `--prefill-chunk 512`, `--kv-precision f16`, `--draft-vocab 0`) print a `note:`
+example `--prefill-chunk 512`, `--kv-k f16`, `--draft-vocab 0`) print a `note:`
 line on stderr and keep running.
 
 ## GGUF index
@@ -121,6 +121,10 @@ Budget rules:
   tiers of `bench/README.md` are simulated. 0 means no cap.
 - Fixed buckets: dense 2079 MiB (RESULTS 25), KV `kv_page_tokens x 6336 B` for q4_0 or
   `x 22528 B` for f16 (RESULTS 25), compute 700 MiB (design 5.5 lower bound), draft 100 MiB.
+  Since M2-6a the KV bucket is per side: `kv_page_tokens x 11 x 2 x (k_row + v_row)` with the
+  row bytes of `QRT_KV_K` / `QRT_KV_V` (q8_0 272, q4_0 144, f16 512 at head_dim 256), so the
+  default pair is `x 9152 B`; the old `x 6336 B` line was the q4_0/q4_0 budget before the K
+  side moved to q8_0.
 - If the fixed buckets do not fit, the plan fails with a message (exit 2). Otherwise the
   expert cache takes `min(requested, what is left)`, rounded down to whole MiB, and every
   256 MiB it had to give up is counted in `reductions`.
@@ -319,8 +323,9 @@ build-vulkan/bin/qrt.exe --layer-check <gguf> --layer 3 --layer-tokens 512 --lay
   (default cols, the 32-column recurrence from RESULTS 63).
 - `--layer-check` compares each stage against one CPU double chain. The reference for a stage
   is fed the *device's* previous stage output, so the check validates the wiring; each kernel
-  keeps its own check. For a full-attention layer the reference reads the device's f16 KV cache
-  and dequantises it, so the f16 storage error is shared instead of landing in the gate. The
+  keeps its own check. For a full-attention layer the reference reads the device's KV cache and
+  dequantises it with the same f16 rounding the attention kernel stages, so the row precision
+  is shared instead of landing in the gate (M2-6a). The
   FFN reference covers the router and the shared expert over the first 64 tokens and the routed
   experts over their pairs, and reuses the K-quant dequant order of `--moe-check`.
 - Cost at 10K (two submits, the expert store read counted apart): 95 ms attention + 93 ms FFN

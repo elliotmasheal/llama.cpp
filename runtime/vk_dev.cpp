@@ -370,7 +370,15 @@ int qrt_vk_query_budget(qrt_vk_dev * dev, char * err, size_t err_size) {
 int qrt_vk_plan_budget(qrt_vk_dev * dev, const qrt_config * cfg, uint64_t expert_store_bytes,
                 qrt_vk_plan * out, char * err, size_t err_size) {
     memset(out, 0, sizeof(*out));
-    const uint64_t kv_per_token = cfg->kv_precision == QRT_KV_F16 ? 22528ull : 6336ull;
+    // 11 full-attention layers, n_kv = 2, head_dim = 256 (design 5.5): the same
+    // accounting the attention module allocates per token.
+    const uint32_t row_k = qrt_kv_row_bytes(cfg->kv_k, 256);
+    const uint32_t row_v = qrt_kv_row_bytes(cfg->kv_v, 256);
+    if (row_k == 0 || row_v == 0) {
+        return fail(err, err_size, "KV precision K=%d V=%d has no row layout",
+                    cfg->kv_k, cfg->kv_v);
+    }
+    const uint64_t kv_per_token = 11ull * 2ull * (uint64_t) (row_k + row_v);
     const uint64_t kv_bytes = (uint64_t) cfg->kv_page_tokens * kv_per_token;
     out->dense_bytes   = DENSE_BYTES;
     out->kv_bytes      = kv_bytes;

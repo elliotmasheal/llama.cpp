@@ -1,7 +1,9 @@
 #version 450
 #extension GL_EXT_control_flow_attributes : require
 
-// Flash-style causal attention over the f16 KV cache (M2-6d step 2).
+#include "common.glsl"
+
+// Flash-style causal attention over the KV cache (M2-6d step 2, M2-6a precision).
 //
 // One workgroup is one (query head, query tile of 64) with 256 threads. head_dim is 256,
 // which does not fit two shared-memory tiles at once on this device (32768 B), so the
@@ -12,6 +14,11 @@
 // time. Splitting the dims across *workgroups* instead would need the two partial dots
 // summed across workgroups, i.e. a global round trip per score block, so the split is
 // inside one workgroup on purpose.
+//
+// The shared tiles always hold f16 pairs of the value the arithmetic sees: f16 rows are
+// copied, q8_0/q4_0 rows are dequantised and staged with packHalf2x16 (truncating on this
+// driver, DECISIONS 64.1). That staging never leaves the kernel, and the check mirrors the
+// same conversion, so the gate is about the attention arithmetic, not the row format (M2-6a).
 //
 // Per KV block of 32 keys:
 //   scores  S[t][u] = qscale * sum_d Q[t][d] K[u][d]    2 rows x 4 keys, two dim passes
@@ -28,12 +35,20 @@ const uint KPAD = BKV + 1;              // padding: transposed reads stay confli
 const uint VSUB = 8;    // keys staged at a time for the accumulate phase
 const uint NH  = 16;    // n_head
 const uint NKV = 2;     // n_kv
+const uint SCALE_W = (HD / 32u) / 2u;   // f16 scale words at the row start
+
+// enum qrt_kv_precision: 0 f16, 1 q8_0, 2 q4_0. Specialisation constants keep the f16
+// pipeline free of the dequant branches (the f16 tile fill is a plain copy).
+layout(constant_id = 0) const uint K_TYPE = 0;
+layout(constant_id = 1) const uint V_TYPE = 0;
 
 layout(push_constant) uniform PC {
     uint  pos0;      // position of the first token of the chunk
     uint  tokens;
     uint  kv_cap;    // tokens the KV cache holds
     uint  qg_ch;     // n_head * 2 * head_dim
+    uint  k_stride_w;// K row stride in 32-bit words
+    uint  v_stride_w;// V row stride in 32-bit words
     float kq_scale;
 } pc;
 
@@ -93,9 +108,32 @@ void main() {
                 const uint dp = idx / BKV;          // pair index inside the half
                 const uint u  = idx % BKV;
                 const uint kpos = kbase + u;
-                kt[dp * KPAD + u] = kpos < pos_end
-                    ? kc[(kvh * pc.kv_cap + kpos) * (HD / 2u) + dbase / 2u + dp]
-                    : 0u;
+                uint pair = 0u;
+                if (kpos < pos_end) {
+                    const uint rb = (kvh * pc.kv_cap + kpos) * pc.k_stride_w;
+                    if (K_TYPE == 0u) {
+                        pair = kc[rb + (dbase + 2u * dp) / 2u];
+                    } else {
+                        const uint c0 = dbase + 2u * dp;
+                        const uint blk = c0 >> 5u;
+                        const uint off = c0 & 31u;
+                        const float d = unpackHalf2x16(kc[rb + (blk >> 1u)])[blk & 1u];
+                        float v0, v1;
+                        if (K_TYPE == 1u) {
+                            const uint w = kc[rb + SCALE_W + (blk * 32u + off) / 4u];
+                            const uint sh = (off & 3u) * 8u;
+                            v0 = float(int(w << (24u - sh)) >> 24) * d;
+                            v1 = float(int(w << (16u - sh)) >> 24) * d;
+                        } else {
+                            const uint w = kc[rb + SCALE_W + (blk * 16u + (off >> 1u)) / 4u];
+                            const uint b = (w >> (((off >> 1u) & 3u) * 8u)) & 0xFFu;
+                            v0 = (float(b & 0xFu) - 8.0f) * d;
+                            v1 = (float(b >> 4u) - 8.0f) * d;
+                        }
+                        pair = packHalf2x16(vec2(v0, v1));
+                    }
+                }
+                kt[dp * KPAD + u] = pair;
             }
             barrier();
             for (uint dl = 0; dl < 128u; dl += 4u) {
@@ -166,7 +204,32 @@ void main() {
                 const uint u  = idx / (HD / 2u);
                 const uint dp = idx % (HD / 2u);
                 const uint kpos = kbase + u0 + u;
-                vt[idx] = kpos < pos_end ? vc[(kvh * pc.kv_cap + kpos) * (HD / 2u) + dp] : 0u;
+                uint pair = 0u;
+                if (kpos < pos_end) {
+                    const uint rb = (kvh * pc.kv_cap + kpos) * pc.v_stride_w;
+                    if (V_TYPE == 0u) {
+                        pair = vc[rb + dp];
+                    } else {
+                        const uint c0 = 2u * dp;
+                        const uint blk = c0 >> 5u;
+                        const uint off = c0 & 31u;
+                        const float d = unpackHalf2x16(vc[rb + (blk >> 1u)])[blk & 1u];
+                        float v0, v1;
+                        if (V_TYPE == 1u) {
+                            const uint w = vc[rb + SCALE_W + (blk * 32u + off) / 4u];
+                            const uint sh = (off & 3u) * 8u;
+                            v0 = float(int(w << (24u - sh)) >> 24) * d;
+                            v1 = float(int(w << (16u - sh)) >> 24) * d;
+                        } else {
+                            const uint w = vc[rb + SCALE_W + (blk * 16u + (off >> 1u)) / 4u];
+                            const uint b = (w >> (((off >> 1u) & 3u) * 8u)) & 0xFFu;
+                            v0 = (float(b & 0xFu) - 8.0f) * d;
+                            v1 = (float(b >> 4u) - 8.0f) * d;
+                        }
+                        pair = packHalf2x16(vec2(v0, v1));
+                    }
+                }
+                vt[idx] = pair;
             }
             barrier();
             for (uint u = 0; u < VSUB; ++u) {

@@ -31,16 +31,27 @@
 - `test-backend-ops -o MUL_MAT_ID -b Vulkan1` = 939/939
 - `test-backend-ops -o MUL_MAT -b Vulkan1` = 2275/2275
 - `test-backend-ops -o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332
-- `ctest --test-dir build-vulkan` = 34/34（M2-0 实测；33 原有 + `qrt_selftest`；M1-3c 时为 33/33，2026-10-23 的 32/32 早于 992c2f57a）
+- `ctest --test-dir build-vulkan` = 34/34（M2-0 实测；33 原有 + `qrt_selftest`）
 
 ## 4. 为什么质量门是两级
 
-旧条文把"改数值路径"一律判为"不许合入"。项目当前唯一能推进的工作全在 `runtime/` 的内核里，字面上全部违规，执行时只能靠人解释绕开（提交信息里写 `G-REG n/a`）。所以拆开：
+旧条文把"改数值路径"一律判"不许合入"，而当前工作全在 `runtime/` 内核里，只能靠人解释绕开（提交写 `G-REG n/a`）。所以拆开：
 
 - **L-KERN**：内核正确性。过了就**允许合入**，允许留在仓库。
 - **L-MODEL**：整模型保真。过了才**允许成为默认值**，才允许写进 design 第 7 节的默认开关。
 
-未过 L-MODEL 的能力必须默认关闭，并在 `DECISIONS.md` 开关表里标"未过 L-MODEL"。
+未过 L-MODEL 的能力必须默认关闭，并在 `DECISIONS.md` 开关表里标注。**豁免只有一份**：`U-11`
+（KV 默认档 q8_0 K + q4_0 V，2026-10-25，`DECISIONS.md#kv-exempt-q8k-q4v`）——判据不变、
+读数照报，不阻塞默认；**L-KERN 不豁免**，其他任何默认值仍要 L-MODEL。
+
+## 4.1 长上下文质量门（G-QUAL-LONG，2026-10-25 用户要求）
+
+- 触发：改 KV 精度 / 窗口 / 分页；M2-7 收口。命令 `qrt --logits-dump` + `qgate.py compare`。
+- A 侧必须是**同引擎 f16 KV**；跨引擎禁止（fork `-ctk/-ctv` 地板 1.5e-2，`RESULTS.md#q-kv1-fork-floor`）。
+- 数据 `prompt256k.txt`；rt fp32 只取尾部 512 行（全量 65 GB，不可行）。
+- 判据：10K / 128K / 256K 三档，每档 tail mean KLD <= 1e-4、top-1 >= 99%、分叉 margin < 0.05、
+  needle@0.9N 两侧都对。**只过 10K 不算过**，报随长度的斜率。
+- 256K 的 f16 A 侧 5632 MiB 装不下，必须分页（M2-6a）；128K 档 2816 MiB 不需要。
 
 ## 5. 门禁纪律
 
@@ -48,13 +59,3 @@
 - 失败必须留复现命令与已排除项；"配置不对"不是结论。
 - 方差：同口径 r >= 3，相对极差 > 15% 该批作废；报中位与极差，禁报单次最优。
 - 跨口径比较视为错误（口径含：日期、提交、电源态、显存档位、专家缓存 MiB、k、草稿词表）。
-
-## 4.1 长上下文质量门（G-QUAL-LONG，2026-10-25 用户要求）
-
-- 触发：改 KV 精度 / 常驻窗口 / 分页；M2-7 收口。命令：`qrt --logits-dump` + `qgate.py compare`。
-- A 侧必须是**同一引擎的 f16 KV**；跨引擎禁止（fork 的 `-ctk/-ctv` 地板 1.5e-2，
-  `RESULTS.md#q-kv1-fork-floor`）。
-- 数据：`bench/prompts/prompt256k.txt`；rt fp32 只取尾部 512 行（256K 全量转储 65 GB，不可行）。
-- 判据：10K / 128K / 256K 三档，每档 tail mean KLD <= 1e-4、same top-1 >= 99%、分叉 margin
-  < 0.05 nat，且 needle@0.9N 两侧都答对。**只过 10K 不算过**，要报随长度的斜率。
-- 256K 档的 f16 A 侧 = 5632 MiB，装不下，必须走分页（M2-6a）；128K 档 2816 MiB，不需要。

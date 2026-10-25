@@ -49,7 +49,7 @@ date | commit | phase | task | model | ctx | prompt tokens | n_gen | k | draft v
 9. 改完代码先确认二进制含本次改动（看构建时间戳），再做 A/B。
 10. 外部推理进程在 GPU 上时整批数据作废；容量类失败先看 RAM 再怀疑显存。
 11. 编译、repack、第二个模型进程都会扰动计时：跑数前确认 `state_check.py` 的 `lock` 行是 `free`。
-12. KV 精度（默认 q8_0 K + q4_0 V）改动注意力数值路径：不过 L-MODEL 不许当默认；16K 窗口外页面在主机，长上下文 decode 不计入 TG。
+12. KV 精度（默认 q8_0 K + q4_0 V）改动注意力数值路径：该默认档已由 U-11 豁免 L-MODEL（读数照报），其他组合不过 L-MODEL 不许当默认；16K 窗口外页面在主机，长上下文 decode 不计入 TG。
 13. 两臂对比前必须各跑一次预热 pass：首触缺页会造假加速比（`DECISIONS` 35）。
 
 ## 4. 目录

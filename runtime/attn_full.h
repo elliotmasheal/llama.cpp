@@ -19,12 +19,29 @@
 //   kin  [tokens][n_kv * head_dim]
 //   vin  [tokens][n_kv * head_dim]
 //   q    [tokens][n_head * head_dim]       normed and roped Q
-//   kv   [n_kv][n_ctx][head_dim] f16       normed/roped K and raw V, appended per chunk
+//   kv   [n_kv][n_ctx][kv_row]             normed/roped K and raw V, appended per chunk
 //   out  [tokens][n_head * head_dim]       attention output already multiplied by sigmoid(gate)
+//
+// The KV row is the precision's layout (U-10/U-11, M2-6a): f16 is a flat f16 row; q8_0 and
+// q4_0 put the per-32-block f16 scales first, then the quantised channels, so every field
+// starts on a 4-byte boundary for head_dim 256.
 
 struct qrt_full;
+struct qrt_kv_row_layout;
 
 enum { FULL_BUFFER_COUNT = 9 };
+
+// Bytes one KV row takes; see qrt_kv_row_bytes() in qrt_config.h for the totals.
+struct qrt_kv_row_layout {
+    int32_t  type;         // enum qrt_kv_precision
+    uint32_t row_bytes;    // whole row
+    uint32_t blocks;       // head_dim / 32
+    uint32_t scale_bytes;  // f16 scales at the row start, 0 for f16
+    uint32_t data_offset;  // quantised channels start here
+};
+
+// Returns -1 for a type the kernels do not implement at this head_dim.
+int qrt_kv_row_layout_of(int32_t type, uint32_t head_dim, qrt_kv_row_layout * out);
 
 struct qrt_full_shapes {
     uint32_t n_embd;
@@ -60,16 +77,21 @@ struct qrt_gguf_hparams;
 int qrt_full_shapes_from_gguf(const qrt_gguf_hparams * hp, qrt_full_shapes * out,
                               char * err, size_t err_size);
 
-// max_tokens sizes the per-chunk planes; n_ctx sizes the KV cache pages.
+// max_tokens sizes the per-chunk planes; n_ctx sizes the KV cache pages. kv_k/kv_v are
+// enum qrt_kv_precision values (QRT_KV_K / QRT_KV_V).
 int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes * sh,
-                  uint32_t max_tokens, uint32_t n_ctx, qrt_full ** out,
-                  char * err, size_t err_size);
+                  uint32_t max_tokens, uint32_t n_ctx, int32_t kv_k, int32_t kv_v,
+                  qrt_full ** out, char * err, size_t err_size);
 void qrt_full_close(qrt_vk_dev * dev, qrt_full * f);
 
 const qrt_full_shapes * qrt_full_shapes_of(const qrt_full * f);
 const qrt_full_bufs *   qrt_full_buffers(const qrt_full * f);
-// Bytes of one KV plane (K or V); the pair is twice this. f16 storage.
+int32_t                 qrt_full_kv_k(const qrt_full * f);
+int32_t                 qrt_full_kv_v(const qrt_full * f);
+// Bytes of one KV plane (K or V), and the row layout the kernels use.
 uint64_t                qrt_full_kv_bytes(const qrt_full * f);
+uint64_t                qrt_full_v_bytes(const qrt_full * f);
+uint32_t                qrt_full_kv_row_bytes(const qrt_full * f, int is_v);
 // Step 1: per-head RMS norm of Q and K, IMRoPE on both, V copied as is. Writes q,
 // kcache[pos0 .. pos0+tokens) and vcache[pos0 .. pos0+tokens).
 int qrt_full_qk(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t err_size);
@@ -109,4 +131,13 @@ void qrt_full_attn_rows_cpu_f16(const qrt_full_shapes * sh, uint32_t n_ctx,
                                 const float * q, const float * kcache, const float * vcache,
                                 const float * qg, float * out);
 
-int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const char * spv_dir);
+// Unpacks one KV plane [n_kv][n_ctx][row] for positions pos0..pos0+tokens into
+// out [n_kv][row_stride][head_dim]. round_mode: 0 = the cache's own value (storage error),
+// 1 = f16 RNE, 2 = f16 truncation (what the kernel's packHalf2x16 stages). Use the mode the
+// attention kernel applies to that row type, so the comparison gates the arithmetic only.
+void qrt_full_kv_unpack(const qrt_kv_row_layout * lay, uint32_t head_dim, uint32_t n_kv,
+                        uint32_t n_ctx, uint32_t pos0, uint32_t tokens, uint32_t row_stride,
+                        const void * plane, int round_mode, float * out);
+
+int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const char * spv_dir,
+                   int32_t kv_k, int32_t kv_v);

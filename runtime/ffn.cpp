@@ -957,7 +957,8 @@ float silu(float x) { return x / (1.0f + expf(-x)); }
 
 } // namespace
 
-int qrt_ffn_ref_cpu(qrt_ffn * f, const float * xpost, uint32_t ref_tokens, float * logits,
+int qrt_ffn_ref_cpu(qrt_ffn * f, const float * xpost, const signed char * xpost_qs,
+                    const uint32_t * xpost_ds, uint32_t ref_tokens, float * logits,
                     uint32_t * ids, float * weights, float * sgate, float * shexp,
                     float * moe, char * err, size_t err_size) {
     if (f == NULL || xpost == NULL || ref_tokens == 0 || ref_tokens > f->cfg.tokens) {
@@ -969,10 +970,16 @@ int qrt_ffn_ref_cpu(qrt_ffn * f, const float * xpost, uint32_t ref_tokens, float
     const uint32_t K  = f->cfg.top_k;
     const uint32_t T  = ref_tokens;
 
-    // the same Q8_1 rule the device applies to the post norm row
+    // the same Q8_1 rule the device applies to the post norm row, on the device's own planes
+    // when the caller passes them
     std::vector<signed char> qs((size_t) T * E);
     std::vector<uint32_t> ds((size_t) T * (E / 32u));
-    qrt_norm_quant_cpu(T, E, xpost, nullptr, qs.data(), ds.data());
+    if (xpost_qs != NULL && xpost_ds != NULL) {
+        memcpy(qs.data(), xpost_qs, qs.size());
+        memcpy(ds.data(), xpost_ds, ds.size() * sizeof(uint32_t));
+    } else {
+        qrt_norm_quant_cpu(T, E, xpost, nullptr, qs.data(), ds.data());
+    }
 
     std::vector<float> probs((size_t) T * NE);
     std::vector<float> picked((size_t) K);

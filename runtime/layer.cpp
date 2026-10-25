@@ -10,6 +10,7 @@
 #include "gguf_index.h"
 #include "kernels/gemm.h"
 #include "kernels/norm.h"
+#include "qrt_config.h"
 #include "weights.h"
 
 #include <math.h>
@@ -603,7 +604,8 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_
             qrt_gguf_close(g);
             return fail(err, err_size, "attention.n_embd=%u, the norms are %u", fsh.n_embd, E);
         }
-        if (qrt_full_open(dev, spv_dir, &fsh, T, T, &l->full, err, err_size) != 0) {
+        if (qrt_full_open(dev, spv_dir, &fsh, T, T, l->cfg.kv_k, l->cfg.kv_v, &l->full,
+                          err, err_size) != 0) {
             qrt_layer_close(dev, l);
             qrt_gguf_close(g);
             return -1;
@@ -1303,24 +1305,33 @@ int qrt_layer_check(const char * gguf_path, const char * store_prefix, uint32_t 
                         g_proj_full[2].data(),
                         l->h_qnw.data(), l->h_knw.data(), q_out.data(), k_out.data(),
                         v_out.data());
-        // The reference reads the DEVICE's f16 KV cache and dequantises it, so the 3.5e-04
-        // of f16 storage error is shared by both sides instead of landing in the gate.
+        // The reference reads the DEVICE's KV cache and dequantises it with the kernel's own
+        // f16 staging rounding, so the row precision is shared by both sides instead of
+        // landing in the gate (M2-6a).
         const qrt_full_bufs * fb = qrt_full_buffers(l->full);
-        std::vector<uint16_t> kc((size_t) sh.n_kv * T * sh.head_dim);
-        std::vector<uint16_t> vc(kc.size());
-        if (download(l, fb->kcache, kc.data(), kc.size() * 2, err, sizeof(err)) != 0 ||
-            download(l, fb->vcache, vc.data(), vc.size() * 2, err, sizeof(err)) != 0) {
+        const uint64_t k_bytes = qrt_full_kv_bytes(l->full);
+        const uint64_t v_bytes = qrt_full_v_bytes(l->full);
+        std::vector<uint8_t> kraw((size_t) k_bytes);
+        std::vector<uint8_t> vraw((size_t) v_bytes);
+        if (download(l, fb->kcache, kraw.data(), k_bytes, err, sizeof(err)) != 0 ||
+            download(l, fb->vcache, vraw.data(), v_bytes, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             qrt_layer_close(dev, l);
             qrt_vk_close(dev);
             return 2;
         }
-        for (size_t i = 0; i < kc.size(); ++i) {
-            k_out[i] = f16_to_f32(kc[i]);
+        qrt_kv_row_layout klay, vlay;
+        if (qrt_kv_row_layout_of(qrt_full_kv_k(l->full), sh.head_dim, &klay) != 0 ||
+            qrt_kv_row_layout_of(qrt_full_kv_v(l->full), sh.head_dim, &vlay) != 0) {
+            fprintf(stderr, "qrt: the layer's KV row layout is not one the check knows\n");
+            qrt_layer_close(dev, l);
+            qrt_vk_close(dev);
+            return 2;
         }
-        for (size_t i = 0; i < vc.size(); ++i) {
-            v_out[i] = f16_to_f32(vc[i]);
-        }
+        qrt_full_kv_unpack(&klay, sh.head_dim, sh.n_kv, T, 0, T, T, kraw.data(),
+                           qrt_full_kv_k(l->full) == QRT_KV_F16 ? 1 : 2, k_out.data());
+        qrt_full_kv_unpack(&vlay, sh.head_dim, sh.n_kv, T, 0, T, T, vraw.data(),
+                           qrt_full_kv_v(l->full) == QRT_KV_F16 ? 1 : 2, v_out.data());
         std::vector<uint32_t> rows(T);
         for (uint32_t i = 0; i < T; ++i) {
             rows[i] = i;
@@ -1418,8 +1429,21 @@ int qrt_layer_check(const char * gguf_path, const char * store_prefix, uint32_t 
         std::vector<float> ref_wts((size_t) ref * info.top_k);
         std::vector<float> ref_sgate(ref), ref_shexp((size_t) ref * E);
         std::vector<float> ref_moe((size_t) ref * E);
-        if (qrt_ffn_ref_cpu(qrt_layer_ffn(l), g_post.data(), ref, ref_logits.data(),
-                            ref_ids.data(), ref_wts.data(), ref_sgate.data(),
+        // the device's own Q8_1 planes of the post norm row, so the quantiser's boundary
+        // decisions are shared by both sides (the out projection stage does the same)
+        std::vector<signed char> post_qs((size_t) ref * E);
+        std::vector<uint32_t> post_ds((size_t) ref * (E / 32u));
+        int rcp = download(l, l->qs, post_qs.data(), post_qs.size(), err, sizeof(err));
+        rcp = rcp == 0 ? download(l, l->ds, post_ds.data(), post_ds.size() * 4, err,
+                                  sizeof(err)) : rcp;
+        if (rcp != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            qrt_layer_close(dev, l);
+            qrt_vk_close(dev);
+            return 2;
+        }
+        if (qrt_ffn_ref_cpu(qrt_layer_ffn(l), g_post.data(), post_qs.data(), post_ds.data(), ref,
+                            ref_logits.data(), ref_ids.data(), ref_wts.data(), ref_sgate.data(),
                             ref_shexp.data(), ref_moe.data(), err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             qrt_layer_close(dev, l);

@@ -67,7 +67,7 @@
 默认值按 design v0.4 更正（旧表里的 k=5 / chunk 512 / cache 待定是 v0.1-v0.3 的残留）。
 "引擎"一列指真正消费该开关的模块，仍未实现。
 
-| 开关 | 默认（design v0.4） | 作用 | 状态 |
+| 开关 | 默认（design v0.6） | 作用 | 状态 |
 |---|---|---|---|
 | `QRT_SPEC_K` | 4 | 推测深度，取 {1,2,4,5,8}；4 是验收配置（U-7） | 已解析；引擎待 M3-0 |
 | `QRT_DRAFT_VOCAB` | 16384 | 0 = 完整词表（基线，约 125）；16384 = 受限词表 | 已解析；引擎待 M3-4 |
@@ -75,8 +75,9 @@
 | `QRT_MISS_SPLIT` | auto | auto = 让三条腿耗时相等；0 = 全 CPU，100 = 全 H2D | 已解析；引擎待 M3-2a |
 | `QRT_CACHE_POLICY` | slru | slru / lru / static（static 仅对照） | 已解析；引擎待 M3-2 |
 | `QRT_PREFILL_CHUNK` | 2048 | prefill 分块；PP 1000 需 >= 1420 | 已解析；引擎待 M2-5 |
-| `QRT_KV_PRECISION` | q4_0 | kv 精度；q4_0 必须过 G-QUAL，否则回退 f16 | 已解析；引擎待 M2-6a |
-| `QRT_KV_PAGE_TOKENS` | 16384 | KV 常驻窗口；窗口外页面放主机（U-3） | 已解析；引擎待 M2-6 |
+| `QRT_KV_K` | q8_0 | K 缓存精度 {f16, q8_0, q4_0}（U-10/U-11）；q4_0 K 只作对照 | 已实现（M2-6a） |
+| `QRT_KV_V` | q4_0 | V 缓存精度，与 K 独立 | 已实现（M2-6a） |
+| `QRT_KV_PAGE_TOKENS` | 16384 | KV 常驻窗口；窗口外页面放主机（U-3） | 预算已用；分页待 M2-6a 第二块 |
 | `QRT_TELEMETRY` | 0 | 每 pass 记录命中、H2D 字节、耗时、接受数 | 已解析；出口已实现（M2-0） |
 | `QRT_TELEMETRY_PATH` | `qrt-telemetry.csv` | 运行时扩展：sink 路径，不是 design 开关 | 已实现（M2-0） |
 | `QRT_VRAM_TIER_MIB` | 0（auto） | 运行时扩展：把预算压到指定 MiB，模拟 4G/6G 档 | 已实现（M2-2） |
@@ -1911,3 +1912,79 @@ h 平面，所以"gate/up 行主序 + swiglu 读 token-major"这类错**在任�
 （枚举 {q4_0, f16}，默认 q4_0），`vk_dev.cpp` 的 KV 预算也按这两档算。设计已经前移，
 M2-6a 负责迁移成 K/V 两开关并把 q8_0 K + q4_0 V 的 832 B/token/层 接进预算。
 在迁移前 `--selftest` 断言的是旧表，**不算回归**；但新档位不得在此之前写进 CLI 默认值。
+
+## 判决：q8_0 K + q4_0 V 豁免 L-MODEL（U-11，2026-10-25）
+<!-- slug: kv-exempt-q8k-q4v -->
+
+### 74.1 变更
+
+- 用户 2026-10-25 书面批准：KV 默认档 **q8_0 K + q4_0 V 豁免 L-MODEL / G-QUAL**，直接作为默认生效，
+  不再等 KLD 判决。design v0.6 第 7 节与 5.5 节同步。
+- 豁免范围：**只有这一个默认档、只有 L-MODEL 这一条判据**。`L-KERN` 不豁免（数值路径仍要
+  rel_L1 <= 1e-6）；`G-QUAL-LONG` 仍要跑，降级为"报告项"而不是"阻塞项"。其他任何默认值仍走
+  `docs/agent/gates.md` §4。
+
+### 74.2 为什么需要豁免（不是走流程）
+
+- Q-KV1 的差分读数 + 理论都指向 q4 单侧 ~0.5-1e-2 KLD，比 1e-4 高 50-100 倍
+  （`RESULTS.md#q-kv1-fork-floor`）。按 gates §4 它会永久停在"未过 L-MODEL、默认关闭"，
+  也就是 design 想要的默认永远不生效。
+- 只有两条路：改判据（铁律 3 禁止）或用户豁免（本决定）。**判据 1e-4 保持不动**。
+
+### 74.3 代价与可观测性（豁免不等于不测）
+
+- M2-6a 仍必须报默认档的 KLD / top-1（10K）与 VRAM 峰值、换页次数。这些读数是
+  **"达标证据缺席"的记录**，不是通过证据，报的时候要这么写。
+- 回退阶梯保留为运维选项（q8_0/q8_0 21.4% -> f16/f16 20.6%），不再是默认行为。
+- 若 G-QUAL-LONG 的 needle 在长上下文上失败，按 M3 缺陷处理，不拿本豁免当挡箭牌。
+
+### 74.4 未结项
+
+- q4 V 在 256K 的真实代价仍未知（Q-KV3）。豁免只解除"默认阻塞"，没有改变"没测过"。
+
+## 75. M2-6a 第一块判决：KV 精度迁移成 K/V 双开关，q8_0/q4_0 行格式落地（2026-10-25）
+<!-- slug: m2-6a-kv-switches -->
+
+### 75.1 变更
+
+- `QRT_KV_PRECISION`（{q4_0, f16}）删除，改为 `QRT_KV_K` / `QRT_KV_V`（{f16, q8_0, q4_0}，K/V
+  独立），默认 `q8_0` + `q4_0`。这不是新决定：design v0.6 第 7 节与 U-10 早已定，本轮只是把
+  代码、`--selftest`、notes、`--print-config` 和 `vk_dev.cpp` 的预算同步过去。
+- 预算口径 `kv_page_tokens x 11 x 2 x (k_row + v_row)`；行字节 f16 512 / q8_0 272 / q4_0 144
+  （head_dim 256）。默认档 832 B/token/层、16K 窗口 143 MiB，与 design 5.5 一致。RESULTS 75.1。
+- 旧开关的坏值用例（`--kv-precision q8_0`）换成 `--kv-k q5_0` / `--kv-v q4_1`；另加一条
+  "validate 拒绝三档之外的 kv_k"。
+
+### 75.2 行格式判决：scale 放行首，不跟 ggml 的块交错
+
+- ggml 的 q8_0 块是 34 B（d + 32 int8），q4_0 是 18 B，块内不是 4 的倍数；内核按 32-bit 字索引
+  就会踩到未对齐。本实现把每行的 8 个 f16 scale 提到行首（16 B），后面才是量化通道：
+  272 = 16 + 256、144 = 16 + 128，行 stride 与 data 起点都是 4 的倍数。
+- 极值复用 norm 归约的同一块 shared 平面；q4_0 用**带符号**极值（`d = max/-8`），否则全负块会
+  饱和到 15。scale 由 4 条 lane 各写一个整字（两个 f16），不存在 read-modify-write 竞争。
+- 存储里的 scale 用 RNE（DECISIONS 64.1 的规则不破）；反量化后的 f16 **staging** 用
+  `packHalf2x16`（本驱动向零），因为那段值从不落回存储，检查侧用同一规则镜像。实测这两种取整
+  在 10K 注意力上差 **434.5 -> 318.6 ms（-27%）**，rel_L1 不动；用 RNE 只是白花位运算。
+  见 RESULTS 75.5 第 3 条。
+
+### 75.3 检查器改动（判据不变）
+
+- `--layer-check` 的 full-attn 参考改为按行格式反量化设备缓存。旧代码按 f16 行大小下载量化平面，
+  越界读直接 device lost；同一条命令 f16 臂正常，所以症状是"只有 q8 臂崩"。
+- 同一处把 FFN 参考喂**设备自己的** post-norm Q8_1 平面（输出投影从 RESULTS 73 起就这么做）。
+  之前 host 重新量化让 shexp 在 q8 臂读 5.880e-05（门 5e-5）而 f16 臂 5.9e-08——那是输入量化
+  的 0.5 边界命中，不是 KV 缺陷。改后 1.136e-05。**没有放宽任何门。**
+- `--fullattn-check` 打印 `full_kv k=/v= k_row/v_row/per_token_layer`，臂由 `--kv-k/--kv-v` 选。
+
+### 75.4 判决与未结项
+
+- **L-KERN pass**：三条臂注意力 1.32e-06..2.33e-06（门 1e-4），追加用例逐位不变，整层四类
+  健康检查 PASS，`--selftest` 0 failed。f16 臂的 10K 读数与 RESULTS 67 逐位相同。
+- **L-MODEL n/a**：默认档按 U-11 豁免；KLD/top-1/greedy 逐 token 的读数仍欠，交 M2-7（10K）
+  与 Q-KV3（128K/256K）。
+- 未结项：
+  1. 常驻窗口与分页（M2-6a 第二块）：`QRT_KV_PAGE_TOKENS` 目前只进预算，`qrt_full_open` 仍按
+     n_ctx 全长分配；窗口外页落主机与换页计数没做。
+  2. 256K 档的 VRAM 峰值、换页次数、G-QUAL-LONG 三档读数（Q-KV3）。
+  3. `q4_0` K 只是对照臂；`f16/f16` 保留为 G-QUAL 的 A 侧，不是回退默认。
+  4. decode 的注意力腿没测：本节全是 prefill 的 10K 块（TG 的注意力在 M3 单步里才量）。

@@ -11,7 +11,8 @@ enum {
     OPT_MISS_SPLIT,
     OPT_CACHE_POLICY,
     OPT_PREFILL_CHUNK,
-    OPT_KV_PRECISION,
+    OPT_KV_K,
+    OPT_KV_V,
     OPT_KV_PAGE_TOKENS,
     OPT_TELEMETRY,
     OPT_TELEMETRY_PATH,
@@ -32,7 +33,8 @@ static const struct qrt_opt_desc OPT_DESC[OPT_COUNT] = {
     { "--miss-split",       "QRT_MISS_SPLIT",       "auto or 0..100 percent to H2D" },
     { "--cache-policy",     "QRT_CACHE_POLICY",     "slru, lru or static" },
     { "--prefill-chunk",    "QRT_PREFILL_CHUNK",    "1..16384 tokens" },
-    { "--kv-precision",     "QRT_KV_PRECISION",     "q4_0 or f16" },
+    { "--kv-k",             "QRT_KV_K",             "f16, q8_0 or q4_0" },
+    { "--kv-v",             "QRT_KV_V",             "f16, q8_0 or q4_0" },
     { "--kv-page-tokens",   "QRT_KV_PAGE_TOKENS",   "32..1048576 tokens, multiple of 32" },
     { "--telemetry",        "QRT_TELEMETRY",        "0 or 1" },
     { "--telemetry-path",   "QRT_TELEMETRY_PATH",   "a writable file path" },
@@ -46,7 +48,8 @@ void qrt_config_defaults(qrt_config * cfg) {
     cfg->miss_split      = QRT_MISS_SPLIT_AUTO;
     cfg->cache_policy    = QRT_CACHE_SLRU;
     cfg->prefill_chunk   = 2048;
-    cfg->kv_precision    = QRT_KV_Q4_0;
+    cfg->kv_k            = QRT_KV_Q8_0;
+    cfg->kv_v            = QRT_KV_Q4_0;
     cfg->kv_page_tokens  = 16384;
     cfg->telemetry       = 0;
     cfg->telemetry_path  = "qrt-telemetry.csv";
@@ -64,10 +67,24 @@ const char * qrt_cache_policy_name(int32_t policy) {
 
 const char * qrt_kv_precision_name(int32_t precision) {
     switch (precision) {
-        case QRT_KV_Q4_0: return "q4_0";
         case QRT_KV_F16:  return "f16";
+        case QRT_KV_Q8_0: return "q8_0";
+        case QRT_KV_Q4_0: return "q4_0";
     }
     return "?";
+}
+
+uint32_t qrt_kv_row_bytes(int32_t precision, uint32_t head_dim) {
+    if (head_dim == 0 || (head_dim % 32) != 0) {
+        return 0;
+    }
+    const uint32_t blocks = head_dim / 32;
+    switch (precision) {
+        case QRT_KV_F16:  return head_dim * 2;
+        case QRT_KV_Q8_0: return blocks * 34;   // f16 scale per 32 + 32 int8
+        case QRT_KV_Q4_0: return blocks * 18;   // f16 scale per 32 + 16 nibble bytes
+    }
+    return 0;
 }
 
 int qrt_config_switch_count(void) {
@@ -108,7 +125,7 @@ static int parse_policy(const char * s, int32_t * out) {
 }
 
 static int parse_precision(const char * s, int32_t * out) {
-    for (int32_t p = QRT_KV_Q4_0; p <= QRT_KV_F16; ++p) {
+    for (int32_t p = QRT_KV_F16; p <= QRT_KV_Q4_0; ++p) {
         if (strcmp(s, qrt_kv_precision_name(p)) == 0) {
             *out = p;
             return 0;
@@ -171,10 +188,16 @@ static int apply_opt(qrt_config * cfg, int opt, const char * value, char * err, 
                 cfg->prefill_chunk = v;
             }
             break;
-        case OPT_KV_PRECISION:
+        case OPT_KV_K:
             ok = value != NULL ? parse_precision(value, &v) : -1;
             if (ok == 0) {
-                cfg->kv_precision = v;
+                cfg->kv_k = v;
+            }
+            break;
+        case OPT_KV_V:
+            ok = value != NULL ? parse_precision(value, &v) : -1;
+            if (ok == 0) {
+                cfg->kv_v = v;
             }
             break;
         case OPT_KV_PAGE_TOKENS:
@@ -292,8 +315,12 @@ int qrt_config_validate(const qrt_config * cfg, char * err, size_t err_size) {
         snprintf(err, err_size, "QRT_PREFILL_CHUNK %d is outside 1..16384", cfg->prefill_chunk);
         return -1;
     }
-    if (cfg->kv_precision != QRT_KV_Q4_0 && cfg->kv_precision != QRT_KV_F16) {
-        snprintf(err, err_size, "QRT_KV_PRECISION %d is not q4_0 or f16", cfg->kv_precision);
+    if (cfg->kv_k < QRT_KV_F16 || cfg->kv_k > QRT_KV_Q4_0) {
+        snprintf(err, err_size, "QRT_KV_K %d is not f16, q8_0 or q4_0", cfg->kv_k);
+        return -1;
+    }
+    if (cfg->kv_v < QRT_KV_F16 || cfg->kv_v > QRT_KV_Q4_0) {
+        snprintf(err, err_size, "QRT_KV_V %d is not f16, q8_0 or q4_0", cfg->kv_v);
         return -1;
     }
     if (cfg->kv_page_tokens < 32 || (cfg->kv_page_tokens % 32) != 0 || cfg->kv_page_tokens > 1048576) {
@@ -344,8 +371,13 @@ int qrt_config_notes(const qrt_config * cfg, FILE * f) {
         fprintf(f, "note: QRT_SPEC_K 8 is a speed arm only, it reads more expert bytes than k=4 (design 3.1)\n");
         ++n;
     }
-    if (cfg->kv_precision == QRT_KV_F16) {
-        fprintf(f, "note: QRT_KV_PRECISION f16 drops the cache budget to about 20.6%% (design 5.5)\n");
+    if (cfg->kv_k == QRT_KV_F16 || cfg->kv_v == QRT_KV_F16) {
+        fprintf(f, "note: QRT_KV_K/V f16 grows the KV bucket and shrinks the expert cache "
+                   "to about 20.6%% when both sides are f16 (design 5.5)\n");
+        ++n;
+    }
+    if (cfg->kv_k == QRT_KV_Q4_0) {
+        fprintf(f, "note: QRT_KV_K q4_0 is a comparison arm; the design default is q8_0 K (U-10)\n");
         ++n;
     }
     if (cfg->kv_page_tokens < 16384) {
@@ -367,7 +399,8 @@ void qrt_config_print_switches(FILE * f) {
     snprintf(def[OPT_MISS_SPLIT], 32, "%s", d.miss_split == QRT_MISS_SPLIT_AUTO ? "auto" : "percent");
     snprintf(def[OPT_CACHE_POLICY], 32, "%s", qrt_cache_policy_name(d.cache_policy));
     snprintf(def[OPT_PREFILL_CHUNK], 32, "%d", d.prefill_chunk);
-    snprintf(def[OPT_KV_PRECISION], 32, "%s", qrt_kv_precision_name(d.kv_precision));
+    snprintf(def[OPT_KV_K], 32, "%s", qrt_kv_precision_name(d.kv_k));
+    snprintf(def[OPT_KV_V], 32, "%s", qrt_kv_precision_name(d.kv_v));
     snprintf(def[OPT_KV_PAGE_TOKENS], 32, "%d", d.kv_page_tokens);
     snprintf(def[OPT_TELEMETRY], 32, "%d", d.telemetry);
     snprintf(def[OPT_TELEMETRY_PATH], 32, "%s", d.telemetry_path);
@@ -399,7 +432,8 @@ void qrt_config_print_effective(const qrt_config * cfg, FILE * f) {
     }
     fprintf(f, "cache_policy=%s\n", qrt_cache_policy_name(cfg->cache_policy));
     fprintf(f, "prefill_chunk=%d\n", cfg->prefill_chunk);
-    fprintf(f, "kv_precision=%s\n", qrt_kv_precision_name(cfg->kv_precision));
+    fprintf(f, "kv_k=%s\n", qrt_kv_precision_name(cfg->kv_k));
+    fprintf(f, "kv_v=%s\n", qrt_kv_precision_name(cfg->kv_v));
     fprintf(f, "kv_page_tokens=%d\n", cfg->kv_page_tokens);
     fprintf(f, "telemetry=%d\n", cfg->telemetry);
     fprintf(f, "telemetry_path=%s\n", cfg->telemetry_path != NULL ? cfg->telemetry_path : "");

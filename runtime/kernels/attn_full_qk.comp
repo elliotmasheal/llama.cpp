@@ -1,8 +1,11 @@
 #version 450
 #extension GL_EXT_control_flow_attributes : require
 
-// Full-attention Q/K preparation (M2-6d): per-head RMS norm, IMRoPE on the two halves
-// of the first N_ROT channels, then the append into the f16 KV cache.
+#include "common.glsl"
+
+// Full-attention Q/K preparation (M2-6d, M2-6a): per-head RMS norm, IMRoPE on the two
+// halves of the first N_ROT channels, then the append into the K/V cache in the
+// precision the pair asks for (QRT_KV_K / QRT_KV_V).
 //
 // A workgroup is one token. A warp owns one head job: 32 lanes hold eight channels
 // each, so a lane's slice is a 32-byte read. There are 16 Q jobs plus 2 K jobs, run
@@ -14,8 +17,14 @@
 // mrope sectors only choose which of the four positions feeds a pair, and for text
 // all four are the same, so they drop out; the check compares cos/sin both ways.
 //
-// head_dim is fixed at 256 here (eight channels per lane); qrt_full_open() refuses
-// any other shape instead of computing something wrong.
+// KV row layout (attn_full.h): f16 is a flat f16 row; q8_0 and q4_0 start with one f16
+// scale per 32 channels, then the quantised channels. A block is four lanes, so the
+// block's extreme comes out of the same shared plane the norm reduction uses; the
+// scale words are written by four lanes after one barrier, never read-modify-written.
+// The reduction barriers sit on the uniform path because a round mixes Q and K warps.
+//
+// head_dim is fixed at 256 here (eight channels per lane, eight blocks); qrt_full_open()
+// refuses any other shape instead of computing something wrong.
 
 layout(local_size_x = 128) in;
 
@@ -23,6 +32,10 @@ layout(constant_id = 0) const uint HEAD_DIM = 256;
 layout(constant_id = 1) const uint N_ROT    = 64;
 layout(constant_id = 2) const uint N_HEAD   = 16;
 layout(constant_id = 3) const uint N_KV     = 2;
+// enum qrt_kv_precision: 0 f16, 1 q8_0, 2 q4_0. Specialisation constants, so the f16
+// pipeline keeps the copy path and only the quantised variants carry the block reduction.
+layout(constant_id = 4) const uint K_TYPE   = 0;
+layout(constant_id = 5) const uint V_TYPE   = 0;
 
 layout(push_constant) uniform PC {
     uint  pos0;       // position of the first token of the chunk
@@ -30,6 +43,8 @@ layout(push_constant) uniform PC {
     uint  qg_ch;      // N_HEAD * 2 * HEAD_DIM
     uint  kv_ch;      // N_KV * HEAD_DIM
     uint  kv_cap;     // tokens the KV cache holds
+    uint  k_stride_w; // K row stride in 32-bit words
+    uint  v_stride_w; // V row stride in 32-bit words
     float eps;
     float freq_base;
     float freq_scale;
@@ -39,13 +54,62 @@ layout(binding = 0) readonly  buffer QgBuf  { float qg[];  };   // [token][qg_ch
 layout(binding = 1) readonly  buffer KiBuf  { float kin[]; };   // [token][kv_ch]
 layout(binding = 2) readonly  buffer ViBuf  { float vin[]; };   // [token][kv_ch]
 layout(binding = 3) writeonly buffer QBuf   { float q[];   };   // [token][N_HEAD*HEAD_DIM]
-layout(binding = 4) writeonly buffer KcBuf  { uint  kc[];  };   // f16 pairs, [kv][cap][HEAD_DIM]
-layout(binding = 5) writeonly buffer VcBuf  { uint  vc[];  };   // f16 pairs
+layout(binding = 4) writeonly buffer KcBuf  { uint  kc[];  };   // [N_KV][cap][k row]
+layout(binding = 5) writeonly buffer VcBuf  { uint  vc[];  };   // [N_KV][cap][v row]
 layout(binding = 6) readonly  buffer QnBuf  { float qnw[]; };   // [HEAD_DIM]
 layout(binding = 7) readonly  buffer KnBuf  { float knw[]; };   // [HEAD_DIM]
 
 shared float red[4 * 32];
 shared float exch[4 * 64];
+
+const uint BLOCKS = HEAD_DIM / 32u;   // 8
+const uint SCALE_W = BLOCKS / 2u;     // f16 scale words at the row start
+
+// The signed extreme of one block, from the four lanes' candidates in red[].
+float block_extreme(uint redbase, uint blk) {
+    float e = red[redbase + blk * 4u + 0u];
+    e = abs(red[redbase + blk * 4u + 1u]) > abs(e) ? red[redbase + blk * 4u + 1u] : e;
+    e = abs(red[redbase + blk * 4u + 2u]) > abs(e) ? red[redbase + blk * 4u + 2u] : e;
+    e = abs(red[redbase + blk * 4u + 3u]) > abs(e) ? red[redbase + blk * 4u + 3u] : e;
+    return e;
+}
+
+// ggml's block scale: q8_0 divides by abs(amax)/127, q4_0 by the signed extreme / -8.
+float block_delta(float e, uint type) {
+    return type == 2u ? e / -8.0f : abs(e) / 127.0f;
+}
+
+// The f16 scales of blocks 2w and 2w+1, packed into one word.
+uint scale_pair(uint redbase, uint w, uint type) {
+    const float d0 = block_delta(block_extreme(redbase, 2u * w), type);
+    const float d1 = block_delta(block_extreme(redbase, 2u * w + 1u), type);
+    return qrt_f32_to_f16_rne(d0) | (qrt_f32_to_f16_rne(d1) << 16u);
+}
+
+uint q8_word4(float x0, float x1, float x2, float x3, float inv) {
+    const uint a = uint(clamp(int(round(x0 * inv)), -128, 127)) & 0xFFu;
+    const uint b = uint(clamp(int(round(x1 * inv)), -128, 127)) & 0xFFu;
+    const uint c = uint(clamp(int(round(x2 * inv)), -128, 127)) & 0xFFu;
+    const uint d = uint(clamp(int(round(x3 * inv)), -128, 127)) & 0xFFu;
+    return a | (b << 8u) | (c << 16u) | (d << 24u);
+}
+
+uint q4_word8(const float x[8], float inv) {
+    uint w = 0u;
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+        const int q = int(round(x[i] * inv)) + 8;
+        w |= (uint(clamp(q, 0, 15)) & 0xFu) << (4u * i);
+    }
+    return w;
+}
+
+float lane_extreme(const float x[8]) {
+    float e = x[0];
+    [[unroll]] for (uint i = 1u; i < 8u; ++i) {
+        e = abs(x[i]) > abs(e) ? x[i] : e;
+    }
+    return e;
+}
 
 void head_job(uint tid, uint tok, uint job, uint pos) {
     const uint warp = tid >> 5u;
@@ -58,6 +122,9 @@ void head_job(uint tid, uint tok, uint job, uint pos) {
     const uint qout = tok * (N_HEAD * HEAD_DIM);
 
     float x[8];
+    [[unroll]] for (uint i = 0; i < 8u; ++i) {
+        x[i] = 0.0f;
+    }
     if (valid) {
         const uint sb = is_k ? tok * pc.kv_ch + h * HEAD_DIM : qrow + h * 2u * HEAD_DIM;
         [[unroll]] for (uint i = 0; i < 8u; ++i) {
@@ -113,19 +180,42 @@ void head_job(uint tid, uint tok, uint job, uint pos) {
         }
     }
 
-    if (valid) {
-        // the caches hold f16 pairs, so one word covers two channels
-        if (is_k) {
-            const uint db = ((h * pc.kv_cap + pos) * HEAD_DIM + d0) / 2u;
-            [[unroll]] for (uint i = 0; i < 8u; i += 2) {
-                kc[db + i / 2u] = packHalf2x16(vec2(x[i], x[i + 1]));
+    if (!is_k && valid) {
+        const uint db = qout + h * HEAD_DIM + d0;
+        [[unroll]] for (uint i = 0; i < 8u; ++i) {
+            q[db + i] = x[i];
+        }
+    }
+
+    // K append: an f16 row takes the pairs as is; a quantised row needs the block
+    // extreme first, and the two barriers below are reached by Q warps as well.
+    if (is_k && valid && K_TYPE == 0u) {
+        const uint db = (h * pc.kv_cap + pos) * pc.k_stride_w + d0 / 2u;
+        [[unroll]] for (uint i = 0; i < 8u; i += 2) {
+            kc[db + i / 2u] = packHalf2x16(vec2(x[i], x[i + 1]));
+        }
+    }
+    if (K_TYPE != 0u) {
+        red[warp * 32u + lane] = (is_k && valid) ? lane_extreme(x) : 0.0f;
+        barrier();
+        if (is_k && valid) {
+            const uint blk = lane >> 2u;
+            const float d = block_delta(block_extreme(warp * 32u, blk), K_TYPE);
+            const float inv = d != 0.0f ? 1.0f / d : 0.0f;
+            const uint rb = (h * pc.kv_cap + pos) * pc.k_stride_w;
+            if (lane < SCALE_W) {
+                kc[rb + lane] = scale_pair(warp * 32u, lane, K_TYPE);
             }
-        } else {
-            const uint db = qout + h * HEAD_DIM + d0;
-            [[unroll]] for (uint i = 0; i < 8u; ++i) {
-                q[db + i] = x[i];
+            const uint off = lane & 3u;
+            if (K_TYPE == 1u) {
+                const uint w = rb + SCALE_W + blk * 8u + off * 2u;
+                kc[w + 0u] = q8_word4(x[0], x[1], x[2], x[3], inv);
+                kc[w + 1u] = q8_word4(x[4], x[5], x[6], x[7], inv);
+            } else {
+                kc[rb + SCALE_W + blk * 4u + off] = q4_word8(x, inv);
             }
         }
+        barrier();
     }
     barrier();
 }
@@ -139,15 +229,44 @@ void main() {
         return;
     }
     const uint pos  = pc.pos0 + t;
-    const uint qout = t * (N_HEAD * HEAD_DIM);
 
-    // V is copied, not normed or rotated: two warps, eight channels each
+    // V is copied, not normed or rotated: two warps, eight channels each. Quantised V
+    // needs its block extreme first, so every warp joins the reduction barrier.
+    float vx[8];
     if (warp < N_KV) {
         const uint vsrc = t * pc.kv_ch + warp * HEAD_DIM + lane * 8u;
-        const uint vdst = ((warp * pc.kv_cap + pos) * HEAD_DIM + lane * 8u) / 2u;
-        [[unroll]] for (uint i = 0; i < 8u; i += 2) {
-            vc[vdst + i / 2u] = packHalf2x16(vec2(vin[vsrc + i], vin[vsrc + i + 1]));
+        [[unroll]] for (uint i = 0; i < 8u; ++i) {
+            vx[i] = vin[vsrc + i];
         }
+    }
+    if (V_TYPE == 0u) {
+        if (warp < N_KV) {
+            const uint vdst = (warp * pc.kv_cap + pos) * pc.v_stride_w + lane * 4u;
+            [[unroll]] for (uint i = 0; i < 8u; i += 2) {
+                vc[vdst + i / 2u] = packHalf2x16(vec2(vx[i], vx[i + 1]));
+            }
+        }
+    } else {
+        red[warp * 32u + lane] = (warp < N_KV) ? lane_extreme(vx) : 0.0f;
+        barrier();
+        if (warp < N_KV) {
+            const uint blk = lane >> 2u;
+            const float d = block_delta(block_extreme(warp * 32u, blk), V_TYPE);
+            const float inv = d != 0.0f ? 1.0f / d : 0.0f;
+            const uint rb = (warp * pc.kv_cap + pos) * pc.v_stride_w;
+            if (lane < SCALE_W) {
+                vc[rb + lane] = scale_pair(warp * 32u, lane, V_TYPE);
+            }
+            const uint off = lane & 3u;
+            if (V_TYPE == 1u) {
+                const uint w = rb + SCALE_W + blk * 8u + off * 2u;
+                vc[w + 0u] = q8_word4(vx[0], vx[1], vx[2], vx[3], inv);
+                vc[w + 1u] = q8_word4(vx[4], vx[5], vx[6], vx[7], inv);
+            } else {
+                vc[rb + SCALE_W + blk * 4u + off] = q4_word8(vx, inv);
+            }
+        }
+        barrier();
     }
 
     // rounds of four warps: jobs 0..15 are Q heads, 16..17 the two K heads

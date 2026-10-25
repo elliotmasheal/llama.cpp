@@ -150,7 +150,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-6a",
+      "head": "X-4",
       "order": [
         "M2-0",
         "M2-1",
@@ -166,7 +166,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6 is done; M2-6a (switchable KV precision, default q8_0 K + q4_0 V, plus the 16K resident window) is next, then M3-1/M3-2"
+      "note": "M2-6a is doing (KV precision round 1); X-4 is the next unblocked impl task"
     },
     {
       "lane": "data",
@@ -1116,7 +1116,7 @@
       "id": "M2-6a",
       "milestone": "M2",
       "lane": "impl",
-      "status": "todo",
+      "status": "doing",
       "title": "KV 精度可配（默认 q8_0 K + q4_0 V）+ 16384 token 常驻窗口分页",
       "deps": [
         "M2-6d"
@@ -1126,9 +1126,19 @@
         "machine-quiet"
       ],
       "paths": [
-        "runtime/attn.*"
+        "runtime/attn.*",
+        "runtime/kernels/attn_full_*.comp",
+        "runtime/qrt_config.*",
+        "runtime/qrt_main.cpp",
+        "runtime/vk_dev.cpp",
+        "runtime/CMakeLists.txt",
+        "runtime/README.md"
       ],
-      "done_when": "QRT_KV_K / QRT_KV_V 可配，q8_0/q4_0（默认）与 q8_0/q8_0 两档都能切；窗口可配，窗口外页落主机并可换入；k=1 KLD <= 1e-4、greedy 逐 token 一致（G-QUAL），不过按 q8_0/q8_0 -> f16/f16 阶梯回退并记录；报两档的 VRAM 峰值与换页次数"
+      "owner": "deepseek-v4.1-flash@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-25T21:55:00+08:00",
+      "note": "doing 2026-10-25: round 1 landed the KV precision itself (QRT_KV_K/QRT_KV_V, q8_0 K + q4_0 V rows in the append and attention kernels, default 832 B/token/layer = 143 MiB at 16K). L-KERN pass: attention 1.32e-06..2.33e-06 against the double reference, f16 arm bit-identical to RESULTS 67, three layer-chain arms PASS, selftest 0 failed (RESULTS m2-6a-kv-precision, DECISIONS m2-6a-kv-switches). Round 2 is the resident window and host paging (QRT_KV_PAGE_TOKENS still only feeds the budget), then the 256K VRAM/page-in readings",
+      "done_when": "QRT_KV_K / QRT_KV_V 可配，q8_0/q4_0（默认）与 q8_0/q8_0 两档都能切；窗口可配，窗口外页落主机并可换入；k=1 的 KLD/top-1 与 greedy 逐 token 一致仍要报（G-QUAL 读数，默认档已豁免、不阻塞）；q8_0/q8_0 与 f16/f16 仅作运维选项；报两档的 VRAM 峰值与换页次数"
     },
     {
       "id": "U-7",
@@ -1330,6 +1340,15 @@
   },
   "blockers": [],
   "escalations": [
+    {
+      "id": "E-KV1",
+      "state": "closed",
+      "resolved": "2026-10-25",
+      "decision": "DECISIONS.md#kv-exempt-q8k-q4v",
+      "question": "q8_0 K + q4_0 V 的 KLD 预期超 1e-4 门 50-100 倍（Q-KV1 差分 + 理论），它是否仍作为默认档？",
+      "needs_by": "M2-6a 落地前",
+      "outcome": "用户 2026-10-25 批准豁免 L-MODEL：默认直接生效，判据不变、读数照报；L-KERN 与 G-QUAL-LONG 不豁免"
+    },
     {
       "id": "E-R1",
       "state": "closed",

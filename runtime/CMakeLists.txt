@@ -184,7 +184,7 @@ if(Vulkan_GLSLC_EXECUTABLE)
         OUTPUT  ${_qrt_full_qk_spv}
         COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1
                 ${_qrt_kernels}/attn_full_qk.comp -o ${_qrt_full_qk_spv}
-        DEPENDS ${_qrt_kernels}/attn_full_qk.comp
+        DEPENDS ${_qrt_kernels}/attn_full_qk.comp ${_qrt_kernels}/common.glsl
         COMMENT "Compiling kernels/attn_full_qk.comp"
         VERBATIM)
     set(_qrt_full_attn_spv "${CMAKE_CURRENT_BINARY_DIR}/attn_full_attn.spv")
@@ -192,7 +192,7 @@ if(Vulkan_GLSLC_EXECUTABLE)
         OUTPUT  ${_qrt_full_attn_spv}
         COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1
                 ${_qrt_kernels}/attn_full_attn.comp -o ${_qrt_full_attn_spv}
-        DEPENDS ${_qrt_kernels}/attn_full_attn.comp
+        DEPENDS ${_qrt_kernels}/attn_full_attn.comp ${_qrt_kernels}/common.glsl
         COMMENT "Compiling kernels/attn_full_attn.comp"
         VERBATIM)
     add_custom_target(qrt_shaders DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv}

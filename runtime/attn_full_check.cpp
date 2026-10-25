@@ -5,6 +5,7 @@
 #include "attn_full.h"
 
 #include "gguf_index.h"
+#include "qrt_config.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -50,23 +51,6 @@ int read_tensor_f32(qrt_gguf * g, const char * name, std::vector<float> * out,
     return qrt_gguf_read_tensor(g, t, out->data(), out->size() * sizeof(float), err, err_size);
 }
 
-// f16 storage: the check unpacks what the kernel wrote, so the comparison sees the
-// cache exactly as the attention kernel will.
-float half_to_float(uint32_t h) {
-    const uint32_t sign = (h >> 15) & 1u;
-    const uint32_t expo = (h >> 10) & 0x1fu;
-    const uint32_t mant = h & 0x3ffu;
-    float v;
-    if (expo == 0) {
-        v = ldexpf((float) mant, -24);
-    } else if (expo == 31) {
-        v = mant ? NAN : INFINITY;
-    } else {
-        v = ldexpf((float) (mant | 0x400u), (int) expo - 25);
-    }
-    return sign ? -v : v;
-}
-
 double rel_l1(const float * got, const float * want, size_t n, double * max_abs) {
     double num = 0.0, den = 0.0, mx = 0.0;
     for (size_t i = 0; i < n; ++i) {
@@ -105,7 +89,8 @@ double imrope_theta(const qrt_full_shapes * sh, uint32_t pos, uint32_t pair,
 
 } // namespace
 
-int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const char * spv_dir) {
+int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const char * spv_dir,
+                   int32_t kv_k, int32_t kv_v) {
     char err[512] = {0};
     qrt_vk_dev * dev = NULL;
     if (qrt_vk_open(0, &dev, err, sizeof(err)) != 0) {
@@ -162,6 +147,21 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
     const uint32_t max_tokens = tokens > 512 ? tokens : 512;
     const uint32_t n_ctx = max_tokens * 2 + 64;
 
+    qrt_kv_row_layout klay, vlay;
+    if (qrt_kv_row_layout_of(kv_k, sh.head_dim, &klay) != 0 ||
+        qrt_kv_row_layout_of(kv_v, sh.head_dim, &vlay) != 0) {
+        fprintf(stderr, "qrt: KV precision K=%s V=%s has no row layout\n",
+                qrt_kv_precision_name(kv_k), qrt_kv_precision_name(kv_v));
+        qrt_vk_close(dev);
+        return 2;
+    }
+    const uint32_t kv_per_token = sh.n_kv * (klay.row_bytes + vlay.row_bytes);
+    printf("full_kv      k=%s v=%s k_row=%u v_row=%u block=%u per_token_layer=%u "
+           "ctx_tokens=%u kv_pair_mib=%.2f\n",
+           qrt_kv_precision_name(kv_k), qrt_kv_precision_name(kv_v),
+           klay.row_bytes, vlay.row_bytes, klay.blocks, kv_per_token, n_ctx,
+           (double) n_ctx * kv_per_token / (1024.0 * 1024.0));
+
     qrt_vk_staging * stg = NULL;
     uint64_t stg_bytes = (uint64_t) max_tokens * sh.qg_ch * 4;
     if (qrt_vk_staging_create(dev, stg_bytes, &stg, err, sizeof(err)) != 0) {
@@ -173,7 +173,8 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
     int rc_out = 2;
     qrt_full * f = NULL;
     do {
-        if (qrt_full_open(dev, spv_dir, &sh, max_tokens, n_ctx, &f, err, sizeof(err)) != 0) {
+        if (qrt_full_open(dev, spv_dir, &sh, max_tokens, n_ctx, kv_k, kv_v, &f, err,
+                          sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             break;
         }
@@ -231,47 +232,43 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
         qrt_full_qk_cpu(&sh, 0, tokens, qg.data(), kin.data(), vin.data(), qnw.data(), knw.data(),
                         q_ref.data(), k_ref.data(), v_ref.data());
 
-        std::vector<uint32_t> kc((size_t) sh.n_kv * n_ctx * sh.head_dim / 2);
-        std::vector<uint32_t> vc((size_t) sh.n_kv * n_ctx * sh.head_dim / 2);
-        const uint64_t kv_bytes = qrt_full_kv_bytes(f);
+        const uint64_t k_bytes = qrt_full_kv_bytes(f);
+        const uint64_t v_bytes = qrt_full_v_bytes(f);
+        std::vector<uint8_t> kc((size_t) k_bytes);
+        std::vector<uint8_t> vc((size_t) v_bytes);
         if (qrt_vk_download(dev, stg, b->q, 0, q_gpu.data(),
                             (uint64_t) tokens * sh.n_head * sh.head_dim * 4, err, sizeof(err)) != 0 ||
-            qrt_vk_download(dev, stg, b->kcache, 0, kc.data(), kv_bytes, err, sizeof(err)) != 0 ||
-            qrt_vk_download(dev, stg, b->vcache, 0, vc.data(), kv_bytes, err, sizeof(err)) != 0) {
+            qrt_vk_download(dev, stg, b->kcache, 0, kc.data(), k_bytes, err, sizeof(err)) != 0 ||
+            qrt_vk_download(dev, stg, b->vcache, 0, vc.data(), v_bytes, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             break;
         }
 
         double mq = 0.0, mk = 0.0, mv = 0.0;
         const double rq = rel_l1(q_gpu.data(), q_ref.data(), q_gpu.size(), &mq);
-        // the cache holds f16, so unpack it and compare against the f32 reference; the
-        // arithmetic is gated at 1e-4 through q, the f16 storage error is reported
+        // The cache holds the row format, so unpack what the kernel wrote and compare it
+        // against the f32 reference: this is the storage error of the format itself. A
+        // q8_0/q4_0 row cannot be held to the f16 bound, so quantised planes only get a
+        // sanity bound; the quality gate for them is the KLD run (M2-7 / Q-KV3).
         std::vector<float> k_un((size_t) sh.n_kv * tokens * sh.head_dim);
         std::vector<float> v_un(k_un.size());
-        for (uint32_t h = 0; h < sh.n_kv; ++h) {
-            for (uint32_t t = 0; t < tokens; ++t) {
-                const size_t slot = ((size_t) h * n_ctx + t) * sh.head_dim;
-                const size_t dst = ((size_t) h * tokens + t) * sh.head_dim;
-                for (uint32_t i = 0; i < sh.head_dim; i += 2) {
-                    const uint32_t pair_k = kc[slot / 2 + i / 2];
-                    k_un[dst + i]     = half_to_float(pair_k & 0xffffu);
-                    k_un[dst + i + 1] = half_to_float(pair_k >> 16);
-                    const uint32_t pair_v = vc[slot / 2 + i / 2];
-                    v_un[dst + i]     = half_to_float(pair_v & 0xffffu);
-                    v_un[dst + i + 1] = half_to_float(pair_v >> 16);
-                }
-            }
-        }
+        qrt_full_kv_unpack(&klay, sh.head_dim, sh.n_kv, n_ctx, 0, tokens, tokens, kc.data(), 0,
+                           k_un.data());
+        qrt_full_kv_unpack(&vlay, sh.head_dim, sh.n_kv, n_ctx, 0, tokens, tokens, vc.data(), 0,
+                           v_un.data());
         const double rk = rel_l1(k_un.data(), k_ref.data(), k_un.size(), &mk);
         const double rv = rel_l1(v_un.data(), v_ref.data(), v_un.size(), &mv);
+        const double k_gate = kv_k == QRT_KV_F16 ? 1e-3 : 0.1;
+        const double v_gate = kv_v == QRT_KV_F16 ? 1e-3 : 0.1;
         const int ok_q = rq <= 1e-4;
-        const int ok_kv = rk <= 1e-3 && rv <= 1e-3;   // f16 storage bound
+        const int ok_kv = rk <= k_gate && rv <= v_gate;
         printf("full_qk      tokens=%u pos0=0 q_rel_l1=%.3e q_max_abs=%.3e "
-               "k_f16_rel_l1=%.3e v_f16_rel_l1=%.3e verdict=%s ms=%.3f\n",
-               tokens, rq, mq, rk, rv, (ok_q && ok_kv) ? "PASS" : "FAIL", qk_ms);
+               "k_%s_store_rel_l1=%.3e v_%s_store_rel_l1=%.3e verdict=%s ms=%.3f\n",
+               tokens, rq, mq, qrt_kv_precision_name(kv_k), rk,
+               qrt_kv_precision_name(kv_v), rv, (ok_q && ok_kv) ? "PASS" : "FAIL", qk_ms);
 
         // 2) second chunk: positions continue, and the first chunk's cache must not move
-        std::vector<uint32_t> kc_before(kc.begin(), kc.begin() + kc.size());
+        std::vector<uint8_t> kc_before(kc.begin(), kc.end());
         const uint32_t t2 = tokens / 2 > 0 ? tokens / 2 : 1;
         if (upload(b->qg, qg.data(), (uint64_t) t2 * sh.qg_ch * 4) != 0 ||
             upload(b->kin, kin.data(), (uint64_t) t2 * sh.kv_ch * 4) != 0 ||
@@ -291,19 +288,20 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
                         q2_ref.data(), k2_ref.data(), v2_ref.data());
         if (qrt_vk_download(dev, stg, b->q, 0, q2.data(), (uint64_t) q2.size() * 4,
                             err, sizeof(err)) != 0 ||
-            qrt_vk_download(dev, stg, b->kcache, 0, kc.data(), kv_bytes, err, sizeof(err)) != 0) {
+            qrt_vk_download(dev, stg, b->kcache, 0, kc.data(), k_bytes, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             break;
         }
         double m2 = 0.0;
         const double r2 = rel_l1(q2.data(), q2_ref.data(), q2.size(), &m2);
-        // the first chunk's slots (and the untouched tail) must be bit identical
+        // the first chunk's rows (and the untouched tail) must be bit identical
         size_t moved = 0;
-        for (int h = 0; h < (int) sh.n_kv; ++h) {
-            const size_t lo = ((size_t) h * n_ctx) * sh.head_dim / 2;
-            const size_t hi = lo + (size_t) tokens * sh.head_dim / 2;
-            const size_t tail_lo = lo + ((size_t) tokens + t2) * sh.head_dim / 2;
-            const size_t tail_hi = lo + (size_t) n_ctx * sh.head_dim / 2;
+        const size_t k_row = klay.row_bytes;
+        for (uint32_t h = 0; h < sh.n_kv; ++h) {
+            const size_t lo = (size_t) h * n_ctx * k_row;
+            const size_t hi = lo + (size_t) tokens * k_row;
+            const size_t tail_lo = lo + ((size_t) tokens + t2) * k_row;
+            const size_t tail_hi = lo + (size_t) n_ctx * k_row;
             for (size_t i = lo; i < hi; ++i) {
                 moved += kc[i] != kc_before[i];
             }
@@ -313,22 +311,15 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
         }
         // the second chunk's K must match the reference too
         std::vector<float> k2_un((size_t) sh.n_kv * t2 * sh.head_dim);
-        for (uint32_t h = 0; h < sh.n_kv; ++h) {
-            for (uint32_t t = 0; t < t2; ++t) {
-                const size_t slot = ((size_t) h * n_ctx + tokens + t) * sh.head_dim;
-                for (uint32_t i = 0; i < sh.head_dim; i += 2) {
-                    const uint32_t pair_k = kc[slot / 2 + i / 2];
-                    k2_un[((size_t) h * t2 + t) * sh.head_dim + i] = half_to_float(pair_k & 0xffffu);
-                    k2_un[((size_t) h * t2 + t) * sh.head_dim + i + 1] = half_to_float(pair_k >> 16);
-                }
-            }
-        }
+        qrt_full_kv_unpack(&klay, sh.head_dim, sh.n_kv, n_ctx, tokens, t2, t2, kc.data(), 0,
+                           k2_un.data());
         double mk2 = 0.0;
         const double rk2 = rel_l1(k2_un.data(), k2_ref.data(), k2_un.size(), &mk2);
         const int ok_append = (moved == 0);
-        printf("full_qk      tokens=%u pos0=%u q_rel_l1=%.3e q_max_abs=%.3e k_f16_rel_l1=%.3e "
-               "append_moved=%zu verdict=%s\n", t2, tokens, r2, m2, rk2, moved,
-               (r2 <= 1e-4 && rk2 <= 1e-3 && ok_append) ? "PASS" : "FAIL");
+        printf("full_qk      tokens=%u pos0=%u q_rel_l1=%.3e q_max_abs=%.3e k_%s_store_rel_l1=%.3e "
+               "append_moved=%zu verdict=%s\n", t2, tokens, r2, m2,
+               qrt_kv_precision_name(kv_k), rk2, moved,
+               (r2 <= 1e-4 && rk2 <= k_gate && ok_append) ? "PASS" : "FAIL");
 
         // 3) the rope angle both ways: plain NEOX and the IMRoPE sector form must agree
         const uint32_t half = sh.n_rot / 2;
@@ -363,24 +354,19 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
             if (qrt_vk_download(dev, stg, b->out, 0, out_gpu.data(),
                                 (uint64_t) out_gpu.size() * 4, err, sizeof(err)) != 0 ||
                 qrt_vk_download(dev, stg, b->q, 0, q_full.data(),
-                                (uint64_t) q_full.size() * 4, err, sizeof(err)) != 0) {
+                                (uint64_t) q_full.size() * 4, err, sizeof(err)) != 0 ||
+                qrt_vk_download(dev, stg, b->kcache, 0, kc.data(), k_bytes, err, sizeof(err)) != 0 ||
+                qrt_vk_download(dev, stg, b->vcache, 0, vc.data(), v_bytes, err, sizeof(err)) != 0) {
                 fprintf(stderr, "qrt: %s\n", err);
                 break;
             }
-            // unpack the cache the kernel actually read into f32 reference planes
-            for (uint32_t h = 0; h < sh.n_kv; ++h) {
-                for (uint32_t t = 0; t < tokens; ++t) {
-                    const size_t slot = ((size_t) h * n_ctx + t) * sh.head_dim;
-                    for (uint32_t i = 0; i < sh.head_dim; i += 2) {
-                        const uint32_t pair_k = kc[slot / 2 + i / 2];
-                        kd[slot + i]     = half_to_float(pair_k & 0xffffu);
-                        kd[slot + i + 1] = half_to_float(pair_k >> 16);
-                        const uint32_t pair_v = vc[slot / 2 + i / 2];
-                        vd[slot + i]     = half_to_float(pair_v & 0xffffu);
-                        vd[slot + i + 1] = half_to_float(pair_v >> 16);
-                    }
-                }
-            }
+            // Unpack the cache the kernel actually read into f32 planes, with the same f16
+            // rounding the kernel stages in shared memory, so the rows' precision is not
+            // counted twice.
+            qrt_full_kv_unpack(&klay, sh.head_dim, sh.n_kv, n_ctx, 0, tokens, n_ctx, kc.data(),
+                               kv_k == QRT_KV_F16 ? 1 : 2, kd.data());
+            qrt_full_kv_unpack(&vlay, sh.head_dim, sh.n_kv, n_ctx, 0, tokens, n_ctx, vc.data(),
+                               kv_v == QRT_KV_F16 ? 1 : 2, vd.data());
             // the longest causal ranges are the interesting ones; a full sweep runs
             // when the chunk is small enough for the double reference to finish
             std::vector<uint32_t> rows;
@@ -410,9 +396,9 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
                 worst_abs = fmax(worst_abs, mx);
             }
             // the KV account: bytes the kernel read per layer against the plane size
-            const double kv_bytes_plane = (double) sh.n_kv * tokens * sh.head_dim * 2.0;
+            const double kv_bytes_pair = (double) sh.n_kv * tokens * (klay.row_bytes + vlay.row_bytes);
             const double implied = (double) kv_reads / (attn_ms * 1e-3) / 1e9;
-            const double ratio = (double) kv_reads / (2.0 * kv_bytes_plane);
+            const double ratio = (double) kv_reads / kv_bytes_pair;
             ok_attn = worst_rel <= 1e-4;
             // the f16-packed probe: same rows, operands rounded to f16 and eight-product
             // chunks summed in f16. This decides whether the fast path is even allowed.
@@ -430,21 +416,21 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
                 abs16 = fmax(abs16, mx);
             }
             printf("full_attn    tokens=%u rows=%zu rel_l1=%.3e max_abs=%.3e ms=%.3f "
-                   "attn_tflops=%.2f kv_read_gib=%.2f kv_plane_mib=%.1f kv_reads_per_plane=%.1f "
+                   "attn_tflops=%.2f kv_read_gib=%.2f kv_pair_mib=%.1f kv_reads_per_plane=%.1f "
                    "implied_gb_s=%.1f verdict=%s\n",
                    tokens, rows.size(), worst_rel, worst_abs, attn_ms,
                    // 2 x HD x 2 flops per pair, one pair per (query, key, head)
                    (double) tokens * (tokens + 1) / 2.0 * sh.n_head * sh.head_dim * 4.0 /
                        (attn_ms * 1e-3) / 1e12,
                    (double) kv_reads / (1024.0 * 1024.0 * 1024.0),
-                   2.0 * kv_bytes_plane / (1024.0 * 1024.0), ratio, implied,
+                   kv_bytes_pair / (1024.0 * 1024.0), ratio, implied,
                    ok_attn ? "PASS" : "FAIL");
             printf("full_attn_f16 tokens=%u rows=%zu rel_l1=%.3e max_abs=%.3e "
                    "gate_1e-4=%s (probe: f16 operands, eight-product chunks in f16)\n",
                    tokens, rows.size(), worst16, abs16, worst16 <= 1e-4 ? "PASS" : "FAIL");
         }
 
-        rc_out = (ok_q && ok_kv && r2 <= 1e-4 && rk2 <= 1e-3 && ok_append && worst == 0.0 &&
+        rc_out = (ok_q && ok_kv && r2 <= 1e-4 && rk2 <= k_gate && ok_append && worst == 0.0 &&
                   ok_attn) ? 0 : 1;
     } while (0);
 
@@ -456,11 +442,14 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
 
 #else // QRT_HAVE_VULKAN
 
-int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const char * spv_dir) {
+int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const char * spv_dir,
+                   int32_t kv_k, int32_t kv_v) {
     (void) gguf_path;
     (void) layer;
     (void) tokens;
     (void) spv_dir;
+    (void) kv_k;
+    (void) kv_v;
     fprintf(stderr, "qrt: --fullattn-check needs a Vulkan build\n");
     return 2;
 }

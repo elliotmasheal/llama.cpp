@@ -60,8 +60,8 @@ static char * lit(const char * s) {
 }
 
 static int parse_argv(qrt_config * cfg, int n, const char * const * args, char * err, size_t err_size) {
-    char * av[24];
-    if (n > 22) {
+    char * av[26];
+    if (n > 24) {
         return -1;
     }
     av[0] = lit("qrt");
@@ -872,7 +872,7 @@ static int qrt_selftest(void) {
     qrt_config_defaults(&d);
     expect(d.spec_k == 4 && d.draft_vocab == 16384 && d.expert_cache_mib == 4198 &&
            d.miss_split == QRT_MISS_SPLIT_AUTO && d.cache_policy == QRT_CACHE_SLRU &&
-           d.prefill_chunk == 2048 && d.kv_precision == QRT_KV_Q4_0 &&
+           d.prefill_chunk == 2048 && d.kv_k == QRT_KV_Q8_0 && d.kv_v == QRT_KV_Q4_0 &&
            d.kv_page_tokens == 16384 && d.telemetry == 0 && d.vram_tier_mib == 0,
            "defaults match design section 7");
 
@@ -880,15 +880,16 @@ static int qrt_selftest(void) {
         const char * all[] = {
             "--spec-k", "5", "--draft-vocab", "32768", "--expert-cache-mib", "3800",
             "--miss-split", "60", "--cache-policy", "lru", "--prefill-chunk", "1024",
-            "--kv-precision", "f16", "--kv-page-tokens", "8192", "--telemetry", "1",
+            "--kv-k", "f16", "--kv-v", "q8_0", "--kv-page-tokens", "8192", "--telemetry", "1",
             "--telemetry-path", "bench/raw/x.csv", "--vram-tier-mib", "6144",
         };
         qrt_config c;
         qrt_config_defaults(&c);
-        const int ok = parse_argv(&c, 22, all, err, sizeof(err)) == 0;
+        const int ok = parse_argv(&c, 24, all, err, sizeof(err)) == 0;
         expect(ok && c.spec_k == 5 && c.draft_vocab == 32768 && c.expert_cache_mib == 3800 &&
                c.miss_split == 60 && c.cache_policy == QRT_CACHE_LRU && c.prefill_chunk == 1024 &&
-               c.kv_precision == QRT_KV_F16 && c.kv_page_tokens == 8192 && c.telemetry == 1 &&
+               c.kv_k == QRT_KV_F16 && c.kv_v == QRT_KV_Q8_0 && c.kv_page_tokens == 8192 &&
+               c.telemetry == 1 &&
                strcmp(c.telemetry_path, "bench/raw/x.csv") == 0 && c.vram_tier_mib == 6144,
                "all twelve switches parse from the CLI");
     }
@@ -922,7 +923,7 @@ static int qrt_selftest(void) {
             { "--spec-k", "3" },        { "--draft-vocab", "12" },
             { "--expert-cache-mib", "9000" }, { "--miss-split", "101" },
             { "--cache-policy", "foo" }, { "--prefill-chunk", "0" },
-            { "--kv-precision", "q8_0" }, { "--kv-page-tokens", "1000" },
+            { "--kv-k", "q5_0" }, { "--kv-v", "q4_1" }, { "--kv-page-tokens", "1000" },
             { "--telemetry", "2" },     { "--vram-tier-mib", "40000" },
             { "--nope", "1" },
         };
@@ -955,6 +956,10 @@ static int qrt_selftest(void) {
         qrt_config_defaults(&c);
         c.spec_k = 3;
         expect(qrt_config_validate(&c, err, sizeof(err)) != 0, "validate rejects a programmatic spec_k");
+        qrt_config_defaults(&c);
+        c.kv_k = 9;
+        expect(qrt_config_validate(&c, err, sizeof(err)) != 0,
+               "validate rejects a KV precision outside f16/q8_0/q4_0");
     }
 
     {
@@ -1955,6 +1960,8 @@ int main(int argc, char ** argv) {
         lcfg.ffn = layer_ffn && layer_store != NULL ? 1 : 0;
         lcfg.single_submit = layer_pass;
         lcfg.dn_recur = dn_recur;
+        lcfg.kv_k = cfg.kv_k;
+        lcfg.kv_v = cfg.kv_v;
         return qrt_layer_check(layer_gguf_check, layer_store, (uint32_t) layer_index,
                                (uint32_t) layer_tokens, &lcfg, g_spv_dir);
     }
@@ -1972,7 +1979,7 @@ int main(int argc, char ** argv) {
     }
     if (fullattn_gguf != NULL) {
         return qrt_full_check(fullattn_gguf, (uint32_t) fullattn_layer, (uint32_t) fullattn_tokens,
-                              g_spv_dir);
+                              g_spv_dir, cfg.kv_k, cfg.kv_v);
     }
     if (moe_prefix != NULL) {
         std::string dir = argc > 0 ? argv[0] : "qrt";
