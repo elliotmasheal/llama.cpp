@@ -11,6 +11,8 @@ struct qrt_weights {
     uint32_t      experts;
     uint32_t      records;
     uint64_t      align;
+    uint64_t      min_expert;
+    uint64_t      max_expert;
     char          arch[64];
     char          payload_sha[65];
     qrt_expert_loc * loc;   // layers * experts, row major
@@ -135,6 +137,12 @@ int qrt_weights_open(const char * prefix, qrt_weights ** out, char * err, size_t
         if (off + bytes > w->payload_bytes) {
             w->payload_bytes = off + bytes;
         }
+        if (w->min_expert == 0 || bytes < w->min_expert) {
+            w->min_expert = bytes;
+        }
+        if (bytes > w->max_expert) {
+            w->max_expert = bytes;
+        }
         ++w->records;
     }
     fclose(fi);
@@ -179,6 +187,8 @@ uint32_t qrt_weights_experts(const qrt_weights * w) { return w->experts; }
 uint64_t qrt_weights_payload_bytes(const qrt_weights * w) { return w->payload_bytes; }
 uint32_t qrt_weights_records(const qrt_weights * w) { return w->records; }
 const char * qrt_weights_arch(const qrt_weights * w) { return w->arch; }
+uint64_t qrt_weights_max_expert_bytes(const qrt_weights * w) { return w->max_expert; }
+uint64_t qrt_weights_min_expert_bytes(const qrt_weights * w) { return w->min_expert; }
 
 int qrt_weights_locate(const qrt_weights * w, uint32_t layer, uint32_t expert,
                        qrt_expert_loc * out, char * err, size_t err_size) {

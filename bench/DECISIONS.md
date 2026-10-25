@@ -519,3 +519,44 @@ M1-GATE 的依赖里去掉 M3-1a（它是门后条件，不是门的阻塞项）
   最小 copy 用例逐行二分；确认后再接稠密常驻（2079 MiB）与 M2-3 的 done。
 - 注意：`qrt_vk_alloc` 返回的 buffer 必须带 TRANSFER 位才能被 upload/download 使用，这条已确定要保留。
 
+
+## 30. M2-3 VRAM 侧第一块：H2D 通路打通（2026-10-25，第 29 节结项）
+
+第 29 节的访问违例已不再出现。重写的通路与读数见 `RESULTS.md` 第 35 节。
+
+| 项 | 结果 |
+|---|---|
+| staging + 拷贝 + fence | `qrt_vk_staging_create/destroy/wait`、`qrt_vk_upload[_mapped/_submit]`、`qrt_vk_download[_mapped]` |
+| 真实 1.9-2.2 MB 专家块往返 | **123 / 123 逐字节一致**，`io_failures=0` |
+| 串行单专家 | 0.24-0.43 ms（跨运行抖动大，min 0.21-0.36），固定开销 0.065 ms/次 |
+| 8 槽流水 | **11.5-12.1 GB/s（±2%）**，单专家摊销 0.19 ms，稳定 |
+| 复现 | `qrt --vk-io-check [--repack <prefix>]` |
+
+**崩溃的最可能根因（已封堵）**：旧实现用 `qrt_vk_alloc` 取 staging，而该函数只挑 `DEVICE_LOCAL`；
+本机 device-local 里可映射的只有 resizable-BAR 那一块，落到别的槽类型后 `vkMapMemory` 成功、
+主机第一次写就访问违例。现在 staging 走 `pick_host_type`：只接受 `HOST_VISIBLE`，优先
+`HOST_CACHED|HOST_COHERENT`，`vkMapMemory` 返回值与空指针都检查，失败返回错误不崩溃。
+`pick_memory_type` 的"随便回退到任意类型"只留给设备缓冲（M2-2 的语义），不再用于 staging。
+旧代码已回退，无法复跑证实，按"最可能根因 + 已封堵 + 有回归命令"记录。
+
+**内存类型是本轮最大的单变量收益**（RESULTS 35 表）：BAR 读回 59.8 ms/1.9 MB、
+write-combined 9.1 ms、cached 0.12 ms；H2D 侧三者差别在噪声内（0.38-0.65 ms）。
+因此 staging 固定用 `HOST_CACHED`，代价为零、读回快 40-500 倍。
+
+**新增开关/接口**
+
+| 名字 | 作用 | 默认 |
+|---|---|---|
+| `--vk-io-check` | 跑 staging 与流水的自检+计时（会分配约 70 MiB 显存） | 不跑 |
+| `--repack <prefix>` | 只被 `--vk-io-check` 读取，附加真实专家块往返 | 空 |
+| `qrt_vk_upload_submit` + `qrt_vk_staging_wait` | 不等待的提交 + 单独的等待，M2-5 双缓冲用 | - |
+
+`qrt_config` 的 12 个开关没有变化（design 第 7 节保持不变）。
+
+**未结项**
+
+1. **稠密 2079 MiB 常驻**：M2-3 的另一半，下一轮做（分配走 M2-2 的规划器，按张量表上传）。
+2. **每次拷贝 0.065 ms 固定开销**：本轮每拷贝录一次命令缓冲；M3-2 的"每 pass 预录"要把它摊掉，
+   8 槽流水才有 12 GB/s 以上的空间。
+3. **专家槽尺寸**（E-1，等用户裁决）：层间尺寸不同，最大 2.195 MiB，design 的 1.84 MiB 常数不成立。
+4. D2H 只在验证路径用；将来若 KV 回读上主机，直接用 cached 映射（0.12 ms/1.9 MB）。

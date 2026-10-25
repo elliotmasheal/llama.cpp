@@ -75,7 +75,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M2-3 data=- io=- user=-
+queues: bench=- impl=M2-6 data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -100,7 +100,12 @@ blockers: none
   （8 线程首轮，门禁口径），code 的 0.059 达到、技术类 0.0665 中位；t=1..5 曲线在 `RESULTS.md` 第 31 节。
   遗留：design 6.2 回填（用户）、逐 token（X-4）。U-2 不再需要。
 - **M2-3 partial（2026-10-25）**：`runtime/weights.*` 解析索引建 41x256 页表，10496/10496 专家
-  全量读回通过、64 KiB 对齐全通过；VRAM 侧等 M2-5 的形状。
+  全量读回通过、64 KiB 对齐全通过。
+- **M2-3 VRAM 侧第一块（2026-10-25）**：staging + H2D/D2H 通路打通，第 29 节的崩溃已封堵
+  （根因是 staging 用了只挑 DEVICE_LOCAL 的分配器）；真实专家块 123/123 往返一致，
+  串行 0.24-0.43 ms/专家（抖动大）、**8 槽流水 11.5-12.1 GB/s**（0.19 ms/专家），见 `RESULTS.md` 第 35 节、
+  `DECISIONS.md` 第 30 节。顺带测得专家尺寸层间不同（最大 2.195 MiB，不是 1.84 MiB），
+  已登记 **E-1 等用户裁决**。剩：稠密 2079 MiB 常驻。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、

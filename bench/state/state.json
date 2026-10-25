@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-3",
+      "head": "M2-6",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-4 next (int8 GEMM, the PP 6.0 TFLOPS gate); M2-3 waits for M5-1/M5-2. M3-1a stays partial on code 0.059"
+      "note": "M2-3 is doing (VRAM side: H2D staging then dense residency); M2-6 (attention) is the next runnable task in this lane"
     },
     {
       "lane": "data",
@@ -474,10 +474,10 @@
       "id": "M2-3",
       "milestone": "M2",
       "lane": "impl",
-      "status": "partial",
-      "claimed_at": "2026-10-25T00:20:00",
+      "status": "doing",
+      "claimed_at": "2026-10-25T10:05:00",
       "title": "weights：稠密常驻 + 专家页表",
-      "note": "host side done: runtime/weights.* parses the index into a 41x256 page table and reads all 10496 experts back (RESULTS 34); VRAM residency and the expert cache wait for the M2-5 shapes",
+      "note": "host side done: page table for 41x256 and 10496 read backs (RESULTS 34). VRAM side: the staging + H2D/D2H copy path is in and round trips 123/123 real expert blocks, 8 slots pipelined 11.5-12.1 GB/s (RESULTS 35, DECISIONS 30). Left: the 2079 MiB dense residency",
       "deps": [
         "M2-1",
         "M2-2",
@@ -486,7 +486,10 @@
       ],
       "resources": [],
       "paths": [
-        "runtime/weights.*"
+        "runtime/weights.*",
+        "runtime/vk_dev.*",
+        "runtime/qrt_main.cpp",
+        "runtime/CMakeLists.txt"
       ],
       "done_when": "稠密 2.02 GiB 常驻设备；专家按 [层][专家] 连续偏移可查；未命中走可恢复路径"
     },
@@ -1130,5 +1133,11 @@
     "detail": "backend-ops baseline is 2026-10-23 / 44bd79305 (ctest 32/32 there, 33/33 after 992c2f57a; M1-3c re-ran ctest 33/33). M1-3c touched only common/, so the backend-ops record still stands but is stale; rerun the full set before any ggml or backend change."
   },
   "blockers": [],
-  "escalations": []
+  "escalations": [
+    {
+      "id": "E-1",
+      "question": "专家块尺寸不是 1.84 MiB 常数：层 39 是 2.195 MiB，层 34/38 是 1.945 MiB，其余 38 层 1.812 MiB（RESULTS 35）。design 5.3/304 行写的是「每个槽 1.84 MiB」，按这个开槽会漏掉 768 个专家（7.3%）。选 A 全局按最大 2.195 MiB 开槽（4198 MiB = 1912 槽），B 按层分槽（38 层 1.812 MiB + 34/38 层 1.945 + 39 层 2.195，槽数多约 15%），C 保留 1.84 MiB 标称另开大专家溢出区？design 由用户改，M3-0 的槽尺寸等这个决定",
+      "needs_by": "M3-0"
+    }
+  ]
 }

@@ -6,6 +6,7 @@ add_library(qrt_core STATIC
     qrt_config.cpp
     qrt_telemetry.cpp
     gguf_index.cpp
+    weights.cpp
     vk_dev.cpp)
 
 target_include_directories(qrt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -26,6 +26,11 @@ uint32_t qrt_weights_experts(const qrt_weights * w);
 uint64_t qrt_weights_payload_bytes(const qrt_weights * w);
 uint32_t qrt_weights_records(const qrt_weights * w);
 const char * qrt_weights_arch(const qrt_weights * w);
+// The largest and smallest expert block. They differ per layer: layer 39 is
+// 2301952 B while 38 of the 41 layers are 1900544 B (RESULTS 35), so a cache slot
+// sized from the mean is too small and a global slot must use the maximum.
+uint64_t qrt_weights_max_expert_bytes(const qrt_weights * w);
+uint64_t qrt_weights_min_expert_bytes(const qrt_weights * w);
 
 // Returns -1 with a message when the pair is unknown or out of range.
 int qrt_weights_locate(const qrt_weights * w, uint32_t layer, uint32_t expert,

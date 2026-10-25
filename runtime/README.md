@@ -16,15 +16,17 @@ What exists now:
   the byte account `bench/tools/gguf_dims.py` prints. No abort path: malformed files come
   back as an error string.
 - `vk_dev.*` - Vulkan device, compute and transfer queues, memory type selection, the
-  `VK_EXT_memory_budget` query, and the design 5.5 budget planner with a tier cap.
+  `VK_EXT_memory_budget` query, the design 5.5 budget planner with a tier cap, and the
+  staging buffer with the H2D/D2H copy path.
+- `weights.*` - the repacked expert store: `.idx` page table, per-expert byte ranges, reads.
 - `qrt_main.cpp` - the `qrt` binary: `--help`, `--print-config`, `--selftest`,
-  `--gguf-index`, `--require-tensor`, `--vk-info`, `--vk-alloc-probe`.
+  `--gguf-index`, `--require-tensor`, `--vk-info`, `--vk-alloc-probe`, `--vk-io-check`.
 - `CMakeLists.txt` - the `qrt_core` library and the `qrt` executable, plus the
   `qrt_selftest` ctest case.
 
-What does not exist yet: weights and the expert cache (M2-3), kernels (M2-4), prefill
-(M2-5), decode (M3). `runtime/proto/` and `runtime/cpu_moe*` predate the scaffold and keep
-their own targets.
+What does not exist yet: the dense residency and the expert cache (M2-3, in progress),
+kernels (M2-4), prefill (M2-5), decode (M3). `runtime/proto/` and `runtime/cpu_moe*` predate
+the scaffold and keep their own targets.
 
 ## Build
 
@@ -131,6 +133,35 @@ Budget rules:
 The device opens with Vulkan 1.2 and a timeline semaphore, which is what the single-submit
 pass model of design 4.6 needs later.
 
+## Host to device transfers
+
+```
+build-vulkan/bin/qrt.exe --vk-io-check
+build-vulkan/bin/qrt.exe --vk-io-check --repack F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL
+```
+
+`--vk-io-check` proves the staging path before anything depends on it (RESULTS 35):
+
+- a 4 KiB, 64 KiB, 1.9 MB and 64 MiB pattern round trip through one staging buffer, 7
+  samples each after a warm-up, `match=1` required;
+- an 8 slot pipelined upload of 1.9 MB blocks, which is the shape M2-5 and M3-0 need;
+- with `--repack <prefix>`, three experts per layer (123 in total) are read from the
+  repacked store straight into the staging mapping, uploaded, read back and compared byte
+  for byte.
+
+Rules the implementation follows:
+
+- staging memory must be `HOST_VISIBLE`; `HOST_CACHED|HOST_COHERENT` is preferred because
+  the CPU then reads the mapping at PCIe speed instead of 0.21 GB/s (RESULTS 35).
+  `pick_host_type` never falls back to a type that cannot be mapped, which is what made the
+  first attempt fault (DECISIONS 29/30).
+- device buffers need `QRT_VK_USAGE_TRANSFER_DST` to be an upload target and
+  `QRT_VK_USAGE_TRANSFER_SRC` to be a download source.
+- one copy is one `vkCmdCopyBuffer` plus one submit and one fence wait; that costs a fixed
+  0.065 ms, so a single 1.9 MB copy serializes at only 4.7 GB/s. Use
+  `qrt_vk_upload_submit` on several staging buffers and wait once for the pipelined rate.
+- failures return a message and bump `io_failures`; nothing aborts (design 9).
+
 ## Telemetry
 
 `--telemetry 1 --telemetry-path <file>` writes a CSV with this header:
@@ -155,6 +186,7 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `qrt_config.h/.cpp` | switch table, defaults, parsing, validation, notes |
 | `qrt_telemetry.h/.cpp` | per-pass CSV sink |
 | `gguf_index.h/.cpp` | GGUF metadata, tensor table, absolute offsets, byte account |
-| `vk_dev.h/.cpp` | device, queues, memory types, budget planner, allocator |
-| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info` |
+| `vk_dev.h/.cpp` | device, queues, memory types, budget planner, allocator, staging transfers |
+| `weights.h/.cpp` | repacked expert store: index page table, expert ranges, reads |
+| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check` |
 | `CMakeLists.txt` | `qrt_core`, `qrt`, `qrt_selftest` |

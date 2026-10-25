@@ -16,6 +16,11 @@ typedef uint32_t                 VkBufferUsageFlags;
 
 // VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, spelled here so the CLI builds without the SDK.
 #define QRT_VK_USAGE_STORAGE 0x00000020u
+// TRANSFER_SRC/DST: a device buffer that is a copy target for qrt_vk_upload must
+// carry QRT_VK_USAGE_TRANSFER_DST, and one that qrt_vk_download reads must carry
+// QRT_VK_USAGE_TRANSFER_SRC. Missing bits are a validation error, not a no-op.
+#define QRT_VK_USAGE_TRANSFER_SRC 0x00000001u
+#define QRT_VK_USAGE_TRANSFER_DST 0x00000002u
 
 // Device, queues, memory types and the VRAM budget of design 5.5. Opening the
 // device is a recoverable failure: no abort, no exit, a message in err instead.
@@ -42,6 +47,7 @@ struct qrt_vk_dev {
     uint64_t alloc_bytes;
     uint32_t alloc_failures;    // counted fallbacks, never a crash (design 9)
     uint32_t cache_reductions;  // expert-cache steps given up by the planner
+    uint32_t io_failures;       // upload/download fallbacks, same rule
 };
 
 // The five buckets of design 5.5 plus what the planner had to give up.
@@ -71,5 +77,40 @@ int qrt_vk_plan_budget(qrt_vk_dev * dev, const qrt_config * cfg, uint64_t expert
 int qrt_vk_alloc(qrt_vk_dev * dev, uint64_t bytes, VkBufferUsageFlags usage,
                  VkBuffer * buf, VkDeviceMemory * mem, char * err, size_t err_size);
 void qrt_vk_free(qrt_vk_dev * dev, VkBuffer buf, VkDeviceMemory mem);
+
+// Host-visible staging buffer plus its own command buffer and fence. Mapped once
+// at creation; a copy is one vkCmdCopyBuffer and one submit+wait. M2-5 keeps two
+// of them to overlap the upload of block n+1 with the compute of block n.
+struct qrt_vk_staging;
+int qrt_vk_staging_create(qrt_vk_dev * dev, uint64_t bytes, qrt_vk_staging ** out,
+                          char * err, size_t err_size);
+void qrt_vk_staging_destroy(qrt_vk_dev * dev, qrt_vk_staging * stg);
+uint64_t qrt_vk_staging_bytes(const qrt_vk_staging * stg);
+// One line saying which memory type and heap the staging buffer landed in.
+const char * qrt_vk_staging_label(const qrt_vk_staging * stg);
+
+// Copies host memory into a device buffer, or back out of it, and returns only
+// after the fence signals. Both report failure instead of aborting (design 9).
+int qrt_vk_upload(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer dst,
+                  uint64_t dst_offset, const void * src, uint64_t bytes,
+                  char * err, size_t err_size);
+int qrt_vk_download(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer src,
+                    uint64_t src_offset, void * dst, uint64_t bytes,
+                    char * err, size_t err_size);
+
+// The variants the engine uses: the caller writes straight into the mapping (a
+// file read lands there, so one memcpy disappears) and only the copy runs here.
+void * qrt_vk_staging_map(qrt_vk_staging * stg);
+int qrt_vk_upload_mapped(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer dst,
+                         uint64_t dst_offset, uint64_t bytes, char * err, size_t err_size);
+int qrt_vk_download_mapped(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer src,
+                           uint64_t src_offset, uint64_t bytes, char * err, size_t err_size);
+
+// Fire and forget: the copy is in flight when this returns. Keep one staging
+// buffer per copy in flight and wait before touching its mapping again; this is
+// how M2-5 overlaps the upload of block n+1 with the compute of block n.
+int qrt_vk_upload_submit(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer dst,
+                         uint64_t dst_offset, uint64_t bytes, char * err, size_t err_size);
+int qrt_vk_staging_wait(qrt_vk_dev * dev, qrt_vk_staging * stg, char * err, size_t err_size);
 
 void qrt_vk_print_info(const qrt_vk_dev * dev, FILE * f);
