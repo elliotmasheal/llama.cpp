@@ -315,8 +315,8 @@ untime/layer.* runs one transformer block's attention half in the order the mode
   6.0-6.2 s for the 41 layers.
 - QRT_LAYER_STOP_PROJ=1 stops after the projections; it exists to bisect the open 1e-3
   projection discrepancy (RESULTS 72.4) and changes nothing by default.
-- Open: attn_v and ssm_out disagree with the reference by 1e-3 while every isolated check
-  passes for the same bytes, so M2-6 is not done (DECISIONS 67.1).
+- Still missing for M2-6: the FFN half (shared expert + routed MoE) is not part of this chain,
+  and a layer costs one submit per module call instead of one per layer.
 
 ## Telemetry## Telemetry
 

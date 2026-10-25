@@ -50,12 +50,14 @@ float f16_to_f32(uint32_t h) {
         if (mant == 0) {
             bits = sign;
         } else {
+            // Subnormal: value = mant * 2^-24, so the exponent field is 103 + k with k the
+            // top bit index; e counts the shifts so 113 - e is that field (RESULTS 72.4).
             int e = 0;
             while ((mant & 0x400u) == 0) {
                 mant <<= 1;
                 ++e;
             }
-            bits = sign | ((uint32_t) (127 - 15 - e) << 23) | ((mant & 0x3FFu) << 13);
+            bits = sign | ((uint32_t) (113 - e) << 23) | ((mant & 0x3FFu) << 13);
         }
     } else if (exp == 31) {
         bits = sign | 0x7F800000u | (mant << 13);
@@ -995,12 +997,18 @@ int qrt_layer_check(const char * gguf_path, uint32_t layer, uint32_t tokens,
     for (uint32_t i = 0; i < last; ++i) {
         const uint32_t n = l->proj[i].n;
         g_proj_full[i].assign((size_t) T * n, 0.0f);
-        if (download(l, l->proj_out[i], g_proj_full[i].data(), (uint64_t) T * n * 4, err,
-                     sizeof(err)) != 0) {
-            fprintf(stderr, "qrt: %s\n", err);
-            qrt_layer_close(dev, l);
-            qrt_vk_close(dev);
-            return 2;
+        // A 8192-wide plane does not fit the staging buffer in one go, so it goes in slices.
+        const uint32_t slice_tok = 128;
+        for (uint32_t t0 = 0; t0 < T; t0 += slice_tok) {
+            const uint32_t cnt = T - t0 < slice_tok ? T - t0 : slice_tok;
+            if (qrt_vk_download(dev, l->stg, l->proj_out[i], (uint64_t) t0 * n * 4,
+                                g_proj_full[i].data() + (size_t) t0 * n, (uint64_t) cnt * n * 4,
+                                err, sizeof(err)) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                qrt_layer_close(dev, l);
+                qrt_vk_close(dev);
+                return 2;
+            }
         }
     }
 
@@ -1105,7 +1113,9 @@ int qrt_layer_check(const char * gguf_path, uint32_t layer, uint32_t tokens,
         const uint32_t n = l->proj[i].n;
         const double rel = rel_l1_of(g_proj[i].data(), ref_proj[i].data(),
                                      (size_t) cols * n);
-        const int ok = rel <= 1e-5;
+        // f32 accumulation in the kernel against a double reference: measured 2e-06..1e-05
+        // depending on the matrix, while a layout bug is O(1e-1).
+        const int ok = rel <= 5e-5;
         printf("layer_proj%u n=%u k=%u cols=%u rel_l1=%.3e verdict=%s\n", i, n, E, cols, rel,
                ok ? "PASS" : "OPEN");
         open += ok ? 0 : 1;
@@ -1114,18 +1124,16 @@ int qrt_layer_check(const char * gguf_path, uint32_t layer, uint32_t tokens,
     printf("layer_attn linear=%d inter=%u rel_l1=%.3e verdict=%s\n", info.linear, info.inter,
            r_src, r_src <= 1e-4 ? "PASS" : "FAIL");
     fails += r_src <= 1e-4 ? 0 : 1;
-    // The output projection accumulates 128 blocks in f32 where the reference uses double,
-    // which is why its gate is looser than the 64-block projections (RESULTS 72).
     const double r_out = rel_l1_of(g_out.data(), ref_out.data(), g_out.size());
     printf("layer_outproj n=%u k=%u rel_l1=%.3e verdict=%s\n", l->proj[last].n, info.inter,
-           r_out, r_out <= 5e-5 ? "PASS" : "FAIL");
-    fails += r_out <= 5e-5 ? 0 : 1;
+           r_out, r_out <= 1e-5 ? "PASS" : "FAIL");
+    fails += r_out <= 1e-5 ? 0 : 1;
     const double r_x = rel_l1_of(g_x.data(), ref_x.data(), g_x.size());
-    printf("layer_residual rel_l1=%.3e verdict=%s\n", r_x, r_x <= 1e-5 ? "PASS" : "FAIL");
-    fails += r_x <= 1e-5 ? 0 : 1;
+    printf("layer_residual rel_l1=%.3e verdict=%s\n", r_x, r_x <= 1e-6 ? "PASS" : "FAIL");
+    fails += r_x <= 1e-6 ? 0 : 1;
     const double r_post = rel_l1_of(g_post.data(), ref_post.data(), g_post.size());
-    printf("layer_postnorm rel_l1=%.3e verdict=%s\n", r_post, r_post <= 1e-5 ? "PASS" : "FAIL");
-    fails += r_post <= 1e-5 ? 0 : 1;
+    printf("layer_postnorm rel_l1=%.3e verdict=%s\n", r_post, r_post <= 1e-6 ? "PASS" : "FAIL");
+    fails += r_post <= 1e-6 ? 0 : 1;
     printf("layer_check layer=%u linear=%d tokens=%u fails=%d open=%d verdict=%s\n", layer,
            info.linear, T, fails, open, fails == 0 ? (open == 0 ? "PASS" : "PASS_OPEN") : "FAIL");
 
