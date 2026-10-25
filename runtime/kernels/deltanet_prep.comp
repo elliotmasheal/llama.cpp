@@ -17,9 +17,9 @@ layout(push_constant) uniform PC {
     uint  qk_ch;      // 2048 = n_k_heads * 128
     uint  head_dim;   // 128
     uint  taps;       // 4
+    // field order and count must match the host struct in qrt_dn_prep_run exactly
     uint  qbase;      // first q element of token 0 in the q plane
     uint  kbase;
-    uint  vbase;
     float l2_eps;     // eps / head_dim, as build_gdn_l2_norm does
 } pc;
 
@@ -69,6 +69,6 @@ void main() {
             kb.k[pc.kbase + tok * pc.qk_ch + (c - pc.qk_ch)] = nval;
         }
     } else {
-        vb.v[pc.vbase + tok * (pc.conv_ch - 2u * pc.qk_ch) + (c - 2u * pc.qk_ch)] = silu;
+        vb.v[tok * (pc.conv_ch - 2u * pc.qk_ch) + (c - 2u * pc.qk_ch)] = silu;
     }
 }

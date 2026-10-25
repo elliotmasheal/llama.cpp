@@ -346,6 +346,49 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
                 fprintf(stderr, "qrt: %s\n", err);
                 break;
             }
+            // pattern probe: constant weights and inputs remove every data dependence, so a
+            // wrong value here means the v path itself is broken, not the data
+            {
+                std::vector<float> ones_w((size_t) sh.conv_taps * sh.conv_ch, 1.0f);
+                std::vector<float> ones_x((size_t) tokens * sh.conv_ch, 1.0f);
+                std::vector<float> zero_s((size_t) (sh.conv_taps - 1) * sh.conv_ch, 0.0f);
+                std::vector<float> qp((size_t) sh.qk_ch), kp((size_t) sh.qk_ch), vp((size_t) sh.d_inner);
+                const int prc = qrt_vk_upload(dev, stg, qrt_dn_weights_conv(w), 0, ones_w.data(),
+                                              ones_w.size() * 4, err, sizeof(err));
+                const int prc2 = prc == 0 ? qrt_vk_upload(dev, stg, b->qkv, 0, ones_x.data(),
+                                                         ones_x.size() * 4, err, sizeof(err)) : -1;
+                const int prc3 = prc2 == 0 ? qrt_vk_upload(dev, stg, b->conv_state, 0,
+                                                           zero_s.data(), zero_s.size() * 4, err,
+                                                           sizeof(err)) : -1;
+                if (prc3 == 0 && qrt_dn_prep_run(dn, w, tokens, l2_eps, err, sizeof(err)) == 0 &&
+                    qrt_vk_download(dev, stg, b->q, 0, qp.data(), qp.size() * 4, err, sizeof(err)) == 0 &&
+                    qrt_vk_download(dev, stg, b->v, 0, vp.data(), vp.size() * 4, err, sizeof(err)) == 0) {
+                    // one tap of the conv is live (j = taps-1 reads this token), the rest read a
+                    // zeroed state, so conv = 1 for every channel: silu(1) = 0.7310586
+                    const double want_v = 1.0 / (1.0 + exp(-1.0));
+                    const double want_q = want_v / (want_v * sqrt((double) sh.head_dim));
+                    printf("dn_prep_pattern q0=%.6f (want %.6f) v0=%.6f v_mid=%.6f v_last=%.6f "
+                           "(want %.6f) verdict=%s\n", (double) qp[0], want_q, (double) vp[0],
+                           (double) vp[sh.d_inner / 2], (double) vp[sh.d_inner - 1], want_v,
+                           (fabs((double) vp[0] - want_v) < 1e-4 &&
+                            fabs((double) vp[sh.d_inner - 1] - want_v) < 1e-4 &&
+                            fabs((double) qp[0] - want_q) < 1e-4) ? "PASS" : "FAIL");
+                } else {
+                    fprintf(stderr, "qrt: prep pattern probe failed: %s\n", err);
+                }
+                // put the real weights and inputs back
+                if (qrt_vk_upload(dev, stg, qrt_dn_weights_conv(w), 0, cw.data(), cw.size() * 4,
+                                  err, sizeof(err)) != 0 ||
+                    qrt_vk_upload(dev, stg, b->qkv, 0, qkv_host.data(), qkv_host.size() * 4, err,
+                                  sizeof(err)) != 0 ||
+                    qrt_vk_upload(dev, stg, b->conv_state, 0, cst.data(), cst.size() * 4, err,
+                                  sizeof(err)) != 0) {
+                    qrt_dn_weights_free(dev, w);
+                    fprintf(stderr, "qrt: %s\n", err);
+                    break;
+                }
+            }
+
             std::vector<float> qg((size_t) tokens * sh.qk_ch), kg((size_t) tokens * sh.qk_ch);
             std::vector<float> vg((size_t) tokens * sh.d_inner);
             if (qrt_vk_upload(dev, stg, b->qkv, 0, qkv_host.data(),
@@ -377,11 +420,8 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
             qrt_dn_weights_free(dev, w);
             printf("dn_prep  tokens=%u q_rel_l1=%.3e k_rel_l1=%.3e v_rel_l1=%.3e max_abs=%.3e "
                    "ms=%.3f verdict=%s\n", tokens, rq, rk, rv, fmax(mq, fmax(mk, mv)), prep_ms,
-                   (rq <= 1e-4 && rk <= 1e-4 && rv <= 1e-4) ? "PASS"
-                   : (rq <= 1e-4 && rk <= 1e-4 ? "PARTIAL(v-open)" : "FAIL"));
-            // q and k are verified; the v branch of the prep shader is still open, and the
-            // exit code must not pretend otherwise (RESULTS 56)
-            if (!(rq <= 1e-4 && rk <= 1e-4)) {
+                   (rq <= 1e-4 && rk <= 1e-4 && rv <= 1e-4) ? "PASS" : "FAIL");
+            if (!(rq <= 1e-4 && rk <= 1e-4 && rv <= 1e-4)) {
                 break;
             }
         }

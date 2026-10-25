@@ -122,14 +122,20 @@ target_link_libraries(qrt PRIVATE qrt_core)
 target_include_directories(qrt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(qrt PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 
-# The shaders land next to qrt.exe, which is where the checks look by default.
+# The shaders land next to qrt.exe, which is where the checks look by default. The copy
+# must be its own target: a POST_BUILD step on qrt only fires when qrt relinks, so a
+# shader-only change would leave a stale .spv next to the binary (that cost a debugging
+# round on M2-6c).
 if(TARGET qrt_shaders)
     add_dependencies(qrt qrt_shaders)
-    add_custom_command(TARGET qrt POST_BUILD
+    add_custom_target(qrt_spv_copy ALL
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_deltanet_spv}
                 ${_qrt_dn_prep_spv} $<TARGET_FILE_DIR:qrt>
+        DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_deltanet_spv}
+                ${_qrt_dn_prep_spv}
         COMMENT "Copying the runtime shaders next to qrt")
+    add_dependencies(qrt qrt_spv_copy)
 endif()
 
 if (BUILD_TESTING)
