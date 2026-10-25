@@ -1334,3 +1334,16 @@ wl: gate 3 ok count=5
 
 **下一步**：gnorm 现 6.7 us/token（16384 个 workgroup，每个 128 元素归约），按同一配方重写；
 之后是递推的 token 并行（现 5.7 us/token，理论 0.14 us 量级）。
+
+## 60. M2-6c 性能判决：gnorm 达标，只剩递推并行化（2026-10-25）
+
+**采纳**：gnorm 改 "workgroup = token，warp 轮头" 后 6.7 -> **1.19 us/token**，正确性不变。
+DeltaNet 三条腿现在：prep 0.3 s、gate 0.32 s、gnorm 0.37 s（30 层 10K 推算），
+**递推 1.75 s 是唯一超出 1.35 s 预算的一项**。
+
+**递推并行化的约束（写下来，避免下次走错）**
+1. 现在"批量 ≡ 串行逐位相同"来自 token 循环在 shader 内、状态常驻寄存器。改成 chunked/WY
+   （token 并行）之后这个性质会降级为 fp 级差异，必须按 U-7 口径报分叉率与分叉处 margin。
+2. 目标：3.15 MFLOP/token ÷ 7 TFLOPS ≈ 0.14 us/token 是算术下限；现实目标是 0.3-0.5 us/token
+   （30 层 10K = 0.9-1.5 s），至少要压到 1.35 s 预算内。
+3. 保持状态保存/恢复接口不变（M3 串行解码要用同一状态）。

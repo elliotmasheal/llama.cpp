@@ -1207,7 +1207,7 @@
         "runtime/README.md"
       ],
       "done_when": "单层 DeltaNet 前向对 CPU 参考逐元素一致（1e-4）；递推状态在 t 步串行解码与批量一致；conv1d 状态可保存/恢复",
-      "note": "correctness done 2026-10-25 (prep/gate/gnorm/recurrence all <= 1.2e-07, weight table bug fixed at the root). Performance: gate is now 1.05 us/token (was 12.7) with one warp per head and coalesced reads; the old 3.9 us/token was exactly the DRAM line of the uncoalesced pattern, so that was a false ceiling, not hardware. Still open: gnorm 6.7 us/token (16384 tiny workgroups, needs the same warp-per-head recipe) and the recurrence 5.7 us/token (needs token parallelism). Then the whole-layer chain with the q8_0 projections. RESULTS 61, DECISIONS 59"
+      "note": "performance 2026-10-25: gate 12.7 -> 1.05 us/token and gnorm 6.7 -> 1.19 us/token by giving a warp one head with coalesced reads (shared-memory tree reduce because the device subgroup is 64 wide). prep 0.3 s, gate 0.32 s, gnorm 0.37 s per 30 layers at 10K; the recurrence at 1.75 s is the only leg over the 1.35 s budget, so token parallelism (chunked/WY) is the next and last performance item. Note the side effect: the batch-equals-serial bitwise property will degrade to fp level and must then be reported under the U-7 rule. Then the whole-layer chain with the q8_0 projections. RESULTS 61/62, DECISIONS 59/60"
     },
     {
       "id": "M2-6d",

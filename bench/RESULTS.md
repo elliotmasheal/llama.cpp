@@ -1917,3 +1917,17 @@ xnorm 随机，RX 6700S，平衡+AC，`qrt --deltanet-check`，正确性每次�
 
 **gnorm 仍是 6.7 us/token**（16384 个 workgroup、每个只做 128 元素归约），下一刀按同一配方：
 warp 管一头 + 多 token 一个 workgroup，目标同量级（< 1 us/token）。
+
+## 62. M2-6c 性能：gnorm 6.7 -> 1.19 us/token（5.6 倍），同样越过"调度开销"假线（2026-10-25）
+
+口径：layer 0，tokens=512，真实 `ssm_norm`，y/z 随机，RX 6700S，平衡+AC，正确性先过（5.76e-08）。
+
+| 形状 | 每 token | 30 层 10K | 说明 |
+|---|---:|---:|---|
+| 1 workgroup = (token, head)，128 线程 | 6.7 us | 2.1 s | 512 token 时 **16384 个 workgroup**，每个只做 128 元素归约，全是调度与屏障开销 |
+| **1 workgroup = token，4 warp 轮 32 头** | **1.19 us** | **0.37 s** | 512 个 workgroup；每 warp 读 128 个连续 float，共享内存树归约 |
+
+- 还剩一处可优化：`z` 来自 GEMM，布局是 `[channel][token]`，gnorm 按 stride=m 读，
+  每个元素落在不同 cacheline。整层串联时会加一次转置（8 MB/512 token，带宽受限约 0.05 ms），
+  预计还能再降。
+- 正确性不变：5.76e-08。

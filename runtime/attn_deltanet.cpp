@@ -898,7 +898,8 @@ int qrt_dn_gnorm_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t token
     vkCmdBindDescriptorSets(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
                             &dn->gnorm_set, 0, nullptr);
     vkCmdPushConstants(dn->cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
-    vkCmdDispatch(dn->cmd, dn->sh.n_v_heads, tokens, 1);
+    // one workgroup per token; the shader walks the heads four at a time
+    vkCmdDispatch(dn->cmd, tokens, 1, 1);
     r = vkEndCommandBuffer(dn->cmd);
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkEndCommandBuffer (deltanet gnorm)", r);

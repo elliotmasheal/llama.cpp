@@ -1,41 +1,65 @@
 #version 450
 #extension GL_EXT_control_flow_attributes : require
-// DeltaNet gated RMS norm (M2-6c step 2): per (token, v-head) over the 128 head values,
-//   out = rms_norm(raw, eps) * ssm_norm * silu(z)
-// which is build_norm_gated in src/models/qwen35moe.cpp. The result is the input of the
-// ssm_out projection, so it is written contiguously as [t][n_v_heads * 128].
+// DeltaNet gated RMS norm, coalesced shape (M2-6c). The old kernel was one workgroup per
+// (token, head): 16384 workgroups for 512 tokens, each doing a 128-element reduction, and it
+// measured 6.7 us/token, i.e. almost pure scheduling overhead.
+//
+// Now a workgroup owns one token and a warp walks heads four at a time: each lane loads four
+// elements of a head (lane, +32, +64, +96), so a warp reads 128 contiguous floats, and the
+// reduction is a shared-memory tree over its 32 lanes (the device subgroup is 64 wide, so a
+// 32-lane group is half a subgroup and subgroupAdd cannot be used). The gate vector z comes
+// from a GEMM and is [channel][token]; it is read with stride m.
+//
+//   out = rms_norm(y, eps) * ssm_norm * silu(z)
 
 layout(local_size_x = 128) in;
 
 layout(push_constant) uniform PC {
     uint  head_dim;   // 128
-    uint  m;          // tokens; the gate projection writes [channel][token]
+    uint  m;          // tokens
     float eps;
 } pc;
 
-layout(binding = 0) readonly  buffer InBuf    { float raw[]; } inb;   // [t][heads][head_dim]
-layout(binding = 1) readonly  buffer ZBuf     { float z[]; }   zb;    // same shape
-layout(binding = 2) readonly  buffer WBuf     { float w[]; }   wb;    // [head_dim]
-layout(binding = 3) writeonly buffer OutBuf   { float o[]; }   ob;
+layout(binding = 0) readonly  buffer InBuf  { float raw[]; } inb;   // [t][head][head_dim]
+layout(binding = 1) readonly  buffer ZBuf   { float z[]; }   zb;    // [channel][token]
+layout(binding = 2) readonly  buffer WBuf   { float w[]; }   wb;    // [head_dim]
+layout(binding = 3) writeonly buffer OutBuf { float o[]; }   ob;
+
+layout(constant_id = 0) const uint HEADS = 32;
 
 shared float red[128];
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
-    const uint head = gl_WorkGroupID.x;
-    const uint tok = gl_WorkGroupID.y;
-    const uint base = (tok * gl_NumWorkGroups.x + head) * pc.head_dim;
+    const uint tok = gl_WorkGroupID.x;
+    const uint warp = tid >> 5u;
+    const uint lane = tid & 31u;
+    const uint warps = 128u >> 5u;
 
-    const float v = inb.raw[base + tid];
-    red[tid] = v * v;
-    barrier();
-    [[unroll]] for (uint s = 64u; s > 0u; s >>= 1u) {
-        if (tid < s) {
-            red[tid] += red[tid + s];
+    for (uint h = warp; h < HEADS; h += warps) {
+        const uint base = (tok * HEADS + h) * pc.head_dim;
+        float v[4];
+        float ss = 0.0;
+        [[unroll]] for (uint i = 0; i < 4u; ++i) {
+            v[i] = inb.raw[base + lane + i * 32u];
+            ss += v[i] * v[i];
+        }
+        red[tid] = ss;
+        barrier();
+        [[unroll]] for (uint s = 16u; s > 0u; s >>= 1u) {
+            if (lane < s) {
+                red[tid] += red[tid + s];
+            }
+            barrier();
+        }
+        const float total = red[tid & ~31u];
+        const float scale = inversesqrt(total / float(pc.head_dim) + pc.eps);
+        [[unroll]] for (uint i = 0; i < 4u; ++i) {
+            const uint j = lane + i * 32u;
+            const uint ch = h * pc.head_dim + j;
+            const float g = zb.z[ch * pc.m + tok];
+            ob.o[base + j] = v[i] * scale * wb.w[j] * (g / (1.0 + exp(-g)));
         }
         barrier();
     }
-    const float scale = inversesqrt(red[0] / float(pc.head_dim) + pc.eps);
-    const float g = zb.z[(head * pc.head_dim + tid) * pc.m + tok];
-    ob.o[base + tid] = v * scale * wb.w[tid] * (g / (1.0 + exp(-g)));
 }
