@@ -117,8 +117,10 @@ struct qrt_gemm {
     VkDescriptorSet gemm_sets[2];
     VkDescriptorSet swiglu_set;
     VkCommandPool   cmd_pool;
-    VkCommandBuffer cmd;
-    VkFence         fence;
+    VkCommandBuffer cmd[2];
+    VkFence         fence[2];
+    uint32_t        cur;        // ring the record calls append to
+    int             pending[2]; // submitted and not waited yet
     // Each descriptor set caches what it was last written with, so the prefill loop
     // rewrites them once per scheduler open instead of four times per expert.
     struct set_state {
@@ -305,8 +307,8 @@ int qrt_gemm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_gemm ** out,
     cai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cai.commandPool        = g->cmd_pool;
     cai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    r = vkAllocateCommandBuffers(dev->device, &cai, &g->cmd);
+    cai.commandBufferCount = 2;
+    r = vkAllocateCommandBuffers(dev->device, &cai, g->cmd);
     if (r != VK_SUCCESS) {
         qrt_gemm_close(dev, g);
         return vk_fail(err, err_size, "vkAllocateCommandBuffers (gemm)", r);
@@ -314,8 +316,15 @@ int qrt_gemm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_gemm ** out,
     VkFenceCreateInfo fci;
     memset(&fci, 0, sizeof(fci));
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    r = vkCreateFence(dev->device, &fci, nullptr, &g->fence);
+    r = vkCreateFence(dev->device, &fci, nullptr, &g->fence[0]);
     if (r != VK_SUCCESS) {
+        g->fence[0] = VK_NULL_HANDLE;
+        qrt_gemm_close(dev, g);
+        return vk_fail(err, err_size, "vkCreateFence (gemm)", r);
+    }
+    r = vkCreateFence(dev->device, &fci, nullptr, &g->fence[1]);
+    if (r != VK_SUCCESS) {
+        g->fence[1] = VK_NULL_HANDLE;
         qrt_gemm_close(dev, g);
         return vk_fail(err, err_size, "vkCreateFence (gemm)", r);
     }
@@ -328,8 +337,10 @@ void qrt_gemm_close(qrt_vk_dev * dev, qrt_gemm * g) {
         return;
     }
     if (dev != NULL && dev->device != VK_NULL_HANDLE) {
-        if (g->fence != VK_NULL_HANDLE) {
-            vkDestroyFence(dev->device, g->fence, nullptr);
+        for (int i = 0; i < 2; ++i) {
+            if (g->fence[i] != VK_NULL_HANDLE) {
+                vkDestroyFence(dev->device, g->fence[i], nullptr);
+            }
         }
         if (g->cmd_pool != VK_NULL_HANDLE) {
             vkDestroyCommandPool(dev->device, g->cmd_pool, nullptr);
@@ -382,11 +393,17 @@ int pick_set(qrt_gemm * g, const qrt_gemm_args * a, VkDescriptorSet * out) {
 
 } // namespace
 
-int qrt_gemm_begin(qrt_gemm * g, char * err, size_t err_size) {
+uint32_t qrt_gemm_rings(void) { return 2; }
+
+int qrt_gemm_begin(qrt_gemm * g, uint32_t ring, char * err, size_t err_size) {
     if (g == NULL) {
         return fail(err, err_size, "no GEMM context");
     }
-    VkResult r = vkResetFences(g->dev->device, 1, &g->fence);
+    if (ring > 1) {
+        return fail(err, err_size, "ring %u is outside the two command rings", ring);
+    }
+    g->cur = ring;
+    VkResult r = vkResetFences(g->dev->device, 1, &g->fence[ring]);
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkResetFences (gemm)", r);
     }
@@ -394,7 +411,7 @@ int qrt_gemm_begin(qrt_gemm * g, char * err, size_t err_size) {
     memset(&bi, 0, sizeof(bi));
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    r = vkBeginCommandBuffer(g->cmd, &bi);
+    r = vkBeginCommandBuffer(g->cmd[ring], &bi);
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkBeginCommandBuffer (gemm)", r);
     }
@@ -414,12 +431,13 @@ int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t er
     }
     VkDescriptorSet set = VK_NULL_HANDLE;
     pick_set(g, a, &set);
-    vkCmdBindPipeline(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_pipe[a->type]);
-    vkCmdBindDescriptorSets(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_layout, 0, 1,
+    vkCmdBindPipeline(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_pipe[a->type]);
+    vkCmdBindDescriptorSets(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_layout, 0, 1,
                             &set, 0, nullptr);
     const uint32_t pc[6] = { a->n, a->k, a->m, a->wbase, a->obase, a->abase };
-    vkCmdPushConstants(g->cmd, g->gemm_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-    vkCmdDispatch(g->cmd, a->n / Q4K_TILE_N, a->m / Q4K_TILE_M, 1);
+    vkCmdPushConstants(g->cmd[g->cur], g->gemm_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(pc), pc);
+    vkCmdDispatch(g->cmd[g->cur], a->n / Q4K_TILE_N, a->m / Q4K_TILE_M, 1);
     ++g->dispatches;
     return 0;
 }
@@ -445,12 +463,13 @@ int qrt_gemm_record_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer ou
         g->st[GEMM_SET_HIDDEN].ds = out_ds;
     }
     const uint32_t nk32 = hid / 32;
-    vkCmdBindPipeline(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_pipe);
-    vkCmdBindDescriptorSets(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_layout, 0, 1,
+    vkCmdBindPipeline(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_pipe);
+    vkCmdBindDescriptorSets(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_layout, 0, 1,
                             &g->swiglu_set, 0, nullptr);
     const uint32_t pc[5] = { m, nk32, hid, qsbase, dsbase };
-    vkCmdPushConstants(g->cmd, g->swiglu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-    vkCmdDispatch(g->cmd, (m * nk32 + 63u) / 64u, 1, 1);
+    vkCmdPushConstants(g->cmd[g->cur], g->swiglu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(pc), pc);
+    vkCmdDispatch(g->cmd[g->cur], (m * nk32 + 63u) / 64u, 1, 1);
     ++g->dispatches;
     return 0;
 }
@@ -464,16 +483,17 @@ int qrt_gemm_record_barrier(qrt_gemm * g, char * err, size_t err_size) {
     mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(g->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vkCmdPipelineBarrier(g->cmd[g->cur], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     return 0;
 }
 
-int qrt_gemm_submit(qrt_gemm * g, char * err, size_t err_size) {
+int qrt_gemm_submit_nowait(qrt_gemm * g, char * err, size_t err_size) {
     if (g == NULL) {
         return fail(err, err_size, "no GEMM context");
     }
-    VkResult r = vkEndCommandBuffer(g->cmd);
+    const uint32_t ring = g->cur;
+    VkResult r = vkEndCommandBuffer(g->cmd[ring]);
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkEndCommandBuffer (gemm)", r);
     }
@@ -481,22 +501,41 @@ int qrt_gemm_submit(qrt_gemm * g, char * err, size_t err_size) {
     memset(&si, 0, sizeof(si));
     si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
-    si.pCommandBuffers    = &g->cmd;
-    r = vkQueueSubmit(g->dev->compute_queue, 1, &si, g->fence);
+    si.pCommandBuffers    = &g->cmd[ring];
+    r = vkQueueSubmit(g->dev->compute_queue, 1, &si, g->fence[ring]);
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkQueueSubmit (gemm)", r);
     }
-    r = vkWaitForFences(g->dev->device, 1, &g->fence, VK_TRUE, UINT64_MAX);
+    g->pending[ring] = 1;
+    return 0;
+}
+
+int qrt_gemm_wait(qrt_gemm * g, uint32_t ring, char * err, size_t err_size) {
+    if (g == NULL || ring > 1) {
+        return fail(err, err_size, "no GEMM ring %u to wait for", ring);
+    }
+    if (!g->pending[ring]) {
+        return 0;
+    }
+    g->pending[ring] = 0;
+    const VkResult r = vkWaitForFences(g->dev->device, 1, &g->fence[ring], VK_TRUE, UINT64_MAX);
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkWaitForFences (gemm)", r);
     }
     return 0;
 }
 
+int qrt_gemm_submit(qrt_gemm * g, char * err, size_t err_size) {
+    if (qrt_gemm_submit_nowait(g, err, err_size) != 0) {
+        return -1;
+    }
+    return qrt_gemm_wait(g, g->cur, err, err_size);
+}
+
 uint32_t qrt_gemm_dispatches(const qrt_gemm * g) { return g != NULL ? g->dispatches : 0; }
 
 int qrt_gemm_dispatch(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t err_size) {
-    if (qrt_gemm_begin(g, err, err_size) != 0 || qrt_gemm_record(g, a, err, err_size) != 0) {
+    if (qrt_gemm_begin(g, 0, err, err_size) != 0 || qrt_gemm_record(g, a, err, err_size) != 0) {
         return -1;
     }
     return qrt_gemm_submit(g, err, err_size);
@@ -504,7 +543,7 @@ int qrt_gemm_dispatch(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t 
 
 int qrt_gemm_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs, VkBuffer out_ds,
                    uint32_t m, uint32_t hid, char * err, size_t err_size) {
-    if (qrt_gemm_begin(g, err, err_size) != 0 ||
+    if (qrt_gemm_begin(g, 0, err, err_size) != 0 ||
         qrt_gemm_record_swiglu(g, gate, up, out_qs, out_ds, m, hid, 0, 0, err, err_size) != 0) {
         return -1;
     }

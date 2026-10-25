@@ -56,7 +56,9 @@ int qrt_gemm_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs, V
 // Record several dispatches into one command buffer and submit once: per expert the
 // three GEMMs plus swiglu would otherwise pay four submit+fence rounds at ~0.065 ms
 // each, which is the same order as the math at 64 tokens (RESULTS 39).
-int qrt_gemm_begin(qrt_gemm * g, char * err, size_t err_size);
+// Two command rings so one layer can be computed while the next is recorded.
+uint32_t qrt_gemm_rings(void);
+int qrt_gemm_begin(qrt_gemm * g, uint32_t ring, char * err, size_t err_size);
 int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t err_size);
 // The plane bases let one buffer hold every expert's swiglu output of a layer: qs is
 // counted in uvec4, ds in words.
@@ -67,4 +69,7 @@ int qrt_gemm_record_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer ou
 // One layer of prefill records hundreds of these instead of going back to the CPU.
 int qrt_gemm_record_barrier(qrt_gemm * g, char * err, size_t err_size);
 int qrt_gemm_submit(qrt_gemm * g, char * err, size_t err_size);
+// Submit and return: the caller overlaps host work with the GPU and waits later.
+int qrt_gemm_submit_nowait(qrt_gemm * g, char * err, size_t err_size);
+int qrt_gemm_wait(qrt_gemm * g, uint32_t ring, char * err, size_t err_size);
 uint32_t qrt_gemm_dispatches(const qrt_gemm * g);

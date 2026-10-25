@@ -40,9 +40,11 @@ int qrt_moe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
 // expert's swiglu output goes to its own slice of the hidden planes, and the expert
 // outputs rotate over eight slices because accumulation into the token rows is not
 // implemented yet (DECISIONS 37).
-int qrt_moe_compute_batch(void * user, uint32_t layer, VkBuffer buf, const uint32_t * experts,
-                          const uint64_t * offsets, const uint64_t * bytes, uint32_t count,
-                          char * err, size_t err_size);
+int qrt_moe_compute_batch(void * user, uint32_t layer, uint32_t ring, VkBuffer buf,
+                          const uint32_t * experts, const uint64_t * offsets,
+                          const uint64_t * bytes, uint32_t count, char * err, size_t err_size);
+// qrt_prefill_wait_fn: waits for the submit of the given ring to finish.
+int qrt_moe_wait(void * user, uint32_t ring, char * err, size_t err_size);
 
 // Per-matrix result of the cross-check below.
 struct qrt_moe_check_result {

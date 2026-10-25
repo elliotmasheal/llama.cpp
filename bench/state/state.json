@@ -538,7 +538,7 @@
       ],
       "done_when": "chunk 可配；上传与计算重叠；compute 腿是 int8 GEMM（PP 有实测值）；失败可退化",
       "claimed_at": "2026-10-25T13:10:00",
-      "note": "step 1 scheduler + mmap read path (RESULTS 37/38). step 2/3 the int8 GEMM as the compute leg with Q4_K, Q5_K and Q6_K variants, all three matrices correct to 2.5e-7 (RESULTS 39/40). step 4: one submit per layer instead of one per expert, 2.02 -> 3.69-3.71 TFLOPS, 0.272 ms per block (RESULTS 41, DECISIONS 38). Next: double buffer the layer so read and compute overlap, then the MoE output accumulation"
+      "note": "step 1 scheduler + mmap read path (RESULTS 37/38). step 2/3 the int8 GEMM as the compute leg with Q4_K, Q5_K and Q6_K variants, correct to 2.5e-7 (RESULTS 39/40). step 4: one submit per layer, 2.0 -> 3.7 TFLOPS (RESULTS 41). step 5: layer-level double buffering, 0.272 -> 0.190 ms per block and 1226 tok/s on the expert leg (RESULTS 42, DECISIONS 39). Next: coalesce H2D into 8-16 MiB chunks, then the MoE output accumulation and the input Q8_1 quantization"
     },
     {
       "id": "M2-6",
@@ -1147,6 +1147,17 @@
       "resources": [],
       "paths": [],
       "done_when": "用户 2026-10-25 定 B：槽字节 = 该层专家实际字节（1.812 / 1.945 / 2.195 MiB），4198 MiB 按层切分，仍只有一个缓存预算器；design 2.1/4.3/4.4 与 5.1 已按此改"
+    },
+    {
+      "id": "U-9",
+      "milestone": "M2",
+      "lane": "user",
+      "status": "done",
+      "title": "U-9 已决：prefill 的层缓冲复用 decode 专家缓存区",
+      "deps": [],
+      "resources": [],
+      "paths": [],
+      "done_when": "用户 2026-10-25 定：层间双缓冲需要两块层缓冲（约 952 MiB），从 4198 MiB 的 decode 专家缓存区里借，prefill 不新增预算桶；decode 启动时按原计划重建缓存。design 5.5 已加这条复用说明"
     }
   ],
   "last_gate": {

@@ -313,7 +313,7 @@ int qrt_moe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
 
     // One command buffer for all dispatches: at 64 tokens each GEMM is ~0.03 ms of math,
     // so four submit+fence rounds would cost more than the work (RESULTS 39).
-    if (qrt_gemm_begin(m->gemm, err, err_size) != 0 ||
+    if (qrt_gemm_begin(m->gemm, 0, err, err_size) != 0 ||
         qrt_gemm_record(m->gemm, &gate, err, err_size) != 0 ||
         qrt_gemm_record(m->gemm, &up, err, err_size) != 0 ||
         qrt_gemm_record_swiglu(m->gemm, m->g_out, m->u_out, m->h_qs, m->h_ds, t, ffn, 0, 0,
@@ -328,9 +328,9 @@ int qrt_moe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
     return 0;
 }
 
-int qrt_moe_compute_batch(void * user, uint32_t layer, VkBuffer buf, const uint32_t * experts,
-                          const uint64_t * offsets, const uint64_t * bytes, uint32_t count,
-                          char * err, size_t err_size) {
+int qrt_moe_compute_batch(void * user, uint32_t layer, uint32_t ring, VkBuffer buf,
+                          const uint32_t * experts, const uint64_t * offsets,
+                          const uint64_t * bytes, uint32_t count, char * err, size_t err_size) {
     qrt_moe * m = (qrt_moe *) user;
     if (m == NULL || buf == VK_NULL_HANDLE || experts == NULL || offsets == NULL) {
         return fail(err, err_size, "the batch needs a slot buffer and the expert list");
@@ -346,7 +346,7 @@ int qrt_moe_compute_batch(void * user, uint32_t layer, VkBuffer buf, const uint3
     const uint32_t h_ds_stride = t * (ffn / 32);       // words per expert's ds plane
     const uint32_t o_stride = t * hidden;              // floats per output slice
 
-    if (qrt_gemm_begin(m->gemm, err, err_size) != 0) {
+    if (qrt_gemm_begin(m->gemm, ring, err, err_size) != 0) {
         return -1;
     }
     for (uint32_t e = 0; e < count; ++e) {
@@ -407,7 +407,16 @@ int qrt_moe_compute_batch(void * user, uint32_t layer, VkBuffer buf, const uint3
         }
         ++m->experts_run;
     }
-    return qrt_gemm_submit(m->gemm, err, err_size);
+    // Submit only: the scheduler overlaps the next layer's upload with this one's math.
+    return qrt_gemm_submit_nowait(m->gemm, err, err_size);
+}
+
+int qrt_moe_wait(void * user, uint32_t ring, char * err, size_t err_size) {
+    qrt_moe * m = (qrt_moe *) user;
+    if (m == NULL) {
+        return fail(err, err_size, "no MoE leg to wait for");
+    }
+    return qrt_gemm_wait(m->gemm, ring, err, err_size);
 }
 
 // Canonical dequant of the three K-quants (ggml dequantize_row_q*_K order) times the

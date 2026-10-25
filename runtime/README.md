@@ -196,6 +196,11 @@ build-vulkan/bin/qrt.exe --prefill-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL -
   swiglu, a barrier and down for every expert of the layer into one command buffer. That took
   the compute leg from 2.0 to 3.7 TFLOPS (RESULTS 41). `--prefill-mode perexpert` is the
   earlier one-submit-per-expert shape, kept for comparison.
+- `--prefill-pipeline 1` (default) gives the scheduler two layer buffers and two command rings: layer
+  L+1 is read and uploaded while layer L is still computing, which took 0.272 to 0.190 ms per
+  block (RESULTS 42). `--prefill-pipeline 0` keeps the single buffer for comparison.
+- The two layer buffers (about 952 MiB) come out of the decode expert-cache region during
+  prefill (U-9): the cache is a decode structure and the two phases never run together.
 - In the layer batch every expert gets its own slice of the hidden planes, because a shared
   plane would be overwritten by the next expert's swiglu before this expert's down reads it.
   Expert outputs rotate over eight slices since accumulation into the token rows is not

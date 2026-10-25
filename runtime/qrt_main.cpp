@@ -137,7 +137,8 @@ static int qrt_moe_check(const qrt_config * cfg, const char * prefix, const char
 // M2-5 step 1: layer-first prefill with uploads in flight. Runs the same layer set
 // twice, serial (1 slot) and pipelined (slots), so the overlap is a single variable.
 static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const char * spv,
-                             uint32_t slots, uint32_t layers, int use_moe, int layer_batch) {
+                             uint32_t slots, uint32_t layers, int use_moe, int layer_batch,
+                             int prefill_pipeline) {
     char err[QRT_ERR_SIZE] = {0};
     qrt_vk_dev * dev = NULL;
     if (qrt_vk_open((uint32_t) cfg->vram_tier_mib, &dev, err, sizeof(err)) != 0) {
@@ -228,6 +229,7 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
         pcfg.chunk = cfg->prefill_chunk;
         pcfg.slots = arms[a];
         pcfg.slot_bytes = 0;
+        pcfg.pipeline = (uint32_t) prefill_pipeline;
         qrt_prefill * p = NULL;
         if (qrt_prefill_open(dev, w, &pcfg, &p, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
@@ -247,8 +249,8 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
         qrt_prefill_stats st;
         const int rc_run = layer_batch
                            ? qrt_prefill_run_layers(p, ids.data(), experts, counts.data(),
-                                                    qrt_moe_compute_batch, moe, &st, err,
-                                                    sizeof(err))
+                                                    qrt_moe_compute_batch, qrt_moe_wait, moe,
+                                                    &st, err, sizeof(err))
                            : qrt_prefill_run(p, ids.data(), experts, counts.data(), compute,
                                              user, &st, err, sizeof(err));
         if (rc_run != 0) {
@@ -259,17 +261,20 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
             arm_ms[a] = st.total_ms;
             const double flops = use_moe && moe != NULL
                                  ? (double) qrt_moe_flops(moe) * st.blocks_done : 0.0;
-            printf("prefill mode=%s slots=%u chunk=%u layers=%u of %u blocks=%u done=%u failed=%u "
+            printf("prefill mode=%s pipe=%d slots=%u chunk=%u layers=%u of %u blocks=%u done=%u failed=%u "
                    "bytes=%llu slot_mib=%.2f total_ms=%.1f per_block_ms=%.3f "
                    "read_ms=%.1f upload_ms=%.1f wait_ms=%.1f compute_ms=%.1f "
-                   "gflop=%.1f tflops=%.2f down_skipped=%u reductions=%u\n",
-                   layer_batch ? "layer" : "perexpert", pcfg.slots, pcfg.chunk, (layers),
+                   "gflop=%.1f tflops_wall=%.2f tflops_rec=%.2f down_skipped=%u reductions=%u\n",
+                   layer_batch ? "layer" : "perexpert", prefill_pipeline, pcfg.slots,
+                   pcfg.chunk, (layers),
                    st.layers, st.blocks, st.blocks_done,
                    st.blocks_failed, (unsigned long long) st.bytes,
                    (double) (layer_batch ? 0 : qrt_prefill_slot_bytes(p)) / (1024.0 * 1024.0),
                    st.total_ms,
                    st.total_ms / blocks, st.read_ms, st.upload_ms, st.wait_ms, st.compute_ms,
-                   flops / 1e9, st.compute_ms > 0.0 ? flops / st.compute_ms / 1e9 : 0.0,
+                   flops / 1e9,
+                   st.total_ms > 0.0 ? flops / st.total_ms / 1e9 : 0.0,
+                   st.compute_ms > 0.0 ? flops / st.compute_ms / 1e9 : 0.0,
                    use_moe && moe != NULL ? qrt_moe_down_skipped(moe) - skipped_before : 0,
                    st.slot_reductions);
         }
@@ -814,6 +819,7 @@ int main(int argc, char ** argv) {
     int prefill_layers = 4;
     int prefill_compute_moe = 1;
     int prefill_layer_batch = 1;
+    int prefill_pipeline = 1;
     const char * moe_prefix = NULL;
     int moe_layer = 0;
     int moe_expert = 0;
@@ -882,6 +888,14 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "qrt: --prefill-compute wants probe or moe, not '%s'\n", v);
                 return 2;
             }
+            continue;
+        }
+        if (strcmp(argv[i], "--prefill-pipeline") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --prefill-pipeline wants 0 or 1\n");
+                return 2;
+            }
+            prefill_pipeline = atoi(argv[++i]) ? 1 : 0;
             continue;
         }
         if (strcmp(argv[i], "--prefill-mode") == 0) {
@@ -1060,7 +1074,7 @@ int main(int argc, char ** argv) {
         }
         return qrt_prefill_check(&cfg, prefill_prefix, shader_path.c_str(),
                                  (uint32_t) prefill_slots, (uint32_t) prefill_layers,
-                                 prefill_compute_moe, prefill_layer_batch);
+                                 prefill_compute_moe, prefill_layer_batch, prefill_pipeline);
     }
     if (moe_prefix != NULL) {
         std::string dir = argc > 0 ? argv[0] : "qrt";

@@ -23,10 +23,12 @@ struct qrt_prefill_cfg {
     uint32_t chunk;        // tokens per chunk (QRT_PREFILL_CHUNK), reported only
     uint32_t slots;        // staging buffers in flight; 1 is the serial baseline
     uint32_t slot_bytes;   // 0 = largest expert block in the store
+    uint32_t pipeline;     // 1 = two layer buffers, upload L+1 during compute of L
     uint32_t slot_reductions; // out: slots given up because allocation failed
 };
 
 struct qrt_prefill_stats {
+    uint32_t pipeline;        // 1 when the two layer buffers were used
     uint32_t layers;
     uint32_t blocks;          // blocks the router asked for
     uint32_t blocks_done;
@@ -54,14 +56,24 @@ int qrt_prefill_run(qrt_prefill * p, const uint32_t * ids, uint32_t stride,
 // then the whole layer runs as a single submit. The callback records all of the layer's
 // dispatches into one command buffer and submits once, so the GPU keeps 512 workgroups
 // busy instead of 16 (RESULTS 39).
-typedef int (*qrt_prefill_batch_fn)(void * user, uint32_t layer, VkBuffer buf,
+typedef int (*qrt_prefill_batch_fn)(void * user, uint32_t layer, uint32_t ring, VkBuffer buf,
                                     const uint32_t * experts, const uint64_t * offsets,
                                     const uint64_t * bytes, uint32_t count,
                                     char * err, size_t err_size);
 
+// Waits for one ring of the batch callback's submissions; the scheduler calls it before
+// it reuses that ring's buffer or command buffer.
+typedef int (*qrt_prefill_wait_fn)(void * user, uint32_t ring, char * err, size_t err_size);
+
+// With pipeline = 1 the layer buffers alternate, so layer L+1 is read and uploaded while
+// layer L is still computing. pipeline = 0 is the serial shape, kept for comparison.
 int qrt_prefill_run_layers(qrt_prefill * p, const uint32_t * ids, uint32_t stride,
-                           const uint32_t * counts, qrt_prefill_batch_fn batch, void * user,
-                           qrt_prefill_stats * out, char * err, size_t err_size);
+                           const uint32_t * counts, qrt_prefill_batch_fn batch,
+                           qrt_prefill_wait_fn wait, void * user, qrt_prefill_stats * out,
+                           char * err, size_t err_size);
+
+// How many layer buffers the scheduler keeps (1, or 2 with pipeline on).
+uint32_t qrt_prefill_layer_buffers(const qrt_prefill * p);
 
 // Expected unique experts per layer for `chunk` tokens of top-k routing over
 // `experts`, uniform: the prefill byte volume of RESULTS 11 and design 4.5.
