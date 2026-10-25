@@ -44,6 +44,7 @@ struct qrt_dn_bufs {
     VkBuffer xnorm;     // [tokens][n_embd]  normalised input, input of the gate GEMV
     VkBuffer z;         // [tokens][d_inner] gate projection output (silu input)
     VkBuffer gnorm;     // [tokens][d_inner] gated norm output (ssm_out input)
+    VkBuffer ssm_norm_w; // [head_dim] the gated norm weight
     VkBuffer norm;      // [tokens][n_embd] f32 rms-norm output (the gate input)
 };
 
@@ -87,7 +88,12 @@ int qrt_dn_prep_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens
 //   decay = exp(ssm_a * softplus(alpha + ssm_dt)), beta = sigmoid(beta_raw)
 int qrt_dn_gate_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
                     char * err, size_t err_size);
+// gnorm: out = rms_norm(y, eps) * ssm_norm * silu(z). The norm vector is a device buffer
+// owned by the layer object (qrt_dn_bufs.ssm_norm_w) so the weight loader never grows.
+int qrt_dn_gnorm_run(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size);
 
+void qrt_dn_gnorm_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * y,
+                      const float * z, const float * norm_w, float eps, float * out);
 void qrt_dn_gate_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * xnorm,
                      const float * alpha_w, const float * beta_w, const float * dt,
                      const float * a, float * decay, float * beta);

@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : require
 // DeltaNet gated RMS norm (M2-6c step 2): per (token, v-head) over the 128 head values,
 //   out = rms_norm(raw, eps) * ssm_norm * silu(z)
 // which is build_norm_gated in src/models/qwen35moe.cpp. The result is the input of the
@@ -8,6 +9,7 @@ layout(local_size_x = 128) in;
 
 layout(push_constant) uniform PC {
     uint  head_dim;   // 128
+    uint  m;          // tokens; the gate projection writes [channel][token]
     float eps;
 } pc;
 
@@ -34,6 +36,6 @@ void main() {
         barrier();
     }
     const float scale = inversesqrt(red[0] / float(pc.head_dim) + pc.eps);
-    const float g = zb.z[base + tid];
+    const float g = zb.z[(head * pc.head_dim + tid) * pc.m + tok];
     ob.o[base + tid] = v * scale * wb.w[tid] * (g / (1.0 + exp(-g)));
 }
