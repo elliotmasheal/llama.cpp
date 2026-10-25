@@ -76,7 +76,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=X-2 data=- io=- user=-
+queues: bench=- impl=M2-6c data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -170,6 +170,13 @@ blockers: none
   `-fa on/off` 对照 KLD 1.47e-2 / same top 93.7% -> FAIL，区分度成立。口径判决：fork 的 16 nat
   地板会给尖峰行凭空加最多 2.8% 质量，**PPL 与 KLD 都必须按保留词表重新归一**，fork 打印的 PPL
   不能当门禁读数。见 `RESULTS.md` 第 51 节、`DECISIONS.md` 第 47 节。队列头 -> **X-2**。
+- **X-2 不可跑（2026-10-25）**：它的 CSV schema 由 M3-4 定义，已补 `deps: [M3-4]`；impl 队首改回内核线。
+- **M2-6c 第一步（2026-10-25，partial）**：DeltaNet 递推核对 CPU 双精度参考 `rel_L1 2.3e-07`，
+  状态保存/恢复与串行解码对批量**逐位相同**（token 循环在 shader 内、状态常驻寄存器）；
+  4.75-4.83 us/token -> 30 层 10K **1.46-1.48 s**，是第 45 节整条 attention 预算 1.35 s 的 **1.09x**，
+  理想 0.32 s，所以下一步先做 token 并行再接线 conv1d/投影/gated norm。**可移植性教训**：
+  按 32 写死 lane 组会全错（本机 subgroup=64），subgroup size 现在从设备属性读并特化。
+  见 `RESULTS.md` 第 52 节、`DECISIONS.md` 第 48 节。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、

@@ -236,6 +236,27 @@ build-vulkan/bin/qrt.exe --prefill-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL -
   `VK_KHR_shader_integer_dot_product` when the device has it, and `--prefill-compute moe`
   refuses to run when it does not.
 
+## DeltaNet recurrence (M2-6c)
+
+```
+build-vulkan/bin/qrt.exe --deltanet-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --deltanet-layer 0 --deltanet-tokens 256
+```
+
+- One workgroup owns the state columns of one v-head in groups that follow the device's
+  subgroup size; the 128x128 matrix state lives in registers and the token loop sits inside
+  the shader, so a batched chunk and a token-by-token decode are the same operations in the
+  same order (bitwise identical, RESULTS 52).
+- The kernel takes q (already L2 normalised), k, v, decay (already exp'd) and beta; the prep
+  chain (conv1d(4)+silu, the alpha/beta/dt projections) and the gated RMS norm with `ssm_out`
+  are the next step, so the check feeds random unit q/k and N(0,1) v with the real
+  `ssm_a`/`ssm_dt` for the decay.
+- Speed is the open item: 4.75-4.83 us per token, 1.46-1.48 s for the 30 linear layers of a
+  10K prompt, against 1.35 s for the whole attention budget (DECISIONS 48).
+- **The lane group must not be hard coded to 32.** This device reports subgroup size 64;
+  assuming 32 reduces across 64 lanes, which is silently wrong (rel_L1 1.036) rather than a
+  crash. `qrt_vk_dev` now carries `subgroup_size` and `has_subgroup_arithmetic`, the value is
+  passed as a specialization constant, and the kernel refuses shapes it cannot tile.
+
 ## Telemetry
 
 `--telemetry 1 --telemetry-path <file>` writes a CSV with this header:
@@ -263,6 +284,7 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `vk_dev.h/.cpp` | device, queues, memory types, budget planner, allocator, staging transfers |
 | `weights.h/.cpp` | repacked expert store (index page table, expert reads) and dense residency |
 | `prefill.h/.cpp` | layer-first prefill scheduler, staging ring, read-probe compute leg |
+| `attn_deltanet.h/.cpp`, `attn_deltanet_check.cpp` | DeltaNet delta-rule recurrence (M2-6c) and its CPU reference |
 | `kernels/q4k_gemm.*` | Q4_K x Q8_1 int8 GEMM and swiglu+Q8_1 kernels, one submit per call |
 | `kernels/moe_expert.*` | one expert's gate/up/swiglu/down as a prefill compute callback |
 | `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check`, `--dense-check`, `--prefill-check`, `--moe-check` |

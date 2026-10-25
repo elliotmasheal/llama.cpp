@@ -1648,3 +1648,52 @@ KLD 对独立 float64 参考相对误差 < 0.01%（0.35 logit 噪声 4.0606e-2 v
   n_pos、start_pos、tokens[n_pos+1]、f32 rows）。qrt 按这个格式写一段区间即可与本节基线对比。
 - 参考基线 `bench/raw/x-1/ref-t5-a.bin`（120.3 MiB、254 行）就是 M2-7 与 M2-6a（q4 KV）的 A 侧。
 - **KLD 只看保留词表**：地板以下的排序错误抓不到；要更强的门只能上 fp32 参考基线。
+
+## 52. M2-6c 第一步：DeltaNet 递推核落地，对 CPU 双精度参考 rel_L1 2e-7，状态逐位可保存/恢复（2026-10-25）
+
+口径：`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` layer 0/1（`is_recr` 层），`qrt --deltanet-check`，
+AMD RX 6700S（Vulkan 1.2，**subgroup_size=64**，subgroup arithmetic 可用），平衡电源 + AC。
+输入：`q`/`k` 为随机单位向量（预处理链会做 L2 norm，方向才是有效信息），`v` 为 N(0,1)，
+`decay = exp(ssm_a * softplus(alpha + ssm_dt))` 与 `beta = sigmoid(...)` 用**真实** `ssm_a`/`ssm_dt`。
+**这不是整层前向**：conv1d(4)+silu、alpha/beta 投影、gated RMS norm + `ssm_out` 是第二步。
+
+### 52.1 形状（从张量表推出，与 GGUF 元数据一致）
+
+`head_dim=128`、`n_k_heads=16`（`ssm.group_count`）、`n_v_heads=32`（`ssm.time_step_rank`）、
+`d_inner=4096`、`qk_ch=2048`、`conv_ch=8192`（q 2048 + k 2048 + v 4096）、`conv_taps=4`。
+每个 v-head 的状态是 **128x128 f32 = 64 KiB**，32 头合计 2 MiB/层；30 个线性层 = 60 MiB。
+
+### 52.2 正确性与状态语义
+
+| 项 | 读数 | 判决 |
+|---|---|---|
+| GPU vs CPU 双精度（layer 0，tokens 256） | `rel_L1` **2.31e-07**、`max_abs` 6.7e-08、状态 `rel_L1` 2.53e-07 | PASS（门限 1e-4） |
+| 同上（tokens 128 / 512 / 1024） | 1.85e-07 / 2.77e-07 / 3.09e-07 | PASS |
+| 同上（layer 1） | 2.04e-07 | PASS |
+| 状态保存/恢复：128 + 128 vs 一次 256 | y 与状态 **逐位相同（0.000e+00）** | PASS |
+| 串行解码：64 次单 token vs 一次 64 token | y 与状态 **逐位相同（0.000e+00）** | PASS |
+
+逐位相同是设计结果而不是巧合：token 循环放在 shader 内（一个 workgroup 一个 v-head 的列组，
+状态常驻寄存器，每 token 两次 subgroup 归约），所以批量与串行执行的是同一串运算、同一顺序。
+`-fa` 那种"换个数值路径"的差别在这里不存在，M3 的串行解码可以直接复用同一内核。
+
+### 52.3 速度（r=3，1024 token 的中位）
+
+| layer | 中位 | 每 token | 单层 10K | 30 层 10K |
+|---|---:|---:|---:|---:|
+| 0 | 4.87-4.93 ms | 4.75-4.83 us | 48.7-49.4 ms | **1459-1483 ms** |
+| 1 | 4.86 ms | 4.75 us | 48.6 ms | 1459 ms |
+
+- 折算 **约 655 GFLOPS**（每 token 3x128x128x32x2 = 3.15 MFLOP），是 7.06 TFLOPS 绑定腿的 **9%**。
+- **attention 腿的预算是 1.35 s（第 45 节），单 DeltaNet 已经 1.46-1.48 s**：即 1.09x 预算，
+  还没算 full-attn。瓶颈不是算力而是**串行依赖**：每 token 只有 3x128 次乘加就要等两次归约。
+- 理想值（同样 FLOP 跑 3 TFLOPS）是 **0.32 s**，即当前实现有 4.6x 的空间；
+  下一步要么上 chunked/WY 形式（把 token 维度并行化），要么一头一 workgroup 全 128 列减少冗余读。
+
+### 52.4 一个可移植性教训
+
+第一版把 lane 组按 **32** 写死（跟着 ggml 的 Vulkan `gated_delta_net.comp` 的默认），
+结果 `rel_L1 = 1.036`、状态全错，但**不崩**：本机 subgroup 是 **64**，`subgroupAdd` 归约了 64 条
+而不是 32 条，列映射直接错位。现在 subgroup size 走 `VkPhysicalDeviceSubgroupProperties`
+（`vk_info` 新增 `subgroup_size` 一列），作为 specialization constant 传进 shader，
+`head_dim` 与它不整除时内核直接拒绝而不是算错。这条要写进 design 5.1 的模块约束。

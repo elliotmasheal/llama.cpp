@@ -7,6 +7,7 @@
 #include "vk_dev.h"
 #include "weights.h"
 #include "prefill.h"
+#include "attn_deltanet.h"
 #include "kernels/moe_expert.h"
 
 #include <chrono>
@@ -1085,6 +1086,9 @@ int main(int argc, char ** argv) {
     const char * repack_prefix = NULL;
     const char * gguf_path = NULL;
     const char * require_tensor = NULL;
+    const char * deltanet_gguf = NULL;
+    int deltanet_layer = 0;
+    int deltanet_tokens = 256;
 
     {
         const char * exe = argc > 0 ? argv[0] : "qrt";
@@ -1231,6 +1235,38 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             dense_tensor = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--deltanet-check") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --deltanet-check needs the GGUF path\n");
+                return 2;
+            }
+            deltanet_gguf = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--deltanet-layer") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --deltanet-layer needs an index\n");
+                return 2;
+            }
+            deltanet_layer = atoi(argv[++i]);
+            if (deltanet_layer < 0) {
+                fprintf(stderr, "qrt: --deltanet-layer wants a layer index\n");
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--deltanet-tokens") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --deltanet-tokens needs a count\n");
+                return 2;
+            }
+            deltanet_tokens = atoi(argv[++i]);
+            if (deltanet_tokens < 16) {
+                fprintf(stderr, "qrt: --deltanet-tokens wants at least 16\n");
+                return 2;
+            }
             continue;
         }
         if (strcmp(argv[i], "--dense-tokens") == 0) {
@@ -1410,6 +1446,10 @@ int main(int argc, char ** argv) {
     }
     if (dense_gguf_check != NULL) {
         return qrt_dense_gemm_check(&cfg, dense_gguf_check, dense_tensor, (uint32_t) dense_tokens);
+    }
+    if (deltanet_gguf != NULL) {
+        return qrt_dn_check(deltanet_gguf, (uint32_t) deltanet_layer, (uint32_t) deltanet_tokens,
+                            g_spv_dir);
     }
     if (moe_prefix != NULL) {
         std::string dir = argc > 0 ? argv[0] : "qrt";

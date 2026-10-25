@@ -1017,3 +1017,29 @@ int8 点积"路线上不可达**，要过线必须改变稠密的数值方案（
 
 **开关**：无新增运行时开关。`reference.ps1` 的 `-Ctx/-Batch/-Chunks/-Threads/-Fa/-Ncmoe/-Extra`
 只影响参考侧转储，不进入 qrt。
+
+## 48. M2-6c 第一步判决：DeltaNet 递推核正确且状态可比特，但速度只用掉预算的 1.09x（2026-10-25）
+
+**改了什么**：`runtime/attn_deltanet.{h,cpp}`（内核驱动 + 双精度 CPU 参考）、
+`runtime/attn_deltanet_check.cpp`（`qrt --deltanet-check`）、`runtime/kernels/deltanet_recur.comp`；
+`qrt_main.cpp`/`qrt_config.cpp`/`CMakeLists.txt` 接线；`vk_dev.{h,cpp}` 增加
+`subgroup_size` 与 `has_subgroup_arithmetic`（`--vk-info` 里可看）。
+
+**判决**
+1. **采纳**递推实现：GPU 对 CPU 双精度参考 `rel_L1 = 2.3e-07`（门限 1e-4），状态
+   `2.5e-07`；状态保存/恢复与串行解码对批量**逐位相同**，所以 M3 的串行解码可以复用同一内核，
+   不需要第二套实现。
+2. **口径**：token 循环放在 shader 内（每 workgroup 一个 v-head 的列组，状态常驻寄存器），
+   这是"批量 == 串行"能够逐位成立的唯一原因；一旦改成 token 并行的 chunked 形式，
+   这个等价性就要重新验证（允许 fp 级差异，但要按 X-1 的 U-7 口径报分叉）。
+3. **partial 的原因（性能）**：4.75-4.83 us/token，30 层 10K = **1.46-1.48 s**，而第 45 节给整条
+   attention 腿的预算只有 1.35 s，单 DeltaNet 就 1.09x 超了；折算 655 GFLOPS，只有绑定腿的 9%。
+   理想 0.32 s。**下一步先做 token 并行（chunked/WY 或一头一 workgroup 全 128 列），
+   再谈 conv1d/投影/gated norm 的接线**，否则接完也过不了 PP。
+4. **证伪**：不能按 32 写死 lane 组。本机 subgroup 是 64，写死 32 时 `rel_L1 = 1.036` 且**不报错**，
+   只是全错。subgroup size 现在从设备属性读、作为 specialization constant 传入，且与 `head_dim`
+   不整除时直接拒绝。**这条对其他内核同样适用**（ggml 那边靠 `USE_SUBGROUP_*` 编译开关规避）。
+
+**遗留（进 M2-6c 第二步）**：conv1d(4)+silu、L2 norm、`ssm_alpha`/`ssm_beta`/`ssm_dt` 投影、
+gated RMS norm + `ssm_out`，以及整层对 CPU 参考的端到端比对。并行化提速单独立项，
+因为它是"能不能到 PP 目标"的分水岭。

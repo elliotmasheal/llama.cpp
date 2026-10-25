@@ -8,6 +8,8 @@ add_library(qrt_core STATIC
     gguf_index.cpp
     weights.cpp
     prefill.cpp
+    attn_deltanet.cpp
+    attn_deltanet_check.cpp
     kernels/gemm.cpp
     kernels/moe_expert.cpp
     vk_dev.cpp)
@@ -93,7 +95,18 @@ if(Vulkan_GLSLC_EXECUTABLE)
         DEPENDS ${_qrt_kernels}/swiglu_q8.comp
         COMMENT "Compiling kernels/swiglu_q8.comp"
         VERBATIM)
-    add_custom_target(qrt_shaders DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv})
+    # The DeltaNet recurrence (M2-6c) keeps the 128x128 state in registers and
+    # reduces within 32-lane subgroups, so it needs SPIR-V 1.3 (Vulkan 1.1).
+    set(_qrt_deltanet_spv "${CMAKE_CURRENT_BINARY_DIR}/deltanet_recur.spv")
+    add_custom_command(
+        OUTPUT  ${_qrt_deltanet_spv}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1
+                ${_qrt_kernels}/deltanet_recur.comp -o ${_qrt_deltanet_spv}
+        DEPENDS ${_qrt_kernels}/deltanet_recur.comp
+        COMMENT "Compiling kernels/deltanet_recur.comp"
+        VERBATIM)
+    add_custom_target(qrt_shaders DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv}
+                      ${_qrt_deltanet_spv})
 endif()
 
 add_executable(qrt qrt_main.cpp)
@@ -106,7 +119,8 @@ if(TARGET qrt_shaders)
     add_dependencies(qrt qrt_shaders)
     add_custom_command(TARGET qrt POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} $<TARGET_FILE_DIR:qrt>
+                ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_deltanet_spv}
+                $<TARGET_FILE_DIR:qrt>
         COMMENT "Copying the runtime shaders next to qrt")
 endif()
 

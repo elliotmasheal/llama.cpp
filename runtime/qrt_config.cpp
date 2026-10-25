@@ -384,6 +384,7 @@ void qrt_config_print_switches(FILE * f) {
     fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--require-tensor <name>", "-", "exit 2 when the tensor is missing");
     fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--vk-info", "-", "device, memory types and the VRAM plan");
     fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--vk-alloc-probe <mib>", "-", "allocate once and re-read the budget");
+    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--deltanet-check <path>", "-", "DeltaNet recurrence vs the CPU reference");
     fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--help, -h", "-", "this table");
 }
 

@@ -263,6 +263,23 @@ int qrt_vk_open(uint32_t tier_mib, qrt_vk_dev ** out, char * err, size_t err_siz
     }
     const int dot_ext = has_device_extension(dev->phys, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) ? 1 : 0;
     dev->has_dot_product = (dotf.shaderIntegerDotProduct == VK_TRUE) ? 1 : 0;
+
+    // Subgroup size is not 32 everywhere (RDNA can report wave64 and some iGPUs 8
+    // or 16), and the DeltaNet recurrence reduces across it, so kernels specialize
+    // on the real value instead of assuming it.
+    {
+        VkPhysicalDeviceSubgroupProperties sub;
+        memset(&sub, 0, sizeof(sub));
+        sub.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+        VkPhysicalDeviceProperties2 p2;
+        memset(&p2, 0, sizeof(p2));
+        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        p2.pNext = &sub;
+        vkGetPhysicalDeviceProperties2(dev->phys, &p2);
+        dev->subgroup_size = sub.subgroupSize;
+        dev->has_subgroup_arithmetic =
+            (sub.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) ? 1 : 0;
+    }
     VkPhysicalDeviceVulkan12Features enable12;
     memset(&enable12, 0, sizeof(enable12));
     enable12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
@@ -810,6 +827,8 @@ void qrt_vk_print_info(const qrt_vk_dev * dev, FILE * f) {
     fprintf(f, "alloc_count=%u alloc_mib=%llu alloc_failures=%u cache_reductions=%u io_failures=%u\n",
             dev->alloc_count, (unsigned long long) (dev->alloc_bytes / MIB),
             dev->alloc_failures, dev->cache_reductions, dev->io_failures);
+    fprintf(f, "subgroup_size=%u subgroup_arithmetic=%d dot_product=%d\n", dev->subgroup_size,
+            dev->has_subgroup_arithmetic, dev->has_dot_product);
 }
 
 #else // QRT_HAVE_VULKAN

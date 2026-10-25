@@ -52,6 +52,8 @@ struct qrt_vk_dev {
     uint32_t cache_reductions;  // expert-cache steps given up by the planner
     uint32_t io_failures;       // upload/download fallbacks, same rule
     int      has_dot_product;   // VK_KHR_shader_integer_dot_product enabled
+    uint32_t subgroup_size;     // VkPhysicalDeviceSubgroupProperties, 0 if unknown
+    int      has_subgroup_arithmetic; // subgroup add is available to kernels
 };
 
 // The five buckets of design 5.5 plus what the planner had to give up.

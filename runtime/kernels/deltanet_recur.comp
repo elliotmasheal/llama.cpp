@@ -1,0 +1,95 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// DeltaNet delta-rule recurrence for one v-head column group (M2-6c).
+//
+// The state per v-head is a head_dim x head_dim matrix; column j holds
+// s[0..S_V-1][j]. One workgroup owns COLS_PER_WG columns of one head: each
+// 32-lane subgroup owns one column and each lane holds ROWS_PER_LANE rows in
+// registers, so the whole state stays in registers across the token loop and
+// the two reductions are subgroup adds. Tokens are walked in order inside the
+// shader, which makes a batched prefill chunk and a serial decode produce the
+// same numbers (same operations, same order).
+//
+// Per token, with decay d (already exp'd) and beta b for this head:
+//   sk[j]    = sum_i d * s[i][j] * k[i]
+//   delta[j] = (v[j] - sk[j]) * b
+//   s[i][j]  = d * s[i][j] + k[i] * delta[j]
+//   y[j]     = qscale * sum_i s[i][j] * q[i]
+// which is tools/perplexity-free reference math: build_delta_net_autoregressive
+// in src/models/delta-net-base.cpp.
+
+layout(local_size_x = 128) in;
+
+layout(constant_id = 0) const uint S_V = 128;       // head_dim
+layout(constant_id = 1) const uint SUBGROUP = 32;   // the device's real subgroup size
+
+const uint COLS_PER_WG = (gl_WorkGroupSize.x / SUBGROUP);
+const uint ROWS_PER_LANE = S_V / SUBGROUP;
+
+layout(push_constant) uniform Params {
+    uint  n_tokens;
+    uint  heads;      // n_v_heads
+    uint  kq_ch;      // n_k_heads * S_V, the row stride of the q and k planes
+    uint  k_ratio;    // v-heads per k-head (2 here)
+    float qscale;     // 1/sqrt(S_V), applied to the output
+} pc;
+
+layout(binding = 0) readonly  buffer QBuf    { float q[];     };  // [t][k head][S_V]
+layout(binding = 1) readonly  buffer KBuf    { float kk[];    };
+layout(binding = 2) readonly  buffer VBuf    { float v[];     };  // [t][head][S_V]
+layout(binding = 3) readonly  buffer DecayBuf{ float decay[]; };  // [t][head]
+layout(binding = 4) readonly  buffer BetaBuf { float beta[];  };  // [t][head]
+layout(binding = 5) readonly  buffer StInBuf { float st_in[]; };  // [head][col][row]
+layout(binding = 6) writeonly buffer DstBuf  { float dst[];   };  // [t][head][S_V]
+layout(binding = 7) writeonly buffer StOutBuf{ float st_out[];};
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint col  = gl_WorkGroupID.y * COLS_PER_WG + gl_SubgroupID;
+    const uint head = gl_WorkGroupID.x;
+    const uint khead = head / pc.k_ratio;
+    const uint st_base = (head * S_V + col) * S_V;
+
+    float s[ROWS_PER_LANE];
+    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+        s[r] = st_in[st_base + r * SUBGROUP + lane];
+    }
+
+    const uint qk_base = khead * S_V + lane;
+    const uint v_base  = head * S_V + col;
+
+    for (uint t = 0; t < pc.n_tokens; ++t) {
+        const float d = decay[t * pc.heads + head];
+        const float b = beta[t * pc.heads + head];
+        const float vv = v[t * pc.heads * S_V + v_base];
+
+        float k_lane[ROWS_PER_LANE];
+        float q_lane[ROWS_PER_LANE];
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+            k_lane[r] = kk[(t * pc.kq_ch) + qk_base + r * SUBGROUP];
+            q_lane[r] = q[(t * pc.kq_ch) + qk_base + r * SUBGROUP];
+        }
+
+        float kv = 0.0;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+            kv += d * s[r] * k_lane[r];
+        }
+        const float delta = (vv - subgroupAdd(kv)) * b;
+
+        float acc = 0.0;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+            s[r] = d * s[r] + k_lane[r] * delta;
+            acc += s[r] * q_lane[r];
+        }
+        const float o = subgroupAdd(acc);
+        if (lane == 0u) {
+            dst[t * pc.heads * S_V + v_base] = o * pc.qscale;
+        }
+    }
+
+    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+        st_out[st_base + r * SUBGROUP + lane] = s[r];
+    }
+}
