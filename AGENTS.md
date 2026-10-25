@@ -188,12 +188,17 @@ blockers: none
   `RESULTS 46-50` 的"q8_0 位宽是上限"结论作废；12.9 TFLOPS 高于 design 的 fp32 roofline 7.06
   （int8 dot4 每条指令 4 次乘加），**要不要改 roofline 口径请你定**。见 `RESULTS.md` 第 55 节、
   `DECISIONS.md` 第 51 节。
-- **M2-6c 进度（2026-10-25）**：递推核（对 CPU 双精度 1.5e-07，状态保存/恢复与串行逐位相同）、
-  prep（conv1d+silu+L2 norm，q/k/v 分别 6.1e-08 / 6.1e-08 / 5.1e-08）、gate（decay 1.4e-08、
-  beta 1.2e-07）三块已绿，检查里常驻一条"常量模式"回归；`qrt` 的 stdout 改为无缓冲（崩溃不再丢日志）。
-  未完成：gnorm 接线（两次尝试均崩溃、已回滚，计划见 `DECISIONS` 56.1-56.3）、整层 q8_0 投影串联、
-  递推与 gate 的并行化（现 5.8 / 12.7 us/token，30 层 10K 约 1.8 s / 3.9 s）。
-- **M2-6c 第一步（2026-10-25，partial）**：DeltaNet 递推核对 CPU 双精度参考 `rel_L1 2.3e-07`，
+- **M2-6c done（2026-10-25）**：递推 **4.75 -> 1.23-1.26 us/token（3.85x）**，30 层 10K
+  **1458-1479 -> 377-388 ms**。改法是纯并行度：原版一个 workgroup 只管 2 列、一个头要 64 个
+  workgroup，于是每 token 每层重复读 **2 MiB** 的 k/q（4.75 us 折 419 GB/s，等于 L2 实测上限），
+  新版一个 workgroup 管 32 列、1 列 4 个线程各 32 行、共享内存合 4 片，读降到 128 KiB。
+  **批量 ≡ 串行仍逐位相同（0.000e+00，两个变体都测）**，所以 M2-6c 的 done_when 不用降级；
+  用户提的 **chunked WY 判定为不需要**（同一收益不用付 U-7 代价），三条约束留在 `DECISIONS` 60。
+  中间负结果入账：一线程一整列（128 寄存器）= 6.77 us/token，只 1 wave/SIMD，慢 1.4x。
+  见 `RESULTS.md` 第 63 节、`DECISIONS.md` 第 61 节。队列头 -> **M2-6d（full-attn 批量）**。
+  遗留（给 M2-6 整层串联）：递推变体开关目前只有 C API（`qrt_dn_set_recur`），要补
+  `--dn-recur serial|cols`；整层 q8_0 投影串联未做。
+- **M2-6c 第一步（2026-10-25）**：DeltaNet 递推核对 CPU 双精度参考 `rel_L1 2.3e-07`，
   状态保存/恢复与串行解码对批量**逐位相同**（token 循环在 shader 内、状态常驻寄存器）；
   4.75-4.83 us/token -> 30 层 10K **1.46-1.48 s**，是第 45 节整条 attention 预算 1.35 s 的 **1.09x**，
   理想 0.32 s，所以下一步先做 token 并行再接线 conv1d/投影/gated norm。**可移植性教训**：

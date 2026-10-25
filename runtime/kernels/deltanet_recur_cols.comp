@@ -1,0 +1,111 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+// DeltaNet delta-rule recurrence, token-serial but wide per head (M2-6c).
+//
+// The first kernel gives one workgroup two state columns, so a single head needs 64
+// workgroups and every one of them re-reads that head's whole k/q vector: 2 MiB of
+// replicated reads per token per layer, which is exactly what the 4.8 us/token
+// measurement equals at the L2 rate the gate kernel reached (RESULTS 61). Here a
+// workgroup owns 32 columns of one head (four workgroups per head), a thread owns
+// 32 rows of one column, and the k/q vector is read once per workgroup instead of
+// once per column pair.
+//
+// The row sum is no longer a full-subgroup add: four threads hold the four 32-row
+// slices of a column and meet in shared memory, the same idiom as the gate kernel.
+// The token loop stays inside the shader, so a batched chunk and a serial decode
+// still run the same operations in the same order and agree bit for bit.
+//
+// Per token, with decay d and beta b for this head:
+//   s[i]  = d * s[i]                        (decay folded into the state first)
+//   sk    = sum_i s[i] * k[i]               (four slices, shared-memory sum)
+//   delta = (v - sk) * b
+//   s[i]  = s[i] + k[i] * delta
+//   y     = qscale * sum_i s[i] * q[i]
+
+layout(local_size_x = 128) in;
+
+layout(constant_id = 0) const uint S_V = 128;        // head_dim
+
+const uint COLS_PER_WG = 32;                          // columns one workgroup owns
+const uint SPLIT       = 4;                           // threads per column
+const uint ROWS_PER_THREAD = S_V / SPLIT;
+
+layout(push_constant) uniform Params {
+    uint  n_tokens;
+    uint  heads;      // n_v_heads
+    uint  kq_ch;      // n_k_heads * S_V, the row stride of the q and k planes
+    uint  k_ratio;    // v-heads per k-head (2 here)
+    float qscale;     // 1/sqrt(S_V), applied to the output
+} pc;
+
+layout(binding = 0) readonly  buffer QBuf    { float q[];     };  // [t][k head][S_V]
+layout(binding = 1) readonly  buffer KBuf    { float kk[];    };
+layout(binding = 2) readonly  buffer VBuf    { float v[];     };  // [t][head][S_V]
+layout(binding = 3) readonly  buffer DecayBuf{ float decay[]; };  // [t][head]
+layout(binding = 4) readonly  buffer BetaBuf { float beta[];  };  // [t][head]
+layout(binding = 5) readonly  buffer StInBuf { float st_in[]; };  // [head][col][row]
+layout(binding = 6) writeonly buffer DstBuf  { float dst[];   };  // [t][head][S_V]
+layout(binding = 7) writeonly buffer StOutBuf{ float st_out[];};
+
+shared float red[128];
+shared float red2[128];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint sub  = tid >> 5u;          // which 32-row slice this thread owns
+    const uint cl   = tid & 31u;          // column inside the workgroup
+    const uint col  = gl_WorkGroupID.y * COLS_PER_WG + cl;
+    const uint head = gl_WorkGroupID.x;
+    const uint khead = head / pc.k_ratio;
+    const uint st_base = (head * S_V + col) * S_V + sub * ROWS_PER_THREAD;
+    // four threads of a column meet here; the slot does not depend on sub
+    const uint slot = cl * SPLIT + sub;
+
+    float s[ROWS_PER_THREAD];
+    [[unroll]] for (uint r = 0; r < ROWS_PER_THREAD; ++r) {
+        s[r] = st_in[st_base + r];
+    }
+
+    const uint v_base = head * S_V + col;
+    const uint qk_off = khead * S_V + sub * ROWS_PER_THREAD;
+
+    for (uint t = 0; t < pc.n_tokens; ++t) {
+        const float d = decay[t * pc.heads + head];
+        const float b = beta[t * pc.heads + head];
+        const float vv = v[t * pc.heads * S_V + v_base];
+        const uint  qk = t * pc.kq_ch + qk_off;
+
+        float a0 = 0.0, a1 = 0.0;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_THREAD; r += 2) {
+            s[r] = d * s[r];
+            s[r + 1] = d * s[r + 1];
+            a0 += s[r] * kk[qk + r];
+            a1 += s[r + 1] * kk[qk + r + 1];
+        }
+        red[slot] = a0 + a1;
+        barrier();
+        // all four threads of the column sum the same four slices, so nobody waits
+        const float sk = ((red[slot - sub] + red[slot - sub + 1]) +
+                          (red[slot - sub + 2] + red[slot - sub + 3]));
+        const float delta = (vv - sk) * b;
+
+        float y0 = 0.0, y1 = 0.0;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_THREAD; r += 2) {
+            s[r] = s[r] + kk[qk + r] * delta;
+            s[r + 1] = s[r + 1] + kk[qk + r + 1] * delta;
+            y0 += s[r] * q[qk + r];
+            y1 += s[r + 1] * q[qk + r + 1];
+        }
+        red2[slot] = y0 + y1;
+        barrier();
+        if (sub == 0u) {
+            const float y = ((red2[slot] + red2[slot + 1]) + (red2[slot + 2] + red2[slot + 3]));
+            dst[t * pc.heads * S_V + v_base] = pc.qscale * y;
+        }
+    }
+
+    [[unroll]] for (uint r = 0; r < ROWS_PER_THREAD; ++r) {
+        st_out[st_base + r] = s[r];
+    }
+}

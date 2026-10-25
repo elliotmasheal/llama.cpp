@@ -105,6 +105,17 @@ if(Vulkan_GLSLC_EXECUTABLE)
         DEPENDS ${_qrt_kernels}/deltanet_recur.comp
         COMMENT "Compiling kernels/deltanet_recur.comp"
         VERBATIM)
+    # Wide recurrence variant (M2-6c): a workgroup owns 32 columns of one head, a
+    # thread owns 32 rows of one column, so the k/q vector is read once per
+    # workgroup instead of once per column pair (RESULTS 63).
+    set(_qrt_dn_cols_spv "${CMAKE_CURRENT_BINARY_DIR}/deltanet_recur_cols.spv")
+    add_custom_command(
+        OUTPUT  ${_qrt_dn_cols_spv}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1
+                ${_qrt_kernels}/deltanet_recur_cols.comp -o ${_qrt_dn_cols_spv}
+        DEPENDS ${_qrt_kernels}/deltanet_recur_cols.comp
+        COMMENT "Compiling kernels/deltanet_recur_cols.comp"
+        VERBATIM)
     set(_qrt_dn_gate_spv "${CMAKE_CURRENT_BINARY_DIR}/deltanet_gate.spv")
     add_custom_command(
         OUTPUT  ${_qrt_dn_gate_spv}
@@ -130,7 +141,8 @@ if(Vulkan_GLSLC_EXECUTABLE)
         COMMENT "Compiling kernels/deltanet_prep.comp"
         VERBATIM)
     add_custom_target(qrt_shaders DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv}
-                      ${_qrt_deltanet_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv})
+                      ${_qrt_deltanet_spv} ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv}
+                      ${_qrt_dn_gnorm_spv})
 endif()
 
 add_executable(qrt qrt_main.cpp)
@@ -147,9 +159,10 @@ if(TARGET qrt_shaders)
     add_custom_target(qrt_spv_copy ALL
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_deltanet_spv}
-                ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv} $<TARGET_FILE_DIR:qrt>
+                ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv}
+                $<TARGET_FILE_DIR:qrt>
         DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_deltanet_spv}
-                ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv}
+                ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv}
         COMMENT "Copying the runtime shaders next to qrt")
     add_dependencies(qrt qrt_spv_copy)
 endif()

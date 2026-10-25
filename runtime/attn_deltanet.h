@@ -60,6 +60,11 @@ uint64_t              qrt_dn_state_bytes(const qrt_deltanet * dn);
 // One dispatch for the whole chunk: the shader walks the tokens in order, so a
 // batch and a serial decode run the same operations in the same order.
 int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size);
+// Kernel variant: 0 = two state columns per workgroup with two subgroup reductions
+// per token (the original), 1 = 32 columns per workgroup with a thread-per-row-slice
+// split (shared memory sum). Both keep the token loop inside the shader, so
+// batch == serial holds either way.
+int qrt_dn_set_recur(qrt_deltanet * dn, int cols);
 double qrt_dn_last_ms(const qrt_deltanet * dn);
 
 // Double precision serial reference of the same recurrence, for the gate.

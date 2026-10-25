@@ -92,6 +92,46 @@ double now_ms(void) {
     return std::chrono::duration<double, std::milli>(clock::now() - t0).count();
 }
 
+// DeltaNet recurrence pipelines share one layout and one descriptor set, so the
+// only thing that differs between the variants is the SPIR-V and its spec block.
+int make_dn_pipeline(qrt_vk_dev * dev, VkPipelineLayout layout, const char * spv_dir,
+                     const char * name, const uint32_t * spec, uint32_t n_spec,
+                     VkPipeline * out, char * err, size_t err_size) {
+    VkShaderModule mod = load_module(dev->device, spv_dir, name, err, err_size);
+    if (mod == VK_NULL_HANDLE) {
+        return -1;
+    }
+    VkSpecializationMapEntry sme[4];
+    memset(sme, 0, sizeof(sme));
+    for (uint32_t i = 0; i < n_spec; ++i) {
+        sme[i].constantID = i;
+        sme[i].offset     = i * sizeof(uint32_t);
+        sme[i].size       = sizeof(uint32_t);
+    }
+    VkSpecializationInfo sinfo;
+    memset(&sinfo, 0, sizeof(sinfo));
+    sinfo.mapEntryCount = n_spec;
+    sinfo.pMapEntries   = sme;
+    sinfo.dataSize      = n_spec * sizeof(uint32_t);
+    sinfo.pData         = spec;
+
+    VkComputePipelineCreateInfo cpci;
+    memset(&cpci, 0, sizeof(cpci));
+    cpci.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = mod;
+    cpci.stage.pName  = "main";
+    cpci.stage.pSpecializationInfo = n_spec > 0 ? &sinfo : nullptr;
+    cpci.layout       = layout;
+    const VkResult r = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &cpci, nullptr, out);
+    vkDestroyShaderModule(dev->device, mod, nullptr);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkCreateComputePipelines (deltanet)", r);
+    }
+    return 0;
+}
+
 } // namespace
 
 struct qrt_deltanet {
@@ -124,6 +164,9 @@ struct qrt_deltanet {
     VkDescriptorSet       set;
     VkPipelineLayout      layout;
     VkPipeline            pipe;
+    // 32 columns per workgroup; the same math, no per-token subgroup reduction
+    VkPipeline            pipe_cols;
+    int                   recur_cols;
     VkCommandPool         cmd_pool;
     VkCommandBuffer       cmd;
     VkFence               fence;
@@ -237,41 +280,24 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
         return vk_fail(err, err_size, "vkCreatePipelineLayout (deltanet)", r);
     }
 
-    VkShaderModule mod = load_module(dev->device, spv_dir, "deltanet_recur.spv", err, err_size);
-    if (mod == VK_NULL_HANDLE) {
+    // S_V and the real subgroup size; the lane tiling depends on both
+    const uint32_t spec_serial[2] = { sh->head_dim, subgroup };
+    if (make_dn_pipeline(dev, dn->layout, spv_dir, "deltanet_recur.spv", spec_serial, 2,
+                         &dn->pipe, err, err_size) != 0) {
         qrt_dn_close(dev, dn);
         return -1;
     }
-    VkComputePipelineCreateInfo cpci;
-    memset(&cpci, 0, sizeof(cpci));
-    cpci.sType       = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = mod;
-    cpci.stage.pName  = "main";
-    cpci.layout       = dn->layout;
-    // S_V and the real subgroup size; the lane tiling depends on both
-    VkSpecializationMapEntry sme[2];
-    sme[0].constantID = 0;
-    sme[0].offset     = 0;
-    sme[0].size       = sizeof(uint32_t);
-    sme[1].constantID = 1;
-    sme[1].offset     = sizeof(uint32_t);
-    sme[1].size       = sizeof(uint32_t);
-    uint32_t spec_data[2] = { sh->head_dim, subgroup };
-    VkSpecializationInfo sinfo;
-    memset(&sinfo, 0, sizeof(sinfo));
-    sinfo.mapEntryCount = 2;
-    sinfo.pMapEntries   = sme;
-    sinfo.dataSize      = sizeof(spec_data);
-    sinfo.pData         = spec_data;
-    cpci.stage.pSpecializationInfo = &sinfo;
-    r = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &cpci, nullptr, &dn->pipe);
-    vkDestroyShaderModule(dev->device, mod, nullptr);
-    if (r != VK_SUCCESS) {
-        qrt_dn_close(dev, dn);
-        return vk_fail(err, err_size, "vkCreateComputePipelines (deltanet)", r);
+    // the column variant only needs S_V: the row split is fixed at four threads
+    if (sh->head_dim % 32 == 0) {
+        const uint32_t spec_cols[1] = { sh->head_dim };
+        if (make_dn_pipeline(dev, dn->layout, spv_dir, "deltanet_recur_cols.spv", spec_cols, 1,
+                             &dn->pipe_cols, err, err_size) != 0) {
+            qrt_dn_close(dev, dn);
+            return -1;
+        }
     }
+    // measured default: the column variant is 3.8x faster and keeps batch == serial
+    dn->recur_cols = dn->pipe_cols != VK_NULL_HANDLE ? 1 : 0;
 
     VkDescriptorPoolSize psize;
     memset(&psize, 0, sizeof(psize));
@@ -466,6 +492,7 @@ void qrt_dn_close(qrt_vk_dev * dev, qrt_deltanet * dn) {
     if (dn->cmd_pool != VK_NULL_HANDLE) vkDestroyCommandPool(dev->device, dn->cmd_pool, nullptr);
     if (dn->pool != VK_NULL_HANDLE)     vkDestroyDescriptorPool(dev->device, dn->pool, nullptr);
     if (dn->pipe != VK_NULL_HANDLE)     vkDestroyPipeline(dev->device, dn->pipe, nullptr);
+    if (dn->pipe_cols != VK_NULL_HANDLE) vkDestroyPipeline(dev->device, dn->pipe_cols, nullptr);
     if (dn->layout != VK_NULL_HANDLE)   vkDestroyPipelineLayout(dev->device, dn->layout, nullptr);
     if (dn->dsl != VK_NULL_HANDLE)      vkDestroyDescriptorSetLayout(dev->device, dn->dsl, nullptr);
     free(dn);
@@ -477,6 +504,14 @@ double                qrt_dn_last_ms(const qrt_deltanet * dn) { return dn->last_
 
 uint64_t qrt_dn_state_bytes(const qrt_deltanet * dn) {
     return (uint64_t) dn->sh.n_v_heads * dn->sh.head_dim * dn->sh.head_dim * 4;
+}
+
+int qrt_dn_set_recur(qrt_deltanet * dn, int cols) {
+    if (cols && dn->pipe_cols == VK_NULL_HANDLE) {
+        return -1;
+    }
+    dn->recur_cols = cols ? 1 : 0;
+    return 0;
 }
 
 int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size) {
@@ -503,14 +538,19 @@ int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size
     pcs.kq_ch    = dn->sh.qk_ch;
     pcs.k_ratio  = dn->sh.n_v_heads / dn->sh.n_k_heads;
     pcs.qscale   = 1.0f / sqrtf((float) dn->sh.head_dim);
-    vkCmdBindPipeline(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->pipe);
+    vkCmdBindPipeline(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->recur_cols ? dn->pipe_cols : dn->pipe);
     vkCmdBindDescriptorSets(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
                             &dn->set, 0, nullptr);
     vkCmdPushConstants(dn->cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
-    // one workgroup per (v-head, column group); the group count follows the
-    // device's subgroup size, which the shader is specialized on
-    const uint32_t cols_per_wg = 128u / dn->subgroup;
-    vkCmdDispatch(dn->cmd, dn->sh.n_v_heads, dn->sh.head_dim / cols_per_wg, 1);
+    // serial: one workgroup per (v-head, column group), the group count follows the
+    // device's subgroup size which that shader is specialized on; cols: 32 columns per
+    // workgroup with a thread owning 32 rows of one column
+    if (dn->recur_cols) {
+        vkCmdDispatch(dn->cmd, dn->sh.n_v_heads, dn->sh.head_dim / 32u, 1);
+    } else {
+        const uint32_t cols_per_wg = 128u / dn->subgroup;
+        vkCmdDispatch(dn->cmd, dn->sh.n_v_heads, dn->sh.head_dim / cols_per_wg, 1);
+    }
     r = vkEndCommandBuffer(dn->cmd);
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkEndCommandBuffer (deltanet)", r);

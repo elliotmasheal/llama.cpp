@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "track": "qwen36-runtime",
-  "updated": "2026-10-25",
+  "updated": "2026-10-25T14:40:38+08:00",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6c step 2 is running (prep chain + gated norm). The head is the next runnable task, M2-6d (full-attn batch); M2-6a follows and M2-7 closes M2 (bench). X-2 waits for M3-4"
+      "note": "M2-6c is done (RESULTS 63, DECISIONS 61). M2-6d (full-attn batch) is the head, M2-6a follows, M2-7 closes M2 (bench). X-2 waits for M3-4"
     },
     {
       "lane": "data",
@@ -1191,7 +1191,7 @@
       "id": "M2-6c",
       "milestone": "M2",
       "lane": "impl",
-      "status": "partial",
+      "status": "done",
       "title": "DeltaNet 算子：conv1d(4) + L2 norm + 递推 + gated RMS norm",
       "deps": [],
       "resources": [
@@ -1207,7 +1207,7 @@
         "runtime/README.md"
       ],
       "done_when": "单层 DeltaNet 前向对 CPU 参考逐元素一致（1e-4）；递推状态在 t 步串行解码与批量一致；conv1d 状态可保存/恢复",
-      "note": "performance 2026-10-25: gate 12.7 -> 1.05 us/token and gnorm 6.7 -> 1.19 us/token by giving a warp one head with coalesced reads (shared-memory tree reduce because the device subgroup is 64 wide). prep 0.3 s, gate 0.32 s, gnorm 0.37 s per 30 layers at 10K; the recurrence at 1.75 s is the only leg over the 1.35 s budget, so token parallelism (chunked/WY) is the next and last performance item. Note the side effect: the batch-equals-serial bitwise property will degrade to fp level and must then be reported under the U-7 rule. Then the whole-layer chain with the q8_0 projections. RESULTS 61/62, DECISIONS 59/60"
+      "note": "done 2026-10-25: prep, gate, gnorm and the recurrence all pass against the double precision reference, state save/restore and 64 single-token dispatches are still bitwise identical to one batch. Performance: prep 0.30 s + gate 0.32 s + gnorm 0.37 s + recurrence 0.38 s per 30 layers at 10K (recurrence 4.75 -> 1.23 us/token, 3.85x, by giving a workgroup 32 state columns of one head instead of 2; the 1-thread-per-column attempt was 1.4x slower and is recorded as a negative result). The chunked WY / token parallel scan was judged unnecessary: the same 3.85x came from parallelism alone, which keeps batch == serial and therefore the done_when. RESULTS 63, DECISIONS 61. Open for M2-6: the variant switch is a C API only (add --dn-recur when the layer chain lands) and the whole-layer chain with the q8_0 projections."
     },
     {
       "id": "M2-6d",

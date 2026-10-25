@@ -174,8 +174,10 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
     }
 
     qrt_vk_staging * stg = NULL;
-    const uint64_t stg_bytes = (uint64_t) max_tokens * sh.d_inner * 4 > st_bytes
-                                 ? (uint64_t) max_tokens * sh.d_inner * 4 : st_bytes;
+    // the widest upload is the prep chain's qkv plane (conv_ch per token), not y
+    const uint64_t row_bytes = (uint64_t) (sh.conv_ch > sh.d_inner ? sh.conv_ch : sh.d_inner);
+    const uint64_t stg_bytes = (uint64_t) max_tokens * row_bytes * 4 > st_bytes
+                                 ? (uint64_t) max_tokens * row_bytes * 4 : st_bytes;
     if (qrt_vk_staging_create(dev, stg_bytes, &stg, err, sizeof(err)) != 0) {
         fprintf(stderr, "qrt: %s\n", err);
         qrt_vk_close(dev);
@@ -233,89 +235,109 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
                "conv_ch=%u taps=%u tokens=%u\n", sh.n_embd, sh.head_dim, sh.n_k_heads,
                sh.n_v_heads, sh.d_inner, sh.conv_ch, sh.conv_taps, tokens);
 
-        // 1) GPU against the double precision reference
-        if (upload_range(0, tokens) != 0 || push_state(zero_state.data()) != 0 ||
-            run_chunk(tokens, y_gpu.data(), st_a.data()) != 0) {
-            fprintf(stderr, "qrt: %s\n", err);
-            break;
-        }
+        // 1-3) both recurrence variants: against the double precision reference,
+        // state save and restore, and one token per dispatch
         std::fill(st_cpu.begin(), st_cpu.end(), 0.0);
         qrt_dn_recur_cpu(&sh, tokens, q.data(), k.data(), v.data(), decay.data(), beta.data(),
                          st_cpu.data(), y_cpu.data());
         for (size_t i = 0; i < st_cpu.size(); ++i) {
             st_cpu_f[i] = (float) st_cpu[i];
         }
-        double max_y = 0.0, max_s = 0.0;
-        const double rel_y = rel_l1(y_gpu.data(), y_cpu.data(), (size_t) tokens * sh.d_inner, &max_y);
-        const double rel_s = rel_l1(st_a.data(), st_cpu_f.data(), st_cpu_f.size(), &max_s);
-        const int ok_ref = rel_y <= 1e-4 && rel_s <= 1e-4;
-        printf("dn_recur correct rel_l1=%.3e max_abs=%.3e state_rel_l1=%.3e state_max_abs=%.3e "
-               "verdict=%s\n", rel_y, max_y, rel_s, max_s, ok_ref ? "PASS" : "FAIL");
-
-        // 2) state save and restore: two half chunks must equal one whole chunk
         const uint32_t half = tokens / 2;
         const uint32_t rest = tokens - half;
-        if (push_state(zero_state.data()) != 0 || upload_range(0, half) != 0 ||
-            run_chunk(half, y_split.data(), st_saved.data()) != 0) {
-            fprintf(stderr, "qrt: %s\n", err);
-            break;
-        }
-        // the saved state goes back in, the second half continues from it
-        if (push_state(st_saved.data()) != 0 || upload_range(half, rest) != 0 ||
-            run_chunk(rest, y_split.data(), st_b.data()) != 0) {
-            fprintf(stderr, "qrt: %s\n", err);
-            break;
-        }
-        double max_split = 0.0, max_state = 0.0;
-        const double rel_split = rel_l1(y_split.data(), y_gpu.data() + (size_t) half * sh.d_inner,
-                                        (size_t) rest * sh.d_inner, &max_split);
-        const double rel_state = rel_l1(st_b.data(), st_a.data(), st_a.size(), &max_state);
-        const int ok_split = rel_split == 0.0 && rel_state == 0.0;
-        printf("dn_recur split   half_tokens=%u rel_l1=%.3e max_abs=%.3e state_rel_l1=%.3e "
-               "verdict=%s\n", half, rel_split, max_split, rel_state, ok_split ? "PASS" : "FAIL");
-
-        // 3) serial decode: one token per dispatch must match the same chunk
-        if (push_state(zero_state.data()) != 0 || upload_range(0, serial_tokens) != 0 ||
-            run_chunk(serial_tokens, y_gpu.data() + (size_t) (max_tokens - serial_tokens) * sh.d_inner,
-                      st_serial.data()) != 0) {
-            fprintf(stderr, "qrt: %s\n", err);
-            break;
-        }
-        // the batched reference for the same prefix sits at the tail of y_gpu
-        const float * y_batch_prefix = y_gpu.data() + (size_t) (max_tokens - serial_tokens) * sh.d_inner;
-        std::vector<float> y_batch_prefix_copy(y_batch_prefix, y_batch_prefix +
-                                               (size_t) serial_tokens * sh.d_inner);
-        std::vector<float> st_batch_prefix(st_serial);
         std::vector<float> y_row((size_t) sh.d_inner);
-        int serial_fail = push_state(zero_state.data()) != 0;
-        for (uint32_t t = 0; t < serial_tokens && !serial_fail; ++t) {
-            // in place would be cheaper, but the two state buffers make the copy explicit
-            if (upload_range(t, 1) != 0 || qrt_dn_recur(dn, 1, err, sizeof(err)) != 0 ||
-                qrt_vk_download(dev, stg, b->y, 0, y_row.data(),
-                                (uint64_t) sh.d_inner * 4, err, sizeof(err)) != 0 ||
-                qrt_vk_download(dev, stg, b->state_out, 0, st_serial.data(), st_bytes,
-                                err, sizeof(err)) != 0 ||
-                push_state(st_serial.data()) != 0) {
-                serial_fail = 1;
+        std::vector<float> y_batch_prefix((size_t) serial_tokens * sh.d_inner);
+        std::vector<float> st_batch_prefix((size_t) st_floats);
+        int all_ok = 1;
+        for (int v = 0; v < 2; ++v) {
+            const char * vname = v ? "cols" : "serial";
+            if (qrt_dn_set_recur(dn, v) != 0) {
+                printf("dn_recur variant %s unavailable on this device\n", vname);
+                all_ok = 0;
+                continue;
             }
-            if (!serial_fail) {
-                memcpy(y_split.data() + (size_t) t * sh.d_inner, y_row.data(),
-                       (size_t) sh.d_inner * 4);
+            // 1) GPU against the double precision reference
+            if (upload_range(0, tokens) != 0 || push_state(zero_state.data()) != 0 ||
+                run_chunk(tokens, y_gpu.data(), st_a.data()) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                all_ok = 0;
+                break;
             }
+            double max_y = 0.0, max_s = 0.0;
+            const double rel_y = rel_l1(y_gpu.data(), y_cpu.data(), (size_t) tokens * sh.d_inner, &max_y);
+            const double rel_s = rel_l1(st_a.data(), st_cpu_f.data(), st_cpu_f.size(), &max_s);
+            const int ok_ref = rel_y <= 1e-4 && rel_s <= 1e-4;
+            printf("dn_recur correct variant=%s rel_l1=%.3e max_abs=%.3e state_rel_l1=%.3e "
+                   "state_max_abs=%.3e verdict=%s\n", vname, rel_y, max_y, rel_s, max_s,
+                   ok_ref ? "PASS" : "FAIL");
+            all_ok &= ok_ref;
+
+            // 2) state save and restore: two half chunks must equal one whole chunk
+            if (push_state(zero_state.data()) != 0 || upload_range(0, half) != 0 ||
+                run_chunk(half, y_split.data(), st_saved.data()) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                all_ok = 0;
+                break;
+            }
+            // the saved state goes back in, the second half continues from it
+            if (push_state(st_saved.data()) != 0 || upload_range(half, rest) != 0 ||
+                run_chunk(rest, y_split.data(), st_b.data()) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                all_ok = 0;
+                break;
+            }
+            double max_split = 0.0, max_state = 0.0;
+            const double rel_split = rel_l1(y_split.data(), y_gpu.data() + (size_t) half * sh.d_inner,
+                                            (size_t) rest * sh.d_inner, &max_split);
+            const double rel_state = rel_l1(st_b.data(), st_a.data(), st_a.size(), &max_state);
+            const int ok_split = rel_split == 0.0 && rel_state == 0.0;
+            printf("dn_recur split   variant=%s half_tokens=%u rel_l1=%.3e max_abs=%.3e "
+                   "state_rel_l1=%.3e verdict=%s\n", vname, half, rel_split, max_split, rel_state,
+                   ok_split ? "PASS" : "FAIL");
+            all_ok &= ok_split;
+
+            // 3) serial decode: one token per dispatch must match the same chunk
+            if (push_state(zero_state.data()) != 0 || upload_range(0, serial_tokens) != 0 ||
+                run_chunk(serial_tokens, y_batch_prefix.data(), st_batch_prefix.data()) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                all_ok = 0;
+                break;
+            }
+            int serial_fail = push_state(zero_state.data()) != 0;
+            for (uint32_t t = 0; t < serial_tokens && !serial_fail; ++t) {
+                // in place would be cheaper, but the two state buffers make the copy explicit
+                if (upload_range(t, 1) != 0 || qrt_dn_recur(dn, 1, err, sizeof(err)) != 0 ||
+                    qrt_vk_download(dev, stg, b->y, 0, y_row.data(),
+                                    (uint64_t) sh.d_inner * 4, err, sizeof(err)) != 0 ||
+                    qrt_vk_download(dev, stg, b->state_out, 0, st_serial.data(), st_bytes,
+                                    err, sizeof(err)) != 0 ||
+                    push_state(st_serial.data()) != 0) {
+                    serial_fail = 1;
+                }
+                if (!serial_fail) {
+                    memcpy(y_split.data() + (size_t) t * sh.d_inner, y_row.data(),
+                           (size_t) sh.d_inner * 4);
+                }
+            }
+            if (serial_fail) {
+                fprintf(stderr, "qrt: %s\n", err);
+                all_ok = 0;
+                break;
+            }
+            double max_serial = 0.0, max_serial_state = 0.0;
+            const double rel_serial = rel_l1(y_split.data(), y_batch_prefix.data(),
+                                             (size_t) serial_tokens * sh.d_inner, &max_serial);
+            const double rel_serial_state = rel_l1(st_serial.data(), st_batch_prefix.data(),
+                                                   st_batch_prefix.size(), &max_serial_state);
+            const int ok_serial = rel_serial == 0.0 && rel_serial_state == 0.0;
+            printf("dn_recur serial  variant=%s tokens=%u rel_l1=%.3e max_abs=%.3e state_rel_l1=%.3e "
+                   "verdict=%s\n", vname, serial_tokens, rel_serial, max_serial, rel_serial_state,
+                   ok_serial ? "PASS" : "FAIL");
+            all_ok &= ok_serial;
         }
-        if (serial_fail) {
-            fprintf(stderr, "qrt: %s\n", err);
-            break;
+        if (all_ok == 0) {
+            printf("dn_recur verdict FAIL (see the lines above)\n");
         }
-        double max_serial = 0.0, max_serial_state = 0.0;
-        const double rel_serial = rel_l1(y_split.data(), y_batch_prefix_copy.data(),
-                                         (size_t) serial_tokens * sh.d_inner, &max_serial);
-        const double rel_serial_state = rel_l1(st_serial.data(), st_batch_prefix.data(),
-                                               st_batch_prefix.size(), &max_serial_state);
-        const int ok_serial = rel_serial == 0.0 && rel_serial_state == 0.0;
-        printf("dn_recur serial  tokens=%u rel_l1=%.3e max_abs=%.3e state_rel_l1=%.3e verdict=%s\n",
-               serial_tokens, rel_serial, max_serial, rel_serial_state,
-               ok_serial ? "PASS" : "FAIL");
 
 
         // 5) prep chain: conv1d(taps) + silu + per-head L2 norm against the CPU reference
@@ -502,39 +524,92 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
             }
         }
 
-        // 4) timing at the chunk the prefill scheduler would use
-        if (upload_range(0, max_tokens) != 0 || push_state(zero_state.data()) != 0) {
-            fprintf(stderr, "qrt: %s\n", err);
-            break;
-        }
-        double t[5];
+        // 4) timing at the chunk the prefill scheduler would use, for both variants
+        double us_per_token[2] = { 0.0, 0.0 };
         int time_fail = 0;
-        for (int i = 0; i < 5 && !time_fail; ++i) {
-            if (qrt_dn_recur(dn, max_tokens, err, sizeof(err)) != 0) {
+        for (int v = 0; v < 2 && !time_fail; ++v) {
+            qrt_dn_set_recur(dn, v);
+            if (upload_range(0, max_tokens) != 0 || push_state(zero_state.data()) != 0) {
                 fprintf(stderr, "qrt: %s\n", err);
                 time_fail = 1;
                 break;
             }
-            t[i] = qrt_dn_last_ms(dn);
+            double t[5];
+            for (int i = 0; i < 5; ++i) {
+                if (qrt_dn_recur(dn, max_tokens, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "qrt: %s\n", err);
+                    time_fail = 1;
+                    break;
+                }
+                t[i] = qrt_dn_last_ms(dn);
+            }
+            if (time_fail) {
+                break;
+            }
+            for (int i = 0; i < 5; ++i) {
+                for (int j = i + 1; j < 5; ++j) {
+                    if (t[j] < t[i]) {
+                        const double tmp = t[i];
+                        t[i] = t[j];
+                        t[j] = tmp;
+                    }
+                }
+            }
+            us_per_token[v] = t[2] * 1000.0 / (double) max_tokens;
+            printf("dn_recur timing  variant=%s tokens=%u median_ms=%.3f us_per_token=%.2f "
+                   "layer_10k_ms=%.1f layers30_10k_ms=%.0f\n",
+                   v ? "cols" : "serial", max_tokens, t[2], us_per_token[v],
+                   us_per_token[v] * 10240.0 / 1000.0, us_per_token[v] * 10240.0 * 30.0 / 1000.0);
         }
         if (time_fail) {
             break;
         }
-        for (int i = 0; i < 5; ++i) {
-            for (int j = i + 1; j < 5; ++j) {
-                if (t[j] < t[i]) {
-                    const double tmp = t[i];
-                    t[i] = t[j];
-                    t[j] = tmp;
-                }
-            }
-        }
-        const double us_per_token = t[2] * 1000.0 / (double) max_tokens;
-        printf("dn_recur timing  tokens=%u median_ms=%.3f us_per_token=%.2f layer_10k_ms=%.1f "
-               "layers30_10k_ms=%.0f\n", max_tokens, t[2], us_per_token,
-               us_per_token * 10240.0 / 1000.0, us_per_token * 10240.0 * 30.0 / 1000.0);
 
-        rc = (ok_ref && ok_split && ok_serial) ? 0 : 1;
+        // 5) the two variants against the same double precision reference, and
+        // against each other: they are different summation orders, so this is the
+        // fp level difference a chunked scan would have to report under U-7.
+        {
+            std::vector<float> y_ser((size_t) tokens * sh.d_inner), y_col((size_t) tokens * sh.d_inner);
+            std::vector<float> st_ser((size_t) st_floats), st_col((size_t) st_floats);
+            int cmp_fail = upload_range(0, tokens) != 0;
+            if (!cmp_fail) {
+                qrt_dn_set_recur(dn, 0);
+                cmp_fail = push_state(zero_state.data()) != 0 ||
+                           qrt_dn_recur(dn, tokens, err, sizeof(err)) != 0 ||
+                           qrt_vk_download(dev, stg, b->y, 0, y_ser.data(),
+                                           (uint64_t) tokens * sh.d_inner * 4, err, sizeof(err)) != 0 ||
+                           qrt_vk_download(dev, stg, b->state_out, 0, st_ser.data(), st_bytes,
+                                           err, sizeof(err)) != 0;
+            }
+            if (!cmp_fail) {
+                qrt_dn_set_recur(dn, 1);
+                cmp_fail = push_state(zero_state.data()) != 0 ||
+                           qrt_dn_recur(dn, tokens, err, sizeof(err)) != 0 ||
+                           qrt_vk_download(dev, stg, b->y, 0, y_col.data(),
+                                           (uint64_t) tokens * sh.d_inner * 4, err, sizeof(err)) != 0 ||
+                           qrt_vk_download(dev, stg, b->state_out, 0, st_col.data(), st_bytes,
+                                           err, sizeof(err)) != 0;
+            }
+            if (cmp_fail) {
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            double m1 = 0.0, m2 = 0.0, m3 = 0.0, m4 = 0.0;
+            const double rs_cpu = rel_l1(y_ser.data(), y_cpu.data(), y_ser.size(), &m1);
+            const double rc_cpu = rel_l1(y_col.data(), y_cpu.data(), y_col.size(), &m2);
+            const double rc_ser = rel_l1(y_col.data(), y_ser.data(), y_col.size(), &m3);
+            const double st_ser_col = rel_l1(st_col.data(), st_ser.data(), st_col.size(), &m4);
+            printf("dn_recur compare serial_vs_ref=%.3e cols_vs_ref=%.3e cols_vs_serial=%.3e "
+                   "state_cols_vs_serial=%.3e max_abs=%.3e verdict=%s\n",
+                   rs_cpu, rc_cpu, rc_ser, st_ser_col, m3,
+                   (rs_cpu <= 1e-4 && rc_cpu <= 1e-4) ? "PASS" : "FAIL");
+            if (rs_cpu > 1e-4 || rc_cpu > 1e-4) {
+                break;
+            }
+            qrt_dn_set_recur(dn, 0);
+        }
+
+        rc = all_ok ? 0 : 1;
     } while (0);
 
     qrt_dn_close(dev, dn);
