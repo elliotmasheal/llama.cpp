@@ -1177,7 +1177,7 @@
       ],
       "done_when": "q8_0 权重 x q8_1 激活的 GEMM 对 CPU 参考 rel_L1 <= 1e-5；在 N=8192/K=2048/M=10240 的形状上 >= 5 TFLOPS；与 K-quant GEMM 共用记录/提交接口",
       "claimed_at": "2026-10-25T18:00:00",
-      "note": "slices 1-2: gemm_q8k.comp (Q8_0 x Q8_1) + aligned plane repacking, correct at 1.297e-7, 2.17 -> 3.50 TFLOPS once the working set fits L2. slice 3: the tile shape does not matter (rows 2 vs 8: 3.44 vs 3.52) and L2 residency only buys 33%, so the cap is the q8_0 bit width (half the values per byte of Q4_K, hence 3.5 vs 7.1). PP at this rate is 706 tok/s (RESULTS 48, DECISIONS 45). Open: whether to reduce dense FLOPs (qkv+z merge) or requantise the dense weights, which changes numerics and needs the user"
+      "note": "Q8_0 dense GEMM in the runtime, correct at 1.297e-7, 2.64 TFLOPS on the dense working set and 3.2-3.5 when it fits L2. Tile shape was swept with the build plumbing fixed (RESULTS 49): no effect. User decision 2026-10-25: dense weights must NOT be requantised to 4 bit, so the only path to the 5.2-5.4 TFLOPS that PP 1000 needs is a dedicated kernel that raises operand reuse (4x16 register tile + LDS activation panel + K-panel double buffering)"
     },
     {
       "id": "M2-6c",
