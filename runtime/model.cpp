@@ -189,6 +189,9 @@ int qrt_model_logits(const char * gguf_path, const char * store_prefix, const ch
                 break;
             }
             int lrc = qrt_layer_set_input(layer, x.data(), e, sizeof(e));
+            std::vector<float> xprev(2 * (size_t) E, 0.0f);
+            memcpy(xprev.data(), x.data() + (size_t) (n_tokens - 2) * E, (size_t) E * 4);
+            memcpy(xprev.data() + E, x.data() + (size_t) (n_tokens - 1) * E, (size_t) E * 4);
             if (lrc == 0) {
                 lrc = qrt_layer_zero_state(layer, e, sizeof(e));
             }
@@ -204,7 +207,26 @@ int qrt_model_logits(const char * gguf_path, const char * store_prefix, const ch
                 fprintf(stderr, "qrt: layer %u: %s\n", l, e);
                 break;
             }
-            printf("model_layer layer=%u out_norm=%.4f\n", l, x[(size_t) (n_tokens - 1) * E]);
+            printf("model_layer layer=%u x0=%.4f", l, x[(size_t) (n_tokens - 1) * E]);
+            {
+                // is the layer's contribution token-independent? delta for two adjacent tokens
+                const float * a0 = x.data() + (size_t) (n_tokens - 2) * E;
+                const float * a1 = x.data() + (size_t) (n_tokens - 1) * E;
+                const float * b0 = xprev.data();
+                const float * b1 = xprev.data() + E;
+                double d0 = 0.0, d1 = 0.0, dn = 0.0, nn = 0.0;
+                for (uint32_t i = 0; i < E; ++i) {
+                    const double p = (double) a0[i] - b0[i], q = (double) a1[i] - b1[i];
+                    d0 += p * p;
+                    d1 += q * q;
+                    dn += (p - q) * (p - q);
+                    nn += p * p;
+                }
+                printf(" delta_rms=%.4f/%.4f delta_cos=%.4f",
+                       sqrt(d0 / (double) E), sqrt(d1 / (double) E),
+                       (d0 > 0.0 && d1 > 0.0) ? (d0 + d1 - dn) / (2.0 * sqrt(d0 * d1)) : 0.0);
+            }
+            printf("\n");
         }
         if (cfg.ffn == 0) {
             fprintf(stderr, "qrt: note: no --model-store, the expert half is off\n");
@@ -212,6 +234,19 @@ int qrt_model_logits(const char * gguf_path, const char * store_prefix, const ch
 
         // final norm of the last row, then the head rows we dump
         const uint32_t start = n_tokens - 1u - n_rows;
+        {
+            const float * a = x.data() + (size_t) (n_tokens - 1) * E;
+            const float * b = x.data() + (size_t) (n_tokens - 2) * E;
+            double ab = 0.0, aa = 0.0, bb = 0.0, ra = 0.0;
+            for (uint32_t i = 0; i < E; ++i) {
+                ab += (double) a[i] * b[i];
+                aa += (double) a[i] * a[i];
+                bb += (double) b[i] * b[i];
+            }
+            ra = sqrt(aa / (double) E);
+            printf("model_hidden cos_adj=%.4f rms=%.4f\n",
+                   (aa > 0.0 && bb > 0.0) ? ab / sqrt(aa * bb) : 0.0, ra);
+        }
         FILE * f = fopen(out_path, "wb");
         if (f == NULL) {
             fprintf(stderr, "qrt: cannot write '%s'\n", out_path);
