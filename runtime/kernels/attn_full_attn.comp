@@ -1,0 +1,175 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+// Flash-style causal attention over the f16 KV cache (M2-6d step 2).
+//
+// One workgroup is one (query head, query tile of 32). The KV cache is token major,
+// so the K tile is transposed into shared memory on load (a lane-per-key read of the
+// token-major layout would hit one bank 32 ways); V stays in its own layout because
+// phase 2 reads it eight channels at a time along a row.
+//
+// Per KV block of 32 keys:
+//   scores  S[t][u] = qscale * sum_d Q[t][d] K[u][d]     4 rows x 2 keys per thread
+//   softmax online:  m, l per row, P = exp(S - m), rescale O by exp(m_old - m)
+//   accumulate       O[t][d] += sum_u P[t][u] V[u][d]    8 rows x 8 channels per thread
+// Then O/l and the sigmoid gate that the joint QG projection carries.
+//
+// head_dim is fixed at 256 and the tiles at 32x32: shared memory is 54 KiB per
+// workgroup, which fits this device's 64 KiB and nothing smaller, so qrt_full_open()
+// checks the device limit and refuses instead of overrunning it.
+
+layout(local_size_x = 128) in;
+
+const uint HD  = 256;   // head_dim
+const uint BQ  = 32;    // query rows per workgroup
+const uint BKV = 16;    // keys per tile (see the 32 KiB shared-memory limit)
+const uint KPAD = BKV + 1;              // padding kills the transposed-read conflicts
+const uint NH  = 16;    // n_head
+const uint NKV = 2;     // n_kv
+
+layout(push_constant) uniform PC {
+    uint  pos0;      // position of the first token of the chunk
+    uint  tokens;
+    uint  kv_cap;    // tokens the KV cache holds
+    uint  qg_ch;     // n_head * 2 * head_dim
+    float kq_scale;
+} pc;
+
+layout(binding = 0) readonly  buffer QBuf  { float q[];   };   // [token][NH*HD]
+layout(binding = 1) readonly  buffer KcBuf { uint  kc[];  };   // f16 pairs [kv][cap][HD]
+layout(binding = 2) readonly  buffer VcBuf { uint  vc[];  };   // f16 pairs
+layout(binding = 3) writeonly buffer OutBuf{ float dst[]; };   // [token][NH*HD]
+layout(binding = 4) readonly  buffer QgBuf { float qg[];  };   // [token][qg_ch]
+
+shared float kt[HD * KPAD];          // [d][u], transposed
+shared uint  vt[BKV * (HD / 2)];     // [u][d/2]
+shared float sc[BQ * KPAD + BQ];     // [t][u] then the per-row rescale factors
+shared float ml[2 * BQ];             // m[0..BQ), l[BQ..2BQ)
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint q0   = gl_WorkGroupID.x * BQ;
+    const uint head = gl_WorkGroupID.y;
+    if (q0 >= pc.tokens) {
+        return;
+    }
+    const uint rows = min(BQ, pc.tokens - q0);
+    const uint kvh  = head / (NH / NKV);
+    const uint pos_end = pc.pos0 + pc.tokens;
+
+    // thread -> 8 query rows x 8 channels for the accumulator
+    const uint r0 = 8u * (tid >> 5u);
+    const uint d0 = 8u * (tid & 31u);
+    // thread -> 4 query rows x 1 key for the scores (8 row groups x 16 keys)
+    const uint sr0 = 4u * (tid >> 4u);
+    const uint sk  = tid & 15u;
+
+    if (tid < BQ) {
+        ml[tid]      = -1e30f;
+        ml[BQ + tid] = 0.0f;
+    }
+    float o[64];
+    [[unroll]] for (uint i = 0; i < 64u; ++i) {
+        o[i] = 0.0f;
+    }
+    barrier();
+
+    const uint nkb = (pc.pos0 + q0 + rows + BKV - 1u) / BKV;   // keys are absolute
+    for (uint kb = 0; kb < nkb; ++kb) {
+        const uint kbase = kb * BKV;
+
+        // one read of the KV tile: token major from the cache, transposed for K
+        for (uint idx = tid; idx < BKV * (HD / 2u); idx += 128u) {
+            const uint u  = idx / (HD / 2u);
+            const uint dp = idx % (HD / 2u);
+            const uint kpos = kbase + u;
+            uint word = 0u;
+            uint wordv = 0u;
+            if (kpos < pos_end) {
+                word  = kc[(kvh * pc.kv_cap + kpos) * (HD / 2u) + dp];
+                wordv = vc[(kvh * pc.kv_cap + kpos) * (HD / 2u) + dp];
+            }
+            vt[idx] = wordv;
+            const vec2 h = unpackHalf2x16(word);
+            kt[(2u * dp) * KPAD + u]      = h.x;
+            kt[(2u * dp + 1u) * KPAD + u] = h.y;
+        }
+        barrier();
+
+        // scores: four query rows against one key each
+        float s[4];
+        [[unroll]] for (uint i = 0; i < 4u; ++i) {
+            s[i] = 0.0f;
+        }
+        for (uint d = 0; d < HD; ++d) {
+            const float kd = kt[d * KPAD + sk];
+            [[unroll]] for (uint r = 0; r < 4u; ++r) {
+                s[r] += q[((q0 + sr0 + r) * NH + head) * HD + d] * kd;
+            }
+        }
+        [[unroll]] for (uint r = 0; r < 4u; ++r) {
+            const uint pos_q = pc.pos0 + q0 + sr0 + r;
+            const uint pos_k = kbase + sk;
+            sc[(sr0 + r) * KPAD + sk] = (pos_k <= pos_q) ? s[r] * pc.kq_scale : -1e30f;
+        }
+        barrier();
+
+        // online softmax, one thread per query row
+        if (tid < BQ) {
+            float mx = -1e30f;
+            for (uint u = 0; u < BKV; ++u) {
+                mx = max(mx, sc[tid * KPAD + u]);
+            }
+            const float old  = ml[tid];
+            const float mnew = max(old, mx);
+            const float f    = exp(old - mnew);
+            float sum = 0.0f;
+            for (uint u = 0; u < BKV; ++u) {
+                const float e = exp(sc[tid * KPAD + u] - mnew);
+                sc[tid * KPAD + u] = e;
+                sum += e;
+            }
+            ml[tid]      = mnew;
+            ml[BQ + tid] = ml[BQ + tid] * f + sum;
+            sc[BQ * KPAD + tid] = f;
+        }
+        barrier();
+
+        // rescale the running output, then O += P V
+        [[unroll]] for (uint r = 0; r < 8u; ++r) {
+            const float f = sc[BQ * KPAD + r0 + r];
+            [[unroll]] for (uint j = 0; j < 8u; ++j) {
+                o[r * 8u + j] *= f;
+            }
+        }
+        for (uint u = 0; u < BKV; ++u) {
+            float v[8];
+            const uint base = u * (HD / 2u) + d0 / 2u;
+            [[unroll]] for (uint j = 0; j < 4u; ++j) {
+                const vec2 h = unpackHalf2x16(vt[base + j]);
+                v[2u * j]     = h.x;
+                v[2u * j + 1u] = h.y;
+            }
+            [[unroll]] for (uint r = 0; r < 8u; ++r) {
+                const float p = sc[(r0 + r) * KPAD + u];
+                [[unroll]] for (uint j = 0; j < 8u; ++j) {
+                    o[r * 8u + j] += p * v[j];
+                }
+            }
+        }
+        barrier();
+    }
+
+    // write out: divide by the softmax mass, then the gate
+    [[unroll]] for (uint r = 0; r < 8u; ++r) {
+        if (r0 + r < rows) {
+            const float inv = 1.0f / ml[BQ + r0 + r];
+            const uint tok = q0 + r0 + r;
+            [[unroll]] for (uint j = 0; j < 8u; ++j) {
+                const uint ch = head * 2u * HD + HD + d0 + j;
+                const float g = 1.0f / (1.0f + exp(-qg[tok * pc.qg_ch + ch]));
+                dst[(tok * NH + head) * HD + d0 + j] = o[r * 8u + j] * inv * g;
+            }
+        }
+    }
+}

@@ -89,5 +89,13 @@ void qrt_full_qk_cpu(const qrt_full_shapes * sh, uint32_t pos0, uint32_t tokens,
                      const float * qg, const float * kin, const float * vin,
                      const float * q_norm_w, const float * k_norm_w,
                      float * q_out, float * k_out, float * v_out);
+// Attention rows `rows[i]` (token indices from 0) over their causal range, with the
+// sigmoid gate. kcache/vcache are the dequantized planes [n_kv][n_ctx][head_dim], so
+// the arithmetic is compared without the f16 storage error folded in again. `out`
+// gets one row per entry of `rows`, in that order.
+void qrt_full_attn_rows_cpu(const qrt_full_shapes * sh, uint32_t n_ctx,
+                            const uint32_t * rows, uint32_t n_rows,
+                            const float * q, const float * kcache, const float * vcache,
+                            const float * qg, float * out);
 
 int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const char * spv_dir);

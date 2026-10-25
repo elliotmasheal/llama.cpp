@@ -194,9 +194,23 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
         auto upload = [&](VkBuffer dst, const float * src, uint64_t bytes) -> int {
             return qrt_vk_upload(dev, stg, dst, 0, src, bytes, err, sizeof(err));
         };
-        if (upload(b->qg, qg.data(), (uint64_t) tokens * sh.qg_ch * 4) != 0 ||
-            upload(b->kin, kin.data(), (uint64_t) tokens * sh.kv_ch * 4) != 0 ||
-            upload(b->vin, vin.data(), (uint64_t) tokens * sh.kv_ch * 4) != 0 ||
+        // the staging buffer holds 512 rows, so a long chunk goes up in slices
+        const uint32_t slice = 512;
+        auto upload_rows = [&](VkBuffer dst, const float * base, uint32_t row_floats,
+                               uint32_t t0, uint32_t count) -> int {
+            for (uint32_t off = 0; off < count; off += slice) {
+                const uint32_t n = count - off < slice ? count - off : slice;
+                const size_t at = (size_t) (t0 + off) * row_floats;
+                if (qrt_vk_upload(dev, stg, dst, (uint64_t) at * 4, base + at,
+                                  (uint64_t) n * row_floats * 4, err, sizeof(err)) != 0) {
+                    return -1;
+                }
+            }
+            return 0;
+        };
+        if (upload_rows(b->qg, qg.data(), sh.qg_ch, 0, tokens) != 0 ||
+            upload_rows(b->kin, kin.data(), sh.kv_ch, 0, tokens) != 0 ||
+            upload_rows(b->vin, vin.data(), sh.kv_ch, 0, tokens) != 0 ||
             upload(b->q_norm_w, qnw.data(), (uint64_t) sh.head_dim * 4) != 0 ||
             upload(b->k_norm_w, knw.data(), (uint64_t) sh.head_dim * 4) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
@@ -331,7 +345,89 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
                worst, cos((double) 0 * pow(step, 0.0)), sin((double) 12345 * pow(step, 17.0)),
                worst == 0.0 ? "PASS" : "FAIL");
 
-        rc_out = (ok_q && ok_kv && r2 <= 1e-4 && rk2 <= 1e-3 && ok_append && worst == 0.0) ? 0 : 1;
+        // 5) the attention body: causal, online softmax, gate, over the whole chunk
+        int ok_attn = 0;
+        {
+            if (qrt_full_qk(f, 0, tokens, err, sizeof(err)) != 0 ||
+                qrt_full_attn(f, 0, tokens, err, sizeof(err)) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            const double attn_ms = qrt_full_last_ms(f);
+            const uint64_t kv_reads = qrt_full_last_kv_reads(f);
+
+            std::vector<float> out_gpu((size_t) tokens * sh.n_head * sh.head_dim);
+            std::vector<float> q_full((size_t) tokens * sh.n_head * sh.head_dim);
+            std::vector<float> kd((size_t) sh.n_kv * n_ctx * sh.head_dim);
+            std::vector<float> vd(kd.size());
+            if (qrt_vk_download(dev, stg, b->out, 0, out_gpu.data(),
+                                (uint64_t) out_gpu.size() * 4, err, sizeof(err)) != 0 ||
+                qrt_vk_download(dev, stg, b->q, 0, q_full.data(),
+                                (uint64_t) q_full.size() * 4, err, sizeof(err)) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            // unpack the cache the kernel actually read into f32 reference planes
+            for (uint32_t h = 0; h < sh.n_kv; ++h) {
+                for (uint32_t t = 0; t < tokens; ++t) {
+                    const size_t slot = ((size_t) h * n_ctx + t) * sh.head_dim;
+                    for (uint32_t i = 0; i < sh.head_dim; i += 2) {
+                        const uint32_t pair_k = kc[slot / 2 + i / 2];
+                        kd[slot + i]     = half_to_float(pair_k & 0xffffu);
+                        kd[slot + i + 1] = half_to_float(pair_k >> 16);
+                        const uint32_t pair_v = vc[slot / 2 + i / 2];
+                        vd[slot + i]     = half_to_float(pair_v & 0xffffu);
+                        vd[slot + i + 1] = half_to_float(pair_v >> 16);
+                    }
+                }
+            }
+            // the longest causal ranges are the interesting ones; a full sweep runs
+            // when the chunk is small enough for the double reference to finish
+            std::vector<uint32_t> rows;
+            if (tokens <= 512) {
+                for (uint32_t t = 0; t < tokens; ++t) {
+                    rows.push_back(t);
+                }
+            } else {
+                const uint32_t cand[8] = { tokens - 1, tokens - 2, tokens - 9, tokens - 33,
+                                           tokens / 2, tokens / 3, 1, 0 };
+                for (int i = 0; i < 8; ++i) {
+                    if (cand[i] < tokens) {
+                        rows.push_back(cand[i]);
+                    }
+                }
+            }
+            std::vector<float> ref((size_t) rows.size() * sh.n_head * sh.head_dim, 0.0f);
+            qrt_full_attn_rows_cpu(&sh, n_ctx, rows.data(), (uint32_t) rows.size(), q_full.data(),
+                                   kd.data(), vd.data(), qg.data(), ref.data());
+            double worst_rel = 0.0, worst_abs = 0.0;
+            for (size_t ri = 0; ri < rows.size(); ++ri) {
+                const size_t base = (size_t) rows[ri] * sh.n_head * sh.head_dim;
+                double mx = 0.0;
+                const double r = rel_l1(out_gpu.data() + base, ref.data() + ri * sh.n_head * sh.head_dim,
+                                        (size_t) sh.n_head * sh.head_dim, &mx);
+                worst_rel = fmax(worst_rel, r);
+                worst_abs = fmax(worst_abs, mx);
+            }
+            // the KV account: bytes the kernel read per layer against the plane size
+            const double kv_bytes_plane = (double) sh.n_kv * tokens * sh.head_dim * 2.0;
+            const double implied = (double) kv_reads / (attn_ms * 1e-3) / 1e9;
+            const double ratio = (double) kv_reads / (2.0 * kv_bytes_plane);
+            ok_attn = worst_rel <= 1e-4;
+            printf("full_attn    tokens=%u rows=%zu rel_l1=%.3e max_abs=%.3e ms=%.3f "
+                   "attn_tflops=%.2f kv_read_gib=%.2f kv_plane_mib=%.1f kv_reads_per_plane=%.1f "
+                   "implied_gb_s=%.1f verdict=%s\n",
+                   tokens, rows.size(), worst_rel, worst_abs, attn_ms,
+                   // 2 x HD x 2 flops per pair, one pair per (query, key, head)
+                   (double) tokens * (tokens + 1) / 2.0 * sh.n_head * sh.head_dim * 4.0 /
+                       (attn_ms * 1e-3) / 1e12,
+                   (double) kv_reads / (1024.0 * 1024.0 * 1024.0),
+                   2.0 * kv_bytes_plane / (1024.0 * 1024.0), ratio, implied,
+                   ok_attn ? "PASS" : "FAIL");
+        }
+
+        rc_out = (ok_q && ok_kv && r2 <= 1e-4 && rk2 <= 1e-3 && ok_append && worst == 0.0 &&
+                  ok_attn) ? 0 : 1;
     } while (0);
 
     qrt_full_close(dev, f);

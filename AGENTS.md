@@ -76,7 +76,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M3-0 data=- io=- user=-
+queues: bench=- impl=M2-6d data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -198,12 +198,16 @@ blockers: none
   见 `RESULTS.md` 第 63 节、`DECISIONS.md` 第 61 节。队列头 -> **M2-6d（full-attn 批量）**。
   遗留（给 M2-6 整层串联）：递推变体开关目前只有 C API（`qrt_dn_set_recur`），要补
   `--dn-recur serial|cols`；整层 q8_0 投影串联未做。
-- **M2-6c 第一步（2026-10-25）**：DeltaNet 递推核对 CPU 双精度参考 `rel_L1 2.3e-07`，
-  状态保存/恢复与串行解码对批量**逐位相同**（token 循环在 shader 内、状态常驻寄存器）；
-  4.75-4.83 us/token -> 30 层 10K **1.46-1.48 s**，是第 45 节整条 attention 预算 1.35 s 的 **1.09x**，
-  理想 0.32 s，所以下一步先做 token 并行再接线 conv1d/投影/gated norm。**可移植性教训**：
-  按 32 写死 lane 组会全错（本机 subgroup=64），subgroup size 现在从设备属性读并特化。
-  见 `RESULTS.md` 第 52 节、`DECISIONS.md` 第 48 节。
+- **M2-6d partial（2026-10-25）**：full-attn 两半都通了且正确——qk norm+IMRoPE+f16 KV 追加
+  对双精度参考 **5e-07**（10K 的第二 chunk 追加不动第一段，IMRoPE 与 NEOX theta 差 0）；
+  flash 因果注意力 + 在线 softmax + sigmoid 门 **1.2-2.4e-06**（含 10K 按最长因果范围抽 8 行）。
+  **性能未达标**：10K 时 **1.60 TFLOPS / 538 ms 每层**，11 层 5.9 s 是 1.6 s 预算的 3.7x，
+  按此 PP 约 812。诊断：**不是 KV 带宽**（反推 50 GB/s，DRAM 156）、不是 FLOPs，
+  而是本机 `maxComputeSharedMemorySize=32768` 逼出 Bkv=16 小 tile + Q 每块重读。
+  已证伪：Q 读改 `vec4` 反而慢 1.7x（22.3 -> 37.5 ms）。**"KV 只读一次"字面口径未满足**
+  （10K 读 1284 倍平面），可行目标是"DRAM 每层一次 + 重复读命中 32 MB L2"，需用户确认口径。
+  下一轮入口按收益排序写在 `DECISIONS.md` 63（swizzled f16 K tile、Bq=64）。
+  见 `RESULTS.md` 第 64-65 节、`DECISIONS.md` 第 62-63 节。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、

@@ -151,9 +151,17 @@ if(Vulkan_GLSLC_EXECUTABLE)
         DEPENDS ${_qrt_kernels}/attn_full_qk.comp
         COMMENT "Compiling kernels/attn_full_qk.comp"
         VERBATIM)
+    set(_qrt_full_attn_spv "${CMAKE_CURRENT_BINARY_DIR}/attn_full_attn.spv")
+    add_custom_command(
+        OUTPUT  ${_qrt_full_attn_spv}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1
+                ${_qrt_kernels}/attn_full_attn.comp -o ${_qrt_full_attn_spv}
+        DEPENDS ${_qrt_kernels}/attn_full_attn.comp
+        COMMENT "Compiling kernels/attn_full_attn.comp"
+        VERBATIM)
     add_custom_target(qrt_shaders DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv}
                       ${_qrt_deltanet_spv} ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv}
-                      ${_qrt_dn_gnorm_spv} ${_qrt_full_qk_spv})
+                      ${_qrt_dn_gnorm_spv} ${_qrt_full_qk_spv} ${_qrt_full_attn_spv})
 endif()
 
 add_executable(qrt qrt_main.cpp)
@@ -171,10 +179,10 @@ if(TARGET qrt_shaders)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_deltanet_spv}
                 ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv}
-                ${_qrt_full_qk_spv} $<TARGET_FILE_DIR:qrt>
+                ${_qrt_full_qk_spv} ${_qrt_full_attn_spv} $<TARGET_FILE_DIR:qrt>
         DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_deltanet_spv}
                 ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv}
-                ${_qrt_full_qk_spv}
+                ${_qrt_full_qk_spv} ${_qrt_full_attn_spv}
         COMMENT "Copying the runtime shaders next to qrt")
     add_dependencies(qrt qrt_spv_copy)
 endif()

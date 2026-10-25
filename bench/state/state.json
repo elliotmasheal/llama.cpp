@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "track": "qwen36-runtime",
-  "updated": "2026-10-25T15:03:09+08:00",
+  "updated": "2026-10-25T15:18:03+08:00",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M3-0",
+      "head": "M2-6d",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6d is running (step 1 in, attention kernel next); head is the next runnable task M2-6a, then M2-7 closes M2 (bench). X-2 waits for M3-4"
+      "note": "M2-6d is partial: correctness gates pass, the attention kernel needs the tile work listed in DECISIONS 63; M2-6a and M2-7 follow"
     },
     {
       "lane": "data",
@@ -1213,7 +1213,7 @@
       "id": "M2-6d",
       "milestone": "M2",
       "lane": "impl",
-      "status": "doing",
+      "status": "partial",
       "title": "full-attn 批量：per-head RMS norm + IMRoPE + flash 因果注意力 + sigmoid 门",
       "deps": [],
       "resources": [
@@ -1229,8 +1229,7 @@
         "bench/DECISIONS.md"
       ],
       "done_when": "10K 因果注意力对 CPU 参考 rel_L1 <= 1e-4；KV 只读一次（每层一次 K/V 读）；IMRoPE 的 sections/freq 与参考一致",
-      "claimed_at": "2026-10-25T15:03:09+08:00",
-      "note": "step 1 done 2026-10-25: metadata (attention.head_count, rope.dimension_count, rope.freq_base, rope.dimension_sections) now parsed by gguf_index; kernels/attn_full_qk.comp does the per-head RMS norm, IMRoPE and the f16 KV append. Checked against a double precision reference: q rel_L1 5e-07, f16 K/V error 3.5e-04 (the format bound), second chunk at pos 1024 appends without touching the first. Step 2 is the flash causal attention kernel plus the gate and the 10K check. Paths extended by gguf_index/qrt_main/CMakeLists because the attention needs the rope keys from the metadata; recorded in DECISIONS 62"
+      "note": "partial 2026-10-25: both halves are in and correct. Step 1 (per-head RMS norm + IMRoPE + f16 KV append) matches the double reference at 5e-07; step 2 (flash causal attention + online softmax + sigmoid gate) matches at 1.2-2.4e-06 including the 10K case on the longest causal rows. Performance is the open item: 1.60 TFLOPS at 10K (538 ms/layer, 11 layers = 5.9 s against a 1.6 s budget, PP about 812). Diagnosed as instruction/LDS bound, not KV bandwidth (implied 50 GB/s vs DRAM 156) and not FLOPs; the 32768 B shared-memory limit forces Bkv=16 with head_dim 256. Also open: the literal 'KV read once per layer' is not met (1284x plane per layer at 10K); the workable target is DRAM once per layer with L2 for the repeats, which needs the Bq=64 and swizzled-K tiles listed in DECISIONS 63, and a user call on the criterion. RESULTS 64/65, DECISIONS 62/63. Next entries are ranked in DECISIONS 63"
     }
   ],
   "last_gate": {

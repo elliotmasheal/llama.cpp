@@ -214,10 +214,14 @@ struct qrt_full {
     uint64_t        last_kv_reads;
 
     VkDescriptorSetLayout qk_dsl;
+    VkDescriptorSetLayout attn_dsl;
     VkDescriptorPool      pool;
     VkDescriptorSet       qk_set;
+    VkDescriptorSet       attn_set;
     VkPipelineLayout      qk_layout;
+    VkPipelineLayout      attn_layout;
     VkPipeline            qk_pipe;
+    VkPipeline            attn_pipe;
     VkCommandPool         cmd_pool;
     VkCommandBuffer       cmd;
     VkFence               fence;
@@ -300,6 +304,24 @@ int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes 
         qrt_full_close(dev, f);
         return -1;
     }
+    // the attention kernel needs 27.5 KiB of shared memory per workgroup
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(dev->phys, &props);
+    if (props.limits.maxComputeSharedMemorySize < 28u * 1024u) {
+        qrt_full_close(dev, f);
+        return fail(err, err_size, "the attention kernel needs 28160 bytes of shared memory, "
+                    "this device has %u", props.limits.maxComputeSharedMemorySize);
+    }
+    if (make_set_layout(dev, 5, &f->attn_dsl, err, err_size) != 0 ||
+        make_layout(dev, f->attn_dsl, 5 * sizeof(uint32_t), &f->attn_layout, err, err_size) != 0) {
+        qrt_full_close(dev, f);
+        return -1;
+    }
+    if (make_pipeline(dev, f->attn_layout, spv_dir, "attn_full_attn.spv", NULL, 0, &f->attn_pipe,
+                      err, err_size) != 0) {
+        qrt_full_close(dev, f);
+        return -1;
+    }
     const uint32_t spec[4] = { sh->head_dim, sh->n_rot, sh->n_head, sh->n_kv };
     if (make_pipeline(dev, f->qk_layout, spv_dir, "attn_full_qk.spv", spec, 4, &f->qk_pipe,
                       err, err_size) != 0) {
@@ -331,8 +353,16 @@ int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes 
     r = vkAllocateDescriptorSets(dev->device, &dsai, &f->qk_set);
     if (r != VK_SUCCESS) {
         qrt_full_close(dev, f);
+        return vk_fail(err, err_size, "vkAllocateDescriptorSets (full attention qk)", r);
+    }
+    dsai.pSetLayouts = &f->attn_dsl;
+    r = vkAllocateDescriptorSets(dev->device, &dsai, &f->attn_set);
+    if (r != VK_SUCCESS) {
+        qrt_full_close(dev, f);
         return vk_fail(err, err_size, "vkAllocateDescriptorSets (full attention)", r);
     }
+    VkBuffer attn_bufs[5] = { f->bufs.q, f->bufs.kcache, f->bufs.vcache, f->bufs.out, f->bufs.qg };
+    write_set(dev, f->attn_set, attn_bufs, 5);
     VkBuffer qk_bufs[8] = { f->bufs.qg, f->bufs.kin, f->bufs.vin, f->bufs.q,
                             f->bufs.kcache, f->bufs.vcache, f->bufs.q_norm_w, f->bufs.k_norm_w };
     write_set(dev, f->qk_set, qk_bufs, 8);
@@ -383,11 +413,14 @@ void qrt_full_close(qrt_vk_dev * dev, qrt_full * f) {
         }
     }
     if (f->qk_pipe != VK_NULL_HANDLE)    vkDestroyPipeline(dev->device, f->qk_pipe, nullptr);
+    if (f->attn_pipe != VK_NULL_HANDLE)  vkDestroyPipeline(dev->device, f->attn_pipe, nullptr);
     if (f->fence != VK_NULL_HANDLE)      vkDestroyFence(dev->device, f->fence, nullptr);
     if (f->cmd_pool != VK_NULL_HANDLE)   vkDestroyCommandPool(dev->device, f->cmd_pool, nullptr);
     if (f->pool != VK_NULL_HANDLE)       vkDestroyDescriptorPool(dev->device, f->pool, nullptr);
     if (f->qk_layout != VK_NULL_HANDLE)  vkDestroyPipelineLayout(dev->device, f->qk_layout, nullptr);
+    if (f->attn_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(dev->device, f->attn_layout, nullptr);
     if (f->qk_dsl != VK_NULL_HANDLE)     vkDestroyDescriptorSetLayout(dev->device, f->qk_dsl, nullptr);
+    if (f->attn_dsl != VK_NULL_HANDLE)   vkDestroyDescriptorSetLayout(dev->device, f->attn_dsl, nullptr);
     free(f);
 }
 
@@ -475,8 +508,45 @@ int qrt_full_qk(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t
 }
 
 int qrt_full_attn(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t err_size) {
-    (void) f; (void) pos0; (void) tokens;
-    return fail(err, err_size, "the attention kernel lands in the next round of M2-6d");
+    if (tokens == 0 || tokens > f->max_tokens) {
+        return fail(err, err_size, "chunk of %u tokens does not fit %u", tokens, f->max_tokens);
+    }
+    if (pos0 + tokens > f->n_ctx) {
+        return fail(err, err_size, "positions %u..%u are past the %u token KV cache",
+                    pos0, pos0 + tokens, f->n_ctx);
+    }
+    if (begin_cmd(f, err, err_size) != 0) {
+        return -1;
+    }
+    struct {
+        uint32_t pos0;
+        uint32_t tokens;
+        uint32_t kv_cap;
+        uint32_t qg_ch;
+        float    kq_scale;
+    } pc;
+    pc.pos0     = pos0;
+    pc.tokens   = tokens;
+    pc.kv_cap   = f->n_ctx;
+    pc.qg_ch    = f->sh.qg_ch;
+    pc.kq_scale = f->sh.kq_scale;
+    vkCmdBindPipeline(f->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->attn_pipe);
+    vkCmdBindDescriptorSets(f->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, f->attn_layout, 0, 1,
+                            &f->attn_set, 0, nullptr);
+    vkCmdPushConstants(f->cmd, f->attn_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    // one workgroup per (query tile of 32, query head)
+    vkCmdDispatch(f->cmd, (tokens + 31u) / 32u, f->sh.n_head, 1);
+
+    // the account the "KV read once" claim is checked against: every query tile scans
+    // the KV tiles up to its own diagonal
+    uint64_t tiles = 0;
+    for (uint32_t q0 = 0; q0 < tokens; q0 += 32u) {
+        const uint32_t rows = tokens - q0 < 32u ? tokens - q0 : 32u;
+        tiles += (q0 + rows + 31u) / 32u;
+    }
+    f->last_kv_reads = tiles * f->sh.n_head * 32ull * f->sh.head_dim * 2ull * 2ull;
+
+    return submit_and_wait(f, err, err_size);
 }
 
 // ---------------------------------------------------------------- references
@@ -534,6 +604,54 @@ void qrt_full_qk_cpu(const qrt_full_shapes * sh, uint32_t pos0, uint32_t tokens,
     }
 }
 
+void qrt_full_attn_rows_cpu(const qrt_full_shapes * sh, uint32_t n_ctx,
+                            const uint32_t * rows, uint32_t n_rows,
+                            const float * q, const float * kcache, const float * vcache,
+                            const float * qg, float * out) {
+    const uint32_t hd = sh->head_dim;
+    std::vector<double> acc(hd);
+    for (uint32_t ri = 0; ri < n_rows; ++ri) {
+        const uint32_t t = rows[ri];
+        for (uint32_t h = 0; h < sh->n_head; ++h) {
+            const uint32_t kvh = h / (sh->n_head / sh->n_kv);
+            // causal range is [0, t]
+            std::vector<double> scores((size_t) t + 1);
+            double mx = -1e30;
+            for (uint32_t u = 0; u <= t; ++u) {
+                double dot = 0.0;
+                const float * krow = kcache + ((size_t) kvh * n_ctx + u) * hd;
+                const float * qrow = q + ((size_t) t * sh->n_head + h) * hd;
+                for (uint32_t d = 0; d < hd; ++d) {
+                    dot += (double) qrow[d] * (double) krow[d];
+                }
+                scores[u] = dot * (double) sh->kq_scale;
+                mx = fmax(mx, scores[u]);
+            }
+            double sum = 0.0;
+            for (uint32_t u = 0; u <= t; ++u) {
+                scores[u] = exp(scores[u] - mx);
+                sum += scores[u];
+            }
+            for (uint32_t d = 0; d < hd; ++d) {
+                acc[d] = 0.0;
+            }
+            for (uint32_t u = 0; u <= t; ++u) {
+                const float * vrow = vcache + ((size_t) kvh * n_ctx + u) * hd;
+                const double p = scores[u] / sum;
+                for (uint32_t d = 0; d < hd; ++d) {
+                    acc[d] += p * (double) vrow[d];
+                }
+            }
+            float * dst = out + ((size_t) ri * sh->n_head + h) * hd;
+            for (uint32_t d = 0; d < hd; ++d) {
+                const uint32_t ch = h * 2 * hd + hd + d;
+                const double g = 1.0 / (1.0 + exp(-(double) qg[(size_t) t * sh->qg_ch + ch]));
+                dst[d] = (float) (acc[d] * g);
+            }
+        }
+    }
+}
+
 #else // QRT_HAVE_VULKAN
 
 int qrt_full_shapes_from_gguf(const qrt_gguf_hparams * hp, qrt_full_shapes * out,
@@ -571,6 +689,13 @@ void qrt_full_qk_cpu(const qrt_full_shapes * sh, uint32_t pos0, uint32_t tokens,
                      float * q_out, float * k_out, float * v_out) {
     (void) sh; (void) pos0; (void) tokens; (void) qg; (void) kin; (void) vin;
     (void) q_norm_w; (void) k_norm_w; (void) q_out; (void) k_out; (void) v_out;
+}
+void qrt_full_attn_rows_cpu(const qrt_full_shapes * sh, uint32_t n_ctx,
+                            const uint32_t * rows, uint32_t n_rows,
+                            const float * q, const float * kcache, const float * vcache,
+                            const float * qg, float * out) {
+    (void) sh; (void) n_ctx; (void) rows; (void) n_rows; (void) q; (void) kcache;
+    (void) vcache; (void) qg; (void) out;
 }
 
 #endif // QRT_HAVE_VULKAN
