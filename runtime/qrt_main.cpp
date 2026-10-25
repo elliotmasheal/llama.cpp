@@ -215,6 +215,8 @@ static int qrt_dense_gemm_check(const qrt_config * cfg, const char * gguf_path,
     VkDeviceMemory ads_mem = VK_NULL_HANDLE;
     VkBuffer out = VK_NULL_HANDLE;
     VkDeviceMemory out_mem = VK_NULL_HANDLE;
+    VkBuffer out2 = VK_NULL_HANDLE;
+    VkDeviceMemory out2_mem = VK_NULL_HANDLE;
     qrt_vk_staging * stg = NULL;
     unsigned char * host_qs = NULL;
     uint32_t * host_ds = NULL;
@@ -282,42 +284,74 @@ static int qrt_dense_gemm_check(const qrt_config * cfg, const char * gguf_path,
         args.type = QRT_QUANT_Q8_0;
 
         // Correctness: first 32 rows x check_tokens, against the canonical q8_0 dequant.
-        if (qrt_gemm_dispatch(gemm, &args, err, sizeof(err)) != 0) {
+        // Two dispatches go into one command buffer with their own output buffers: the old
+        // shared-set design made the second write apply to both (DECISIONS 65.2).
+        if (qrt_vk_alloc(dev, (uint64_t) check_tokens * n * 4,
+                         QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC, &out2, &out2_mem,
+                         err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            break;
+        }
+        qrt_gemm_args args2 = args;
+        args2.out = out2;
+        if (qrt_gemm_begin(gemm, 0, err, sizeof(err)) != 0 ||
+            qrt_gemm_record(gemm, &args, err, sizeof(err)) != 0 ||
+            qrt_gemm_record(gemm, &args2, err, sizeof(err)) != 0 ||
+            qrt_gemm_submit(gemm, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             break;
         }
         std::vector<float> got((size_t) check_tokens * n);
+        std::vector<float> got2((size_t) check_tokens * n);
         if (qrt_vk_download(dev, stg, out, 0, got.data(), (uint64_t) check_tokens * n * 4,
+                            err, sizeof(err)) != 0 ||
+            qrt_vk_download(dev, stg, out2, 0, got2.data(), (uint64_t) check_tokens * n * 4,
                             err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             break;
         }
         const uint32_t rows = 32;
-        double num = 0.0, den = 0.0;
-        for (uint32_t row = 0; row < rows; ++row) {
-            const unsigned char * wrow = wraw.data() + (size_t) row * (k / 32) * 34;
-            for (uint32_t tok = 0; tok < check_tokens; ++tok) {
-                double acc = 0.0;
-                for (uint32_t b = 0; b < k / 32; ++b) {
-                    const unsigned char * blk = wrow + (size_t) b * 34;
-                    const uint32_t dh = (uint32_t) blk[0] | ((uint32_t) blk[1] << 8);
-                    const float d = f16_to_f32_local(dh);
-                    const uint32_t ab = tok * (k / 32) + b;
-                    const float aq = f16_to_f32_local(host_ds[ab] & 0xFFFFu);
-                    double sub = 0.0;
-                    for (uint32_t e = 0; e < 32; ++e) {
-                        const int8_t qv = (int8_t) blk[2 + e];
-                        const int8_t qa = (int8_t) host_qs[(size_t) ab * 32 + e];
-                        sub += (double) qv * (double) qa;
+        // One reference, two outputs: a mismatch between A and B means the two dispatches
+        // did not each see their own descriptor set.
+        auto rel_of = [&](const std::vector<float> & g, double * num_out) -> double {
+            double num = 0.0, den = 0.0;
+            for (uint32_t row = 0; row < rows; ++row) {
+                const unsigned char * wrow = wraw.data() + (size_t) row * (k / 32) * 34;
+                for (uint32_t tok = 0; tok < check_tokens; ++tok) {
+                    double acc = 0.0;
+                    for (uint32_t b = 0; b < k / 32; ++b) {
+                        const unsigned char * blk = wrow + (size_t) b * 34;
+                        const uint32_t dh = (uint32_t) blk[0] | ((uint32_t) blk[1] << 8);
+                        const float d = f16_to_f32_local(dh);
+                        const uint32_t ab = tok * (k / 32) + b;
+                        const float aq = f16_to_f32_local(host_ds[ab] & 0xFFFFu);
+                        double sub = 0.0;
+                        for (uint32_t e = 0; e < 32; ++e) {
+                            const int8_t qv = (int8_t) blk[2 + e];
+                            const int8_t qa = (int8_t) host_qs[(size_t) ab * 32 + e];
+                            sub += (double) qv * (double) qa;
+                        }
+                        acc += (double) d * (double) aq * sub;
                     }
-                    acc += (double) d * (double) aq * sub;
+                    const double a = g[(size_t) row * check_tokens + tok];
+                    num += fabs(a - acc);
+                    den += fabs(acc);
                 }
-                const double a = got[(size_t) row * check_tokens + tok];
-                num += fabs(a - acc);
-                den += fabs(acc);
             }
+            if (num_out != NULL) {
+                *num_out = num;
+            }
+            return den > 0.0 ? num / den : num;
+        };
+        double num_a = 0.0, num_b = 0.0;
+        const double rel = rel_of(got, &num_a);
+        const double rel2 = rel_of(got2, &num_b);
+        printf("dense_gemm_pair out_a_rel_l1=%.3e out_b_rel_l1=%.3e same_l1=%.3e verdict=%s\n",
+               rel, rel2, num_a == num_b ? 0.0 : fabs(rel - rel2),
+               (rel <= 1e-5 && rel2 <= 1e-5) ? "PASS" : "FAIL");
+        if (rel > 1e-5 || rel2 > 1e-5) {
+            break;
         }
-        const double rel = den > 0.0 ? num / den : num;
         printf("dense_gemm_check tensor=%s type=q8_0 k=%u n=%u rows=%u tokens=%u rel_l1=%.3e "
                "verdict=%s\n", tensor_name, k, n, rows, check_tokens, rel,
                rel <= 1e-5 ? "PASS" : "FAIL");
@@ -347,6 +381,7 @@ static int qrt_dense_gemm_check(const qrt_config * cfg, const char * gguf_path,
     if (aqs_mem != VK_NULL_HANDLE) qrt_vk_free(dev, aqs, aqs_mem);
     if (ads_mem != VK_NULL_HANDLE) qrt_vk_free(dev, ads, ads_mem);
     if (out_mem != VK_NULL_HANDLE) qrt_vk_free(dev, out, out_mem);
+    if (out2_mem != VK_NULL_HANDLE) qrt_vk_free(dev, out2, out2_mem);
     qrt_gemm_close(dev, gemm);
     qrt_vk_close(dev);
     return rc;

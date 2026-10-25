@@ -65,8 +65,9 @@ int qrt_gemm_type_of(uint32_t n, uint32_t k, uint64_t bytes) {
 
 namespace {
 
-const uint32_t GEMM_SET_INPUT  = 0;   // activations of the layer input
-const uint32_t GEMM_SET_HIDDEN = 1;   // activations of the swiglu output
+// Dispatches one command buffer can hold. A prefill layer records 4 per expert over at
+// most 256 experts, so 2048 covers a whole layer plus the dense projections.
+const uint32_t QRT_GEMM_SETS_PER_RING = 2048;
 
 int fail(char * err, size_t err_size, const char * fmt, ...) {
     va_list ap;
@@ -145,22 +146,18 @@ struct qrt_gemm {
     VkPipelineLayout gemm_layout;
     VkPipelineLayout swiglu_layout;
     VkDescriptorSetLayout dsl;
-    VkDescriptorPool pool;
-    VkDescriptorSet gemm_sets[2];
-    VkDescriptorSet swiglu_set;
+    // One pool per ring, reset by begin. Every dispatch gets its own set: two dispatches
+    // recorded into one command buffer that differ only in their output buffer would share
+    // a set otherwise, and the second write then changes what both of them read
+    // (DECISIONS 65.2).
+    VkDescriptorPool pool[2];
+    uint32_t         sets_used[2];
     VkCommandPool   cmd_pool;
     VkCommandBuffer cmd[2];
     VkFence         fence[2];
     uint32_t        cur;        // ring the record calls append to
     int             pending[2]; // submitted and not waited yet
-    // Each descriptor set caches what it was last written with, so the prefill loop
-    // rewrites them once per scheduler open instead of four times per expert.
-    struct set_state {
-        VkBuffer w, qs, ds, out;
-    } st[2];
-    VkBuffer   set_gate;
-    VkBuffer   set_up;
-    uint32_t   dispatches;
+    uint32_t        dispatches;
 };
 
 namespace {
@@ -294,36 +291,20 @@ int qrt_gemm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_gemm ** out,
     VkDescriptorPoolSize size;
     memset(&size, 0, sizeof(size));
     size.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    size.descriptorCount = 64;
+    size.descriptorCount = QRT_GEMM_SETS_PER_RING * 4;
     VkDescriptorPoolCreateInfo dpci;
     memset(&dpci, 0, sizeof(dpci));
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets       = 8;
+    dpci.maxSets       = QRT_GEMM_SETS_PER_RING;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes    = &size;
-    r = vkCreateDescriptorPool(dev->device, &dpci, nullptr, &g->pool);
-    if (r != VK_SUCCESS) {
-        qrt_gemm_close(dev, g);
-        return vk_fail(err, err_size, "vkCreateDescriptorPool (gemm)", r);
+    for (int i = 0; i < 2; ++i) {
+        r = vkCreateDescriptorPool(dev->device, &dpci, nullptr, &g->pool[i]);
+        if (r != VK_SUCCESS) {
+            qrt_gemm_close(dev, g);
+            return vk_fail(err, err_size, "vkCreateDescriptorPool (gemm)", r);
+        }
     }
-    VkDescriptorSet sets[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
-    // pSetLayouts needs one entry per set: passing a single-element array with
-    // descriptorSetCount 3 makes the driver read garbage and report pool exhaustion.
-    VkDescriptorSetLayout layouts[3] = { g->dsl, g->dsl, g->dsl };
-    VkDescriptorSetAllocateInfo dsai;
-    memset(&dsai, 0, sizeof(dsai));
-    dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsai.descriptorPool     = g->pool;
-    dsai.descriptorSetCount = 3;
-    dsai.pSetLayouts        = layouts;
-    r = vkAllocateDescriptorSets(dev->device, &dsai, sets);
-    if (r != VK_SUCCESS) {
-        qrt_gemm_close(dev, g);
-        return vk_fail(err, err_size, "vkAllocateDescriptorSets (gemm)", r);
-    }
-    g->gemm_sets[GEMM_SET_INPUT]  = sets[0];
-    g->gemm_sets[GEMM_SET_HIDDEN] = sets[1];
-    g->swiglu_set                 = sets[2];
 
     VkCommandPoolCreateInfo pci;
     memset(&pci, 0, sizeof(pci));
@@ -378,8 +359,11 @@ void qrt_gemm_close(qrt_vk_dev * dev, qrt_gemm * g) {
         if (g->cmd_pool != VK_NULL_HANDLE) {
             vkDestroyCommandPool(dev->device, g->cmd_pool, nullptr);
         }
-        if (g->pool != VK_NULL_HANDLE) {
-            vkDestroyDescriptorPool(dev->device, g->pool, nullptr);
+        if (g->pool[0] != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(dev->device, g->pool[0], nullptr);
+        }
+        if (g->pool[1] != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(dev->device, g->pool[1], nullptr);
         }
         if (g->swiglu_pipe != VK_NULL_HANDLE) {
             vkDestroyPipeline(dev->device, g->swiglu_pipe, nullptr);
@@ -404,23 +388,33 @@ void qrt_gemm_close(qrt_vk_dev * dev, qrt_gemm * g) {
 
 namespace {
 
-// Chooses the descriptor set for the activation planes and refreshes it when a buffer
-// changed. Returns 0 on success.
-int pick_set(qrt_gemm * g, const qrt_gemm_args * a, VkDescriptorSet * out) {
-    // The activation planes are fixed per slot: the pair the hidden set already holds
-    // means the swiglu output, anything else is the layer input set.
-    const int idx = (a->a_qs == g->st[GEMM_SET_HIDDEN].qs &&
-                     a->a_ds == g->st[GEMM_SET_HIDDEN].ds) ? GEMM_SET_HIDDEN : GEMM_SET_INPUT;
-    qrt_gemm::set_state * st = &g->st[idx];
-    if (a->w != st->w || a->out != st->out || a->a_qs != st->qs || a->a_ds != st->ds) {
-        const VkBuffer bufs[4] = { a->w, a->a_qs, a->out, a->a_ds };
-        write_set(g->dev->device, g->gemm_sets[idx], bufs);
-        st->w = a->w;
-        st->qs = a->a_qs;
-        st->ds = a->a_ds;
-        st->out = a->out;
+// Allocates and fills one set for a dispatch. Sets are never rewritten: the command buffer
+// refers to the set object, so a rewrite would change every dispatch already recorded with
+// it (DECISIONS 65.2).
+int alloc_set(qrt_gemm * g, const VkBuffer * bufs, VkDescriptorSet * out, char * err,
+              size_t err_size) {
+    const uint32_t ring = g->cur;
+    if (ring > 1) {
+        return fail(err, err_size, "ring %u is outside the two command rings", ring);
     }
-    *out = g->gemm_sets[idx];
+    if (g->sets_used[ring] >= QRT_GEMM_SETS_PER_RING) {
+        return fail(err, err_size, "ring %u already holds %u dispatches", ring,
+                    QRT_GEMM_SETS_PER_RING);
+    }
+    VkDescriptorSetAllocateInfo dsai;
+    memset(&dsai, 0, sizeof(dsai));
+    dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool     = g->pool[ring];
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts        = &g->dsl;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    const VkResult r = vkAllocateDescriptorSets(g->dev->device, &dsai, &set);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkAllocateDescriptorSets (gemm)", r);
+    }
+    write_set(g->dev->device, set, bufs);
+    ++g->sets_used[ring];
+    *out = set;
     return 0;
 }
 
@@ -435,7 +429,18 @@ int qrt_gemm_begin(qrt_gemm * g, uint32_t ring, char * err, size_t err_size) {
     if (ring > 1) {
         return fail(err, err_size, "ring %u is outside the two command rings", ring);
     }
+    if (g->pending[ring]) {
+        // The pool and the command buffer of this ring are still being read by the GPU.
+        if (qrt_gemm_wait(g, ring, err, err_size) != 0) {
+            return -1;
+        }
+    }
     g->cur = ring;
+    const VkResult pr = vkResetDescriptorPool(g->dev->device, g->pool[ring], 0);
+    if (pr != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkResetDescriptorPool (gemm)", pr);
+    }
+    g->sets_used[ring] = 0;
     VkResult r = vkResetFences(g->dev->device, 1, &g->fence[ring]);
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkResetFences (gemm)", r);
@@ -463,7 +468,12 @@ int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t er
         return fail(err, err_size, "unknown quant type %d", (int) a->type);
     }
     VkDescriptorSet set = VK_NULL_HANDLE;
-    pick_set(g, a, &set);
+    {
+        const VkBuffer bufs[4] = { a->w, a->a_qs, a->out, a->a_ds };
+        if (alloc_set(g, bufs, &set, err, err_size) != 0) {
+            return -1;
+        }
+    }
     vkCmdBindPipeline(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_pipe[a->type]);
     vkCmdBindDescriptorSets(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_layout, 0, 1,
                             &set, 0, nullptr);
@@ -485,20 +495,17 @@ int qrt_gemm_record_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer ou
     if (hid % 32 != 0) {
         return fail(err, err_size, "hidden %u is not a multiple of 32", hid);
     }
-    if (gate != g->set_gate || up != g->set_up || out_qs != g->st[GEMM_SET_HIDDEN].qs ||
-        out_ds != g->st[GEMM_SET_HIDDEN].ds) {
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    {
         const VkBuffer bufs[4] = { gate, up, out_qs, out_ds };
-        write_set(g->dev->device, g->swiglu_set, bufs);
-        g->set_gate = gate;
-        g->set_up = up;
-        // The down GEMM of the next expert consumes exactly these planes.
-        g->st[GEMM_SET_HIDDEN].qs = out_qs;
-        g->st[GEMM_SET_HIDDEN].ds = out_ds;
+        if (alloc_set(g, bufs, &set, err, err_size) != 0) {
+            return -1;
+        }
     }
     const uint32_t nk32 = hid / 32;
     vkCmdBindPipeline(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_pipe);
     vkCmdBindDescriptorSets(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_layout, 0, 1,
-                            &g->swiglu_set, 0, nullptr);
+                            &set, 0, nullptr);
     const uint32_t pc[5] = { m, nk32, hid, qsbase, dsbase };
     vkCmdPushConstants(g->cmd[g->cur], g->swiglu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(pc), pc);

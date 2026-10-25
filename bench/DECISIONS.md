@@ -1649,3 +1649,25 @@ DECISIONS 63.4 猜的 (a) 分配器别名 / (b) staging 时序都不对，所以
 判据：`--moe-check`、`--dense-gemm-check` 读数不变，且新增"同一命令缓冲两个 GEMM 各写自己的输出"
 的检查项通过。
 
+## 66. M2-6 判决：GEMM 的 descriptor 改成一次 dispatch 一个 set，判据全过（2026-10-25）
+
+**采纳**：`qrt_gemm` 的两个固定 set + 指针缓存（`pick_set`）换成"每 ring 一个描述符池
+（2048 set）+ `begin` 重置 + 每次 record 分配并写新 set"，`swiglu` 同处理；
+`begin` 发现该 ring 还在飞会先 `qrt_gemm_wait`；池用尽返回错误。
+判据全过：同一命令缓冲两次 GEMM（不同 out）**A/B 都是 1.297e-07 且逐位相同**；
+稠密单发 1.297e-07 / 12.82 TFLOPS；MoE gate 1.607e-07 / down 2.532e-07；norm 链 1.251e-07；
+prefill 1 层 256 专家 done=256 failed=0、per_block 0.271 ms。所有 rel_L1 与上一轮**逐位相同**，
+说明旧代码只是碰巧正确（本驱动在 bind 时给 set 拍了快照）。见 `RESULTS.md` 71。
+
+### 66.1 规则
+
+- 同一条命令缓冲里，只要两次 dispatch 的**任一绑定不同**，就必须各自有一个 descriptor set；
+  **禁止**"缓冲指针变了就重写同一个 set"这种缓存。
+- descriptor 池按"一条缓冲最多多少 dispatch"配（现在是 2048/ring），超出要报错而不是让驱动
+  返回一堆空句柄（DECISIONS 59 的教训）。
+- 检查项要跟着形状走：**"两次 dispatch 各写自己的输出"必须有独立的 check 条目**，
+  不能只测单发（单发永远不会暴露这个缺陷）。
+- 这条是整层串联的地基：一层里 norm + 投影 + 注意力 + MoE 会录几百个 dispatch，
+  每次绑不同缓冲是常态。
+
+

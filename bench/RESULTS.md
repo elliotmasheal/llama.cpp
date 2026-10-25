@@ -2338,3 +2338,43 @@ check 里那句注释也换成了"no conv re-upload here：weights_load 已经�
 给 set 拍了快照，所以 `--moe-check` 仍然过。**这是靠驱动实现细节吃饭**，换硬件就会错。
 整层串联前必须先改成"每次 dispatch 一个 set"（池 + 每次 begin 重置），见 DECISIONS 65.3。
 
+## 71. M2-6 第三块：GEMM 改成"一次 dispatch 一个 descriptor set"，同一命令缓冲里的两次 GEMM 不再互相覆盖（2026-10-25）
+
+口径：`--dense-gemm-check` / `--moe-check` / `--norm-check` / `--prefill-check` 全跑一遍，
+权重是真实 GGUF，RX 6700S，平衡电源 + AC，exit 0；读数与上一轮同口径（同 token 数、同 tile）。
+
+### 71.1 改了什么
+
+- `qrt_gemm` 原来有**两个固定 descriptor set** 和一个"缓冲指针变了就重写"的缓存
+  （`pick_set`）。按 Vulkan 规范，命令缓冲里的 dispatch 只是引用 set 对象，**重写 set 会同时
+  改变已经录进去的 dispatch**；MoE 的 gate/up（同激活、不同输出）正是这种形状。
+- 现在：每个 ring 一个 descriptor 池（2048 个 set），`qrt_gemm_begin` 重置该池，
+  每次 `record` / `record_swiglu` 分配并写一个**新 set**；`begin` 发现该 ring 还在飞就先等。
+  池用尽返回错误（不崩、不越界分配）。
+- 新增检查项：同一命令缓冲里录**两次**（不同 out 缓冲）——这是本轮判据，形如上轮
+  `DECISIONS 65.2` 说的形状。
+
+### 71.2 读数
+
+| 口径 | 读数 | 上一轮同口径 | verdict |
+|---|---:|---:|---|
+| **同一命令缓冲两次 GEMM，out A** rel_L1 | **1.297e-07** | - | PASS |
+| **同一命令缓冲两次 GEMM，out B** rel_L1 | **1.297e-07** | - | PASS |
+| A 与 B 是否逐位相同 | **是（差 0.000e+00）** | - | - |
+| 稠密单发 rel_L1 / TFLOPS（M=10240） | 1.297e-07 / **12.82** | 1.297e-07 / 12.89 | PASS |
+| MoE gate / down rel_L1（layer 0, expert 0, 64 行） | 1.607e-07 / 2.532e-07 | 1.6e-07 / 2.5e-07 | PASS |
+| norm 链 GEMM（吃设备端平面） | 1.251e-07 | 1.251e-07 | PASS |
+| prefill 1 层 256 专家（mode=layer，8 槽） | done=256 failed=0，per_block **0.271 ms** | 0.272（RESULTS 41 口径） | PASS |
+
+- 算术没变（所有 rel_L1 与上一轮**逐位相同**），变的只是"dispatch 看到哪个 set"这件事，
+  所以这张表正好证明：旧代码在本驱动上碰巧正确，新代码按规范正确。
+- 2048 set/ring 的容量对 prefill 是够的：一层 256 专家 x 4 dispatch = 1024 set，
+  第二个 ring 同时在飞也不超过 2048。
+
+### 71.3 为什么这条必须先做
+
+整层串联会把 norm + 3-4 个投影 + 注意力 + MoE 全录进**同一条**命令缓冲，届时
+"每次 dispatch 绑不同缓冲"是常态。若继续用两个固定 set，正确性就依赖驱动的 bind 快照行为，
+和"考虑不同硬件"的目标直接冲突。现在这条地基是规范的。
+
+
