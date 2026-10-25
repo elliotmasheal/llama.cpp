@@ -240,9 +240,17 @@ int qrt_vk_open(uint32_t tier_mib, qrt_vk_dev ** out, char * err, size_t err_siz
 
     dev->has_memory_budget = has_device_extension(dev->phys, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) ? 1 : 0;
 
+    // int8 dot product (VK_KHR_shader_integer_dot_product, core in 1.3): the Q4_K x Q8_1
+    // GEMM is 3.66 TFLOPS without it and 6.08-6.20 with it (RESULTS 28). Optional: a
+    // device without it still opens, and the kernel reports the missing feature.
+    dev->has_dot_product = 0;
+    VkPhysicalDeviceShaderIntegerDotProductFeatures dotf;
+    memset(&dotf, 0, sizeof(dotf));
+    dotf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
     VkPhysicalDeviceVulkan12Features f12;
     memset(&f12, 0, sizeof(f12));
     f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    f12.pNext = &dotf;
     VkPhysicalDeviceFeatures2 f2;
     memset(&f2, 0, sizeof(f2));
     f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -253,10 +261,22 @@ int qrt_vk_open(uint32_t tier_mib, qrt_vk_dev ** out, char * err, size_t err_siz
         qrt_vk_close(dev);
         return -1;
     }
+    const int dot_ext = has_device_extension(dev->phys, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) ? 1 : 0;
+    dev->has_dot_product = (dotf.shaderIntegerDotProduct == VK_TRUE) ? 1 : 0;
     VkPhysicalDeviceVulkan12Features enable12;
     memset(&enable12, 0, sizeof(enable12));
     enable12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     enable12.timelineSemaphore = VK_TRUE;
+    VkPhysicalDeviceShaderIntegerDotProductFeatures enable_dot;
+    memset(&enable_dot, 0, sizeof(enable_dot));
+    enable_dot.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+    enable_dot.shaderIntegerDotProduct = VK_TRUE;
+    if (dev->has_dot_product && dot_ext) {
+        enable12.pNext = &enable_dot;
+    } else if (dev->has_dot_product && !dot_ext) {
+        // Promoted to core only from 1.3, so without the extension it is unusable here.
+        dev->has_dot_product = 0;
+    }
 
     VkDeviceQueueCreateInfo qci[2];
     memset(qci, 0, sizeof(qci));
@@ -275,15 +295,22 @@ int qrt_vk_open(uint32_t tier_mib, qrt_vk_dev ** out, char * err, size_t err_siz
         ++n_qci;
     }
 
-    const char * ext_name = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+    const char * ext_names[2];
+    uint32_t n_ext = 0;
+    if (dev->has_memory_budget) {
+        ext_names[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+    }
+    if (dev->has_dot_product) {
+        ext_names[n_ext++] = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
+    }
     VkDeviceCreateInfo dci;
     memset(&dci, 0, sizeof(dci));
     dci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.pNext                   = &enable12;
     dci.queueCreateInfoCount    = n_qci;
     dci.pQueueCreateInfos       = qci;
-    dci.enabledExtensionCount   = dev->has_memory_budget ? 1u : 0u;
-    dci.ppEnabledExtensionNames = &ext_name;
+    dci.enabledExtensionCount   = n_ext;
+    dci.ppEnabledExtensionNames = ext_names;
     r = vkCreateDevice(dev->phys, &dci, nullptr, &dev->device);
     if (r != VK_SUCCESS) {
         fail(err, err_size, "vkCreateDevice failed: VkResult %d", (int) r);

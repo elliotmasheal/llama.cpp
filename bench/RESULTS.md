@@ -1129,3 +1129,43 @@ int8 GEMM 相同但没有数学；本轮只量调度，不量 PP。
 **对目标的意义**：读取腿已从"比设计差 5 倍"变成"差 2 倍以内"，PP 1000 需要的 9 GB/s 存储读取
 现在只差 1.3 倍，而且是在占位 compute 还占着 25 ms/层的前提下测的。
 下一步是 int8 GEMM 接入（compute 腿变成真算力），那时 PP 才有实测口径。
+
+## 39. M2-5 第二步：int8 GEMM 进运行时 compute 腿（2026-10-25）
+
+`runtime/kernels/` 新增 `q4k_gemm.comp`（M2-4 内核 + 权重/输出/激活基址 push constant）、
+`swiglu_q8.comp`（SwiGLU + Q8_1 量化成两平面）、`q4k_gemm.*`（管线、描述符、单次提交）与
+`moe_expert.*`（一个专家的 gate/up/swiglu/down 合成，作为 `qrt_prefill_run` 的 compute 回调）。
+`vk_dev` 打开 `VK_KHR_shader_integer_dot_product`（本机支持，`device_dot_product=1`）。
+
+口径：同第 38 节（chunk 2048、前 4 层、1024 块、mmap、r=2、预热 pass）；新增
+`tokens_per_expert=64`（2048 x top-8 / 256）、hidden 2048、ffn 512；原始输出
+`bench/raw/m25-gemm-20261025/`（`moe-check-r{1,2}.out`、`prefill-moe-r{1,2}.out`），`status = ok`。
+
+**正确性（G-QUAL 口径）**
+
+| 项 | 读数 |
+|---|---|
+| gate GEMM 对照 CPU 双精度反量化参考 | **rel_L1 1.599e-7**（阈值 1e-4），layer 0 expert 0、前 32 行 x 64 token |
+| 判据 | PASS（r=2 同值） |
+
+**性能**
+
+| staging 槽 | total ms | 每块 ms | read | upload | wait | compute | GFLOP | **TFLOPS** |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 541.7 / 545.3 | 0.529 / 0.533 | 117-118 | 28-29 | 217-220 | 178-180 | 274.9 | 1.53 / 1.55 |
+| **8** | **343.2 / 346.1** | **0.335 / 0.338** | 126-128 | 34-35 | **1.5** | 178-182 | 274.9 | 1.51 / 1.52 |
+
+- **算力只有 1.5 TFLOPS，而同一个内核在 M=2048 是 6.08-6.20 TFLOPS（第 28 节）**。差 4 倍，两个原因可分离：
+  1. **占用率**：每个专家 M=64，网格只有 (512/64) x (64/32) = **16 个 workgroup = 2048 个线程**，
+     在 28 CU 上远未填满；M2-4 的 6.1 TFLOPS 是 8 x 64 = 512 个 workgroup 测出来的。
+  2. **每专家一次 submit+fence**：compute 段 0.176 ms/专家里约 0.065 ms 是提交与唤醒（RESULTS 35 的固定开销）。
+  结论：**prefill 不能按"一个专家一次提交"跑**，必须把整层 256 个专家的 dispatch 录进同一个命令缓冲
+  （design 4.6 的每 pass 单次提交模型），这正是 M2-5 的下一步。
+- **down 矩阵在本轮被跳过**（`down_skipped=1024/1024`）：重组库里 gate/up 是 Q4_K、**down 是 Q5_K**，
+  层 34/38 的 down 是 Q6_K、层 39 的 gate/up 是 Q5_K。这也解释了第 35 节的三种尺寸：
+  1 900 544 = Q4_K x2 + Q5_K；2 039 808 = Q4_K x2 + Q6_K；2 301 952 = Q5_K x2 + Q6_K。
+- 因此上表 GFLOP 只含 gate+up（每专家 268.4 MFLOP），**不是完整专家的算力**。
+
+**推算（不是实测）**：按 0.335 ms/块 x 40 层 x 256 专家 = 3.43 s/2048 token，专家腿（且只有 gate+up）
+约 **597 tok/s**；PP 1000 需要这条腿降到 2.05 s。两条路：整层单次提交（吃掉 0.065 ms/专家 与 低占用）
+与 Q5_K/Q6_K 内核（补上 down 的 1/3 算力，但同时也会增加算力需求）。

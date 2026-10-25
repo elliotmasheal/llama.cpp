@@ -116,6 +116,10 @@ blockers: none
 - **M2-5 读取通路（2026-10-25）**：重组文件改只读映射后，每专家读是一次 memcpy，端到端
   **2.6 -> 7.05 GB/s**（每块 0.73 -> 0.27 ms，read 段 13.5 GB/s）；见 `RESULTS.md` 第 38 节、
   `DECISIONS.md` 第 35 节。新增纪律：两臂对比前必须跑预热 pass（首触缺页会造假加速比）。
+- **M2-5 int8 GEMM（2026-10-25）**：`runtime/kernels/` 的 Q4_K x Q8_1 GEMM 接成 prefill 的
+  compute 腿，gate 对 CPU 双精度参考 **rel_L1 1.6e-7**；但只有 **1.51-1.55 TFLOPS**
+  （每专家一次提交、16 个 workgroup），且 down 是 Q5_K/Q6_K 被跳过（`RESULTS.md` 第 39 节、
+  `DECISIONS.md` 第 36 节）。下一步：整层单次提交，再补 Q5_K/Q6_K 内核。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、

@@ -51,6 +51,7 @@ struct qrt_vk_dev {
     uint32_t alloc_failures;    // counted fallbacks, never a crash (design 9)
     uint32_t cache_reductions;  // expert-cache steps given up by the planner
     uint32_t io_failures;       // upload/download fallbacks, same rule
+    int      has_dot_product;   // VK_KHR_shader_integer_dot_product enabled
 };
 
 // The five buckets of design 5.5 plus what the planner had to give up.

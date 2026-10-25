@@ -1,0 +1,59 @@
+#version 450
+// SwiGLU of the expert's gate and up matrices, quantized to the Q8_1 planes the GEMM
+// eats: one invocation per 32-element subblock of the hidden vector, so the block sum
+// and the max stay in one lane without a cross-lane reduction. The planes carry the
+// integer sum of q (biased by 32768) instead of ggml's f16 s, which keeps the min term
+// exact (kernels/bench/README.md).
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly  buffer Gate { float g[]; } gt;
+layout(binding = 1) readonly  buffer Up   { float u[]; } ut;
+layout(binding = 2) writeonly buffer Qs   { uvec4 q[]; } qs;
+layout(binding = 3) writeonly buffer Ds   { uint s[]; } ds;
+
+layout(push_constant) uniform PC {
+    uint m;      // tokens
+    uint nk32;   // 32-element subblocks per token
+    uint hid;    // elements per token of the gate/up output
+} pc;
+
+void main() {
+    const uint blk = gl_GlobalInvocationID.x;
+    if (blk >= pc.m * pc.nk32) {
+        return;
+    }
+    const uint tok = blk / pc.nk32;
+    const uint sub = blk % pc.nk32;
+    const uint base = tok * pc.hid + sub * 32u;
+
+    float x[32];
+    float amax = 0.0;
+    for (uint i = 0; i < 32u; ++i) {
+        const float g = gt.g[base + i];
+        const float h = (g / (1.0 + exp(-g))) * ut.u[base + i];
+        x[i] = h;
+        amax = max(amax, abs(h));
+    }
+
+    const float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+    int sum = 0;
+    uint word[8];
+    [[unroll]] for (uint w = 0; w < 8u; ++w) {
+        word[w] = 0u;
+    }
+    for (uint i = 0; i < 32u; ++i) {        const int v = clamp(int(round(x[i] * inv)), -127, 127);
+        sum += v;
+        word[i / 4u] |= (uint(v) & 0xFFu) << ((i % 4u) * 8u);
+    }
+
+    const float d = amax * (1.0 / 127.0);
+    const uint dh = packHalf2x16(vec2(d, 0.0)) & 0xFFFFu;
+    ds.s[blk] = dh | ((uint(sum + 32768) & 0xFFFFu) << 16);
+
+    const uint o = blk * 2u;
+    qs.q[o]      = uvec4(word[0], word[1], word[2], word[3]);
+    qs.q[o + 1u] = uvec4(word[4], word[5], word[6], word[7]);
+}

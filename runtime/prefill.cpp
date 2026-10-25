@@ -335,15 +335,17 @@ int read_file(const char * path, unsigned char ** out, size_t * out_bytes, char 
 
 } // namespace
 
-int qrt_prefill_probe_open(qrt_vk_dev * dev, const char * spv_path, qrt_prefill * p,
+int qrt_prefill_probe_open(qrt_vk_dev * dev, const char * spv_dir, qrt_prefill * p,
                            qrt_prefill_probe ** out, char * err, size_t err_size) {
     *out = NULL;
-    if (dev == NULL || p == NULL || spv_path == NULL) {
-        return fail(err, err_size, "the probe needs a device, a scheduler and a shader path");
+    if (dev == NULL || p == NULL || spv_dir == NULL) {
+        return fail(err, err_size, "the probe needs a device, a scheduler and a shader dir");
     }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/qrt-read.spv", spv_dir);
     unsigned char * code = NULL;
     size_t code_bytes = 0;
-    if (read_file(spv_path, &code, &code_bytes, err, err_size) != 0) {
+    if (read_file(path, &code, &code_bytes, err, err_size) != 0) {
         return -1;
     }
     qrt_prefill_probe * probe = (qrt_prefill_probe *) calloc(1, sizeof(*probe));

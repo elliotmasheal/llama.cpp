@@ -187,15 +187,28 @@ build-vulkan/bin/qrt.exe --prefill-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL -
 - `qrt_prefill_run` walks layers first and keeps `slots` staging buffers in flight: block `i`
   is uploaded, and by the time block `i - slots` comes back for compute its fence has already
   signalled. Waiting collapsed from 352 to 2 ms per 1024 blocks (RESULTS 37).
-- The math is a callback. `--prefill-check` plugs in the M1-4a read probe, one dispatch per
-  block on the compute queue, because the int8 GEMM is M2-5 step 2; the check therefore
-  measures the scheduler, not prefill tokens per second.
+- The math is a callback. `--prefill-compute moe` (default) plugs in the int8 GEMM leg in
+  `kernels/moe_expert.*`: gate, up, swiglu and down for the block that just landed, all in
+  one command buffer. `--prefill-compute probe` plugs in the M1-4a read kernel instead, which
+  isolates the scheduler from the math.
+- The Q4_K x Q8_1 GEMM is `kernels/q4k_gemm.comp` (the M2-4 kernel plus base offsets) and
+  reaches only ~1.5 TFLOPS at 64 tokens per expert because each expert is a 16 workgroup
+  dispatch behind its own submit (RESULTS 39). One submit per layer is the fix that is in.
+- The store mixes quant types: gate/up are Q4_K on most layers, down is Q5_K, layers 34/38
+  have Q6_K down and layer 39 Q5_K gate/up, so a matrix of another type is skipped and counted
+  (`down_skipped`) instead of being read as garbage.
+- `--moe-check <prefix>` compares the gate output of one expert against a double-precision
+  dequant reference (rel L1 1.6e-7) and exits non-zero above 1e-4.
 - A failed slot halves the ring and bumps `slot_reductions`; a read, locate or upload failure
   counts `blocks_failed` and moves on (design 9, no aborts).
 - `qrt_prefill_unique_experts` gives the unique experts a chunk of `chunk` tokens touches, so
   the byte volume follows `--prefill-chunk`: at 2048 every one of the 256 experts is hit.
 - The shader is compiled by CMake from `proto/qrt-read.comp` and copied next to `qrt`; pass
   `--prefill-shader` to point somewhere else.
+- The int8 kernels are `kernels/q4k_gemm.comp` (Q4_K x Q8_1, built with the dot-product
+  extension) and `kernels/swiglu_q8.comp`; `vk_dev` enables
+  `VK_KHR_shader_integer_dot_product` when the device has it, and `--prefill-compute moe`
+  refuses to run when it does not.
 
 ## Telemetry
 
@@ -224,5 +237,7 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `vk_dev.h/.cpp` | device, queues, memory types, budget planner, allocator, staging transfers |
 | `weights.h/.cpp` | repacked expert store (index page table, expert reads) and dense residency |
 | `prefill.h/.cpp` | layer-first prefill scheduler, staging ring, read-probe compute leg |
-| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check`, `--dense-check`, `--prefill-check` |
+| `kernels/q4k_gemm.*` | Q4_K x Q8_1 int8 GEMM and swiglu+Q8_1 kernels, one submit per call |
+| `kernels/moe_expert.*` | one expert's gate/up/swiglu/down as a prefill compute callback |
+| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check`, `--dense-check`, `--prefill-check`, `--moe-check` |
 | `CMakeLists.txt` | `qrt_core`, `qrt`, `qrt_selftest` |

@@ -7,6 +7,7 @@
 #include "vk_dev.h"
 #include "weights.h"
 #include "prefill.h"
+#include "kernels/moe_expert.h"
 
 #include <chrono>
 #include <stdio.h>
@@ -19,6 +20,9 @@
 static const char QRT_VERSION[] = "0.1-m2-0";
 
 static int g_failures = 0;
+
+// Defined with the measurement helpers below; the MoE check needs it earlier.
+static double now_ms(void);
 
 static void expect(int ok, const char * what) {
     printf("%s %s\n", ok ? "PASS" : "FAIL", what);
@@ -74,11 +78,62 @@ static int count_lines(const char * path, char * first, size_t first_size) {
     return lines;
 }
 
+// M2-5 step 2: the int8 GEMM as the compute leg. Runs one expert's gate/up through the
+// Q4_K x Q8_1 kernel (the down matrix is Q5_K in this store and still skipped), then an
+// optional CPU dequant cross-check of the gate output.
+static int qrt_moe_check(const qrt_config * cfg, const char * prefix, const char * spv_dir,
+                         uint32_t layer, uint32_t expert, uint32_t rows) {
+    char err[QRT_ERR_SIZE] = {0};
+    qrt_vk_dev * dev = NULL;
+    if (qrt_vk_open((uint32_t) cfg->vram_tier_mib, &dev, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        return 2;
+    }
+    printf("moe_check device_dot_product=%d\n", dev->has_dot_product);
+    qrt_weights * w = NULL;
+    if (qrt_weights_open(prefix, &w, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        qrt_vk_close(dev);
+        return 2;
+    }
+    qrt_moe_cfg mcfg;
+    memset(&mcfg, 0, sizeof(mcfg));
+    mcfg.tokens = 64;        // 2048 tokens x top-8 over 256 experts
+    mcfg.hidden = 2048;
+    mcfg.ffn    = 512;
+    qrt_moe * moe = NULL;
+    int rc = 0;
+    if (qrt_moe_open(dev, w, spv_dir, &mcfg, &moe, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        rc = 2;
+    } else {
+        double rel_l1 = 0.0;
+        const double t0 = now_ms();
+        if (qrt_moe_check(dev, moe, w, layer, expert, rows, &rel_l1, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            rc = 2;
+        } else {
+            const double dt = now_ms() - t0;
+            printf("moe_gate_check layer=%u expert=%u rows=%u tokens=%u rel_l1=%.3e "
+                   "ms=%.1f verdict=%s\n", layer, expert, rows, mcfg.tokens, rel_l1, dt,
+                   rel_l1 <= 1e-4 ? "PASS" : "FAIL");
+            if (rel_l1 > 1e-4) {
+                rc = 1;
+            }
+        }
+        qrt_moe_close(dev, moe);
+    }
+    qrt_weights_close(w);
+    printf("moe_io_failures=%u alloc_mib=%llu\n", dev->io_failures,
+           (unsigned long long) (dev->alloc_bytes >> 20));
+    qrt_vk_close(dev);
+    return rc;
+}
+
 // M2-5 step 1: layer-first prefill with uploads in flight. Runs the same layer set
 // twice, serial (1 slot) and pipelined (slots), so the overlap is a single variable.
-// The compute leg is the read probe of prefill.h, not the int8 GEMM yet.
 static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const char * spv,
-                             uint32_t slots, uint32_t layers) {
+                             uint32_t slots, uint32_t layers, int use_moe) {
     char err[QRT_ERR_SIZE] = {0};
     qrt_vk_dev * dev = NULL;
     if (qrt_vk_open((uint32_t) cfg->vram_tier_mib, &dev, err, sizeof(err)) != 0) {
@@ -134,6 +189,35 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
             qrt_prefill_close(dev, warm);
         }
     }
+    // The compute leg is either the read probe (scheduling only) or the real int8 GEMM,
+    // so the same scheduler can be compared before and after the math lands.
+    qrt_moe * moe = NULL;
+    if (use_moe) {
+        if (!dev->has_dot_product) {
+            fprintf(stderr, "qrt: this device has no shaderIntegerDotProduct; "
+                            "run with --prefill-compute probe\n");
+            qrt_weights_close(w);
+            qrt_vk_close(dev);
+            return 2;
+        }
+        qrt_moe_cfg mcfg;
+        memset(&mcfg, 0, sizeof(mcfg));
+        const uint32_t per_expert = (cfg->prefill_chunk * 8u) / experts;
+        mcfg.tokens = per_expert < 32 ? 32 : (per_expert + 31u) / 32u * 32u;
+        mcfg.hidden = 2048;
+        mcfg.ffn    = 512;
+        if (qrt_moe_open(dev, w, spv, &mcfg, &moe, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            qrt_weights_close(w);
+            qrt_vk_close(dev);
+            return 2;
+        }
+        printf("prefill_compute moe tokens_per_expert=%u hidden=%u ffn=%u dot_product=%d\n",
+               mcfg.tokens, mcfg.hidden, mcfg.ffn, dev->has_dot_product);
+    } else {
+        printf("prefill_compute probe (read kernel, no math)\n");
+    }
+
     for (int a = 0; a < 2 && rc == 0; ++a) {
         qrt_prefill_cfg pcfg;
         memset(&pcfg, 0, sizeof(pcfg));
@@ -147,28 +231,35 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
             break;
         }
         qrt_prefill_probe * probe = NULL;
-        if (qrt_prefill_probe_open(dev, spv, p, &probe, err, sizeof(err)) != 0) {
+        if (!use_moe && qrt_prefill_probe_open(dev, spv, p, &probe, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             qrt_prefill_close(dev, p);
             rc = 2;
             break;
         }
+        qrt_prefill_compute_fn compute = use_moe ? qrt_moe_compute : qrt_prefill_probe_compute;
+        void * user = use_moe ? (void *) moe : (void *) probe;
+        const uint32_t skipped_before = use_moe && moe != NULL ? qrt_moe_down_skipped(moe) : 0;
         qrt_prefill_stats st;
-        if (qrt_prefill_run(p, ids.data(), experts, counts.data(), qrt_prefill_probe_compute,
-                            probe, &st, err, sizeof(err)) != 0) {
+        if (qrt_prefill_run(p, ids.data(), experts, counts.data(), compute,
+                            user, &st, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             rc = 2;
         } else {
             const double blocks = st.blocks_done > 0 ? (double) st.blocks_done : 1.0;
             arm_ms[a] = st.total_ms;
+            const double flops = use_moe && moe != NULL
+                                 ? (double) qrt_moe_flops(moe) * st.blocks_done : 0.0;
             printf("prefill slots=%u chunk=%u layers=%u of %u blocks=%u done=%u failed=%u "
                    "bytes=%llu slot_mib=%.2f total_ms=%.1f per_block_ms=%.3f "
                    "read_ms=%.1f upload_ms=%.1f wait_ms=%.1f compute_ms=%.1f "
-                   "reductions=%u\n",
+                   "gflop=%.1f tflops=%.2f down_skipped=%u reductions=%u\n",
                    pcfg.slots, pcfg.chunk, (layers), st.layers, st.blocks, st.blocks_done,
                    st.blocks_failed, (unsigned long long) st.bytes,
                    (double) qrt_prefill_slot_bytes(p) / (1024.0 * 1024.0), st.total_ms,
                    st.total_ms / blocks, st.read_ms, st.upload_ms, st.wait_ms, st.compute_ms,
+                   flops / 1e9, st.compute_ms > 0.0 ? flops / st.compute_ms / 1e9 : 0.0,
+                   use_moe && moe != NULL ? qrt_moe_down_skipped(moe) - skipped_before : 0,
                    st.slot_reductions);
         }
         qrt_prefill_probe_close(dev, probe);
@@ -179,6 +270,7 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
                "hidden_ms=%.1f\n", arm_ms[0], arm_ms[1], arm_ms[0] / arm_ms[1],
                arm_ms[0] - arm_ms[1]);
     }
+    qrt_moe_close(dev, moe);
     qrt_weights_close(w);
     printf("prefill_io_failures=%u alloc_mib=%llu\n", dev->io_failures,
            (unsigned long long) (dev->alloc_bytes >> 20));
@@ -709,6 +801,11 @@ int main(int argc, char ** argv) {
     const char * prefill_shader = NULL;
     int prefill_slots = 8;
     int prefill_layers = 4;
+    int prefill_compute_moe = 1;
+    const char * moe_prefix = NULL;
+    int moe_layer = 0;
+    int moe_expert = 0;
+    int moe_rows = 64;
     const char * repack_prefix = NULL;
     const char * gguf_path = NULL;
     const char * require_tensor = NULL;
@@ -759,8 +856,51 @@ int main(int argc, char ** argv) {
             prefill_shader = argv[++i];
             continue;
         }
-        if (strcmp(argv[i], "--prefill-slots") == 0) {
+        if (strcmp(argv[i], "--prefill-compute") == 0) {
             if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --prefill-compute wants probe or moe\n");
+                return 2;
+            }
+            const char * v = argv[++i];
+            if (strcmp(v, "moe") == 0) {
+                prefill_compute_moe = 1;
+            } else if (strcmp(v, "probe") == 0) {
+                prefill_compute_moe = 0;
+            } else {
+                fprintf(stderr, "qrt: --prefill-compute wants probe or moe, not '%s'\n", v);
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--moe-check") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --moe-check needs the repack prefix\n");
+                return 2;
+            }
+            moe_prefix = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--moe-layer") == 0 || strcmp(argv[i], "--moe-expert") == 0 ||
+            strcmp(argv[i], "--moe-rows") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: %s needs a value\n", argv[i]);
+                return 2;
+            }
+            const int v = atoi(argv[++i]);
+            if (v < 0) {
+                fprintf(stderr, "qrt: %s wants a non-negative value\n", argv[i - 1]);
+                return 2;
+            }
+            if (strcmp(argv[i - 1], "--moe-layer") == 0) {
+                moe_layer = v;
+            } else if (strcmp(argv[i - 1], "--moe-expert") == 0) {
+                moe_expert = v;
+            } else {
+                moe_rows = v;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--prefill-slots") == 0) {            if (i + 1 >= argc) {
                 fprintf(stderr, "qrt: --prefill-slots needs a count\n");
                 return 2;
             }
@@ -878,7 +1018,7 @@ int main(int argc, char ** argv) {
         return qrt_dense_check(&cfg, dense_gguf);
     }
     if (prefill_prefix != NULL) {
-        // Default shader: qrt-read.spv next to the executable, as CMake copies it.
+        // Default shader dir: next to the executable, as CMake copies the .spv files.
         std::string shader_path;
         if (prefill_shader != NULL) {
             shader_path = prefill_shader;
@@ -887,9 +1027,19 @@ int main(int argc, char ** argv) {
             const size_t cut = exe.find_last_of("/\\");
             shader_path = (cut == std::string::npos ? std::string(".") : exe.substr(0, cut)) +
                           "/qrt-read.spv";
+            // The directory is what the kernels want; keep the probe's file name too.
+            shader_path = (cut == std::string::npos ? std::string(".") : exe.substr(0, cut));
         }
         return qrt_prefill_check(&cfg, prefill_prefix, shader_path.c_str(),
-                                 (uint32_t) prefill_slots, (uint32_t) prefill_layers);
+                                 (uint32_t) prefill_slots, (uint32_t) prefill_layers,
+                                 prefill_compute_moe);
+    }
+    if (moe_prefix != NULL) {
+        std::string dir = argc > 0 ? argv[0] : "qrt";
+        const size_t cut = dir.find_last_of("/\\");
+        dir = (cut == std::string::npos ? std::string(".") : dir.substr(0, cut));
+        return qrt_moe_check(&cfg, moe_prefix, (prefill_shader != NULL ? prefill_shader : dir.c_str()),
+                             (uint32_t) moe_layer, (uint32_t) moe_expert, (uint32_t) moe_rows);
     }
     if (vk_info || vk_probe_mib > 0) {
         qrt_vk_dev * dev = NULL;

@@ -62,7 +62,7 @@ uint64_t qrt_prefill_slot_bytes(const qrt_prefill * p);
 // of the real GEMM dispatch but does no math, so it measures the scheduler only;
 // M2-5 step 2 swaps the pipeline for the int8 kernel.
 struct qrt_prefill_probe;
-int qrt_prefill_probe_open(qrt_vk_dev * dev, const char * spv_path, qrt_prefill * p,
+int qrt_prefill_probe_open(qrt_vk_dev * dev, const char * spv_dir, qrt_prefill * p,
                            qrt_prefill_probe ** out, char * err, size_t err_size);
 void qrt_prefill_probe_close(qrt_vk_dev * dev, qrt_prefill_probe * probe);
 int qrt_prefill_probe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,

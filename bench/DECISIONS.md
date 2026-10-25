@@ -687,3 +687,40 @@ design 里的数字都带 RESULTS 回链，符合"design 的估计必须能被�
 1. int8 GEMM 接入（M2-5 step 2），接上后 compute 不再是 25 ms/层 的占位。
 2. `token_embd` 515 MiB 仍未定归属（design 5.5 的 dense 桶不含它）。
 3. 稠密上传（RESULTS 36）也走 `fread`，可顺带改 mmap；那是启动路径，优先级低。
+
+## 36. M2-5 第二步判决：int8 GEMM 接进运行时，但 prefill 必须整层单次提交（2026-10-25）
+
+| 项 | 结果 |
+|---|---|
+| GEMM 正确性 | gate 对 CPU 双精度参考 **rel_L1 1.599e-7**（PASS，阈值 1e-4） |
+| 算力 | **1.51-1.55 TFLOPS**（每专家 M=64），同一内核 M=2048 是 6.08-6.20（第 28 节） |
+| 每块 | 0.335-0.338 ms（8 槽，含 read 0.12 / upload 0.03 / compute 0.18） |
+| 覆盖 | gate+up 跑；**down 跳过**（Q5_K/Q6_K，`down_skipped` 计数） |
+
+**判决**：adopt（GEMM 进运行时，正确性过），但 M2-5 仍 partial。理由：算力只有内核上限的 1/4，
+且 down 的 1/3 矩阵没跑，PP 还不能判。
+
+**根因（两个，都已定位到可测的量）**
+
+1. **占用率**：每专家 M=64 只有 16 个 workgroup（2048 线程），28 CU 填不满；6.1 TFLOPS 是 512 个
+   workgroup 的形状。
+2. **每专家一次 submit+fence**：0.176 ms 里约 0.065 ms 是固定提交开销（第 35 节测过）。
+
+**下一步（按收益排序，下一轮只做第一条）**
+
+1. **整层单次提交**：把 256 个专家的 dispatch 录进一个命令缓冲，上传完成后一次提交。
+   这同时解决占用率（GPU 能持续吃满）与提交开销，等价于 design 4.6 的每 pass 单次提交。
+   验收：prefill 每块 0.335 -> 目标 <= 0.15 ms，TFLOPS >= 3。
+2. **Q5_K / Q6_K 的 GEMM 变体**：补上 down（多数层 Q5_K、层 34/38 Q6_K）与层 39 的 gate/up。
+   量化类型按层混合这件事已写进 design 2.1（RESULTS 39）。
+3. **把 gate/up 的 Q8_1 激活量化也搬上 GPU**：现在输入平面的 Q8_1 是宿主侧生成的固定图案，
+   真实路径要从 hidden state 量化，属于 M2-5 收尾。
+
+**新增开关/接口**
+
+| 名字 | 作用 | 默认 |
+|---|---|---|
+| `--prefill-compute probe|moe` | compute 腿选带宽读核还是 int8 GEMM | `moe` |
+| `--moe-check <prefix>` | gate GEMM 对 CPU 参考的逐元素校验 | 不跑 |
+| `--moe-layer/--moe-expert/--moe-rows` | 校验的取样点与行数 | 0/0/64 |
+| `qrt_q4k_*` / `qrt_moe_*` | GEMM 管线与专家合成（`kernels` 模块，design 5.1 已登记） | - |
