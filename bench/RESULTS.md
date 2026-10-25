@@ -1583,3 +1583,68 @@ rows 从 2 加到 8（每个激活加载喂 8 行而不是 2 行）只换来 2%�
 **结论**：PP 的现实位置是 **约 706 tok/s**（稠密 11.5 s + 专家 2.98 s + 注意力 1.35 s 的预算下
 也就能到 900 上下，取决于注意力内核）。1000 在"q8_0 稠密 + int8 点积"这条技术路线上不可达，
 除非改变量化的数值方案。这是**需要用户拍板的产品级结论**，不是继续调优能解决的。
+
+## 51. X-1 质量门工具落地：参考转储解析 + PPL/KLD/top-1 一行判决，模型基线已落盘（2026-10-25）
+
+口径：`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`，`llama-perplexity`，`-c 256 -b 256 --chunks 2`
+（每个 chunk 只写后半窗口 127 行，两份共 **254 行**），`bench/prompts/prompt10k.txt`，
+`-dev Vulkan1 -ngl 99 -ncmoe 41 -lm none`，平衡电源 + AC，无其它推理进程。
+基线提交 `071a616bc` + 本轮改动；原始产物在 `bench/raw/x-1/`（不入库）。
+**本节不是 PP/TG 测量**，只做数值质量。
+
+### 51.1 工具
+
+`bench/tools/quality/`（`qgate.py` / `logitio.py` / `metrics.py` / `selftest.py` / `reference.ps1`，
+口径与格式规范见该目录的 `README.md`）。一条命令出全部必报项：
+
+```
+python bench/tools/quality/qgate.py compare A.bin B.bin          # 0=PASS 3=FAIL 2=格式错误
+PPL 3.360686 | mean KLD 0.0000e+00 | same top 100.000 % | PASS   # --quiet 形式
+```
+
+- 读两套格式：fork `--save-all-logits`（`_logits_` + n_ctx/n_vocab/n_chunk/tokens，
+  每行 `f32 scale, f32 min_log_prob` + 量化词表，`nv = 2*((n_vocab+1)/2)+4`）与 rt fp32 转储。
+  `qgate.py verify` 用文件大小、逐行归一化质量、行最大值范围反查布局，对不上直接拒绝。
+- 判决按 U-7：token 流一致 + `mean KLD <= 1e-4` + 每次 top-1 分叉的 margin `< 0.05 nat`。
+- 归一化口径：fork 在 16 nat 处夹值，248320 词表最多凭空多出 2.8% 质量，所以 PPL 与 KLD
+  都先在**保留词表上重新归一**；`kept mass` / `clamp mass` 两列必报。
+
+### 51.2 工具自测（不需要模型）
+
+`python bench/tools/quality/selftest.py` -> **9/9**：量化往返误差 <= 半步长；rt 归一化 < 2e-6；
+KLD 对独立 float64 参考相对误差 < 0.01%（0.35 logit 噪声 4.0606e-2 vs 4.0607e-2）；
+1e-3 噪声 PASS、0.35 噪声 FAIL；坏 magic / 截断 / 负 n_vocab / 篡改 n_vocab / token 流不一致全部拒绝。
+
+### 51.3 模型基线（真跑，同一配置重复一次）
+
+| 转储 | 配置 | PPL（工具，含归一） | fork 打印的 PPL | sha256 前 16 |
+|---|---|---:|---:|---|
+| ref-t5-a | `-t 5` | 3.360686 | 3.3621 | 96b07bd2ad63024d |
+| ref-t5-b | `-t 5` 重复 | 3.360686 | 3.3621 | 96b07bd2ad63024d |
+| ref-t8 | `-t 8` | 3.360686 | 3.3621 | 96b07bd2ad63024d |
+| ref-faoff | `-t 5 -fa off` | 3.365118 | 3.3651 | 与上不同 |
+
+- **三份转储逐字节相同**：这个模型在 `-t 5` / `-t 8` 下 logits 完全一致（CPU 专家核的归约顺序
+  不随线程数变），所以线程数不是扰动源；PPL 的第三位差异全部来自 `-fa on/off`。
+- 工具 PPL 比 fork 打印值低 0.04%：归一化把夹值质量排除了（`kept mass` 0.9996）。
+  这是口径差不是实现差，fork 的打印值仍可作交叉核对。
+- `clamp mass` 均值 **2.40e-2**、最大行 **2.79e-2**（尖峰行把整个词表夹到地板）：
+  fork 转储格式的固有损失，KLD 侧已排除，PPL 侧已归一。
+
+### 51.4 判决样例（区分度）
+
+| 对比 | mean KLD | same top-1 | 第一次分叉 | 判决 |
+|---|---:|---:|---|---|
+| t5-a vs t5-b（同配置） | 0.0000e+00 | 100.000% | 无 | **PASS** |
+| t5-a vs faoff | 1.4681e-02 | 93.701%（16 行） | offset 135，margin 0.0732；11 处分叉 margin >= 0.05 | **FAIL** |
+| t5-a vs 自身转成 rt 再比（127 行） | 4.2592e-16 | 100.000% | 无 | **PASS** |
+
+第三行是格式自证：同一份数据换成 fp32 rt 格式读回来，KLD 落在量化噪声以下、PPL 完全相同
+（2.314810 vs 2.314810），说明两套读入路径与归一化口径一致。
+
+### 51.5 留给 M2-7 的
+
+- rt 转储格式已定（`bench/tools/quality/README.md` 第 3 节：magic `QRTLOG1`、version、n_vocab、
+  n_pos、start_pos、tokens[n_pos+1]、f32 rows）。qrt 按这个格式写一段区间即可与本节基线对比。
+- 参考基线 `bench/raw/x-1/ref-t5-a.bin`（120.3 MiB、254 行）就是 M2-7 与 M2-6a（q4 KV）的 A 侧。
+- **KLD 只看保留词表**：地板以下的排序错误抓不到；要更强的门只能上 fp32 参考基线。

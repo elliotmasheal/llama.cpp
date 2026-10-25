@@ -985,3 +985,35 @@ int8 点积"路线上不可达**，要过线必须改变稠密的数值方案（
 1. 接受 **~780 tok/s** 并把 design 的 PP 目标按 U-2 改成实测可达值（需要用户改 design）。
 2. 重新考虑稠密的数值方案（4-bit 或其他），这需要先有 KLD 门（M2-7 + X-1）来量化质量损失。
 3. 把稠密投影放到 CPU 上跑的方案不值得（CPU 约 0.1 TFLOPS 量级，稠密 30.9 TFLOP 要 300 s）。
+
+## 47. X-1 判决：质量门工具成形，参考基线落盘，rt 侧只差 qrt 的 logits 出口（2026-10-25）
+
+**改了什么**：`bench/tools/quality/`（路径 `bench/tools/quality/**`）：
+
+| 文件 | 作用 |
+|---|---|
+| `logitio.py` | 两套转储的流式读写：fork `--save-all-logits`（u16 量化 log-prob）与 rt fp32 |
+| `metrics.py` | PPL / mean KLD / same top-1 / 首次分叉 + margin / `verify_dump` 结构自检 |
+| `qgate.py` | `ppl` / `compare` / `verify` / `convert` / `selftest` 子命令，退出码 0/3/2 |
+| `selftest.py` | 9 项合成自测（不需模型） |
+| `reference.ps1` | `llama-perplexity` 封装，一条命令产参考转储 |
+
+**判决**
+1. **采纳**：一条命令出 `PPL | mean KLD | same top p | PASS/FAIL`，满足 X-1 的 done_when。
+   自测 9/9；真跑区分度成立（同配置 KLD 0 / PASS；`-fa on/off` KLD 1.47e-2 / FAIL）。
+2. **口径判决**：KLD 与 PPL 都在"保留词表"上重新归一（fork 的 16 nat 地板会给尖峰行凭空加
+   最多 2.8% 质量）。不归一的话，同一份数据换格式读回来 PPL 会系统性偏移。
+   **这条口径对 M2-7 强制生效**，不许用 fork 打印值直接当门禁读数。
+3. **采纳**：判决规则 = token 流一致 + `mean KLD <= 1e-4` + top-1 分叉只允许出现在 margin `< 0.05`
+   的位置（U-7 的直接落地）。分叉率与分叉处 margin 作为必报列。
+4. **未结项（不影响 M2-7 起步）**：rt 转储要等 qrt 有 logits 输出；工具侧不再改，
+   格式见 `bench/tools/quality/README.md` 第 3 节。
+5. **证伪**：`-t` 不是这个模型的扰动源（5 vs 8 线程转储逐字节相同）。想在参考侧造"近似但不相同"的
+   对照，只能换数值路径（如 `-fa on/off`），不能换线程数。
+
+**与已有条目的关系**：第 16 节 M1 评审里"`k=1` 路径另测 logits KLD"与本节共用同一套工具；
+第 45 节"要动数值方案就得先有质量门"的产品级结论，现在有了可执行的判据。
+`bench/README.md` 第 2 节"正确性判据与速度分开报"里的 KLD 一栏从此有脚本，不再是手工步骤。
+
+**开关**：无新增运行时开关。`reference.ps1` 的 `-Ctx/-Batch/-Chunks/-Threads/-Fa/-Ncmoe/-Extra`
+只影响参考侧转储，不进入 qrt。

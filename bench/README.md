@@ -44,6 +44,8 @@ H2D MiB/token | VRAM peak | RAM peak | status
   报受限词表时必须同时报词表大小，以及同 prompt 的完整词表对照。
 - `status` 不是 `ok` 一律按缺陷进 `DECISIONS.md` 未结项，不得当成"配置不对"跳过。
 - 正确性判据与速度分开报：接受的 token 必须与参考 greedy 逐 token 一致；`k=1` 路径另报 logits KLD <= 1e-4。
+  KLD / PPL / same top-1 由 `bench/tools/quality/`（**X-1**）出，判决规则与格式见该目录 `README.md`；
+  读数口径见 `RESULTS.md` 第 51 节（**不许**把 fork 自己打印的 PPL 当门禁读数，那份没做保留词表归一）。
 
 ## 3. 测量陷阱
 
@@ -76,6 +78,7 @@ bench/prompts/    prompt10k.txt (10428 tok)  prompt20k.txt (19758 tok)
 bench/env/        power.txt  machine.txt                           口径依赖的机器事实
 bench/tools/      state_check.py（状态一致性）  m0-trace.cpp  m0-sim.py  m0-analyze.py（路由探针）
                   membw_probe.py（带宽）  gguf_dims.py（张量账 + KV）  roofline.py（目标推导）  ssd_probe.py（SSD 能力）
+                  quality/（G-QUAL：参考转储解析 + PPL/KLD/逐 token，X-1）
 bench/raw/        每次跑的 .out/.err/.bin 产物（不入库）
 ```
 

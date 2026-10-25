@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "X-1",
+      "head": "X-2",
       "order": [
         "M2-0",
         "M2-1",
@@ -389,7 +389,7 @@
       "id": "X-1",
       "milestone": "cross",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
       "title": "新模型质量门工具：参考 logits + KLD + 逐 token 对比",
       "deps": [],
       "resources": [
@@ -401,7 +401,7 @@
         "bench/tools/quality/**"
       ],
       "done_when": "一条命令输出 PPL | mean KLD | same top p | PASS/FAIL；基线落 bench/raw（不进 git）",
-      "note": "plan (path 3 chosen by the user on 2026-10-25: finish M2-6c/6d/6a and M2-7 to get a real whole-model PP and KLD before any numerics decision). Layer 1 of the tool: read the fork's --save-all-logits dump (tools/perplexity/perplexity.cpp:144 process_logits(std::ostream&...), uint16 quantised log-probs, read that function before writing the parser) and compare two dumps: mean KLD, same top-1, PPL, first divergence + margin, PASS/FAIL at 1e-4. Layer 2: a runtime side dump (qwen36rt logits, binary f32). Layer 3: one command that runs the fork reference and the runtime and prints the report"
+      "note": "done 2026-10-25: bench/tools/quality/ reads both dump formats (fork --save-all-logits u16 quantised log-probs, rt fp32), prints PPL | mean KLD | same top-1 | PASS/FAIL in one command (exit 0/3/2), selftest 9/9. Reference baseline bench/raw/x-1/ref-t5-a.bin (254 rows, PPL 3.360686, byte-identical across -t 5/8), -fa on/off scores KLD 1.47e-2 so the gate discriminates. Rule: renormalise both sides over the kept vocabulary (the fork 16-nat floor invents up to 2.8% mass on peaked rows), so fork-printed PPL is not a gate reading. rt dump format is fixed and awaits qrt logits in M2-7. RESULTS 51, DECISIONS 47"
     },
     {
       "id": "X-2",

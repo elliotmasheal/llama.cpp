@@ -76,7 +76,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=X-1 data=- io=- user=-
+queues: bench=- impl=X-2 data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -164,6 +164,12 @@ blockers: none
 - **路径 3 已选（用户 2026-10-25）**：先不做稠密优化，把 M2-6c/6d/6a 与 M2-7 做完，拿到整模型
   PP 与 KLD 再决定数值方案。队列头改为 **X-1**（质量门工具，M2-7 的前置）：读 fork 的
   --save-all-logits 转储并输出 KLD / same top-1 / PPL / PASS，计划写在 state.json 的 X-1 note。
+- **X-1 完成（2026-10-25）**：`bench/tools/quality/` 一条命令出 `PPL | mean KLD | same top p |
+  PASS/FAIL`，读 fork u16 量化转储与 rt fp32 转储两套格式，`selftest` 9/9；参考基线
+  `bench/raw/x-1/ref-t5-a.bin`（254 行，PPL 3.360686，同配置 r=2 **逐字节相同**，`-t` 不是扰动源），
+  `-fa on/off` 对照 KLD 1.47e-2 / same top 93.7% -> FAIL，区分度成立。口径判决：fork 的 16 nat
+  地板会给尖峰行凭空加最多 2.8% 质量，**PPL 与 KLD 都必须按保留词表重新归一**，fork 打印的 PPL
+  不能当门禁读数。见 `RESULTS.md` 第 51 节、`DECISIONS.md` 第 47 节。队列头 -> **X-2**。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、
