@@ -536,7 +536,7 @@
       ],
       "done_when": "chunk 可配；上传与计算重叠；compute 腿是 int8 GEMM（PP 有实测值）；失败可退化",
       "claimed_at": "2026-10-25T13:10:00",
-      "note": "step 1 in: runtime/prefill.* schedules layer first with a ring of staging slots and uploads the next blocks while the compute of a block runs (RESULTS 37). wait collapsed 352 -> 2 ms, 0.86 -> 0.73 ms per block. Not done: the compute leg is still the qrt-read bandwidth probe, not the int8 GEMM, and the host read of the store caps the run at 2.6 GB/s (DECISIONS 33)"
+      "note": "step 1 in: runtime/prefill.* schedules layer first with a staging ring (RESULTS 37); the store is mmapped so an expert read is one memcpy, 2.6 -> 7.05 GB/s end to end (RESULTS 38, DECISIONS 35). Not done: the compute leg is still the qrt-read bandwidth probe, the int8 GEMM is next"
     },
     {
       "id": "M2-6",

@@ -7,8 +7,26 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 struct qrt_weights {
-    FILE *        bin;
+#ifdef _WIN32
+    HANDLE        map_file;     // CreateFile handle behind the view
+    HANDLE        map_handle;   // CreateFileMapping handle
+#else
+    int           map_fd;
+#endif
+    const unsigned char * map;  // whole-payload view; NULL means the fread fallback
+    uint64_t      file_bytes;
+    FILE *        bin;          // only opened when the mapping failed
     uint64_t      payload_bytes;
     uint32_t      layers;
     uint32_t      experts;
@@ -29,6 +47,97 @@ struct qrt_weights {
 #define WTELL ftello
 #endif
 
+namespace {
+
+// Maps the whole payload read-only. A 18.8 GiB file is a 18.8 GiB address range, not
+// resident memory, so this is what makes the expert read a memcpy out of the page
+// cache instead of a seek plus fread per block (RESULTS 38).
+int map_payload(qrt_weights * w, const char * path, char * err, size_t err_size) {
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        snprintf(err, err_size, "cannot open %s (error %lu)", path, (unsigned long) GetLastError());
+        return -1;
+    }
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0) {
+        CloseHandle(h);
+        snprintf(err, err_size, "cannot size %s", path);
+        return -1;
+    }
+    HANDLE m = CreateFileMappingA(h, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (m == NULL) {
+        CloseHandle(h);
+        snprintf(err, err_size, "CreateFileMapping failed on %s (error %lu)", path,
+                 (unsigned long) GetLastError());
+        return -1;
+    }
+    void * v = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+    if (v == NULL) {
+        CloseHandle(m);
+        CloseHandle(h);
+        snprintf(err, err_size, "MapViewOfFile failed on %s (error %lu)", path,
+                 (unsigned long) GetLastError());
+        return -1;
+    }
+    w->map_file   = h;
+    w->map_handle = m;
+    w->map        = (const unsigned char *) v;
+    w->file_bytes = (uint64_t) size.QuadPart;
+    return 0;
+#else
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        snprintf(err, err_size, "cannot open %s", path);
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        snprintf(err, err_size, "cannot size %s", path);
+        return -1;
+    }
+    void * v = mmap(NULL, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (v == MAP_FAILED) {
+        close(fd);
+        snprintf(err, err_size, "mmap failed on %s", path);
+        return -1;
+    }
+    w->map_fd     = fd;
+    w->map        = (const unsigned char *) v;
+    w->file_bytes = (uint64_t) st.st_size;
+    return 0;
+#endif
+}
+
+void unmap_payload(qrt_weights * w) {
+#ifdef _WIN32
+    if (w->map != NULL) {
+        UnmapViewOfFile((const void *) w->map);
+    }
+    if (w->map_handle != NULL) {
+        CloseHandle(w->map_handle);
+    }
+    if (w->map_file != NULL) {
+        CloseHandle(w->map_file);
+    }
+    w->map_handle = NULL;
+    w->map_file   = NULL;
+#else
+    if (w->map != NULL) {
+        munmap((void *) w->map, (size_t) w->file_bytes);
+    }
+    if (w->map_fd >= 0) {
+        close(w->map_fd);
+    }
+    w->map_fd = -1;
+#endif
+    w->map = NULL;
+}
+
+} // namespace
+
 int qrt_weights_open(const char * prefix, qrt_weights ** out, char * err, size_t err_size) {
     *out = NULL;
     if (prefix == NULL || *prefix == '\0') {
@@ -45,21 +154,27 @@ int qrt_weights_open(const char * prefix, qrt_weights ** out, char * err, size_t
         snprintf(err, err_size, "cannot open %s", idx_path);
         return -1;
     }
-    FILE * fb = fopen(bin_path, "rb");
-    if (fb == NULL) {
-        snprintf(err, err_size, "cannot open %s", bin_path);
-        fclose(fi);
-        return -1;
-    }
-
     qrt_weights * w = (qrt_weights *) calloc(1, sizeof(qrt_weights));
     if (w == NULL) {
         snprintf(err, err_size, "out of memory for the weights table");
         fclose(fi);
-        fclose(fb);
         return -1;
     }
-    w->bin = fb;
+#ifndef _WIN32
+    w->map_fd = -1;
+#endif
+    // Mapping first: the expert read then costs one memcpy and no seek. The fread
+    // fallback stays for filesystems or handles that refuse a view (RESULTS 38).
+    if (map_payload(w, bin_path, err, err_size) != 0) {
+        w->map = NULL;
+        w->bin = fopen(bin_path, "rb");
+        if (w->bin == NULL) {
+            snprintf(err, err_size, "cannot open %s", bin_path);
+            qrt_weights_close(w);
+            fclose(fi);
+            return -1;
+        }
+    }
     char line[1024];
     int have_layers = 0, have_experts = 0;
     while (fgets(line, sizeof(line), fi) != NULL) {
@@ -157,16 +272,27 @@ int qrt_weights_open(const char * prefix, qrt_weights ** out, char * err, size_t
         qrt_weights_close(w);
         return -1;
     }
-    // The payload on disk must be at least as long as the table claims.
-    if (WSEEK(fb, 0, SEEK_END) != 0) {
-        snprintf(err, err_size, "cannot size %s", bin_path);
-        qrt_weights_close(w);
-        return -1;
+    // The payload must be at least as long as the table claims.
+    if (w->map != NULL) {
+        // file_bytes came from the mapping.
+    } else {
+        if (WSEEK(w->bin, 0, SEEK_END) != 0) {
+            snprintf(err, err_size, "cannot size %s", bin_path);
+            qrt_weights_close(w);
+            return -1;
+        }
+        const long long fb_bytes = WTELL(w->bin);
+        if (fb_bytes < 0) {
+            snprintf(err, err_size, "cannot size %s", bin_path);
+            qrt_weights_close(w);
+            return -1;
+        }
+        w->file_bytes = (uint64_t) fb_bytes;
     }
-    const long long file_bytes = WTELL(fb);
-    if (file_bytes < 0 || (uint64_t) file_bytes < 64 + w->payload_bytes) {
-        snprintf(err, err_size, "table claims %llu payload bytes, %s holds %lld",
-                 (unsigned long long) w->payload_bytes, bin_path, file_bytes);
+    if (w->file_bytes < 64 + w->payload_bytes) {
+        snprintf(err, err_size, "table claims %llu payload bytes, %s holds %llu",
+                 (unsigned long long) w->payload_bytes, bin_path,
+                 (unsigned long long) w->file_bytes);
         qrt_weights_close(w);
         return -1;
     }
@@ -180,7 +306,9 @@ void qrt_weights_close(qrt_weights * w) {
     }
     if (w->bin != NULL) {
         fclose(w->bin);
+        w->bin = NULL;
     }
+    unmap_payload(w);
     free(w->loc);
     free(w);
 }
@@ -218,14 +346,29 @@ int qrt_weights_read_expert(const qrt_weights * w, uint32_t layer, uint32_t expe
                  layer, expert, (unsigned long long) loc.bytes, (unsigned long long) cap);
         return -1;
     }
-    const long long pos = (long long) (64 + loc.offset);
-    if (WSEEK(w->bin, pos, SEEK_SET) != 0 ||
+    const uint64_t pos = 64 + loc.offset;
+    if (pos + loc.bytes > w->file_bytes) {
+        snprintf(err, err_size, "expert %u,%u at %llu runs past the %llu byte file", layer,
+                 expert, (unsigned long long) pos, (unsigned long long) w->file_bytes);
+        return -1;
+    }
+    if (w->map != NULL) {
+        memcpy(dst, w->map + pos, (size_t) loc.bytes);
+        return 0;
+    }
+    if (WSEEK(w->bin, (long long) pos, SEEK_SET) != 0 ||
         fread(dst, 1, (size_t) loc.bytes, w->bin) != (size_t) loc.bytes) {
         snprintf(err, err_size, "short read for expert %u,%u at %llu", layer, expert,
                  (unsigned long long) pos);
         return -1;
     }
     return 0;
+}
+
+int qrt_weights_mapped(const qrt_weights * w) { return w != NULL && w->map != NULL; }
+
+void qrt_weights_reader_name(const qrt_weights * w, char * out, size_t out_size) {
+    snprintf(out, out_size, "%s", (w != NULL && w->map != NULL) ? "mmap" : "fread");
 }
 
 namespace {

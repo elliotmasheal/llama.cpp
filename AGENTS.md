@@ -383,3 +383,6 @@ change  : <one line, single variable>
 - 新增模型：`docs/development/HOWTO-add-model.md`。
 - 构建：`docs/build.md`；解析/模板：`docs/development/parsing.md`、`common/jinja/README.md`。
 - 可复用工作流：`skills/` 目录，其中 `skills/code-review/SKILL.md` 在写代码前必读。
+- **M2-5 读取通路（2026-10-25）**：重组文件改只读映射后，每专家读是一次 memcpy，端到端
+  **2.6 -> 7.05 GB/s**（每块 0.73 -> 0.27 ms，read 段 13.5 GB/s）；见 `RESULTS.md` 第 38 节、
+  `DECISIONS.md` 第 35 节。新增纪律：两臂对比前必须跑预热 pass（首触缺页会造假加速比）。

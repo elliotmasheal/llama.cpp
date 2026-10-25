@@ -106,13 +106,34 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
             ids[(size_t) l * experts + e] = (uint32_t) ((uint64_t) e * experts / unique);
         }
     }
+    char reader[8] = {0};
+    qrt_weights_reader_name(w, reader, sizeof(reader));
     printf("prefill_check chunk=%u layers=%u experts=%u unique_per_layer=%u top_k=8 "
-           "max_expert_bytes=%llu\n", cfg->prefill_chunk, layers, experts, unique,
-           (unsigned long long) qrt_weights_max_expert_bytes(w));
+           "max_expert_bytes=%llu reader=%s\n", cfg->prefill_chunk, layers, experts, unique,
+           (unsigned long long) qrt_weights_max_expert_bytes(w), reader);
 
     const uint32_t arms[] = { 1, slots };
     double arm_ms[2] = { 0.0, 0.0 };
     int rc = 0;
+    // Warm-up: the first pass over a mapping pays the page faults of the store, and
+    // whichever arm runs first would otherwise look slow for that reason alone.
+    {
+        qrt_prefill_cfg wcfg;
+        memset(&wcfg, 0, sizeof(wcfg));
+        wcfg.chunk = cfg->prefill_chunk;
+        wcfg.slots = slots;
+        qrt_prefill * warm = NULL;
+        if (qrt_prefill_open(dev, w, &wcfg, &warm, err, sizeof(err)) == 0) {
+            qrt_prefill_stats wst;
+            if (qrt_prefill_run(warm, ids.data(), experts, counts.data(), NULL, NULL,
+                                &wst, err, sizeof(err)) == 0) {
+                printf("prefill_warmup slots=%u blocks=%u bytes=%llu ms=%.1f per_block_ms=%.3f\n",
+                       wcfg.slots, wst.blocks_done, (unsigned long long) wst.bytes,
+                       wst.total_ms, wst.total_ms / (wst.blocks_done > 0 ? wst.blocks_done : 1));
+            }
+            qrt_prefill_close(dev, warm);
+        }
+    }
     for (int a = 0; a < 2 && rc == 0; ++a) {
         qrt_prefill_cfg pcfg;
         memset(&pcfg, 0, sizeof(pcfg));

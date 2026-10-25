@@ -663,3 +663,27 @@ write-combined 9.1 ms、cached 0.12 ms；H2D 侧三者差别在噪声内（0.38-
 
 `state.json` 新增 **U-8**（user lane，done）记录这个决定；M3-0 的标题与 note 已同步。
 design 里的数字都带 RESULTS 回链，符合"design 的估计必须能被实测替换"的约定。
+
+## 35. M2-5 读取通路判决：mmap 采纳，2.6 -> 7.05 GB/s（2026-10-25）
+
+`qrt_weights_open` 改为只读映射，`qrt_weights_read_expert` 变成 `memcpy`（RESULTS 38）。
+
+| 项 | 结果 |
+|---|---|
+| 端到端 | 2.6 -> **7.05 GB/s**（8 槽臂，2.65x） |
+| 每块 | 0.726-0.737 -> **0.270-0.273 ms** |
+| 读取段 | 484-492 -> 143-145 ms（13.5 GB/s） |
+| 回退 | 映射失败仍用 `fread`，`reader=` 字段标注，不 abort |
+| 代价 | 18.8 GiB 文件 = 18.8 GiB 地址空间，不占常驻内存；打开时多一次 `CreateFileMapping` |
+
+**判决**：adopt。新增 `qrt_weights_mapped()` / `qrt_weights_reader_name()` 供 telemetry 与证据标注。
+
+**测量纪律新增一条（本轮踩到）**：mmap 的第一遍会付缺页 + 磁盘读的代价，所以任何"两臂对比"
+必须先跑一次**预热 pass**（同层集、不接 compute），否则先跑的那一臂会被首触代价惩罚，
+给出 1.2-4.7x 的假加速比。`--prefill-check` 已内置预热并单独打印 `prefill_warmup` 行。
+
+**未结项**
+
+1. int8 GEMM 接入（M2-5 step 2），接上后 compute 不再是 25 ms/层 的占位。
+2. `token_embd` 515 MiB 仍未定归属（design 5.5 的 dense 桶不含它）。
+3. 稠密上传（RESULTS 36）也走 `fread`，可顺带改 mmap；那是启动路径，优先级低。

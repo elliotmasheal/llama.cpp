@@ -42,6 +42,11 @@ int qrt_weights_locate(const qrt_weights * w, uint32_t layer, uint32_t expert,
 int qrt_weights_read_expert(const qrt_weights * w, uint32_t layer, uint32_t expert,
                             void * dst, size_t cap, char * err, size_t err_size);
 
+// 1 when the payload is a read-only mapping (a memcpy per expert), 0 when the open
+// had to fall back to seek plus fread. Reported by the prefill check.
+int qrt_weights_mapped(const qrt_weights * w);
+void qrt_weights_reader_name(const qrt_weights * w, char * out, size_t out_size);
+
 // Dense residency (design 5.5, M2-3): every non-expert tensor of the GGUF lives in
 // one device buffer, streamed up through a staging buffer. token_embd is not part
 // of the design's 2079 MiB dense bucket and is left on the host for now.
