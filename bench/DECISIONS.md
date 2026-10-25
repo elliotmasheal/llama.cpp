@@ -1253,3 +1253,27 @@ qrt_main.cpp 的 main 第一行现在 setvbuf(stdout, NULL, _IONBF, 0)。
 理由：设备丢失/访问违例会在 CRT 刷新之前杀掉进程，**已经打印的行全部丢失**——
 M2-6c 的 gnorm 两次尝试就是因此在盲猜（DECISIONS 56.1/56.2）。
 这条对以后所有内核检查生效：崩溃时至少能看到最后一条通过的检测点。
+
+### 56.4 gnorm 第 3 次尝试：崩溃点已定位到 `qrt_dn_weights_load`，但根因未定（2026-10-25）
+
+**新的读数（这才是本轮的收获）**：stdout 无缓冲之后，崩溃点第一次可见 —— 最后一条通过的是
+`dn_recur serial`，下一条本该是 `dn_prep_pattern`，而 prep 用例的第一件事就是
+`qrt_dn_weights_load()`。**所以崩溃发生在权重加载里，不在 gnorm 的 pipeline 或缓冲。**
+
+**已排除（比上一轮多两条）**
+- 不是描述符池（改成复用 `prep_set` 后仍崩）；
+- 不是 spec 常量继承（三个 pipeline 都显式置 nullptr 后仍崩）；
+- **不是第 5 个门控权重 `ssm_norm`**：把它从门控表里移出、改成和 `conv_w` 一样的独立加载路径后，
+  崩溃点一模一样。**这条最有价值**：说明问题在 `qrt_dn_weights` 这个对象本身。
+
+**剩下的怀疑（第 4 次尝试从这条查起）**
+1. `VkDeviceMemory mem[5]` → `mem[6]` 的数组扩容与 `count` 记账：`qrt_dn_weights_free` 用
+   `bufs[i]` 与 `mem[i]` 配对释放，若某条路径让 `count` 与实际分配错位，释放时会踩空指针。
+   **验证**：临时把 free 里的循环改成只释放 `mem[0]`（conv），若不再崩即坐实。
+2. 同一个 `qrt_gguf * g` 被 `qrt_gguf_open()` 第二次写入前没有置 NULL：若 `qrt_gguf_open`
+   在失败路径上先解引用旧指针，会二次释放。
+   **验证**：第二次 open 前显式 `g = NULL;`。
+3. `h_norm` 的赋值与 `nbuf` 生命周期（`w->h_norm = nbuf;` 是拷贝，正常）。
+
+**纪律**：三次尝试分属三族（描述符资源、spec 常量、权重对象），每次都有新读数，
+符合 DECISIONS 54 的约束；额度还剩 2 次。第 4 次只做上面第 1 条验证（一行改动）。
