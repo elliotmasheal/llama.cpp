@@ -426,6 +426,45 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
             }
         }
 
+        // 5b) gate: decay = exp(a*softplus(alpha+dt)), beta = sigmoid, against the reference
+        {
+            qrt_dn_weights * gw = NULL;
+            if (qrt_dn_weights_load(dev, gguf_path, layer, &sh, &gw, err, sizeof(err)) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            std::vector<float> xnorm((size_t) tokens * sh.n_embd);
+            for (size_t i = 0; i < xnorm.size(); ++i) {
+                xnorm[i] = (float) rng.gauss();
+            }
+            std::vector<float> dg((size_t) tokens * sh.n_v_heads), bg((size_t) tokens * sh.n_v_heads);
+            std::vector<float> dc(dg.size()), bc(dg.size());
+            if (qrt_vk_upload(dev, stg, b->norm, 0, xnorm.data(), xnorm.size() * 4, err,
+                              sizeof(err)) != 0 ||
+                qrt_dn_gate_run(dn, gw, tokens, err, sizeof(err)) != 0 ||
+                qrt_vk_download(dev, stg, b->decay, 0, dg.data(), dg.size() * 4, err,
+                                sizeof(err)) != 0 ||
+                qrt_vk_download(dev, stg, b->beta, 0, bg.data(), bg.size() * 4, err,
+                                sizeof(err)) != 0) {
+                qrt_dn_weights_free(dev, gw);
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            qrt_dn_gate_cpu(&sh, tokens, xnorm.data(), qrt_dn_weights_host(gw, 1), qrt_dn_weights_host(gw, 2),
+                            qrt_dn_weights_host(gw, 3), qrt_dn_weights_host(gw, 4), dc.data(), bc.data());
+            double md = 0.0, mb = 0.0;
+            const double rd = rel_l1(dg.data(), dc.data(), dc.size(), &md);
+            const double rb = rel_l1(bg.data(), bc.data(), bc.size(), &mb);
+            const double gate_ms = qrt_dn_last_ms(dn);
+            qrt_dn_weights_free(dev, gw);
+            printf("dn_gate  tokens=%u decay_rel_l1=%.3e beta_rel_l1=%.3e max_abs=%.3e ms=%.3f "
+                   "verdict=%s\n", tokens, rd, rb, fmax(md, mb), gate_ms,
+                   (rd <= 1e-4 && rb <= 1e-4) ? "PASS" : "FAIL");
+            if (!(rd <= 1e-4 && rb <= 1e-4)) {
+                break;
+            }
+        }
+
         // 4) timing at the chunk the prefill scheduler would use
         if (upload_range(0, max_tokens) != 0 || push_state(zero_state.data()) != 0) {
             fprintf(stderr, "qrt: %s\n", err);

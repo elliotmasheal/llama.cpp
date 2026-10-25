@@ -44,6 +44,7 @@ struct qrt_dn_bufs {
     VkBuffer xnorm;     // [tokens][n_embd]  normalised input, input of the gate GEMV
     VkBuffer z;         // [tokens][d_inner] gate projection output (silu input)
     VkBuffer gnorm;     // [tokens][d_inner] gated norm output (ssm_out input)
+    VkBuffer norm;      // [tokens][n_embd] f32 rms-norm output (the gate input)
 };
 
 // max_tokens sizes the buffers; a later chunk may be shorter.
@@ -77,10 +78,19 @@ int qrt_dn_weights_load(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer
                         const qrt_dn_shapes * sh, qrt_dn_weights ** out, char * err, size_t err_size);
 void qrt_dn_weights_free(qrt_vk_dev * dev, qrt_dn_weights * w);
 VkBuffer qrt_dn_weights_conv(const qrt_dn_weights * w);
+// host copies for the double precision references: 0 conv, 1 alpha, 2 beta, 3 dt, 4 a
+const float * qrt_dn_weights_host(const qrt_dn_weights * w, uint32_t which);
 
 int qrt_dn_prep_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
                     float l2_eps, char * err, size_t err_size);
+// gate: alpha/beta GEMV over the normalised input, then
+//   decay = exp(ssm_a * softplus(alpha + ssm_dt)), beta = sigmoid(beta_raw)
+int qrt_dn_gate_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
+                    char * err, size_t err_size);
 
+void qrt_dn_gate_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * xnorm,
+                     const float * alpha_w, const float * beta_w, const float * dt,
+                     const float * a, float * decay, float * beta);
 void qrt_dn_prep_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * qkv,
                      const float * conv_w, const float * conv_state_in, float l2_eps,
                      float * q, float * k, float * v, float * conv_state_out);

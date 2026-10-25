@@ -1207,7 +1207,7 @@
         "runtime/README.md"
       ],
       "done_when": "单层 DeltaNet 前向对 CPU 参考逐元素一致（1e-4）；递推状态在 t 步串行解码与批量一致；conv1d 状态可保存/恢复",
-      "note": "step 2a done 2026-10-25: kernels/deltanet_prep.comp (conv1d(4) + silu + q/k/v split + per-head L2 norm) matches the double precision reference at rel_L1 6.29e-08 (q), 6.41e-08 (k), 5.20e-08 (v) with a non-zero conv history, 0.26 ms per 256 tokens, plus a permanent constant-pattern check (weights=1, input=1, state=0 -> v = silu(1) everywhere) that separates bad data from a bad path. Two infrastructure defects were found and fixed: the shader push struct had a stray vbase field (36 B vs the host 32 B, so vbase read the l2_eps bits and every v write went out of range), and the .spv copy hung off qrt POST_BUILD so a shader-only change ran stale SPIR-V. Remaining for step 2: wire the gate (alpha/beta/dt/a, deltanet_gate.comp written) and the gated RMS norm (deltanet_gnorm.comp written), then the q8_0 projections for a whole layer. RESULTS 57, DECISIONS 55"
+      "note": "step 2 in progress 2026-10-25: prep passes (q 6.3e-08, k 6.4e-08, v 5.2e-08) and the gate now passes too (decay 1.36e-08, beta 1.24e-07) with the real alpha/beta/dt/a weights; qrt_dn_weights_host() serves the double precision references and qrt_dn_bufs gained norm (the RMS-norm output). The gate shape is correct but slow (12.7 us/token, so 3.9 s for 10K x 30 layers) and must move to the q8_0 GEMM or a 4-lane-per-head reduction before it counts in the PP budget. Remaining: gnorm wiring, the RMS norm + Q8_1 quantiser (qrt_norm.comp written, needs do_norm), the three q8_0 projections (attn_qkv/attn_gate/ssm_out) and the whole-layer reference. RESULTS 58, DECISIONS 56"
     },
     {
       "id": "M2-6d",

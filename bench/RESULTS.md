@@ -1854,3 +1854,21 @@ RX 6700S，平衡+AC，`qrt --deltanet-check`。
 **新增的常驻检测**：`dn_prep_pattern` 用"权重=1、输入=1、状态=0"这种零数据依赖的输入，
 要求 v 处处等于 silu(1) = 0.731059、q 等于 1/sqrt(128)。这类检测能在不看权重的情况下
 区分"数据错"与"通路错"，本轮的根因就是被它一次定位的。
+
+## 58. M2-6c：gate（decay/beta）接线完成并通过，但当前形状慢，需并行化（2026-10-25）
+
+口径：layer 0，tokens=128，真实 `ssm_alpha`/`ssm_beta`（f32 [2048,32]）/`ssm_dt`/`ssm_a`，
+xnorm 为 N(0,1)，RX 6700S，平衡+AC，`qrt --deltanet-check`。
+
+| 项 | 读数 | 判决 |
+|---|---|---|
+| decay = exp(a·softplus(alpha+dt)) | rel_L1 **1.36e-08** | PASS |
+| beta = sigmoid(beta_raw) | rel_L1 **1.24e-07** | PASS |
+| 耗时 | **1.63 ms / 128 token = 12.7 us/token** | **需要并行化** |
+
+- 正确：一个 workgroup 一个 token、一个线程一个 v-head，做 2048 长点积，与双精度参考一致。
+- **慢的原因很清楚**：每线程 2×2048 次串行乘加，只有 32 个线程在忙。
+  按此推算 10K prompt 是 130 ms/层、30 层 **3.9 s**，不可接受。
+- **下一步（性能，不改数值）**：把 alpha/beta 投影改走 q8_0 稠密 GEMM（k=2048 已满足 256 对齐，
+  n=32 需要按 64 行补齐）或改成 4 lane/head + LDS 归约；两者都能把这条腿压到 1 ms/层量级。
+  在修好之前不建议把它计入 PP 预算。

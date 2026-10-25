@@ -1198,3 +1198,16 @@ RESULTS 56；在它归零之前，`--deltanet-check` 的 v 行显示 `PARTIAL(v-
 **方法论**：本轮按第 54 节的规约，每次检测都先写"证伪什么"。真正定位靠的是**零数据依赖的常量模式**
 （权重=1、输入=1、状态=0）：它把"数据错"和"通路错"分开，一步排除了权重、状态、索引三类嫌疑。
 这条检测保留在 `--deltanet-check` 里作为常驻回归。
+
+## 56. M2-6c 判决：gate 正确性达标、形状待优化（2026-10-25）
+
+**采纳**：`deltanet_gate.comp` 与双精度参考一致（decay 1.36e-08、beta 1.24e-07），
+公式与 fork 的 `build_layer_attn_linear` 对齐（`gate = ssm_a * softplus(alpha + ssm_dt)`，
+`beta = sigmoid`）。**不作结论**：12.7 us/token 的形状不可用，10K/30 层约 3.9 s，
+必须换实现（q8_0 GEMM 或 4 lane/head 归约）后才进 PP 预算。
+
+**顺带记录**：本轮把 gate 的权重（alpha/beta/dt/a）纳入 `qrt_dn_weights`，并新增
+`qrt_dn_weights_host()` 供双精度参考读取；`qrt_dn_bufs` 增加 `norm`（RMS norm 输出，gate 的输入）。
+下一步仍是整层串联：RMS norm（`qrt_norm.comp` 已写好）→ qkv GEMM → prep → gate GEMM → gate →
+递推 → gnorm → 量化 → ssm_out GEMM。GEMM 输出是 `[row][token]`，所以 prep/gnorm 的取数要按
+stride=m 切，这一步必须和 host 侧串联同时落地（单独改会打断现有 prep 用例）。

@@ -106,9 +106,12 @@ struct qrt_deltanet {
     // step 2a: conv1d + silu + L2 norm, one pipeline on its own descriptor set
     VkBuffer       prep_qkv;
     VkBuffer       prep_state;
-    VkDeviceMemory prep_mem[2];
+    VkBuffer       prep_norm;   // [tokens][n_embd] f32, the gate input
+    VkDeviceMemory prep_mem[3];
     VkPipeline     prep_pipe;
     VkDescriptorSet prep_set;
+    VkPipeline     gate_pipe;
+    VkDescriptorSet gate_set;
 
     VkDescriptorSetLayout dsl;
     VkDescriptorPool      pool;
@@ -266,11 +269,11 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     VkDescriptorPoolSize psize;
     memset(&psize, 0, sizeof(psize));
     psize.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    psize.descriptorCount = DN_BINDINGS * 2;
+    psize.descriptorCount = DN_BINDINGS * 3;
     VkDescriptorPoolCreateInfo dpci;
     memset(&dpci, 0, sizeof(dpci));
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets       = 2;
+    dpci.maxSets       = 3;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes    = &psize;
     r = vkCreateDescriptorPool(dev->device, &dpci, nullptr, &dn->pool);
@@ -278,13 +281,13 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
         qrt_dn_close(dev, dn);
         return vk_fail(err, err_size, "vkCreateDescriptorPool (deltanet)", r);
     }
-    VkDescriptorSet sets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDescriptorSetLayout layouts[2] = { dn->dsl, dn->dsl };
+    VkDescriptorSet sets[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSetLayout layouts[3] = { dn->dsl, dn->dsl, dn->dsl };
     VkDescriptorSetAllocateInfo dsai;
     memset(&dsai, 0, sizeof(dsai));
     dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     dsai.descriptorPool     = dn->pool;
-    dsai.descriptorSetCount = 2;
+    dsai.descriptorSetCount = 3;
     dsai.pSetLayouts        = layouts;
     r = vkAllocateDescriptorSets(dev->device, &dsai, sets);
     if (r != VK_SUCCESS) {
@@ -293,6 +296,7 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     }
     dn->set      = sets[0];
     dn->prep_set = sets[1];
+    dn->gate_set = sets[2];
     VkDescriptorBufferInfo info[DN_BINDINGS];
     VkWriteDescriptorSet wr[DN_BINDINGS];
     memset(info, 0, sizeof(info));
@@ -327,6 +331,14 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
         return -1;
     }
     dn->bufs.conv_state = dn->prep_state;
+    const uint64_t norm_bytes = (uint64_t) max_tokens * sh->n_embd * 4;
+    if (qrt_vk_alloc(dev, norm_bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
+                     QRT_VK_USAGE_TRANSFER_DST, &dn->prep_norm, &dn->prep_mem[2], err,
+                     err_size) != 0) {
+        qrt_dn_close(dev, dn);
+        return -1;
+    }
+    dn->bufs.norm = dn->prep_norm;
 
     VkShaderModule pmod = load_module(dev->device, spv_dir, "deltanet_prep.spv", err, err_size);
     if (pmod == VK_NULL_HANDLE) {
@@ -346,6 +358,19 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     if (r != VK_SUCCESS) {
         qrt_dn_close(dev, dn);
         return vk_fail(err, err_size, "vkCreateComputePipelines (deltanet prep)", r);
+    }
+
+    VkShaderModule gmod = load_module(dev->device, spv_dir, "deltanet_gate.spv", err, err_size);
+    if (gmod == VK_NULL_HANDLE) {
+        qrt_dn_close(dev, dn);
+        return -1;
+    }
+    pcp.stage.module = gmod;
+    r = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &pcp, nullptr, &dn->gate_pipe);
+    vkDestroyShaderModule(dev->device, gmod, nullptr);
+    if (r != VK_SUCCESS) {
+        qrt_dn_close(dev, dn);
+        return vk_fail(err, err_size, "vkCreateComputePipelines (deltanet gate)", r);
     }
 
     VkCommandPoolCreateInfo cpi;
@@ -390,12 +415,14 @@ void qrt_dn_close(qrt_vk_dev * dev, qrt_deltanet * dn) {
             qrt_vk_free(dev, dn->mem_owner[i], dn->mem[i]);
         }
     }
-    for (uint32_t i = 0; i < 2; ++i) {
+    const VkBuffer prepbuf[3] = { dn->prep_qkv, dn->prep_state, dn->prep_norm };
+    for (uint32_t i = 0; i < 3; ++i) {
         if (dn->prep_mem[i] != VK_NULL_HANDLE) {
-            qrt_vk_free(dev, i == 0 ? dn->prep_qkv : dn->prep_state, dn->prep_mem[i]);
+            qrt_vk_free(dev, prepbuf[i], dn->prep_mem[i]);
         }
     }
     if (dn->prep_pipe != VK_NULL_HANDLE) vkDestroyPipeline(dev->device, dn->prep_pipe, nullptr);
+    if (dn->gate_pipe != VK_NULL_HANDLE) vkDestroyPipeline(dev->device, dn->gate_pipe, nullptr);
     if (dn->fence != VK_NULL_HANDLE)    vkDestroyFence(dev->device, dn->fence, nullptr);
     if (dn->cmd_pool != VK_NULL_HANDLE) vkDestroyCommandPool(dev->device, dn->cmd_pool, nullptr);
     if (dn->pool != VK_NULL_HANDLE)     vkDestroyDescriptorPool(dev->device, dn->pool, nullptr);
@@ -469,8 +496,15 @@ int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size
 }
 
 struct qrt_dn_weights {
-    VkBuffer     conv_w;   // f32 [taps][conv_ch], the conv1d kernel
-    VkDeviceMemory mem;
+    VkBuffer       conv_w;    // f32 [taps][conv_ch]
+    VkBuffer       alpha_w;   // f32 [n_embd][n_v_heads]
+    VkBuffer       beta_w;
+    VkBuffer       dt;        // f32 [n_v_heads]
+    VkBuffer       a;         // f32 [n_v_heads]
+    VkDeviceMemory mem[5];
+    uint32_t       count;
+    // host copies, for the double precision references only
+    std::vector<float> h_conv, h_alpha, h_beta, h_dt, h_a;
 };
 
 static int dn_read_f32(qrt_gguf * g, const char * name, std::vector<float> * out, char * err,
@@ -518,15 +552,67 @@ int qrt_dn_weights_load(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer
     }
     const uint64_t bytes = buf.size() * 4;
     if (qrt_vk_alloc(dev, bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST |
-                     QRT_VK_USAGE_TRANSFER_SRC, &w->conv_w, &w->mem, err, err_size) != 0) {
+                     QRT_VK_USAGE_TRANSFER_SRC, &w->conv_w, &w->mem[w->count], err,
+                     err_size) != 0) {
         free(w);
         return -1;
+    }
+    ++w->count;
+    w->h_conv = buf;
+    // the gate weights: f32 matrices and the two per-head vectors
+    if (qrt_gguf_open(gguf_path, &g, err, err_size) != 0) {
+        qrt_dn_weights_free(dev, w);
+        return -1;
+    }
+    int grc = 0;
+    struct { const char * suffix; VkBuffer * dst; std::vector<float> * host; } gate_w[] = {
+        { ".ssm_alpha.weight", &w->alpha_w, &w->h_alpha },
+        { ".ssm_beta.weight",  &w->beta_w,  &w->h_beta  },
+        { ".ssm_dt.bias",      &w->dt,      &w->h_dt    },
+        { ".ssm_a",            &w->a,       &w->h_a     },
+    };
+    for (uint32_t i = 0; i < 4 && grc == 0; ++i) {
+        snprintf(name, sizeof(name), "blk.%u%s", layer, gate_w[i].suffix);
+        grc = dn_read_f32(g, name, &buf, err, err_size);
+        if (grc != 0) {
+            break;
+        }
+        *gate_w[i].host = buf;
+        if (qrt_vk_alloc(dev, buf.size() * 4, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
+                         gate_w[i].dst, &w->mem[w->count], err, err_size) != 0) {
+            grc = -1;
+            break;
+        }
+        ++w->count;
+    }
+    qrt_gguf_close(g);
+    if (grc != 0) {
+        qrt_dn_weights_free(dev, w);
+        return -1;
+    }
+    {
+        qrt_vk_staging * gstg = NULL;
+        if (qrt_vk_staging_create(dev, w->h_alpha.size() * 4, &gstg, err, err_size) != 0) {
+            qrt_dn_weights_free(dev, w);
+            return -1;
+        }
+        const VkBuffer dsts[4] = { w->alpha_w, w->beta_w, w->dt, w->a };
+        const std::vector<float> * srcs[4] = { &w->h_alpha, &w->h_beta, &w->h_dt, &w->h_a };
+        for (uint32_t i = 0; i < 4 && grc == 0; ++i) {
+            grc = qrt_vk_upload(dev, gstg, dsts[i], 0, srcs[i]->data(), srcs[i]->size() * 4,
+                                err, err_size);
+        }
+        qrt_vk_staging_destroy(dev, gstg);
+        if (grc != 0) {
+            qrt_dn_weights_free(dev, w);
+            return -1;
+        }
     }
     qrt_vk_staging * stg = NULL;
     if (qrt_vk_staging_create(dev, bytes, &stg, err, err_size) != 0 ||
         qrt_vk_upload(dev, stg, w->conv_w, 0, buf.data(), bytes, err, err_size) != 0) {
         qrt_vk_staging_destroy(dev, stg);
-        qrt_vk_free(dev, w->conv_w, w->mem);
+        qrt_vk_free(dev, w->conv_w, w->mem[0]);
         free(w);
         return -1;
     }
@@ -539,12 +625,29 @@ VkBuffer qrt_dn_weights_conv(const qrt_dn_weights * w) {
     return w != NULL ? w->conv_w : VK_NULL_HANDLE;
 }
 
+const float * qrt_dn_weights_host(const qrt_dn_weights * w, uint32_t which) {
+    if (w == NULL) {
+        return NULL;
+    }
+    switch (which) {
+        case 0: return w->h_conv.empty() ? NULL : w->h_conv.data();
+        case 1: return w->h_alpha.empty() ? NULL : w->h_alpha.data();
+        case 2: return w->h_beta.empty() ? NULL : w->h_beta.data();
+        case 3: return w->h_dt.empty() ? NULL : w->h_dt.data();
+        case 4: return w->h_a.empty() ? NULL : w->h_a.data();
+    }
+    return NULL;
+}
+
 void qrt_dn_weights_free(qrt_vk_dev * dev, qrt_dn_weights * w) {
     if (w == NULL) {
         return;
     }
-    if (w->mem != VK_NULL_HANDLE) {
-        qrt_vk_free(dev, w->conv_w, w->mem);
+    const VkBuffer bufs[5] = { w->conv_w, w->alpha_w, w->beta_w, w->dt, w->a };
+    for (uint32_t i = 0; i < w->count && i < 5; ++i) {
+        if (w->mem[i] != VK_NULL_HANDLE) {
+            qrt_vk_free(dev, bufs[i], w->mem[i]);
+        }
     }
     free(w);
 }
@@ -629,8 +732,94 @@ int qrt_dn_prep_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens
              : fail(err, err_size, "vkResetFences (deltanet prep) failed");
 }
 
+int qrt_dn_gate_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
+                    char * err, size_t err_size) {
+    if (tokens == 0 || tokens > dn->max_tokens) {
+        return fail(err, err_size, "gate chunk of %u tokens does not fit %u", tokens,
+                    dn->max_tokens);
+    }
+    // bindings follow kernels/deltanet_gate.comp
+    const VkBuffer bufs[7] = { dn->prep_norm, w->alpha_w, w->beta_w, w->dt, w->a,
+                               dn->bufs.decay, dn->bufs.beta };
+    VkDescriptorBufferInfo info[7];
+    VkWriteDescriptorSet wr[7];
+    memset(info, 0, sizeof(info));
+    memset(wr, 0, sizeof(wr));
+    for (uint32_t i = 0; i < 7; ++i) {
+        info[i].buffer        = bufs[i];
+        info[i].offset        = 0;
+        info[i].range         = VK_WHOLE_SIZE;
+        wr[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstSet          = dn->gate_set;
+        wr[i].dstBinding      = i;
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr[i].pBufferInfo     = &info[i];
+    }
+    vkUpdateDescriptorSets(dn->dev->device, 7, wr, 0, nullptr);
+
+    VkCommandBufferBeginInfo bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkResult r = vkBeginCommandBuffer(dn->cmd, &bi);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkBeginCommandBuffer (deltanet gate)", r);
+    }
+    struct { uint32_t n_embd; uint32_t heads; uint32_t xbase; } pcs;
+    pcs.n_embd = dn->sh.n_embd;
+    pcs.heads  = dn->sh.n_v_heads;
+    pcs.xbase  = 0;
+    vkCmdBindPipeline(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->gate_pipe);
+    vkCmdBindDescriptorSets(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
+                            &dn->gate_set, 0, nullptr);
+    vkCmdPushConstants(dn->cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
+    vkCmdDispatch(dn->cmd, tokens, 1, 1);
+    r = vkEndCommandBuffer(dn->cmd);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkEndCommandBuffer (deltanet gate)", r);
+    }
+    VkSubmitInfo si;
+    memset(&si, 0, sizeof(si));
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &dn->cmd;
+    const double t0 = now_ms();
+    r = vkQueueSubmit(dn->dev->compute_queue, 1, &si, dn->fence);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkQueueSubmit (deltanet gate)", r);
+    }
+    r = vkWaitForFences(dn->dev->device, 1, &dn->fence, VK_TRUE, UINT64_MAX);
+    dn->last_ms = now_ms() - t0;
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkWaitForFences (deltanet gate)", r);
+    }
+    return vkResetFences(dn->dev->device, 1, &dn->fence) == VK_SUCCESS ? 0
+             : fail(err, err_size, "vkResetFences (deltanet gate) failed");
+}
+
 #endif // QRT_HAVE_VULKAN
 
+
+
+void qrt_dn_gate_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * xnorm,
+                     const float * alpha_w, const float * beta_w, const float * dt,
+                     const float * a, float * decay, float * beta) {
+    for (uint32_t t = 0; t < tokens; ++t) {
+        for (uint32_t h = 0; h < sh->n_v_heads; ++h) {
+            double alpha = 0.0;
+            double braw = 0.0;
+            for (uint32_t c = 0; c < sh->n_embd; ++c) {
+                const double xv = (double) xnorm[(size_t) t * sh->n_embd + c];
+                alpha += xv * (double) alpha_w[(size_t) c + (size_t) h * sh->n_embd];
+                braw  += xv * (double) beta_w[(size_t) c + (size_t) h * sh->n_embd];
+            }
+            const double sp = log1p(exp(alpha + (double) dt[h]));
+            decay[(size_t) t * sh->n_v_heads + h] = (float) exp((double) a[h] * sp);
+            beta[(size_t) t * sh->n_v_heads + h] = (float) (1.0 / (1.0 + exp(-braw)));
+        }
+    }
+}
 
 void qrt_dn_prep_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * qkv,
                      const float * conv_w, const float * conv_state_in, float l2_eps,
