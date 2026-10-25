@@ -38,6 +38,12 @@ struct qrt_dn_bufs {
     VkBuffer state_in;  // [n_v_heads][head_dim][head_dim]
     VkBuffer y;         // [tokens][d_inner], the raw attention output
     VkBuffer state_out; // [n_v_heads][head_dim][head_dim], may be state_in
+    // step 2a: the prep chain around the recurrence
+    VkBuffer qkv;       // [tokens][conv_ch]  projection output (input of the conv)
+    VkBuffer conv_state; // [conv_taps-1][conv_ch], may be NULL until written
+    VkBuffer xnorm;     // [tokens][n_embd]  normalised input, input of the gate GEMV
+    VkBuffer z;         // [tokens][d_inner] gate projection output (silu input)
+    VkBuffer gnorm;     // [tokens][d_inner] gated norm output (ssm_out input)
 };
 
 // max_tokens sizes the buffers; a later chunk may be shorter.
@@ -61,8 +67,22 @@ void qrt_dn_recur_cpu(const qrt_dn_shapes * sh, uint32_t tokens,
                       const float * decay, const float * beta,
                       double * state, float * y);
 
-// Self check: real ssm_a/ssm_dt from the GGUF, synthetic q/k/v/beta, then the
-// GPU recurrence against the CPU reference, the state save/restore path and the
-// serial-vs-batch equality. Prints its own report lines.
+// Step 2a: the three prep kernels with already projected inputs, so each can be gated on
+// its own before the GEMMs are wired in (step 2b).
+//   prep : conv1d(conv_taps) + silu + split + per-head L2 norm of q and k
+//   gate : alpha/beta GEMV + decay = exp(a*softplus(alpha+dt)), beta = sigmoid
+//   gnorm: gated RMS norm of the recurrence output, the input of ssm_out
+struct qrt_dn_weights;
+int qrt_dn_weights_load(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer,
+                        const qrt_dn_shapes * sh, qrt_dn_weights ** out, char * err, size_t err_size);
+void qrt_dn_weights_free(qrt_vk_dev * dev, qrt_dn_weights * w);
+VkBuffer qrt_dn_weights_conv(const qrt_dn_weights * w);
+
+int qrt_dn_prep_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
+                    float l2_eps, char * err, size_t err_size);
+
+void qrt_dn_prep_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * qkv,
+                     const float * conv_w, const float * conv_state_in, float l2_eps,
+                     float * q, float * k, float * v, float * conv_state_out);
 int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens,
                  const char * spv_dir);

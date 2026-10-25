@@ -1191,7 +1191,7 @@
       "id": "M2-6c",
       "milestone": "M2",
       "lane": "impl",
-      "status": "doing",
+      "status": "partial",
       "title": "DeltaNet 算子：conv1d(4) + L2 norm + 递推 + gated RMS norm",
       "deps": [],
       "resources": [
@@ -1207,8 +1207,7 @@
         "runtime/README.md"
       ],
       "done_when": "单层 DeltaNet 前向对 CPU 参考逐元素一致（1e-4）；递推状态在 t 步串行解码与批量一致；conv1d 状态可保存/恢复",
-      "note": "step 1 done (RESULTS 52: recurrence matches the CPU reference at rel_L1 2.3e-7, state save/restore and serial-vs-batch bitwise identical, 4.75-4.83 us/token). STEP 2 IS THE CURRENT WORK (user 2026-10-25: proceed from the queue head, one block at a time). Target: the whole linear-attention layer against the CPU reference. Order, each with its own gate: (a) conv1d(4)+silu over the 8192 channels with the 3-token conv state, save/restore included; (b) L2 norm per k-head (rms_norm(x, eps/128) * 1/sqrt(128)) fused into (a) because a workgroup already owns one head; (c) the alpha/beta/dt/a projections: ssm_alpha and ssm_beta are f32 [2048,32], so a small f32 kernel that writes decay = exp(a * softplus(alpha + dt)) and beta = sigmoid(beta_raw) per (token, v-head); (d) gated RMS norm of the recurrence output with ssm_norm and silu(z), then ssm_out (q8_0 GEMM, already in gemm.cpp). Dependencies already in place: the q8_0 dense GEMM at 12.89 TFLOPS (RESULTS 55) for attn_qkv/attn_gate/ssm_out, and the recurrence kernel. Still missing for a real layer: an RMS-norm kernel for attn_norm and a Q8_1 activation quantiser, both shared with the other layers and therefore worth landing here. Paths cover attn_deltanet.*, kernels/deltanet*.comp, CMakeLists, qrt_main, vk_dev",
-      "claimed_at": "2026-10-25T13:26:38"
+      "note": "step 2a in progress 2026-10-25: kernels/deltanet_prep.comp (conv1d(4) + silu + q/k/v split + per-head L2 norm) matches the double precision reference on q (rel_L1 5.07e-06) and k (2.76e-06), 0.51-0.53 ms per 256 tokens. The v channel segment is still wrong (rel_L1 47.7) and is the only open item; the check labels it PARTIAL(v-open) and keeps it out of the exit code until it is fixed. Next probe order is in RESULTS 56. Fixed on the way: the shared pipeline layout declared a 20-byte push range while the prep block is 32 bytes, which crashed the process. Still to do for step 2: gate (alpha/beta/dt/a, shaders written but not wired), gated RMS norm, and the q8_0 projection wiring that turns these into a whole layer. Paths widened for kernels/qrt_norm.comp (the shared RMS norm + Q8_1 quantiser, written and waiting for step 2b)"
     },
     {
       "id": "M2-6d",

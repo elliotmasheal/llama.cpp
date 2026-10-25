@@ -1,0 +1,40 @@
+#version 450
+// DeltaNet per-token gate (M2-6c step 2): alpha and beta are f32 [n_embd, n_v_heads]
+// matrices, so this is a small f32 GEMV rather than a quantised GEMM. One workgroup per
+// token, one thread per v-head:
+//   decay = exp(ssm_a * softplus(alpha + ssm_dt))
+//   beta  = sigmoid(beta_raw)
+// ssm_a already holds -exp(A_log), so decay <= 1.
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform PC {
+    uint n_embd;
+    uint heads;
+    uint xbase;   // first element of token 0 in the normalised input
+} pc;
+
+layout(binding = 0) readonly buffer XBuf     { float x[]; }    xb;
+layout(binding = 1) readonly buffer AlphaBuf { float aw[]; }   ab;
+layout(binding = 2) readonly buffer BetaBuf  { float bw[]; }   bb;
+layout(binding = 3) readonly buffer DtBuf    { float dt[]; }   dtb;
+layout(binding = 4) readonly buffer ABuf     { float aa[]; }   aab;
+layout(binding = 5) writeonly buffer DecayBuf { float decay[]; } db;
+layout(binding = 6) writeonly buffer OutBetaBuf { float beta[]; } ob;
+
+void main() {
+    const uint h = gl_LocalInvocationID.x;
+    const uint tok = gl_WorkGroupID.x;
+    const uint base = pc.xbase + tok * pc.n_embd;
+
+    float alpha = 0.0;
+    float beta = 0.0;
+    for (uint c = 0; c < pc.n_embd; ++c) {
+        const float xv = xb.x[base + c];
+        alpha += xv * ab.aw[c + h * pc.n_embd];
+        beta  += xv * bb.bw[c + h * pc.n_embd];
+    }
+    const float sp = log(1.0 + exp(alpha + dtb.dt[h]));
+    db.decay[tok * pc.heads + h] = exp(aab.aa[h] * sp);
+    ob.beta[tok * pc.heads + h] = 1.0 / (1.0 + exp(-beta));
+}

@@ -1,0 +1,39 @@
+#version 450
+// DeltaNet gated RMS norm (M2-6c step 2): per (token, v-head) over the 128 head values,
+//   out = rms_norm(raw, eps) * ssm_norm * silu(z)
+// which is build_norm_gated in src/models/qwen35moe.cpp. The result is the input of the
+// ssm_out projection, so it is written contiguously as [t][n_v_heads * 128].
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform PC {
+    uint  head_dim;   // 128
+    float eps;
+} pc;
+
+layout(binding = 0) readonly  buffer InBuf    { float raw[]; } inb;   // [t][heads][head_dim]
+layout(binding = 1) readonly  buffer ZBuf     { float z[]; }   zb;    // same shape
+layout(binding = 2) readonly  buffer WBuf     { float w[]; }   wb;    // [head_dim]
+layout(binding = 3) writeonly buffer OutBuf   { float o[]; }   ob;
+
+shared float red[128];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.x;
+    const uint tok = gl_WorkGroupID.y;
+    const uint base = (tok * gl_NumWorkGroups.x + head) * pc.head_dim;
+
+    const float v = inb.raw[base + tid];
+    red[tid] = v * v;
+    barrier();
+    [[unroll]] for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            red[tid] += red[tid + s];
+        }
+        barrier();
+    }
+    const float scale = inversesqrt(red[0] / float(pc.head_dim) + pc.eps);
+    const float g = zb.z[base + tid];
+    ob.o[base + tid] = v * scale * wb.w[tid] * (g / (1.0 + exp(-g)));
+}

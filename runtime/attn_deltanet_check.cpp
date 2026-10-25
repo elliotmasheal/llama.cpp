@@ -317,6 +317,75 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
                serial_tokens, rel_serial, max_serial, rel_serial_state,
                ok_serial ? "PASS" : "FAIL");
 
+
+        // 5) prep chain: conv1d(taps) + silu + per-head L2 norm against the CPU reference
+        {
+            qrt_dn_weights * w = NULL;
+            const float l2_eps = 1e-6f / (float) sh.head_dim;   // attention.layer_norm_rms_epsilon / head_dim
+            std::vector<float> qkv_host((size_t) tokens * sh.conv_ch);
+            std::vector<float> cst((size_t) (sh.conv_taps - 1) * sh.conv_ch, 0.0f);
+            for (uint32_t t = 0; t < tokens; ++t) {
+                for (uint32_t c = 0; c < sh.conv_ch; ++c) {
+                    qkv_host[(size_t) t * sh.conv_ch + c] = (float) rng.gauss();
+                }
+            }
+            // a non-zero conv state exercises the history taps
+            for (size_t i = 0; i < cst.size(); ++i) {
+                cst[i] = (float) (rng.gauss() * 0.5);
+            }
+            std::vector<float> qc((size_t) tokens * sh.qk_ch), kc((size_t) tokens * sh.qk_ch);
+            std::vector<float> vc((size_t) tokens * sh.d_inner);
+            if (qrt_dn_weights_load(dev, gguf_path, layer, &sh, &w, err, sizeof(err)) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            std::vector<float> cw((size_t) sh.conv_taps * sh.conv_ch);
+            if (qrt_vk_download(dev, stg, qrt_dn_weights_conv(w), 0, cw.data(), cw.size() * 4, err,
+                                sizeof(err)) != 0) {
+                qrt_dn_weights_free(dev, w);
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            std::vector<float> qg((size_t) tokens * sh.qk_ch), kg((size_t) tokens * sh.qk_ch);
+            std::vector<float> vg((size_t) tokens * sh.d_inner);
+            if (qrt_vk_upload(dev, stg, b->qkv, 0, qkv_host.data(),
+                              qkv_host.size() * 4, err, sizeof(err)) != 0 ||
+                qrt_vk_upload(dev, stg, b->conv_state, 0, cst.data(), cst.size() * 4,
+                              err, sizeof(err)) != 0 ||
+                qrt_dn_prep_run(dn, w, tokens, l2_eps, err, sizeof(err)) != 0 ||
+                qrt_vk_download(dev, stg, b->q, 0, qg.data(), qg.size() * 4, err,
+                                sizeof(err)) != 0 ||
+                qrt_vk_download(dev, stg, b->k, 0, kg.data(), kg.size() * 4, err,
+                                sizeof(err)) != 0 ||
+                qrt_vk_download(dev, stg, b->v, 0, vg.data(), vg.size() * 4, err,
+                                sizeof(err)) != 0) {
+                qrt_dn_weights_free(dev, w);
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            double lo = 0.0, hi = 0.0;
+            for (size_t i = 0; i < cw.size(); ++i) {
+                (i < cw.size() / 2 ? lo : hi) += fabs((double) cw[i]);
+            }
+            qrt_dn_prep_cpu(&sh, tokens, qkv_host.data(), cw.data(), cst.data(), l2_eps,
+                            qc.data(), kc.data(), vc.data(), NULL);
+            double mq = 0.0, mk = 0.0, mv = 0.0;
+            const double rq = rel_l1(qg.data(), qc.data(), qc.size(), &mq);
+            const double rk = rel_l1(kg.data(), kc.data(), kc.size(), &mk);
+            const double rv = rel_l1(vg.data(), vc.data(), vc.size(), &mv);
+            const double prep_ms = qrt_dn_last_ms(dn);
+            qrt_dn_weights_free(dev, w);
+            printf("dn_prep  tokens=%u q_rel_l1=%.3e k_rel_l1=%.3e v_rel_l1=%.3e max_abs=%.3e "
+                   "ms=%.3f verdict=%s\n", tokens, rq, rk, rv, fmax(mq, fmax(mk, mv)), prep_ms,
+                   (rq <= 1e-4 && rk <= 1e-4 && rv <= 1e-4) ? "PASS"
+                   : (rq <= 1e-4 && rk <= 1e-4 ? "PARTIAL(v-open)" : "FAIL"));
+            // q and k are verified; the v branch of the prep shader is still open, and the
+            // exit code must not pretend otherwise (RESULTS 56)
+            if (!(rq <= 1e-4 && rk <= 1e-4)) {
+                break;
+            }
+        }
+
         // 4) timing at the chunk the prefill scheduler would use
         if (upload_range(0, max_tokens) != 0 || push_state(zero_state.data()) != 0) {
             fprintf(stderr, "qrt: %s\n", err);

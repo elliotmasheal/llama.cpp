@@ -1,0 +1,74 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// DeltaNet prep: conv1d(conv_taps) over the 8192 projected channels, silu, split into
+// q/k/v, and the L2 norm of every q and k head (M2-6c step 2). One workgroup owns one
+// 128-channel head of one token, so the norm reduction is the same 128-thread reduce.
+//
+// conv input order is oldest first: conv_state[0..taps-2] then this chunk's tokens, so
+// tap j multiplies the token t-(taps-1)+j. q and k keep their own head index; the two
+// v-heads that share a k-head read the same q/k (n_v_heads = 2 * n_k_heads).
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform PC {
+    uint  n_tokens;
+    uint  conv_ch;    // 8192 = q + k + v channels
+    uint  qk_ch;      // 2048 = n_k_heads * 128
+    uint  head_dim;   // 128
+    uint  taps;       // 4
+    uint  qbase;      // first q element of token 0 in the q plane
+    uint  kbase;
+    uint  vbase;
+    float l2_eps;     // eps / head_dim, as build_gdn_l2_norm does
+} pc;
+
+layout(binding = 0) readonly  buffer QkvBuf  { float qkv[]; } qkvb;   // [t][conv_ch]
+layout(binding = 1) readonly  buffer ConvBuf { float cwv[]; } cwb;    // [taps][conv_ch]
+layout(binding = 2) readonly  buffer StBuf   { float st[]; } stb;     // [taps-1][conv_ch]
+layout(binding = 3) writeonly buffer QBuf    { float q[]; } qb;
+layout(binding = 4) writeonly buffer KBuf    { float k[]; } kb;
+layout(binding = 5) writeonly buffer VBuf    { float v[]; } vb;
+
+shared float red[128];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint group = gl_WorkGroupID.x;      // index of the 128-channel head
+    const uint tok = gl_WorkGroupID.y;
+    const uint c = group * 128u + tid;        // channel in the conv space
+
+    // gather the taps: 3 from the state, then the chunk's own tokens
+    float acc = 0.0;
+    [[unroll]] for (uint j = 0; j < 4u; ++j) {
+        if (j >= pc.taps) {
+            break;
+        }
+        const int src = int(tok) - int(pc.taps) + 1 + int(j);
+        const float val = src < 0 ? stb.st[uint(int(pc.taps) - 1 + src) * pc.conv_ch + c]
+                                  : qkvb.qkv[uint(src) * pc.conv_ch + c];
+        acc += cwb.cwv[j * pc.conv_ch + c] * val;
+    }
+    const float silu = acc / (1.0 + exp(-acc));
+
+    // q/k heads are L2 normalised; q is not scaled here, the recurrence applies 1/sqrt(d)
+    if (group < 2u * (pc.qk_ch / pc.head_dim)) {
+        red[tid] = silu * silu;
+        barrier();
+        [[unroll]] for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                red[tid] += red[tid + s];
+            }
+            barrier();
+        }
+        // rms_norm(x, eps/n) * 1/sqrt(n) is exactly x / ||x|| for a 128 long head
+        const float nval = silu * inversesqrt(red[0] + pc.l2_eps * float(pc.head_dim));
+        if (group < pc.qk_ch / pc.head_dim) {
+            qb.q[pc.qbase + tok * pc.qk_ch + c] = nval;
+        } else {
+            kb.k[pc.kbase + tok * pc.qk_ch + (c - pc.qk_ch)] = nval;
+        }
+    } else {
+        vb.v[pc.vbase + tok * (pc.conv_ch - 2u * pc.qk_ch) + (c - 2u * pc.qk_ch)] = silu;
+    }
+}

@@ -1797,3 +1797,32 @@ RX 6700S，平衡电源 + AC，`rel_l1 = 1.297e-07`（每次运行都先过正�
   **PP 的 1000 目标重新变成可达**，不再需要动数值方案。注意这与 design 的 roofline
   （fp32 7.06 TFLOPS）口径不同：int8 dot4 每条指令做 4 次乘加，所以实际算力可以超过 fp32 曲线，
   **这条要不要写进 design 由用户定**（agent 只读 design）。
+
+## 56. M2-6c 第二步（进行中）：conv1d+silu+L2 norm 的 q/k 通过（5e-06），v 分支尚未对上（2026-10-25）
+
+口径：`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` layer 0，`qrt --deltanet-check`，tokens=256，
+真实 `ssm_conv1d.weight`（f32 [4, 8192]），输入 qkv 为 N(0,1)、conv 历史状态非零，RX 6700S，平衡+AC。
+
+**新落地**：`kernels/deltanet_prep.comp`（conv1d(4) + silu + q/k/v 拆分 + 每头 L2 norm，
+一个 workgroup 管一个 128 通道的头）、`qrt_dn_weights_load`（conv 权重）、`qrt_dn_prep_run`、
+`qrt_dn_prep_cpu`（双精度参考），以及检查里的 `dn_prep` 一行。
+
+| 项 | 读数 | 判决 |
+|---|---|---|
+| q（16 头，L2 归一化后） | rel_L1 **5.07e-06** | PASS（门限 1e-4） |
+| k（16 头） | rel_L1 **2.76e-06** | PASS |
+| v（32 头，未归一化） | rel_L1 **4.77e+01** | **FAIL（未结项）** |
+| 单次 prep 耗时 | 0.51-0.53 ms / 256 token | 参考值 |
+
+**已排除**：
+- 顶部权重不是零：从设备回读的 `conv_w` 两半 |sum| = 402.9 / 146.7（都非零），
+  且 q/k 用同一缓冲的前半段、逐元素 5e-06 对上，说明 conv 权重与 conv1d 的取数是对的。
+- 不是 conv 状态越界：状态按 3 行填充后 q/k 仍对上。
+- 不是 push constant 超界：已把共享 pipeline layout 的 push 范围从 20 B 加到 32 B
+  （prep 的块是 32 B），否则 vkCmdPushConstants 越界（这条是崩溃的真因，已修）。
+
+**剩下的怀疑点（下一步只查这个）**：v 分支 `group >= 2*qk_ch/head_dim`（group 32..63）。
+GPU 的 v[0] = -1.705 / v[4096] = 0.435，而双精度参考给出 -6.6e-05 / -9.5e-04，
+两者相差 45 倍且方向一致地偏大，像是 GPU 读到了**未归一化的另一段通道**或写了错位地址。
+排查顺序：(1) dump `group` 与 `c`（把 group 写进 v 的备用槽位）；(2) 核对 `mem_owner[2]`
+（v 平面）与 prep 绑定是否同一个 buffer；(3) 单独用 1 个 token 跑 prep，逐通道比对 4096..4223。

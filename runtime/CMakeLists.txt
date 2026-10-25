@@ -105,8 +105,16 @@ if(Vulkan_GLSLC_EXECUTABLE)
         DEPENDS ${_qrt_kernels}/deltanet_recur.comp
         COMMENT "Compiling kernels/deltanet_recur.comp"
         VERBATIM)
+    set(_qrt_dn_prep_spv "${CMAKE_CURRENT_BINARY_DIR}/deltanet_prep.spv")
+    add_custom_command(
+        OUTPUT  ${_qrt_dn_prep_spv}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1
+                ${_qrt_kernels}/deltanet_prep.comp -o ${_qrt_dn_prep_spv}
+        DEPENDS ${_qrt_kernels}/deltanet_prep.comp
+        COMMENT "Compiling kernels/deltanet_prep.comp"
+        VERBATIM)
     add_custom_target(qrt_shaders DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv}
-                      ${_qrt_deltanet_spv})
+                      ${_qrt_deltanet_spv} ${_qrt_dn_prep_spv})
 endif()
 
 add_executable(qrt qrt_main.cpp)
@@ -120,7 +128,7 @@ if(TARGET qrt_shaders)
     add_custom_command(TARGET qrt POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_deltanet_spv}
-                $<TARGET_FILE_DIR:qrt>
+                ${_qrt_dn_prep_spv} $<TARGET_FILE_DIR:qrt>
         COMMENT "Copying the runtime shaders next to qrt")
 endif()
 

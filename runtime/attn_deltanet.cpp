@@ -103,6 +103,13 @@ struct qrt_deltanet {
     VkBuffer       mem_owner[DN_BINDINGS];
     VkDeviceMemory mem[DN_BINDINGS];
 
+    // step 2a: conv1d + silu + L2 norm, one pipeline on its own descriptor set
+    VkBuffer       prep_qkv;
+    VkBuffer       prep_state;
+    VkDeviceMemory prep_mem[2];
+    VkPipeline     prep_pipe;
+    VkDescriptorSet prep_set;
+
     VkDescriptorSetLayout dsl;
     VkDescriptorPool      pool;
     VkDescriptorSet       set;
@@ -204,7 +211,9 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     VkPushConstantRange pcr;
     memset(&pcr, 0, sizeof(pcr));
     pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcr.size       = 4 * sizeof(uint32_t) + sizeof(float);
+    // one layout for every DeltaNet kernel, so the range covers the widest push block
+    // (the prep kernel: 7 uint + 1 float)
+    pcr.size       = 8 * sizeof(uint32_t);
     VkPipelineLayoutCreateInfo plci;
     memset(&plci, 0, sizeof(plci));
     plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -257,11 +266,11 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     VkDescriptorPoolSize psize;
     memset(&psize, 0, sizeof(psize));
     psize.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    psize.descriptorCount = DN_BINDINGS;
+    psize.descriptorCount = DN_BINDINGS * 2;
     VkDescriptorPoolCreateInfo dpci;
     memset(&dpci, 0, sizeof(dpci));
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets       = 1;
+    dpci.maxSets       = 2;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes    = &psize;
     r = vkCreateDescriptorPool(dev->device, &dpci, nullptr, &dn->pool);
@@ -269,17 +278,21 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
         qrt_dn_close(dev, dn);
         return vk_fail(err, err_size, "vkCreateDescriptorPool (deltanet)", r);
     }
+    VkDescriptorSet sets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSetLayout layouts[2] = { dn->dsl, dn->dsl };
     VkDescriptorSetAllocateInfo dsai;
     memset(&dsai, 0, sizeof(dsai));
     dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     dsai.descriptorPool     = dn->pool;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts        = &dn->dsl;
-    r = vkAllocateDescriptorSets(dev->device, &dsai, &dn->set);
+    dsai.descriptorSetCount = 2;
+    dsai.pSetLayouts        = layouts;
+    r = vkAllocateDescriptorSets(dev->device, &dsai, sets);
     if (r != VK_SUCCESS) {
         qrt_dn_close(dev, dn);
         return vk_fail(err, err_size, "vkAllocateDescriptorSets (deltanet)", r);
     }
+    dn->set      = sets[0];
+    dn->prep_set = sets[1];
     VkDescriptorBufferInfo info[DN_BINDINGS];
     VkWriteDescriptorSet wr[DN_BINDINGS];
     memset(info, 0, sizeof(info));
@@ -296,6 +309,44 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
         wr[i].pBufferInfo     = &info[i];
     }
     vkUpdateDescriptorSets(dev->device, DN_BINDINGS, wr, 0, nullptr);
+
+    // step 2a buffers: the projected qkv of this chunk and the conv state
+    const uint64_t qkv_bytes = (uint64_t) max_tokens * sh->conv_ch * 4;
+    const uint64_t cst_bytes = (uint64_t) (sh->conv_taps - 1) * sh->conv_ch * 4;
+    if (qrt_vk_alloc(dev, qkv_bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
+                     QRT_VK_USAGE_TRANSFER_DST, &dn->prep_qkv, &dn->prep_mem[0], err,
+                     err_size) != 0) {
+        qrt_dn_close(dev, dn);
+        return -1;
+    }
+    dn->bufs.qkv = dn->prep_qkv;
+    if (qrt_vk_alloc(dev, cst_bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
+                     QRT_VK_USAGE_TRANSFER_DST, &dn->prep_state, &dn->prep_mem[1], err,
+                     err_size) != 0) {
+        qrt_dn_close(dev, dn);
+        return -1;
+    }
+    dn->bufs.conv_state = dn->prep_state;
+
+    VkShaderModule pmod = load_module(dev->device, spv_dir, "deltanet_prep.spv", err, err_size);
+    if (pmod == VK_NULL_HANDLE) {
+        qrt_dn_close(dev, dn);
+        return -1;
+    }
+    VkComputePipelineCreateInfo pcp;
+    memset(&pcp, 0, sizeof(pcp));
+    pcp.sType         = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pcp.stage.sType   = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pcp.stage.stage   = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcp.stage.module  = pmod;
+    pcp.stage.pName   = "main";
+    pcp.layout        = dn->layout;
+    r = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &pcp, nullptr, &dn->prep_pipe);
+    vkDestroyShaderModule(dev->device, pmod, nullptr);
+    if (r != VK_SUCCESS) {
+        qrt_dn_close(dev, dn);
+        return vk_fail(err, err_size, "vkCreateComputePipelines (deltanet prep)", r);
+    }
 
     VkCommandPoolCreateInfo cpi;
     memset(&cpi, 0, sizeof(cpi));
@@ -339,6 +390,12 @@ void qrt_dn_close(qrt_vk_dev * dev, qrt_deltanet * dn) {
             qrt_vk_free(dev, dn->mem_owner[i], dn->mem[i]);
         }
     }
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (dn->prep_mem[i] != VK_NULL_HANDLE) {
+            qrt_vk_free(dev, i == 0 ? dn->prep_qkv : dn->prep_state, dn->prep_mem[i]);
+        }
+    }
+    if (dn->prep_pipe != VK_NULL_HANDLE) vkDestroyPipeline(dev->device, dn->prep_pipe, nullptr);
     if (dn->fence != VK_NULL_HANDLE)    vkDestroyFence(dev->device, dn->fence, nullptr);
     if (dn->cmd_pool != VK_NULL_HANDLE) vkDestroyCommandPool(dev->device, dn->cmd_pool, nullptr);
     if (dn->pool != VK_NULL_HANDLE)     vkDestroyDescriptorPool(dev->device, dn->pool, nullptr);
@@ -411,7 +468,213 @@ int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size
              : fail(err, err_size, "vkResetFences (deltanet) failed");
 }
 
+struct qrt_dn_weights {
+    VkBuffer     conv_w;   // f32 [taps][conv_ch], the conv1d kernel
+    VkDeviceMemory mem;
+};
+
+static int dn_read_f32(qrt_gguf * g, const char * name, std::vector<float> * out, char * err,
+                       size_t err_size) {
+    const qrt_gguf_tensor * t = NULL;
+    if (qrt_gguf_require(g, name, &t, err, err_size) != 0) {
+        return -1;
+    }
+    if (t->type != 0) {
+        snprintf(err, err_size, "%s is %s, expected f32", name, qrt_gguf_type_name(t->type));
+        return -1;
+    }
+    uint64_t n = 1;
+    for (uint32_t i = 0; i < t->n_dims; ++i) {
+        n *= t->ne[i];
+    }
+    out->assign((size_t) n, 0.0f);
+    return qrt_gguf_read_tensor(g, t, out->data(), out->size() * sizeof(float), err, err_size);
+}
+
+int qrt_dn_weights_load(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer,
+                        const qrt_dn_shapes * sh, qrt_dn_weights ** out, char * err, size_t err_size) {
+    *out = NULL;
+    qrt_gguf * g = NULL;
+    if (qrt_gguf_open(gguf_path, &g, err, err_size) != 0) {
+        return -1;
+    }
+    char name[128];
+    std::vector<float> buf;
+    snprintf(name, sizeof(name), "blk.%u.ssm_conv1d.weight", layer);
+    const int rc = dn_read_f32(g, name, &buf, err, err_size);
+    qrt_gguf_close(g);
+    if (rc != 0) {
+        return -1;
+    }
+    if (buf.size() != (size_t) sh->conv_taps * sh->conv_ch) {
+        snprintf(err, err_size, "%s has %zu values, expected %u", name, buf.size(),
+                 sh->conv_taps * sh->conv_ch);
+        return -1;
+    }
+    qrt_dn_weights * w = (qrt_dn_weights *) calloc(1, sizeof(qrt_dn_weights));
+    if (w == NULL) {
+        snprintf(err, err_size, "out of memory for the conv weights");
+        return -1;
+    }
+    const uint64_t bytes = buf.size() * 4;
+    if (qrt_vk_alloc(dev, bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST |
+                     QRT_VK_USAGE_TRANSFER_SRC, &w->conv_w, &w->mem, err, err_size) != 0) {
+        free(w);
+        return -1;
+    }
+    qrt_vk_staging * stg = NULL;
+    if (qrt_vk_staging_create(dev, bytes, &stg, err, err_size) != 0 ||
+        qrt_vk_upload(dev, stg, w->conv_w, 0, buf.data(), bytes, err, err_size) != 0) {
+        qrt_vk_staging_destroy(dev, stg);
+        qrt_vk_free(dev, w->conv_w, w->mem);
+        free(w);
+        return -1;
+    }
+    qrt_vk_staging_destroy(dev, stg);
+    *out = w;
+    return 0;
+}
+
+VkBuffer qrt_dn_weights_conv(const qrt_dn_weights * w) {
+    return w != NULL ? w->conv_w : VK_NULL_HANDLE;
+}
+
+void qrt_dn_weights_free(qrt_vk_dev * dev, qrt_dn_weights * w) {
+    if (w == NULL) {
+        return;
+    }
+    if (w->mem != VK_NULL_HANDLE) {
+        qrt_vk_free(dev, w->conv_w, w->mem);
+    }
+    free(w);
+}
+
+int qrt_dn_prep_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
+                    float l2_eps, char * err, size_t err_size) {
+    if (tokens == 0 || tokens > dn->max_tokens) {
+        return fail(err, err_size, "prep chunk of %u tokens does not fit %u", tokens,
+                    dn->max_tokens);
+    }
+    // bindings follow kernels/deltanet_prep.comp: qkv, conv_w, conv_state, q, k, v
+    const VkBuffer bufs[6] = { dn->bufs.qkv, w->conv_w, dn->bufs.conv_state, dn->bufs.q,
+                               dn->bufs.k, dn->bufs.v };
+    VkDescriptorBufferInfo info[6];
+    VkWriteDescriptorSet wr[6];
+    memset(info, 0, sizeof(info));
+    memset(wr, 0, sizeof(wr));
+    for (uint32_t i = 0; i < 6; ++i) {
+        info[i].buffer        = bufs[i];
+        info[i].offset        = 0;
+        info[i].range         = VK_WHOLE_SIZE;
+        wr[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstSet          = dn->prep_set;
+        wr[i].dstBinding      = i;
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr[i].pBufferInfo     = &info[i];
+    }
+    vkUpdateDescriptorSets(dn->dev->device, 6, wr, 0, nullptr);
+
+    VkCommandBufferBeginInfo bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkResult r = vkBeginCommandBuffer(dn->cmd, &bi);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkBeginCommandBuffer (deltanet prep)", r);
+    }
+    struct {
+        uint32_t n_tokens;
+        uint32_t conv_ch;
+        uint32_t qk_ch;
+        uint32_t head_dim;
+        uint32_t taps;
+        uint32_t qbase;
+        uint32_t kbase;
+        float    l2_eps;
+    } pcs;
+    pcs.n_tokens = tokens;
+    pcs.conv_ch  = dn->sh.conv_ch;
+    pcs.qk_ch    = dn->sh.qk_ch;
+    pcs.head_dim = dn->sh.head_dim;
+    pcs.taps     = dn->sh.conv_taps;
+    pcs.qbase    = 0;
+    pcs.kbase    = 0;
+    pcs.l2_eps   = l2_eps;    // eps / head_dim, the caller passes attention eps / head_dim
+    vkCmdBindPipeline(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->prep_pipe);
+    vkCmdBindDescriptorSets(dn->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
+                            &dn->prep_set, 0, nullptr);
+    vkCmdPushConstants(dn->cmd, dn->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcs), &pcs);
+    vkCmdDispatch(dn->cmd, dn->sh.conv_ch / dn->sh.head_dim, tokens, 1);
+    r = vkEndCommandBuffer(dn->cmd);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkEndCommandBuffer (deltanet prep)", r);
+    }
+    VkSubmitInfo si;
+    memset(&si, 0, sizeof(si));
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &dn->cmd;
+    const double t0 = now_ms();
+    r = vkQueueSubmit(dn->dev->compute_queue, 1, &si, dn->fence);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkQueueSubmit (deltanet prep)", r);
+    }
+    r = vkWaitForFences(dn->dev->device, 1, &dn->fence, VK_TRUE, UINT64_MAX);
+    dn->last_ms = now_ms() - t0;
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkWaitForFences (deltanet prep)", r);
+    }
+    return vkResetFences(dn->dev->device, 1, &dn->fence) == VK_SUCCESS ? 0
+             : fail(err, err_size, "vkResetFences (deltanet prep) failed");
+}
+
 #endif // QRT_HAVE_VULKAN
+
+
+void qrt_dn_prep_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * qkv,
+                     const float * conv_w, const float * conv_state_in, float l2_eps,
+                     float * q, float * k, float * v, float * conv_state_out) {
+    const uint32_t taps = sh->conv_taps;
+    const uint32_t ch = sh->conv_ch;
+    const uint32_t qk = sh->qk_ch;
+    const uint32_t hd = sh->head_dim;
+    const uint32_t heads = qk / hd;
+    const double eps_term = (double) l2_eps * (double) hd;
+    std::vector<double> conv((size_t) ch);
+    for (uint32_t t = 0; t < tokens; ++t) {
+        for (uint32_t c = 0; c < ch; ++c) {
+            double acc = 0.0;
+            for (uint32_t j = 0; j < taps; ++j) {
+                const int src = (int) t - (int) taps + 1 + (int) j;
+                const double val = src < 0
+                    ? (double) conv_state_in[(size_t) (taps - 1 + (uint32_t) src) * ch + c]
+                    : (double) qkv[(size_t) src * ch + c];
+                acc += (double) conv_w[(size_t) j * ch + c] * val;
+            }
+            conv[c] = acc / (1.0 + exp(-acc));      // silu
+        }
+        for (uint32_t h = 0; h < heads; ++h) {
+            for (uint32_t half = 0; half < 2; ++half) {
+                const uint32_t off = half * qk + h * hd;
+                double ss = 0.0;
+                for (uint32_t i = 0; i < hd; ++i) {
+                    const double val = conv[(size_t) off + i];
+                    ss += val * val;
+                }
+                const double inv = 1.0 / sqrt(ss + eps_term);
+                float * dst = half == 0 ? q : k;
+                for (uint32_t i = 0; i < hd; ++i) {
+                    dst[(size_t) t * qk + (size_t) h * hd + i] = (float) (conv[(size_t) off + i] * inv);
+                }
+            }
+        }
+        for (uint32_t c = 0; c < sh->d_inner; ++c) {
+            v[(size_t) t * sh->d_inner + c] = (float) conv[(size_t) 2 * qk + c];
+        }
+    }
+    (void) conv_state_out;
+}
 
 void qrt_dn_recur_cpu(const qrt_dn_shapes * sh, uint32_t tokens,
                       const float * q, const float * k, const float * v,
