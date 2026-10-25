@@ -105,7 +105,9 @@ blockers: none
   VRAM 侧 staging + H2D/D2H 通路（真实专家块 123/123 往返，串行 0.24-0.43 ms/专家、
   **8 槽流水 11.5-12.1 GB/s**）+ **稠密 629 张量 2079.2 MiB 常驻**（回读 56 MB 一致）。
   见 `RESULTS.md` 第 34-36 节、`DECISIONS.md` 第 30-31 节。队列头 -> **M2-5（prefill）**。
-  遗留：`token_embd` 515 MiB 的归属（design 的 2079 MiB 不含它）、专家槽尺寸 **E-1 等用户裁决**。
+  遗留：`token_embd` 515 MiB 的归属（design 的 2079 MiB 不含它）。
+- **E-1 已决（用户 2026-10-25）**：专家槽**按层分尺寸**（1.812 / 1.945 / 2.195 MiB），4198 MiB 按层切分，
+  仍只有一个预算器；见 `DECISIONS.md` 第 32 节。design 5.1/5.3 的 1.84 MiB 常数**等用户改**。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、

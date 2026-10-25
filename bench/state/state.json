@@ -592,8 +592,8 @@
       "milestone": "M3",
       "lane": "impl",
       "status": "todo",
-      "title": "专家缓存：SLRU + H2D 调度 + 1.84 MiB 槽",
-      "deps": [
+      "title": "专家缓存：SLRU + H2D 调度 + 按层槽尺寸",
+      "note": "slot bytes follow the layer (1.812 / 1.945 / 2.195 MiB), user decision E-1 on 2026-10-25; the 4198 MiB cache is split per layer from the routing trace, with the existing cache budget and no second budgeter",      "deps": [
         "M2-3"
       ],
       "resources": [],
@@ -1134,11 +1134,5 @@
     "detail": "backend-ops baseline is 2026-10-23 / 44bd79305 (ctest 32/32 there, 33/33 after 992c2f57a; M1-3c re-ran ctest 33/33). M1-3c touched only common/, so the backend-ops record still stands but is stale; rerun the full set before any ggml or backend change."
   },
   "blockers": [],
-  "escalations": [
-    {
-      "id": "E-1",
-      "question": "专家块尺寸不是 1.84 MiB 常数：层 39 是 2.195 MiB，层 34/38 是 1.945 MiB，其余 38 层 1.812 MiB（RESULTS 35）。design 5.3/304 行写的是「每个槽 1.84 MiB」，按这个开槽会漏掉 768 个专家（7.3%）。选 A 全局按最大 2.195 MiB 开槽（4198 MiB = 1912 槽），B 按层分槽（38 层 1.812 MiB + 34/38 层 1.945 + 39 层 2.195，槽数多约 15%），C 保留 1.84 MiB 标称另开大专家溢出区？design 由用户改，M3-0 的槽尺寸等这个决定",
-      "needs_by": "M3-0"
-    }
-  ]
+  "escalations": [],
 }
