@@ -31,6 +31,12 @@ void qrt_gemm_close(qrt_vk_dev * dev, qrt_gemm * g);
 
 // Superblock bytes of a type, and the bytes a matrix of n rows by k columns needs.
 size_t qrt_gemm_block_bytes(qrt_quant type);
+
+// Q8_0 weights are repacked once at load time into [k int8][k/8 bytes of deltas] per row,
+// which makes every load aligned: the raw 34-byte blocks are not word aligned and cost a
+// funnel shift per four bytes (RESULTS 46/47). out must hold
+// qrt_gemm_matrix_bytes(QRT_QUANT_Q8_0, n, k).
+void qrt_gemm_q8k_prepare(const void * raw, uint32_t n, uint32_t k, void * out);
 uint64_t qrt_gemm_matrix_bytes(qrt_quant type, uint32_t n, uint32_t k);
 // Picks the type from the byte size of a matrix slice, or -1 when it matches none.
 int qrt_gemm_type_of(uint32_t n, uint32_t k, uint64_t bytes);

@@ -18,7 +18,31 @@ size_t qrt_gemm_block_bytes(qrt_quant type) {
 }
 
 uint64_t qrt_gemm_matrix_bytes(qrt_quant type, uint32_t n, uint32_t k) {
+    // Q8_0 is stored prepared: k bytes of quants plus k/8 bytes of deltas per row.
+    if (type == QRT_QUANT_Q8_0) {
+        return (uint64_t) n * (k + k / 8);
+    }
     return (uint64_t) n * (k / Q4K_QK) * qrt_gemm_block_bytes(type);
+}
+
+void qrt_gemm_q8k_prepare(const void * raw, uint32_t n, uint32_t k, void * out) {
+    const uint32_t blocks = k / 32;
+    const uint32_t stride = k + k / 8;
+    const unsigned char * src = (const unsigned char *) raw;
+    unsigned char * dst = (unsigned char *) out;
+    for (uint32_t row = 0; row < n; ++row) {
+        unsigned char * qrow = dst + (size_t) row * stride;
+        unsigned char * drow = qrow + k;
+        for (uint32_t b = 0; b < blocks; ++b) {
+            const unsigned char * blk = src + ((size_t) row * blocks + b) * 34;
+            memcpy(qrow + (size_t) b * 32, blk + 2, 32);
+            // The delta stays a f16 in the low half; the upper half must read as zero.
+            drow[b * 4 + 0] = blk[0];
+            drow[b * 4 + 1] = blk[1];
+            drow[b * 4 + 2] = 0;
+            drow[b * 4 + 3] = 0;
+        }
+    }
 }
 
 int qrt_gemm_type_of(uint32_t n, uint32_t k, uint64_t bytes) {

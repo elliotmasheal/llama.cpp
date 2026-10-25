@@ -187,15 +187,20 @@ static int qrt_dense_gemm_check(const qrt_config * cfg, const char * gguf_path,
     }
 
     // The tensor pointer dies with the index, so snapshot what the run needs first.
-    const uint64_t wbytes_n = t->nbytes;
-    std::vector<unsigned char> wbytes((size_t) wbytes_n);
-    if (qrt_gguf_read_tensor(g, t, wbytes.data(), wbytes.size(), err, sizeof(err)) != 0) {
+    const uint64_t raw_bytes = t->nbytes;
+    std::vector<unsigned char> wraw((size_t) raw_bytes);
+    if (qrt_gguf_read_tensor(g, t, wraw.data(), wraw.size(), err, sizeof(err)) != 0) {
         fprintf(stderr, "qrt: %s\n", err);
         qrt_gguf_close(g);
         qrt_vk_close(dev);
         return 2;
     }
     qrt_gguf_close(g);
+
+    // Repack into the aligned quants/deltas layout the kernel expects (RESULTS 47).
+    const uint64_t wbytes_n = qrt_gemm_matrix_bytes(QRT_QUANT_Q8_0, n, k);
+    std::vector<unsigned char> wbytes((size_t) wbytes_n);
+    qrt_gemm_q8k_prepare(wraw.data(), n, k, wbytes.data());
 
     int rc = 2;
     qrt_gemm * gemm = NULL;
@@ -287,7 +292,7 @@ static int qrt_dense_gemm_check(const qrt_config * cfg, const char * gguf_path,
         const uint32_t rows = 32;
         double num = 0.0, den = 0.0;
         for (uint32_t row = 0; row < rows; ++row) {
-            const unsigned char * wrow = wbytes.data() + (size_t) row * (k / 32) * 34;
+            const unsigned char * wrow = wraw.data() + (size_t) row * (k / 32) * 34;
             for (uint32_t tok = 0; tok < check_tokens; ++tok) {
                 double acc = 0.0;
                 for (uint32_t b = 0; b < k / 32; ++b) {
