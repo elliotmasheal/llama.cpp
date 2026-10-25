@@ -1211,3 +1211,18 @@ RESULTS 56；在它归零之前，`--deltanet-check` 的 v 行显示 `PARTIAL(v-
 下一步仍是整层串联：RMS norm（`qrt_norm.comp` 已写好）→ qkv GEMM → prep → gate GEMM → gate →
 递推 → gnorm → 量化 → ssm_out GEMM。GEMM 输出是 `[row][token]`，所以 prep/gnorm 的取数要按
 stride=m 切，这一步必须和 host 侧串联同时落地（单独改会打断现有 prep 用例）。
+
+### 56.1 gnorm 接线第 1 次尝试：崩溃，已回滚（2026-10-25）
+
+**现象**：gnorm（gated RMS norm）内核与 host 侧 5 处改动写入后，--deltanet-check 在
+qrt_dn_open 阶段以 0xC0000005 退出，**连 dn_device 一行都没输出**（stdout 缓冲吞掉了前半段）。
+
+**已排除**：spv 拷贝（已确认独立 target 生效）、push 常量范围（gnorm 块 12 B，layout 32 B）。
+
+**首要怀疑**（下次直接从这条查起）：描述符池被恰好用满——maxSets=4、descriptorCount=32，
+而每个 set 声明 8 个 binding，4 个 set 正好 32；但 prep/gate/gnorm 只写 4-7 个，
+kAllocateDescriptorSets 一旦失败，后续 kCmdBindDescriptorSets 拿到的就是空句柄，
+表现为崩溃而不是报错。修法：池子按 DN_BINDINGS * 8 留余量，每个 set 都写满 8 个（未用的绑同一个哑缓冲）。
+
+**纪律**：本轮按新规约第 1 次失败即回滚到最后一个绿提交（313767f9d），未留半成品；
+gnorm 的 shader（含 m 字段）、host 侧缓冲与 CPU 参考的写法已在 RESULTS 57/58 与本节记录中可复原。
