@@ -1,0 +1,618 @@
+#include "prefill.h"
+
+#include "weights.h"
+
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <chrono>
+
+struct qrt_prefill {
+    qrt_vk_dev *    dev;
+    qrt_weights *   w;
+    qrt_prefill_cfg cfg;
+    uint64_t        slot_bytes;
+    uint32_t        slots;
+    VkBuffer        buf;      // slots x slot_bytes of scratch for the compute leg
+    VkDeviceMemory  mem;
+    qrt_vk_staging ** stg;    // one staging buffer per slot, all slot_bytes long
+    uint32_t *      pend_layer;
+    uint32_t *      pend_expert;
+    uint64_t *      pend_bytes;
+};
+
+namespace {
+
+double now_ms() {
+    return (double) std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0;
+}
+
+int fail(char * err, size_t err_size, const char * fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(err, err_size, fmt, ap);
+    va_end(ap);
+    return -1;
+}
+
+} // namespace
+
+uint32_t qrt_prefill_unique_experts(uint32_t chunk, uint32_t top_k, uint32_t experts) {
+    if (experts == 0 || top_k == 0 || chunk == 0) {
+        return 0;
+    }
+    const double picks = (double) chunk * (double) top_k;
+    const double hidden = 1.0 - 1.0 / (double) experts;
+    uint32_t n = (uint32_t) ((double) experts * (1.0 - pow(hidden, picks)) + 0.5);
+    if (n == 0) {
+        n = 1;
+    }
+    return n > experts ? experts : n;
+}
+
+int qrt_prefill_open(qrt_vk_dev * dev, qrt_weights * w, const qrt_prefill_cfg * cfg,
+                     qrt_prefill ** out, char * err, size_t err_size) {
+    *out = NULL;
+    if (dev == NULL || w == NULL || cfg == NULL) {
+        return fail(err, err_size, "prefill needs a device, a store and a config");
+    }
+    qrt_prefill * p = (qrt_prefill *) calloc(1, sizeof(qrt_prefill));
+    if (p == NULL) {
+        return fail(err, err_size, "out of memory for the prefill scheduler");
+    }
+    p->dev = dev;
+    p->w   = w;
+    p->cfg = *cfg;
+    p->slot_bytes = cfg->slot_bytes != 0 ? cfg->slot_bytes : qrt_weights_max_expert_bytes(w);
+    if (p->slot_bytes == 0) {
+        free(p);
+        return fail(err, err_size, "expert store reports zero-byte experts");
+    }
+    uint32_t want = cfg->slots > 0 ? cfg->slots : 1;
+
+    // Slots are one allocation: two multi-GiB blocks can fail to fit where the sum
+    // does (the same reason runtime/proto keeps its dense and expert slices joined).
+    if (qrt_vk_alloc(dev, p->slot_bytes * want,
+                     QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
+                     &p->buf, &p->mem, err, err_size) != 0) {
+        free(p);
+        return -1;
+    }
+    p->stg = (qrt_vk_staging **) calloc(want, sizeof(*p->stg));
+    if (p->stg == NULL) {
+        qrt_prefill_close(dev, p);
+        return fail(err, err_size, "out of memory for %u staging slots", want);
+    }
+    // A failed slot takes half the ring with it, so the count drops by halves and
+    // every step is counted; at one slot the scheduler is the serial baseline.
+    for (uint32_t attempt = want; attempt >= 1; attempt /= 2) {
+        p->slots = 0;
+        while (p->slots < attempt) {
+            if (qrt_vk_staging_create(dev, p->slot_bytes, &p->stg[p->slots],
+                                      err, err_size) != 0) {
+                break;
+            }
+            ++p->slots;
+        }
+        if (p->slots == attempt) {
+            err[0] = '\0';
+            break;
+        }
+        for (uint32_t i = 0; i < p->slots; ++i) {
+            qrt_vk_staging_destroy(dev, p->stg[i]);
+            p->stg[i] = NULL;
+        }
+        ++p->cfg.slot_reductions;
+        if (attempt == 1) {
+            break;
+        }
+    }
+    if (p->slots == 0) {
+        qrt_prefill_close(dev, p);
+        return -1;
+    }
+    p->pend_layer  = (uint32_t *) calloc(want, sizeof(uint32_t));
+    p->pend_expert = (uint32_t *) calloc(want, sizeof(uint32_t));
+    p->pend_bytes  = (uint64_t *) calloc(want, sizeof(uint64_t));
+    if (p->pend_layer == NULL || p->pend_expert == NULL || p->pend_bytes == NULL) {
+        qrt_prefill_close(dev, p);
+        return fail(err, err_size, "out of memory for the slot bookkeeping");
+    }
+    *out = p;
+    return 0;
+}
+
+void qrt_prefill_close(qrt_vk_dev * dev, qrt_prefill * p) {
+    if (p == NULL) {
+        return;
+    }
+    if (p->stg != NULL) {
+        for (uint32_t i = 0; i < p->slots; ++i) {
+            qrt_vk_staging_destroy(dev, p->stg[i]);
+        }
+        free(p->stg);
+    }
+    if (dev != NULL && p->mem != VK_NULL_HANDLE) {
+        qrt_vk_free(dev, p->buf, p->mem);
+    }
+    free(p->pend_layer);
+    free(p->pend_expert);
+    free(p->pend_bytes);
+    free(p);
+}
+
+int qrt_prefill_run(qrt_prefill * p, const uint32_t * ids, uint32_t stride,
+                    const uint32_t * counts, qrt_prefill_compute_fn compute, void * user,
+                    qrt_prefill_stats * out, char * err, size_t err_size) {
+    if (p == NULL || ids == NULL || counts == NULL || out == NULL) {
+        return fail(err, err_size, "prefill run needs ids, counts and a stats sink");
+    }
+    qrt_vk_dev * dev = p->dev;
+    memset(out, 0, sizeof(*out));
+    out->slot_reductions = p->cfg.slot_reductions;
+    const uint32_t layers = qrt_weights_layers(p->w);
+
+    // Flatten (layer, expert) once so the ring has a single index to work with.
+    uint64_t total = 0;
+    for (uint32_t l = 0; l < layers; ++l) {
+        total += counts[l];
+    }
+    if (total == 0) {
+        return fail(err, err_size, "the router asked for no experts");
+    }
+    uint32_t * flat_layer = (uint32_t *) malloc((size_t) total * sizeof(uint32_t));
+    uint32_t * flat_expert = (uint32_t *) malloc((size_t) total * sizeof(uint32_t));
+    if (flat_layer == NULL || flat_expert == NULL) {
+        free(flat_layer);
+        free(flat_expert);
+        return fail(err, err_size, "out of memory for %llu blocks", (unsigned long long) total);
+    }
+    uint64_t n = 0;
+    for (uint32_t l = 0; l < layers; ++l) {
+        for (uint32_t e = 0; e < counts[l]; ++e) {
+            flat_layer[n] = l;
+            flat_expert[n] = ids[(size_t) l * stride + e];
+            ++n;
+        }
+    }
+    out->layers = layers;
+    out->blocks = (uint32_t) total;
+
+    const double t_start = now_ms();
+    int rc = 0;
+    for (uint64_t i = 0; i < total && rc == 0; ++i) {
+        const uint32_t slot = (uint32_t) (i % p->slots);
+        if (i >= p->slots) {
+            // The block sitting in this slot has been in flight for `slots` steps,
+            // so its upload should be long done: wait, then compute it while the
+            // blocks submitted after it keep streaming.
+            const double w0 = now_ms();
+            if (qrt_vk_staging_wait(dev, p->stg[slot], err, err_size) != 0) {
+                rc = -1;
+                break;
+            }
+            out->wait_ms += now_ms() - w0;
+            if (p->pend_bytes[slot] != 0) {
+                const double c0 = now_ms();
+                if (compute != NULL &&
+                    compute(user, p->pend_layer[slot], p->pend_expert[slot], p->buf,
+                            (uint64_t) slot * p->slot_bytes, p->pend_bytes[slot],
+                            err, err_size) != 0) {
+                    ++out->blocks_failed;
+                }
+                out->compute_ms += now_ms() - c0;
+            }
+            p->pend_bytes[slot] = 0;
+        }
+
+        qrt_expert_loc loc;
+        if (qrt_weights_locate(p->w, flat_layer[i], flat_expert[i], &loc,
+                               err, err_size) != 0) {
+            ++out->blocks_failed;
+            continue;
+        }
+        if (loc.bytes > p->slot_bytes) {
+            return fail(err, err_size, "expert %u,%u needs %llu bytes, the slot holds %llu",
+                        flat_layer[i], flat_expert[i], (unsigned long long) loc.bytes,
+                        (unsigned long long) p->slot_bytes);
+        }
+        unsigned char * map = (unsigned char *) qrt_vk_staging_map(p->stg[slot]);
+        const double r0 = now_ms();
+        const int read = qrt_weights_read_expert(p->w, flat_layer[i], flat_expert[i],
+                                                map, (size_t) p->slot_bytes, err, err_size);
+        out->read_ms += now_ms() - r0;
+        if (read != 0) {
+            ++out->blocks_failed;
+            continue;
+        }
+        const double u0 = now_ms();
+        if (qrt_vk_upload_submit(dev, p->stg[slot], p->buf,
+                                 (uint64_t) slot * p->slot_bytes, loc.bytes,
+                                 err, err_size) != 0) {
+            ++out->blocks_failed;
+            continue;
+        }
+        out->upload_ms += now_ms() - u0;
+        p->pend_layer[slot]  = flat_layer[i];
+        p->pend_expert[slot] = flat_expert[i];
+        p->pend_bytes[slot]  = loc.bytes;
+        out->bytes += loc.bytes;
+        ++out->blocks_done;
+    }
+
+    // Drain: the last `slots` blocks never reached the compute leg inside the loop.
+    for (uint32_t k = 0; k < p->slots && rc == 0; ++k) {
+        const uint64_t i = total - p->slots + k;
+        if (i >= total) {
+            break;
+        }
+        const uint32_t slot = (uint32_t) (i % p->slots);
+        const double w0 = now_ms();
+        if (qrt_vk_staging_wait(dev, p->stg[slot], err, err_size) != 0) {
+            rc = -1;
+            break;
+        }
+        out->wait_ms += now_ms() - w0;
+        if (p->pend_bytes[slot] != 0) {
+            const double c0 = now_ms();
+            if (compute != NULL &&
+                compute(user, p->pend_layer[slot], p->pend_expert[slot], p->buf,
+                        (uint64_t) slot * p->slot_bytes, p->pend_bytes[slot],
+                        err, err_size) != 0) {
+                ++out->blocks_failed;
+            }
+            out->compute_ms += now_ms() - c0;
+        }
+        p->pend_bytes[slot] = 0;
+    }
+    out->total_ms = now_ms() - t_start;
+    free(flat_layer);
+    free(flat_expert);
+    return rc;
+}
+
+VkBuffer qrt_prefill_buffer(const qrt_prefill * p) { return p != NULL ? p->buf : VK_NULL_HANDLE; }
+uint64_t qrt_prefill_slot_bytes(const qrt_prefill * p) { return p != NULL ? p->slot_bytes : 0; }
+
+#ifdef QRT_HAVE_VULKAN
+
+struct qrt_prefill_probe {
+    qrt_vk_dev *          dev;
+    VkShaderModule        mod;
+    VkDescriptorSetLayout dsl;
+    VkPipelineLayout      pl;
+    VkPipeline            pipe;
+    VkDescriptorPool      pool;
+    VkDescriptorSet       set;
+    VkBuffer              out_buf;
+    VkDeviceMemory        out_mem;
+    VkCommandPool         cmd_pool;
+    VkCommandBuffer       cmd;
+    VkFence               fence;
+};
+
+namespace {
+
+int vk_fail(char * err, size_t err_size, const char * what, VkResult r) {
+    return fail(err, err_size, "%s failed: VkResult %d", what, (int) r);
+}
+
+int read_file(const char * path, unsigned char ** out, size_t * out_bytes, char * err,
+              size_t err_size) {
+    FILE * f = fopen(path, "rb");
+    if (f == NULL) {
+        return fail(err, err_size, "cannot open %s", path);
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return fail(err, err_size, "cannot size %s", path);
+    }
+    const long bytes = ftell(f);
+    rewind(f);
+    if (bytes <= 0) {
+        fclose(f);
+        return fail(err, err_size, "%s is empty", path);
+    }
+    unsigned char * buf = (unsigned char *) malloc((size_t) bytes);
+    if (buf == NULL) {
+        fclose(f);
+        return fail(err, err_size, "out of memory for %ld bytes of SPIR-V", bytes);
+    }
+    const size_t got = fread(buf, 1, (size_t) bytes, f);
+    fclose(f);
+    if (got != (size_t) bytes) {
+        free(buf);
+        return fail(err, err_size, "short read on %s", path);
+    }
+    *out = buf;
+    *out_bytes = got;
+    return 0;
+}
+
+} // namespace
+
+int qrt_prefill_probe_open(qrt_vk_dev * dev, const char * spv_path, qrt_prefill * p,
+                           qrt_prefill_probe ** out, char * err, size_t err_size) {
+    *out = NULL;
+    if (dev == NULL || p == NULL || spv_path == NULL) {
+        return fail(err, err_size, "the probe needs a device, a scheduler and a shader path");
+    }
+    unsigned char * code = NULL;
+    size_t code_bytes = 0;
+    if (read_file(spv_path, &code, &code_bytes, err, err_size) != 0) {
+        return -1;
+    }
+    qrt_prefill_probe * probe = (qrt_prefill_probe *) calloc(1, sizeof(*probe));
+    if (probe == NULL) {
+        free(code);
+        return fail(err, err_size, "out of memory for the prefill probe");
+    }
+    probe->dev = dev;
+    VkResult r;
+    VkShaderModuleCreateInfo smci;    memset(&smci, 0, sizeof(smci));
+    smci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smci.codeSize = code_bytes;
+    smci.pCode    = (const uint32_t *) code;
+    r = vkCreateShaderModule(dev->device, &smci, nullptr, &probe->mod);
+    free(code);
+    if (r != VK_SUCCESS) {
+        free(probe);
+        return vk_fail(err, err_size, "vkCreateShaderModule", r);
+    }
+
+    VkDescriptorSetLayoutBinding binds[2];
+    memset(binds, 0, sizeof(binds));
+    binds[0].binding         = 0;
+    binds[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    binds[0].descriptorCount = 1;
+    binds[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    binds[1]                 = binds[0];
+    binds[1].binding         = 1;
+    VkDescriptorSetLayoutCreateInfo dlci;
+    memset(&dlci, 0, sizeof(dlci));
+    dlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dlci.bindingCount = 2;
+    dlci.pBindings    = binds;
+    r = vkCreateDescriptorSetLayout(dev->device, &dlci, nullptr, &probe->dsl);
+    if (r != VK_SUCCESS) {
+        qrt_prefill_probe_close(dev, probe);
+        return vk_fail(err, err_size, "vkCreateDescriptorSetLayout", r);
+    }
+    VkPushConstantRange pc;
+    memset(&pc, 0, sizeof(pc));
+    pc.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pc.offset     = 0;
+    pc.size       = 8;   // the shader takes (base, n) as two uints
+    VkPipelineLayoutCreateInfo plci;
+    memset(&plci, 0, sizeof(plci));
+    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount         = 1;
+    plci.pSetLayouts            = &probe->dsl;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &pc;
+    r = vkCreatePipelineLayout(dev->device, &plci, nullptr, &probe->pl);
+    if (r != VK_SUCCESS) {
+        qrt_prefill_probe_close(dev, probe);
+        return vk_fail(err, err_size, "vkCreatePipelineLayout", r);
+    }
+    VkComputePipelineCreateInfo cpci;
+    memset(&cpci, 0, sizeof(cpci));
+    cpci.sType              = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpci.stage.sType        = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage        = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module       = probe->mod;
+    cpci.stage.pName        = "main";
+    cpci.layout             = probe->pl;
+    r = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &cpci, nullptr, &probe->pipe);
+    if (r != VK_SUCCESS) {
+        qrt_prefill_probe_close(dev, probe);
+        return vk_fail(err, err_size, "vkCreateComputePipelines", r);
+    }
+
+    const uint64_t out_bytes = 4096;
+    if (qrt_vk_alloc(dev, out_bytes, QRT_VK_USAGE_STORAGE, &probe->out_buf, &probe->out_mem,
+                     err, err_size) != 0) {
+        qrt_prefill_probe_close(dev, probe);
+        return -1;
+    }
+    VkDescriptorPoolSize size;
+    memset(&size, 0, sizeof(size));
+    size.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    size.descriptorCount = 2;
+    VkDescriptorPoolCreateInfo dpci;
+    memset(&dpci, 0, sizeof(dpci));
+    dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.maxSets       = 1;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes    = &size;
+    r = vkCreateDescriptorPool(dev->device, &dpci, nullptr, &probe->pool);
+    if (r != VK_SUCCESS) {
+        qrt_prefill_probe_close(dev, probe);
+        return vk_fail(err, err_size, "vkCreateDescriptorPool", r);
+    }
+    VkDescriptorSetAllocateInfo dsai;
+    memset(&dsai, 0, sizeof(dsai));
+    dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool     = probe->pool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts        = &probe->dsl;
+    r = vkAllocateDescriptorSets(dev->device, &dsai, &probe->set);
+    if (r != VK_SUCCESS) {
+        qrt_prefill_probe_close(dev, probe);
+        return vk_fail(err, err_size, "vkAllocateDescriptorSets", r);
+    }
+    VkDescriptorBufferInfo info[2];
+    memset(info, 0, sizeof(info));
+    info[0].buffer = qrt_prefill_buffer(p);
+    info[0].offset = 0;
+    info[0].range  = VK_WHOLE_SIZE;
+    info[1].buffer = probe->out_buf;
+    info[1].offset = 0;
+    info[1].range  = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet wr[2];
+    memset(wr, 0, sizeof(wr));
+    for (int i = 0; i < 2; ++i) {
+        wr[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstSet          = probe->set;
+        wr[i].dstBinding      = (uint32_t) i;
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr[i].pBufferInfo     = &info[i];
+    }
+    vkUpdateDescriptorSets(dev->device, 2, wr, 0, nullptr);
+
+    VkCommandPoolCreateInfo pci;
+    memset(&pci, 0, sizeof(pci));
+    pci.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = dev->compute_family;    r = vkCreateCommandPool(dev->device, &pci, nullptr, &probe->cmd_pool);
+    if (r != VK_SUCCESS) {
+        qrt_prefill_probe_close(dev, probe);
+        return vk_fail(err, err_size, "vkCreateCommandPool", r);
+    }
+    VkCommandBufferAllocateInfo cai;
+    memset(&cai, 0, sizeof(cai));
+    cai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cai.commandPool        = probe->cmd_pool;
+    cai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    r = vkAllocateCommandBuffers(dev->device, &cai, &probe->cmd);
+    if (r != VK_SUCCESS) {
+        qrt_prefill_probe_close(dev, probe);
+        return vk_fail(err, err_size, "vkAllocateCommandBuffers", r);
+    }
+    VkFenceCreateInfo fci;
+    memset(&fci, 0, sizeof(fci));
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    r = vkCreateFence(dev->device, &fci, nullptr, &probe->fence);
+    if (r != VK_SUCCESS) {
+        qrt_prefill_probe_close(dev, probe);
+        return vk_fail(err, err_size, "vkCreateFence", r);
+    }
+    *out = probe;
+    return 0;
+}
+
+void qrt_prefill_probe_close(qrt_vk_dev * dev, qrt_prefill_probe * probe) {
+    if (probe == NULL) {
+        return;
+    }
+    if (dev != NULL && dev->device != VK_NULL_HANDLE) {
+        if (probe->fence != VK_NULL_HANDLE) {
+            vkDestroyFence(dev->device, probe->fence, nullptr);
+        }
+        if (probe->cmd_pool != VK_NULL_HANDLE) {
+            vkDestroyCommandPool(dev->device, probe->cmd_pool, nullptr);
+        }
+        if (probe->pool != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(dev->device, probe->pool, nullptr);
+        }
+        if (probe->out_mem != VK_NULL_HANDLE) {
+            qrt_vk_free(dev, probe->out_buf, probe->out_mem);
+        }
+        if (probe->pipe != VK_NULL_HANDLE) {
+            vkDestroyPipeline(dev->device, probe->pipe, nullptr);
+        }
+        if (probe->pl != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(dev->device, probe->pl, nullptr);
+        }
+        if (probe->dsl != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(dev->device, probe->dsl, nullptr);
+        }
+        if (probe->mod != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(dev->device, probe->mod, nullptr);
+        }
+    }
+    free(probe);
+}
+
+int qrt_prefill_probe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
+                              uint64_t slot_offset, uint64_t bytes,
+                              char * err, size_t err_size) {
+    (void) layer;
+    (void) expert;
+    (void) buf;   // the descriptor set already points at the slot buffer
+    qrt_prefill_probe * probe = (qrt_prefill_probe *) user;
+    if (probe == NULL) {
+        return fail(err, err_size, "no probe pipeline");
+    }
+    if ((slot_offset % 16) != 0 || (bytes % 16) != 0) {
+        return fail(err, err_size, "block at %llu (+%llu) is not vec4 aligned",
+                    (unsigned long long) slot_offset, (unsigned long long) bytes);
+    }
+    VkResult r = vkResetFences(probe->dev->device, 1, &probe->fence);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkResetFences (probe)", r);
+    }
+    VkCommandBufferBeginInfo bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    r = vkBeginCommandBuffer(probe->cmd, &bi);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkBeginCommandBuffer (probe)", r);
+    }
+    vkCmdBindPipeline(probe->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, probe->pipe);
+    vkCmdBindDescriptorSets(probe->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, probe->pl, 0, 1,
+                            &probe->set, 0, nullptr);
+    const uint32_t base = (uint32_t) (slot_offset / 16);
+    const uint32_t n    = (uint32_t) (bytes / 16);
+    uint32_t pc[2] = { base, n };
+    vkCmdPushConstants(probe->cmd, probe->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, pc);
+    // 256 threads x 4 vec4 per thread keeps one workgroup near a full wave.
+    uint32_t groups = (n + 1023u) / 1024u;
+    if (groups == 0) {
+        groups = 1;
+    }
+    vkCmdDispatch(probe->cmd, groups, 1, 1);
+    r = vkEndCommandBuffer(probe->cmd);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkEndCommandBuffer (probe)", r);
+    }
+    VkSubmitInfo si;
+    memset(&si, 0, sizeof(si));
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &probe->cmd;
+    r = vkQueueSubmit(probe->dev->compute_queue, 1, &si, probe->fence);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkQueueSubmit (probe)", r);
+    }
+    r = vkWaitForFences(probe->dev->device, 1, &probe->fence, VK_TRUE, UINT64_MAX);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkWaitForFences (probe)", r);
+    }
+    return 0;
+}
+
+#else // QRT_HAVE_VULKAN
+
+struct qrt_prefill_probe { int unused; };
+
+int qrt_prefill_probe_open(qrt_vk_dev * dev, const char * spv_path, qrt_prefill * p,
+                           qrt_prefill_probe ** out, char * err, size_t err_size) {
+    (void) dev;
+    (void) spv_path;
+    (void) p;
+    *out = NULL;
+    return fail(err, err_size, "this build has no Vulkan");
+}
+
+void qrt_prefill_probe_close(qrt_vk_dev * dev, qrt_prefill_probe * probe) {
+    (void) dev;
+    (void) probe;
+}
+
+int qrt_prefill_probe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
+                              uint64_t slot_offset, uint64_t bytes,
+                              char * err, size_t err_size) {
+    (void) user; (void) layer; (void) expert; (void) buf;
+    (void) slot_offset; (void) bytes;
+    return fail(err, err_size, "this build has no Vulkan");
+}
+
+#endif // QRT_HAVE_VULKAN

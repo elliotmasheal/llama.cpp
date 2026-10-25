@@ -1060,3 +1060,41 @@ staging 内存类型 = `HOST_VISIBLE|HOST_COHERENT|HOST_CACHED`（heap 0 系统�
 
 **结论**：M2-3 的 done_when 三条全部满足（稠密常驻、专家 `[层][专家]` 偏移可查、未知专家/未知张量
 返回错误而不 abort），任务记 done。
+
+## 37. M2-5 第一步：prefill 调度骨架与双缓冲上传（2026-10-25）
+
+口径：`qrt --prefill-check <repack> [--prefill-slots N] [--prefill-layers N]`；
+RX 6700S、平衡电源 + AC、dGPU 无其它进程；chunk=2048（`--prefill-chunk` 默认）、top-8 均匀路由模型
+-> **每层 256 个专家全部命中**（`qrt_prefill_unique_experts`），所以每层 464-476 MiB；
+测前 4 层（层 0-3，均为 1.812 MiB 槽）；两臂同一份数据、同一顺序，只有 staging 槽数不同；
+r=2。原始输出 `bench/raw/m25-prefill-20261025/prefill-r{1,2}.out`，`status = ok`。
+
+**compute 腿是占位**：`runtime/proto/qrt-read.comp` 的带宽读核，一块一次 dispatch，几何与将来的
+int8 GEMM 相同但没有数学；本轮只量调度，不量 PP。
+
+| staging 槽 | 块 | 字节 | total ms | 每块 ms | read ms | upload ms | wait ms | compute ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1（串行基线） | 1024 | 1 946 157 056 | 879.0 / 901.2 | 0.858 / 0.880 | 387.3 / 402.9 | 28.8 / 30.6 | **352.4 / 354.8** | 110.1 / 112.4 |
+| **8** | 1024 | 1 946 157 056 | **754.6 / 743.2** | **0.737 / 0.726** | 491.7 / 484.3 | 39.3 / 37.2 | **2.1 / 1.9** | 220.9 / 219.4 |
+
+- **重叠成立**：等待从 352-355 ms 塌到 1.9-2.1 ms（占 total 的 0.3%），加速 1.17-1.21x
+  （`hidden_ms` 124-158）。上传命令本身只占 29-39 ms，其余都在 compute 期间跑掉了。
+- 8 槽臂的 read 与 compute 反而涨了 25-100%：计算读核与在飞的上传同时抢显存/PCIe，单块 dispatch
+  从 0.43 ms 涨到 0.86 ms。**流水不是免费**，M3 的调度要按"计算在飞 + 上传在飞"同时算。
+- **瓶颈已经换到主机读取**：8 槽臂 total 743-755 ms / 1946 MB = **2.6 GB/s**，read 占 65%。
+  可见 design 4.5 的"每层 480 MiB、14.17 GB/s、35.5 ms"前提，卡在 `fread` 进 staging 映射的这一段，
+  而不是 H2D（H2D 此刻是 0.3% 的等待）。
+
+**推算（不是实测）**：chunk 2048 的 PP 要 1000，需要每层 <=51 ms、即整体 >=9 GB/s 的存储读取；
+当前 2.6 GB/s 只够 ~290 tok/s。下一轮的单一变量应先修读取通路（mmap 重组文件后 memcpy，
+或换成多线程读 + 双 staging），再回来量 PP。
+
+**功能项**（done_when 的前两条）
+
+| 项 | 结果 |
+|---|---|
+| chunk 可配 | `--prefill-chunk` 决定每层唯一专家数（`qrt_prefill_unique_experts`），本轮 2048 -> 256 |
+| 上传与计算重叠 | 见上表，wait 塌到 0.3% |
+| 槽不足可退化 | 槽创建失败按半数回退并计入 `slot_reductions`（本轮 0） |
+| 单块失败可恢复 | 读/定位/上传失败只计 `blocks_failed`，不 abort（本轮 0） |
+| 显存 | `alloc_mib=19`（8 槽 x 2.2 MiB + 4 KiB 输出） |

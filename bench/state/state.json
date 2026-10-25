@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "track": "qwen36-runtime",
-  "updated": "2026-10-24",
+  "updated": "2026-10-25",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-5",
+      "head": "M2-6",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-3 closed (dense residency + H2D, RESULTS 35/36); M2-5 (prefill) is the head, M2-6 (attention) can run in parallel"
+      "note": "M2-5 is doing (prefill scheduler); M2-6 (attention) is the next runnable task in this lane"
     },
     {
       "lane": "data",
@@ -518,17 +518,25 @@
       "id": "M2-5",
       "milestone": "M2",
       "lane": "impl",
-      "status": "todo",
+      "status": "doing",
       "title": "prefill 引擎：层优先分块 + 双缓冲上传",
       "deps": [
         "M2-3",
         "M2-4"
       ],
-      "resources": [],
-      "paths": [
-        "runtime/prefill.*"
+      "resources": [
+        "gpu",
+        "machine-quiet",
+        "disk-io"
       ],
-      "done_when": "chunk=512 可跑；上传与计算重叠；chunk 可配且失败可退化"
+      "paths": [
+        "runtime/prefill.*",
+        "runtime/qrt_main.cpp",
+        "runtime/CMakeLists.txt"
+      ],
+      "done_when": "chunk 可配；上传与计算重叠；compute 腿是 int8 GEMM（PP 有实测值）；失败可退化",
+      "claimed_at": "2026-10-25T13:10:00",
+      "note": "step 1 in: runtime/prefill.* schedules layer first with a ring of staging slots and uploads the next blocks while the compute of a block runs (RESULTS 37). wait collapsed 352 -> 2 ms, 0.86 -> 0.73 ms per block. Not done: the compute leg is still the qrt-read bandwidth probe, not the int8 GEMM, and the host read of the store caps the run at 2.6 GB/s (DECISIONS 33)"
     },
     {
       "id": "M2-6",
@@ -593,7 +601,8 @@
       "lane": "impl",
       "status": "todo",
       "title": "专家缓存：SLRU + H2D 调度 + 按层槽尺寸",
-      "note": "slot bytes follow the layer (1.812 / 1.945 / 2.195 MiB), user decision E-1 on 2026-10-25; the 4198 MiB cache is split per layer from the routing trace, with the existing cache budget and no second budgeter",      "deps": [
+      "note": "slot bytes follow the layer (1.812 / 1.945 / 2.195 MiB), user decision E-1 on 2026-10-25; the 4198 MiB cache is split per layer from the routing trace, with the existing cache budget and no second budgeter",
+      "deps": [
         "M2-3"
       ],
       "resources": [],

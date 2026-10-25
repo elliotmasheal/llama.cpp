@@ -605,3 +605,45 @@ write-combined 9.1 ms、cached 0.12 ms；H2D 侧三者差别在噪声内（0.38-
   注释、以及 111 行"每个专家约 1.84 MiB（摊平）"这一平均值的口径说明。
 
 `state.json` 的 escalation E-1 已关闭，M3-0 的标题改为"按层槽尺寸"。
+
+## 33. M2-5 第一步判决：调度与重叠通了，瓶颈换到主机读取（2026-10-25）
+
+`runtime/prefill.*` 落地：层优先、环形 staging 槽、"上传不再等待就当块算完"。读数见 `RESULTS.md` 第 37 节。
+
+| 项 | 结果 |
+|---|---|
+| 上传与计算重叠 | **wait 从 352-355 ms 塌到 1.9-2.1 ms**，1.17-1.21x |
+| 每块摊销 | 0.858-0.880 ms（串行）-> **0.726-0.737 ms**（8 槽） |
+| 退化 | 槽不足按半数回退并计数；单块读/定位/上传失败只计数，不 abort |
+| 复现 | `qrt --prefill-check <repack> [--prefill-slots N] [--prefill-layers N]` |
+
+**判决**：part（M2-5 不记 done）。调度层满足 done_when 的"chunk 可配 / 上传与计算重叠 / 失败可退化"，
+但 **compute 腿仍是 `runtime/proto/qrt-read.comp` 的带宽读核**，不是 int8 GEMM，所以 PP 没有实测值，
+"PP >= 1000"这条无从判定。M2-5 留在 doing。
+
+**本轮暴露的瓶颈（下一轮的单一变量）**：1946 MB / 743 ms = **2.6 GB/s**，其中 read 占 65%，
+而 H2D 完全被藏住。design 4.5 的 35.5 ms/层是按 14.17 GB/s 的传输算的，我们的传输确实到了这个量级
+（8 槽流水 11.5-12.1 GB/s，RESULTS 35），但**读重组文件只有 2.6 GB/s**：`fread` 每次 seek+读 1.9 MB
+进 staging 映射。候选改法（下一轮只动一个）：
+1. `mmap` 重组文件后 memcpy（绕开 CRT 的 fread 路径，按页缓存带宽走）；
+2. 读线程与上传分离（读进普通缓冲，再 memcpy 到槽），用 2 个读线程；
+3. 换更长的连续读（合并相邻专家）以减少 seek。
+
+**新增开关/接口**（都不是 design 第 7 节的开关）
+
+| 名字 | 作用 | 默认 |
+|---|---|---|
+| `--prefill-check <prefix>` | 跑两臂（1 槽 / N 槽）并报告读数 | 不跑 |
+| `--prefill-slots N` | 在飞 staging 槽数，1 即串行基线 | 8 |
+| `--prefill-layers N` | 只跑前 N 层（控盘与时间） | 4 |
+| `--prefill-shader <spv>` | 覆盖占位 compute 的 SPIR-V 路径 | 可执行文件旁的 `qrt-read.spv` |
+| `qrt_prefill_*` | 调度器 API（`open/run/close` + 槽/buffer 访问器） | - |
+
+**未结项**
+
+1. **int8 GEMM 接进 compute 腿**（M2-5 step 2）：`runtime/kernels/bench/q4k-gemm.{comp,cpp}` 已有
+   6.08-6.20 TFLOPS 的内核，缺的是把它做成运行时的 pipeline（描述符布局已定：qs/ds 两个激活平面）。
+   接上之后 PP 才有实测口径。
+2. **主机读取通路 2.6 GB/s**：见上，下一轮优先。
+3. 槽的 `slot_bytes` 现在取最大专家（2.195 MiB），层 0-3 实际只要 1.812 MiB，浪费 0.38 MiB/槽；
+   E-1 已定"按层分槽"，M3-0 的缓存与 M2-5 的槽表都按层取尺寸即可，本轮的按最大值只是为了简单。

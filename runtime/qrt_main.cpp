@@ -6,12 +6,14 @@
 #include "gguf_index.h"
 #include "vk_dev.h"
 #include "weights.h"
+#include "prefill.h"
 
 #include <chrono>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <string>
 #include <vector>
 
 static const char QRT_VERSION[] = "0.1-m2-0";
@@ -70,6 +72,97 @@ static int count_lines(const char * path, char * first, size_t first_size) {
     }
     fclose(f);
     return lines;
+}
+
+// M2-5 step 1: layer-first prefill with uploads in flight. Runs the same layer set
+// twice, serial (1 slot) and pipelined (slots), so the overlap is a single variable.
+// The compute leg is the read probe of prefill.h, not the int8 GEMM yet.
+static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const char * spv,
+                             uint32_t slots, uint32_t layers) {
+    char err[QRT_ERR_SIZE] = {0};
+    qrt_vk_dev * dev = NULL;
+    if (qrt_vk_open((uint32_t) cfg->vram_tier_mib, &dev, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        return 2;
+    }
+    qrt_weights * w = NULL;
+    if (qrt_weights_open(prefix, &w, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        qrt_vk_close(dev);
+        return 2;
+    }
+    const uint32_t all_layers = qrt_weights_layers(w);
+    const uint32_t experts = qrt_weights_experts(w);
+    if (layers == 0 || layers > all_layers) {
+        layers = all_layers;
+    }
+    const uint32_t unique = qrt_prefill_unique_experts(cfg->prefill_chunk, (uint32_t) 8, experts);
+    std::vector<uint32_t> ids((size_t) all_layers * experts);
+    std::vector<uint32_t> counts(all_layers, 0);
+    for (uint32_t l = 0; l < all_layers; ++l) {
+        counts[l] = l < layers ? unique : 0;
+        for (uint32_t e = 0; e < unique; ++e) {
+            // Spread the picked ids over the whole table instead of a prefix.
+            ids[(size_t) l * experts + e] = (uint32_t) ((uint64_t) e * experts / unique);
+        }
+    }
+    printf("prefill_check chunk=%u layers=%u experts=%u unique_per_layer=%u top_k=8 "
+           "max_expert_bytes=%llu\n", cfg->prefill_chunk, layers, experts, unique,
+           (unsigned long long) qrt_weights_max_expert_bytes(w));
+
+    const uint32_t arms[] = { 1, slots };
+    double arm_ms[2] = { 0.0, 0.0 };
+    int rc = 0;
+    for (int a = 0; a < 2 && rc == 0; ++a) {
+        qrt_prefill_cfg pcfg;
+        memset(&pcfg, 0, sizeof(pcfg));
+        pcfg.chunk = cfg->prefill_chunk;
+        pcfg.slots = arms[a];
+        pcfg.slot_bytes = 0;
+        qrt_prefill * p = NULL;
+        if (qrt_prefill_open(dev, w, &pcfg, &p, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            rc = 2;
+            break;
+        }
+        qrt_prefill_probe * probe = NULL;
+        if (qrt_prefill_probe_open(dev, spv, p, &probe, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            qrt_prefill_close(dev, p);
+            rc = 2;
+            break;
+        }
+        qrt_prefill_stats st;
+        if (qrt_prefill_run(p, ids.data(), experts, counts.data(), qrt_prefill_probe_compute,
+                            probe, &st, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            rc = 2;
+        } else {
+            const double blocks = st.blocks_done > 0 ? (double) st.blocks_done : 1.0;
+            arm_ms[a] = st.total_ms;
+            printf("prefill slots=%u chunk=%u layers=%u of %u blocks=%u done=%u failed=%u "
+                   "bytes=%llu slot_mib=%.2f total_ms=%.1f per_block_ms=%.3f "
+                   "read_ms=%.1f upload_ms=%.1f wait_ms=%.1f compute_ms=%.1f "
+                   "reductions=%u\n",
+                   pcfg.slots, pcfg.chunk, (layers), st.layers, st.blocks, st.blocks_done,
+                   st.blocks_failed, (unsigned long long) st.bytes,
+                   (double) qrt_prefill_slot_bytes(p) / (1024.0 * 1024.0), st.total_ms,
+                   st.total_ms / blocks, st.read_ms, st.upload_ms, st.wait_ms, st.compute_ms,
+                   st.slot_reductions);
+        }
+        qrt_prefill_probe_close(dev, probe);
+        qrt_prefill_close(dev, p);
+    }
+    if (rc == 0 && arm_ms[0] > 0.0) {
+        printf("prefill_speedup serial_ms=%.1f pipelined_ms=%.1f ratio=%.3f "
+               "hidden_ms=%.1f\n", arm_ms[0], arm_ms[1], arm_ms[0] / arm_ms[1],
+               arm_ms[0] - arm_ms[1]);
+    }
+    qrt_weights_close(w);
+    printf("prefill_io_failures=%u alloc_mib=%llu\n", dev->io_failures,
+           (unsigned long long) (dev->alloc_bytes >> 20));
+    qrt_vk_close(dev);
+    return rc;
 }
 
 static int qrt_selftest(void) {
@@ -591,6 +684,10 @@ int main(int argc, char ** argv) {
     int vk_probe_mib = 0;
     int vk_io_check = 0;
     const char * dense_gguf = NULL;
+    const char * prefill_prefix = NULL;
+    const char * prefill_shader = NULL;
+    int prefill_slots = 8;
+    int prefill_layers = 4;
     const char * repack_prefix = NULL;
     const char * gguf_path = NULL;
     const char * require_tensor = NULL;
@@ -623,6 +720,46 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             dense_gguf = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--prefill-check") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --prefill-check needs the repack prefix\n");
+                return 2;
+            }
+            prefill_prefix = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--prefill-shader") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --prefill-shader needs the SPIR-V path\n");
+                return 2;
+            }
+            prefill_shader = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--prefill-slots") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --prefill-slots needs a count\n");
+                return 2;
+            }
+            prefill_slots = atoi(argv[++i]);
+            if (prefill_slots < 1 || prefill_slots > 64) {
+                fprintf(stderr, "qrt: --prefill-slots wants 1..64\n");
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--prefill-layers") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --prefill-layers needs a count\n");
+                return 2;
+            }
+            prefill_layers = atoi(argv[++i]);
+            if (prefill_layers < 1) {
+                fprintf(stderr, "qrt: --prefill-layers wants a positive count\n");
+                return 2;
+            }
             continue;
         }
         if (strcmp(argv[i], "--repack") == 0) {
@@ -719,7 +856,20 @@ int main(int argc, char ** argv) {
     if (dense_gguf != NULL) {
         return qrt_dense_check(&cfg, dense_gguf);
     }
-
+    if (prefill_prefix != NULL) {
+        // Default shader: qrt-read.spv next to the executable, as CMake copies it.
+        std::string shader_path;
+        if (prefill_shader != NULL) {
+            shader_path = prefill_shader;
+        } else {
+            std::string exe = argc > 0 ? argv[0] : "qrt";
+            const size_t cut = exe.find_last_of("/\\");
+            shader_path = (cut == std::string::npos ? std::string(".") : exe.substr(0, cut)) +
+                          "/qrt-read.spv";
+        }
+        return qrt_prefill_check(&cfg, prefill_prefix, shader_path.c_str(),
+                                 (uint32_t) prefill_slots, (uint32_t) prefill_layers);
+    }
     if (vk_info || vk_probe_mib > 0) {
         qrt_vk_dev * dev = NULL;
         if (qrt_vk_open((uint32_t) cfg.vram_tier_mib, &dev, err, sizeof(err)) != 0) {

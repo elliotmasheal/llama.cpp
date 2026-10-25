@@ -177,6 +177,26 @@ build-vulkan/bin/qrt.exe --dense-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL.ggu
   which is what M2-5 binds. `qrt_dense_verify` compares evenly spaced probes plus the tail of
   the last tensor against the file and returns the bytes it compared.
 
+## Prefill scheduler
+
+```
+build-vulkan/bin/qrt.exe --prefill-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL
+build-vulkan/bin/qrt.exe --prefill-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL --prefill-slots 4 --prefill-layers 8
+```
+
+- `qrt_prefill_run` walks layers first and keeps `slots` staging buffers in flight: block `i`
+  is uploaded, and by the time block `i - slots` comes back for compute its fence has already
+  signalled. Waiting collapsed from 352 to 2 ms per 1024 blocks (RESULTS 37).
+- The math is a callback. `--prefill-check` plugs in the M1-4a read probe, one dispatch per
+  block on the compute queue, because the int8 GEMM is M2-5 step 2; the check therefore
+  measures the scheduler, not prefill tokens per second.
+- A failed slot halves the ring and bumps `slot_reductions`; a read, locate or upload failure
+  counts `blocks_failed` and moves on (design 9, no aborts).
+- `qrt_prefill_unique_experts` gives the unique experts a chunk of `chunk` tokens touches, so
+  the byte volume follows `--prefill-chunk`: at 2048 every one of the 256 experts is hit.
+- The shader is compiled by CMake from `proto/qrt-read.comp` and copied next to `qrt`; pass
+  `--prefill-shader` to point somewhere else.
+
 ## Telemetry
 
 `--telemetry 1 --telemetry-path <file>` writes a CSV with this header:
@@ -203,5 +223,6 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `gguf_index.h/.cpp` | GGUF metadata, tensor table, absolute offsets, byte account |
 | `vk_dev.h/.cpp` | device, queues, memory types, budget planner, allocator, staging transfers |
 | `weights.h/.cpp` | repacked expert store (index page table, expert reads) and dense residency |
-| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check`, `--dense-check` |
+| `prefill.h/.cpp` | layer-first prefill scheduler, staging ring, read-probe compute leg |
+| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check`, `--dense-check`, `--prefill-check` |
 | `CMakeLists.txt` | `qrt_core`, `qrt`, `qrt_selftest` |

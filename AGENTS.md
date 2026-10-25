@@ -7,6 +7,7 @@
 > 只有一条主线：`design/qwen36-moe-runtime-design.md`（qwen36 专用 MoE 运行时，里程碑 M0-M5）。
 > 解释、归纳、总结时请简单一些，易于非专业人士阅读，并结合目标给出进度及影响。
 > 时刻谨记本仓库(llama.cpp剪裁+二次优化版)仅供参考，核心目标依然是重写而非优化。
+> 保持良好的架构和分包习惯，高内聚低耦合。
 
 ## 0. 怎么开始
 
@@ -75,7 +76,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M2-5 data=- io=- user=-
+queues: bench=- impl=M2-6 data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -108,6 +109,10 @@ blockers: none
   遗留：`token_embd` 515 MiB 的归属（design 的 2079 MiB 不含它）。
 - **E-1 已决（用户 2026-10-25）**：专家槽**按层分尺寸**（1.812 / 1.945 / 2.195 MiB），4198 MiB 按层切分，
   仍只有一个预算器；见 `DECISIONS.md` 第 32 节。design 5.1/5.3 的 1.84 MiB 常数**等用户改**。
+- **M2-5 partial（2026-10-25）**：`runtime/prefill.*` 的层优先调度 + 环形 staging 槽起来了，
+  上传与计算重叠（wait 352->2 ms，每块 0.86->0.73 ms）；但 compute 腿还是带宽读核，
+  **PP 无实测值**，且主机读重组文件只有 2.6 GB/s（`RESULTS.md` 第 37 节、`DECISIONS.md` 第 33 节）。
+  下一步：读通路（mmap）与 int8 GEMM 接入。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、
