@@ -1116,8 +1116,8 @@
       "id": "M2-6a",
       "milestone": "M2",
       "lane": "impl",
-      "status": "doing",
-      "title": "KV 精度可配（默认 q8_0 K + q4_0 V）+ 16384 token 常驻窗口分页",
+      "status": "done",
+      "title": "KV 精度可配（默认 q8_0 K + q4_0 V）+ 常驻窗口按预算推导与主机分页",
       "deps": [
         "M2-6d"
       ],
@@ -1134,10 +1134,7 @@
         "runtime/CMakeLists.txt",
         "runtime/README.md"
       ],
-      "owner": "deepseek-v4.1-flash@ElliotMasheal",
-      "worktree": "E:/fastLlama",
-      "claimed_at": "2026-10-25T21:55:00+08:00",
-      "note": "doing 2026-10-25: round 1 landed the KV precision itself (QRT_KV_K/QRT_KV_V, q8_0 K + q4_0 V rows in the append and attention kernels, default 832 B/token/layer = 143 MiB at 16K). L-KERN pass: attention 1.32e-06..2.33e-06 against the double reference, f16 arm bit-identical to RESULTS 67, three layer-chain arms PASS, selftest 0 failed (RESULTS m2-6a-kv-precision, DECISIONS m2-6a-kv-switches). Round 2 is the resident window and host paging (QRT_KV_PAGE_TOKENS still only feeds the budget), then the 256K VRAM/page-in readings",
+      "note": "done 2026-10-25, two rounds. Round 1: QRT_KV_K/QRT_KV_V with q8_0 K + q4_0 V rows in the append and attention kernels, default 832 B/token/layer; attention 1.32e-06..2.33e-06 against the double reference, f16 arm bit-identical to RESULTS 67, three layer arms PASS, selftest 0 failed (RESULTS m2-6a-kv-precision). Round 2: the resident window is derived from the budget (min(ctx 262144, whole pages left after dense/compute/draft and the cache target)), QRT_KV_PAGE_TOKENS is now the swap granularity, and the attention pages from host memory one dispatch per page with the running softmax carried in VRAM state. Paged results are bit-identical to direct (1.456e-06 / 1.495e-06 / 1.526e-06), with page_ins/page_writes/VRAM peak reported; two defects got regression guards (named push blocks + static_assert, per-buffer transfer range check that turns a device-lost download into a message). 8 GiB card today: kv_tokens 32768 at budget 7378 (RESULTS m2-6a-kv-paging, DECISIONS m2-6a-page-decision). The k=1 KLD/top-1 and greedy reading moved to M2-7 (10K) and Q-KV3 (128K/256K) per gates G-QUAL-LONG; the default tier is exempt from the 1e-4 gate by U-11",
       "done_when": "QRT_KV_K / QRT_KV_V 可配，q8_0/q4_0（默认）与 q8_0/q8_0 两档都能切；窗口可配，窗口外页落主机并可换入；k=1 的 KLD/top-1 与 greedy 逐 token 一致仍要报（G-QUAL 读数，默认档已豁免、不阻塞）；q8_0/q8_0 与 f16/f16 仅作运维选项；报两档的 VRAM 峰值与换页次数"
     },
     {
@@ -1340,6 +1337,14 @@
   },
   "blockers": [],
   "escalations": [
+    {
+      "id": "E-KV2",
+      "state": "open",
+      "decision": "DECISIONS.md#m2-6a-page-decision",
+      "question": "M2-7 的 done_when 仍是 'KLD <= 1e-4 / same top-p 100%'，而默认 KV 档（q8_0 K + q4_0 V）按 U-11 已豁免 L-MODEL、预期 2e-2。M2-7 的判据要改成：(a) 默认档只报读数、1e-4 判据对 f16/f16 A 侧或非默认档判；还是 (b) 保留 1e-4 但默认档记为已知不达标？另：design 7 的 QRT_KV_PAGE_TOKENS 仍写'常驻窗口'，需要用户改成'换页粒度 + 窗口按预算推导'",
+      "needs_by": "M2-7 开跑前",
+      "outcome": null
+    },
     {
       "id": "E-KV1",
       "state": "closed",

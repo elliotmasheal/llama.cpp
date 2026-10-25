@@ -29,7 +29,7 @@
 struct qrt_full;
 struct qrt_kv_row_layout;
 
-enum { FULL_BUFFER_COUNT = 9 };
+enum { FULL_BUFFER_COUNT = 13 };
 
 // Bytes one KV row takes; see qrt_kv_row_bytes() in qrt_config.h for the totals.
 struct qrt_kv_row_layout {
@@ -42,6 +42,17 @@ struct qrt_kv_row_layout {
 
 // Returns -1 for a type the kernels do not implement at this head_dim.
 int qrt_kv_row_layout_of(int32_t type, uint32_t head_dim, qrt_kv_row_layout * out);
+
+// What the caller decides about the KV cache (M2-6a): the two row formats and how much of
+// the context stays in VRAM. resident_tokens < n_ctx turns paging on: the VRAM window is a
+// page cache, the authoritative rows live in host memory, and every attention pass pages
+// in what it reads.
+struct qrt_full_kv_cfg {
+    int32_t  k_type;           // enum qrt_kv_precision
+    int32_t  v_type;
+    uint32_t resident_tokens;  // VRAM rows per plane, capped at n_ctx
+    uint32_t page_tokens;      // swap granularity, a multiple of 32
+};
 
 struct qrt_full_shapes {
     uint32_t n_embd;
@@ -68,6 +79,10 @@ struct qrt_full_bufs {
     VkBuffer out;
     VkBuffer q_norm_w;   // [head_dim]
     VkBuffer k_norm_w;   // [head_dim]
+    VkBuffer kstage;     // paged mode: one chunk of K rows
+    VkBuffer vstage;
+    VkBuffer state_m;    // [n_head][max_tokens] running softmax max
+    VkBuffer state_l;    // running softmax mass
 };
 
 // Shapes from the GGUF metadata (attention.head_count / head_count_kv / key_length,
@@ -77,10 +92,10 @@ struct qrt_gguf_hparams;
 int qrt_full_shapes_from_gguf(const qrt_gguf_hparams * hp, qrt_full_shapes * out,
                               char * err, size_t err_size);
 
-// max_tokens sizes the per-chunk planes; n_ctx sizes the KV cache pages. kv_k/kv_v are
-// enum qrt_kv_precision values (QRT_KV_K / QRT_KV_V).
+// max_tokens sizes the per-chunk planes; n_ctx is the context the cache must cover; kv
+// carries the row formats and the VRAM window. resident_tokens < n_ctx pages the rest.
 int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes * sh,
-                  uint32_t max_tokens, uint32_t n_ctx, int32_t kv_k, int32_t kv_v,
+                  uint32_t max_tokens, uint32_t n_ctx, const qrt_full_kv_cfg * kv,
                   qrt_full ** out, char * err, size_t err_size);
 void qrt_full_close(qrt_vk_dev * dev, qrt_full * f);
 
@@ -88,10 +103,18 @@ const qrt_full_shapes * qrt_full_shapes_of(const qrt_full * f);
 const qrt_full_bufs *   qrt_full_buffers(const qrt_full * f);
 int32_t                 qrt_full_kv_k(const qrt_full * f);
 int32_t                 qrt_full_kv_v(const qrt_full * f);
-// Bytes of one KV plane (K or V), and the row layout the kernels use.
+// Bytes of one KV plane (K or V) in VRAM, and the row layout the kernels use.
 uint64_t                qrt_full_kv_bytes(const qrt_full * f);
 uint64_t                qrt_full_v_bytes(const qrt_full * f);
 uint32_t                qrt_full_kv_row_bytes(const qrt_full * f, int is_v);
+// Paging (M2-6a second half): 0 = the whole context is in VRAM, 1 = host pages + window.
+int                     qrt_full_paged(const qrt_full * f);
+uint32_t                qrt_full_resident_tokens(const qrt_full * f);
+uint32_t                qrt_full_page_tokens(const qrt_full * f);
+// The authoritative rows when paged ([n_kv][n_ctx][row]); NULL in direct mode.
+const void *            qrt_full_kv_host(const qrt_full * f, int is_v);
+uint64_t                qrt_full_page_ins(const qrt_full * f);
+uint64_t                qrt_full_page_writes(const qrt_full * f);
 // Step 1: per-head RMS norm of Q and K, IMRoPE on both, V copied as is. Writes q,
 // kcache[pos0 .. pos0+tokens) and vcache[pos0 .. pos0+tokens).
 int qrt_full_qk(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size_t err_size);
@@ -140,4 +163,4 @@ void qrt_full_kv_unpack(const qrt_kv_row_layout * lay, uint32_t head_dim, uint32
                         const void * plane, int round_mode, float * out);
 
 int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const char * spv_dir,
-                   int32_t kv_k, int32_t kv_v);
+                   int32_t kv_k, int32_t kv_v, uint32_t resident_tokens, uint32_t page_tokens);

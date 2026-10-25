@@ -1451,6 +1451,8 @@ int main(int argc, char ** argv) {
     const char * fullattn_gguf = NULL;
     int fullattn_layer = 3;          // the first full-attention layer of this model
     int fullattn_tokens = 1024;
+    int fullattn_resident = 0;       // 0 = the whole context in VRAM
+    int fullattn_page = 0;           // 0 = the configured page granularity
 
     {
         const char * exe = argc > 0 ? argv[0] : "qrt";
@@ -1767,6 +1769,30 @@ int main(int argc, char ** argv) {
             }
             continue;
         }
+        if (strcmp(argv[i], "--fullattn-resident") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --fullattn-resident needs a token count\n");
+                return 2;
+            }
+            fullattn_resident = atoi(argv[++i]);
+            if (fullattn_resident < 0) {
+                fprintf(stderr, "qrt: --fullattn-resident wants 0 or more\n");
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--fullattn-page") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --fullattn-page needs a token count\n");
+                return 2;
+            }
+            fullattn_page = atoi(argv[++i]);
+            if (fullattn_page < 0) {
+                fprintf(stderr, "qrt: --fullattn-page wants 0 or more\n");
+                return 2;
+            }
+            continue;
+        }
         if (strcmp(argv[i], "--dense-rows") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "qrt: --dense-rows needs a count\n");
@@ -1962,6 +1988,7 @@ int main(int argc, char ** argv) {
         lcfg.dn_recur = dn_recur;
         lcfg.kv_k = cfg.kv_k;
         lcfg.kv_v = cfg.kv_v;
+        lcfg.kv_page_tokens = (uint32_t) cfg.kv_page_tokens;
         return qrt_layer_check(layer_gguf_check, layer_store, (uint32_t) layer_index,
                                (uint32_t) layer_tokens, &lcfg, g_spv_dir);
     }
@@ -1979,7 +2006,8 @@ int main(int argc, char ** argv) {
     }
     if (fullattn_gguf != NULL) {
         return qrt_full_check(fullattn_gguf, (uint32_t) fullattn_layer, (uint32_t) fullattn_tokens,
-                              g_spv_dir, cfg.kv_k, cfg.kv_v);
+                              g_spv_dir, cfg.kv_k, cfg.kv_v, (uint32_t) fullattn_resident,
+                              (uint32_t) fullattn_page);
     }
     if (moe_prefix != NULL) {
         std::string dir = argc > 0 ? argv[0] : "qrt";
@@ -2004,13 +2032,15 @@ int main(int argc, char ** argv) {
             rc = 2;
         } else {
             printf("plan dense_mib=%llu cache_mib=%llu kv_mib=%llu compute_mib=%llu "
-                   "draft_mib=%llu total_mib=%llu coverage_pct=%.2f reductions=%u\n",
+                   "draft_mib=%llu total_mib=%llu kv_tokens=%u ctx_tokens=%u "
+                   "coverage_pct=%.2f reductions=%u\n",
                    (unsigned long long) (plan.dense_bytes >> 20),
                    (unsigned long long) (plan.expert_cache_bytes >> 20),
                    (unsigned long long) (plan.kv_bytes >> 20),
                    (unsigned long long) (plan.compute_bytes >> 20),
                    (unsigned long long) (plan.draft_bytes >> 20),
                    (unsigned long long) (plan.total_bytes >> 20),
+                   plan.kv_tokens, (unsigned) QRT_KV_CTX_TOKENS,
                    (double) plan.cache_coverage_x100 / 100.0, plan.cache_reductions);
         }
         if (vk_probe_mib > 0) {

@@ -90,7 +90,7 @@ double imrope_theta(const qrt_full_shapes * sh, uint32_t pos, uint32_t pair,
 } // namespace
 
 int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const char * spv_dir,
-                   int32_t kv_k, int32_t kv_v) {
+                   int32_t kv_k, int32_t kv_v, uint32_t resident_tokens, uint32_t page_tokens) {
     char err[512] = {0};
     qrt_vk_dev * dev = NULL;
     if (qrt_vk_open(0, &dev, err, sizeof(err)) != 0) {
@@ -146,6 +146,21 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
 
     const uint32_t max_tokens = tokens > 512 ? tokens : 512;
     const uint32_t n_ctx = max_tokens * 2 + 64;
+    uint32_t resident = resident_tokens == 0 ? n_ctx : resident_tokens;
+    if (resident > n_ctx) {
+        resident = n_ctx;
+    }
+    if (resident < 32u) {
+        resident = 32u;
+    }
+    uint32_t page = page_tokens == 0 ? 16384u : page_tokens;
+    if (page > n_ctx) {
+        page = n_ctx;
+    }
+    page = (page / 32u) * 32u;
+    if (page == 0) {
+        page = 32;
+    }
 
     qrt_kv_row_layout klay, vlay;
     if (qrt_kv_row_layout_of(kv_k, sh.head_dim, &klay) != 0 ||
@@ -161,6 +176,9 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
            qrt_kv_precision_name(kv_k), qrt_kv_precision_name(kv_v),
            klay.row_bytes, vlay.row_bytes, klay.blocks, kv_per_token, n_ctx,
            (double) n_ctx * kv_per_token / (1024.0 * 1024.0));
+    printf("full_page    resident_tokens=%u page_tokens=%u mode=%s window_mib=%.2f\n",
+           resident, page, resident >= n_ctx ? "direct" : "paged",
+           (double) resident * kv_per_token / (1024.0 * 1024.0));
 
     qrt_vk_staging * stg = NULL;
     uint64_t stg_bytes = (uint64_t) max_tokens * sh.qg_ch * 4;
@@ -173,7 +191,13 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
     int rc_out = 2;
     qrt_full * f = NULL;
     do {
-        if (qrt_full_open(dev, spv_dir, &sh, max_tokens, n_ctx, kv_k, kv_v, &f, err,
+        qrt_full_kv_cfg kvcfg;
+        memset(&kvcfg, 0, sizeof(kvcfg));
+        kvcfg.k_type = kv_k;
+        kvcfg.v_type = kv_v;
+        kvcfg.resident_tokens = resident;
+        kvcfg.page_tokens = page;
+        if (qrt_full_open(dev, spv_dir, &sh, max_tokens, n_ctx, &kvcfg, &f, err,
                           sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             break;
@@ -236,10 +260,24 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
         const uint64_t v_bytes = qrt_full_v_bytes(f);
         std::vector<uint8_t> kc((size_t) k_bytes);
         std::vector<uint8_t> vc((size_t) v_bytes);
+        // paged mode keeps the authoritative rows in host memory; direct mode reads the planes
+        auto read_kv = [&]() -> int {
+            if (qrt_full_paged(f)) {
+                memcpy(kc.data(), qrt_full_kv_host(f, 0), kc.size());
+                memcpy(vc.data(), qrt_full_kv_host(f, 1), vc.size());
+                return 0;
+            }
+            if (qrt_vk_download(dev, stg, b->kcache, 0, kc.data(), k_bytes, err,
+                                sizeof(err)) != 0 ||
+                qrt_vk_download(dev, stg, b->vcache, 0, vc.data(), v_bytes, err,
+                                sizeof(err)) != 0) {
+                return -1;
+            }
+            return 0;
+        };
         if (qrt_vk_download(dev, stg, b->q, 0, q_gpu.data(),
                             (uint64_t) tokens * sh.n_head * sh.head_dim * 4, err, sizeof(err)) != 0 ||
-            qrt_vk_download(dev, stg, b->kcache, 0, kc.data(), k_bytes, err, sizeof(err)) != 0 ||
-            qrt_vk_download(dev, stg, b->vcache, 0, vc.data(), v_bytes, err, sizeof(err)) != 0) {
+            read_kv() != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             break;
         }
@@ -287,8 +325,7 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
         qrt_full_qk_cpu(&sh, tokens, t2, qg.data(), kin.data(), vin.data(), qnw.data(), knw.data(),
                         q2_ref.data(), k2_ref.data(), v2_ref.data());
         if (qrt_vk_download(dev, stg, b->q, 0, q2.data(), (uint64_t) q2.size() * 4,
-                            err, sizeof(err)) != 0 ||
-            qrt_vk_download(dev, stg, b->kcache, 0, kc.data(), k_bytes, err, sizeof(err)) != 0) {
+                            err, sizeof(err)) != 0 || read_kv() != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             break;
         }
@@ -355,8 +392,7 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
                                 (uint64_t) out_gpu.size() * 4, err, sizeof(err)) != 0 ||
                 qrt_vk_download(dev, stg, b->q, 0, q_full.data(),
                                 (uint64_t) q_full.size() * 4, err, sizeof(err)) != 0 ||
-                qrt_vk_download(dev, stg, b->kcache, 0, kc.data(), k_bytes, err, sizeof(err)) != 0 ||
-                qrt_vk_download(dev, stg, b->vcache, 0, vc.data(), v_bytes, err, sizeof(err)) != 0) {
+                read_kv() != 0) {
                 fprintf(stderr, "qrt: %s\n", err);
                 break;
             }
@@ -428,6 +464,18 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
             printf("full_attn_f16 tokens=%u rows=%zu rel_l1=%.3e max_abs=%.3e "
                    "gate_1e-4=%s (probe: f16 operands, eight-product chunks in f16)\n",
                    tokens, rows.size(), worst16, abs16, worst16 <= 1e-4 ? "PASS" : "FAIL");
+            if (qrt_full_paged(f)) {
+                const double vram_kv = (double) sh.n_kv * qrt_full_resident_tokens(f) *
+                                       (klay.row_bytes + vlay.row_bytes);
+                const double host_kv = (double) sh.n_kv * n_ctx * (klay.row_bytes + vlay.row_bytes);
+                printf("full_paging  resident_tokens=%u page_tokens=%u page_ins=%llu "
+                       "page_writes=%llu vram_kv_mib=%.2f host_kv_mib=%.2f alloc_peak_mib=%.1f\n",
+                       qrt_full_resident_tokens(f), qrt_full_page_tokens(f),
+                       (unsigned long long) qrt_full_page_ins(f),
+                       (unsigned long long) qrt_full_page_writes(f),
+                       vram_kv / (1024.0 * 1024.0), host_kv / (1024.0 * 1024.0),
+                       (double) dev->alloc_peak_bytes / (1024.0 * 1024.0));
+            }
         }
 
         rc_out = (ok_q && ok_kv && r2 <= 1e-4 && rk2 <= k_gate && ok_append && worst == 0.0 &&
@@ -443,13 +491,15 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
 #else // QRT_HAVE_VULKAN
 
 int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const char * spv_dir,
-                   int32_t kv_k, int32_t kv_v) {
+                   int32_t kv_k, int32_t kv_v, uint32_t resident_tokens, uint32_t page_tokens) {
     (void) gguf_path;
     (void) layer;
     (void) tokens;
     (void) spv_dir;
     (void) kv_k;
     (void) kv_v;
+    (void) resident_tokens;
+    (void) page_tokens;
     fprintf(stderr, "qrt: --fullattn-check needs a Vulkan build\n");
     return 2;
 }

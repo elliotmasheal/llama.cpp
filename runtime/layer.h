@@ -27,6 +27,7 @@ struct qrt_layer_cfg {
     int dn_recur;        // 1 = the 32-column DeltaNet recurrence (RESULTS 63)
     int32_t kv_k;        // enum qrt_kv_precision for the full-attention cache
     int32_t kv_v;
+    uint32_t kv_page_tokens;  // page granularity; the window is the chunk in the layer check
 };
 
 struct qrt_layer_info {

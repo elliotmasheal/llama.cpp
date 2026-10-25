@@ -48,6 +48,7 @@ struct qrt_vk_dev {
     int      has_memory_budget;
     uint32_t alloc_count;
     uint64_t alloc_bytes;
+    uint64_t alloc_peak_bytes;  // highest alloc_bytes seen, the VRAM peak
     uint32_t alloc_failures;    // counted fallbacks, never a crash (design 9)
     uint32_t cache_reductions;  // expert-cache steps given up by the planner
     uint32_t io_failures;       // upload/download fallbacks, same rule
@@ -64,9 +65,20 @@ struct qrt_vk_plan {
     uint64_t compute_bytes;
     uint64_t draft_bytes;
     uint64_t total_bytes;
+    uint32_t kv_tokens;             // resident KV window the plan grants (<= ctx)
     uint32_t cache_reductions;
     uint32_t cache_coverage_x100;   // expert cache / expert store, percent x 100
 };
+
+// The context the KV window may grow to (design 2.2: 256K for this model).
+enum { QRT_KV_CTX_TOKENS = 262144 };
+
+// Resident KV tokens that fit in the remaining VRAM: after dense/compute/draft and the
+// expert-cache target, capped at n_ctx and rounded down to whole pages of
+// page_tokens x kv_bytes_per_token. The cache keeps its priority, the KV window takes the
+// headroom (M2-6a); 0 means not even one page fits.
+uint32_t qrt_vk_kv_window_tokens(const qrt_vk_dev * dev, const qrt_config * cfg,
+                                 uint64_t kv_bytes_per_token, uint32_t n_ctx);
 
 // tier_mib caps the budget the way the fork's GGML_VK_VRAM_LIMIT_MIB does; 0 = auto.
 int qrt_vk_open(uint32_t tier_mib, qrt_vk_dev ** out, char * err, size_t err_size);

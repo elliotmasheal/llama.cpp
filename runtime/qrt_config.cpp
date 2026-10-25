@@ -381,8 +381,8 @@ int qrt_config_notes(const qrt_config * cfg, FILE * f) {
         ++n;
     }
     if (cfg->kv_page_tokens < 16384) {
-        fprintf(f, "note: QRT_KV_PAGE_TOKENS %d is below the tested 16384 window (RESULTS section 10)\n",
-                cfg->kv_page_tokens);
+        fprintf(f, "note: QRT_KV_PAGE_TOKENS %d is the swap granularity; the resident window "
+                   "is now derived from the VRAM budget (M2-6a)\n", cfg->kv_page_tokens);
         ++n;
     }
     return n;

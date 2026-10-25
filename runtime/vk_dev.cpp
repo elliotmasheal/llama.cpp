@@ -10,6 +10,55 @@ namespace {
 
 const uint64_t MIB = 1024ull * 1024ull;
 
+// Every device buffer's size, so a copy that runs past its buffer is a reported error
+// instead of a driver fault (RESULTS 75.5 defect 2: a 524 KiB download from a 144 KiB
+// plane ended in VK_ERROR_DEVICE_LOST). Handles are unique while the device lives.
+enum { QRT_BUF_REG = 4096 };
+struct qrt_buf_entry {
+    VkBuffer buf;
+    uint64_t bytes;
+};
+qrt_buf_entry g_buf_reg[QRT_BUF_REG];
+
+void buf_reg_add(VkBuffer buf, uint64_t bytes) {
+    for (uint32_t i = 0; i < QRT_BUF_REG; ++i) {
+        if (g_buf_reg[i].buf == VK_NULL_HANDLE || g_buf_reg[i].buf == buf) {
+            g_buf_reg[i].buf = buf;
+            g_buf_reg[i].bytes = bytes;
+            return;
+        }
+    }
+}
+
+void buf_reg_del(VkBuffer buf) {
+    for (uint32_t i = 0; i < QRT_BUF_REG; ++i) {
+        if (g_buf_reg[i].buf == buf) {
+            g_buf_reg[i].buf = VK_NULL_HANDLE;
+            g_buf_reg[i].bytes = 0;
+            return;
+        }
+    }
+}
+
+// An unregistered handle is not rejected: modules may be handed buffers from a pool this
+// registry never saw. The check only fires where the size is known.
+int fail(char * err, size_t err_size, const char * fmt, ...);
+
+int buf_reg_check(VkBuffer buf, uint64_t offset, uint64_t bytes, char * err, size_t err_size) {
+    for (uint32_t i = 0; i < QRT_BUF_REG; ++i) {
+        if (g_buf_reg[i].buf != buf) {
+            continue;
+        }
+        if (offset > g_buf_reg[i].bytes || bytes > g_buf_reg[i].bytes - offset) {
+            return fail(err, err_size, "copy of %llu bytes at %llu runs past a %llu byte buffer",
+                        (unsigned long long) bytes, (unsigned long long) offset,
+                        (unsigned long long) g_buf_reg[i].bytes);
+        }
+        return 0;
+    }
+    return 0;
+}
+
 // design 5.5 buckets, with the measured bytes from RESULTS section 25:
 // dense (non-expert, incl. output head) 2180153856 B = 2079 MiB, draft 100 MiB,
 // compute 700 MiB is the design's lower bound (decode tensors are only 9.1 MiB).
@@ -367,6 +416,37 @@ int qrt_vk_query_budget(qrt_vk_dev * dev, char * err, size_t err_size) {
     return query_budget(dev, err, err_size);
 }
 
+uint32_t qrt_vk_kv_window_tokens(const qrt_vk_dev * dev, const qrt_config * cfg,
+                                 uint64_t kv_bytes_per_token, uint32_t n_ctx) {
+    const uint64_t fixed = DENSE_BYTES + COMPUTE_BYTES + DRAFT_BYTES;
+    if (dev->budget_bytes <= fixed || kv_bytes_per_token == 0 || n_ctx == 0) {
+        return 0;
+    }
+    const uint64_t avail = dev->budget_bytes - fixed;
+    const uint64_t page = cfg->kv_page_tokens > 0 ? (uint64_t) cfg->kv_page_tokens : 16384ull;
+    const uint64_t page_bytes = page * kv_bytes_per_token;
+    const uint64_t cache_want = (uint64_t) cfg->expert_cache_mib * MIB;
+    uint64_t cache = avail > cache_want ? cache_want : avail;
+    // the KV window keeps at least one page, and takes it out of the cache if it must
+    if (avail - cache < page_bytes) {
+        cache = avail > page_bytes ? avail - page_bytes : 0;
+    }
+    const uint64_t kv_avail = avail - cache;
+    uint64_t pages = kv_avail / page_bytes;
+    const uint64_t want_pages = ((uint64_t) n_ctx + page - 1ull) / page;
+    if (pages > want_pages) {
+        pages = want_pages;
+    }
+    uint64_t tokens = pages * page;
+    if (tokens > n_ctx) {
+        tokens = n_ctx;
+    }
+    if (tokens == 0 && (uint64_t) n_ctx * kv_bytes_per_token <= kv_avail) {
+        tokens = n_ctx;
+    }
+    return (uint32_t) tokens;
+}
+
 int qrt_vk_plan_budget(qrt_vk_dev * dev, const qrt_config * cfg, uint64_t expert_store_bytes,
                 qrt_vk_plan * out, char * err, size_t err_size) {
     memset(out, 0, sizeof(*out));
@@ -379,9 +459,13 @@ int qrt_vk_plan_budget(qrt_vk_dev * dev, const qrt_config * cfg, uint64_t expert
                     cfg->kv_k, cfg->kv_v);
     }
     const uint64_t kv_per_token = 11ull * 2ull * (uint64_t) (row_k + row_v);
-    const uint64_t kv_bytes = (uint64_t) cfg->kv_page_tokens * kv_per_token;
+    // The window is whatever is left after the other buckets and the cache target, capped at
+    // the context: a 16 GiB card gets all of it, an 8 GiB card pages the rest from host.
+    const uint32_t window = qrt_vk_kv_window_tokens(dev, cfg, kv_per_token, QRT_KV_CTX_TOKENS);
+    const uint64_t kv_bytes = (uint64_t) window * kv_per_token;
     out->dense_bytes   = DENSE_BYTES;
     out->kv_bytes      = kv_bytes;
+    out->kv_tokens     = window;
     out->compute_bytes = COMPUTE_BYTES;
     out->draft_bytes   = DRAFT_BYTES;
 
@@ -473,6 +557,10 @@ int qrt_vk_alloc(qrt_vk_dev * dev, uint64_t bytes, VkBufferUsageFlags usage,
     }
     ++dev->alloc_count;
     dev->alloc_bytes += req.size;
+    if (dev->alloc_bytes > dev->alloc_peak_bytes) {
+        dev->alloc_peak_bytes = dev->alloc_bytes;
+    }
+    buf_reg_add(*buf, bytes);
     return 0;
 }
 
@@ -480,6 +568,7 @@ void qrt_vk_free(qrt_vk_dev * dev, VkBuffer buf, VkDeviceMemory mem) {
     if (dev == NULL) {
         return;
     }
+    buf_reg_del(buf);
     if (mem != VK_NULL_HANDLE) {
         vkFreeMemory(dev->device, mem, nullptr);
     }
@@ -873,6 +962,10 @@ static int staging_submit(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer buf, 
         return fail(err, err_size, "copy of %llu bytes does not fit the %llu byte staging buffer",
                     (unsigned long long) bytes, (unsigned long long) stg->bytes);
     }
+    if (buf_reg_check(buf, offset, bytes, err, err_size) != 0) {
+        ++dev->io_failures;
+        return -1;
+    }
     if (stg->pending) {
         ++dev->io_failures;
         return fail(err, err_size, "a copy is already in flight on this staging buffer");
@@ -1047,8 +1140,10 @@ void qrt_vk_print_info(const qrt_vk_dev * dev, FILE * f) {
             dev->has_memory_budget);
     fprintf(f, "queue_compute=%u queue_transfer=%u timestamp_bits=%u\n",
             dev->compute_family, dev->transfer_family, dev->timestamp_bits);
-    fprintf(f, "alloc_count=%u alloc_mib=%llu alloc_failures=%u cache_reductions=%u io_failures=%u\n",
+    fprintf(f, "alloc_count=%u alloc_mib=%llu alloc_peak_mib=%llu alloc_failures=%u "
+               "cache_reductions=%u io_failures=%u\n",
             dev->alloc_count, (unsigned long long) (dev->alloc_bytes / MIB),
+            (unsigned long long) (dev->alloc_peak_bytes / MIB),
             dev->alloc_failures, dev->cache_reductions, dev->io_failures);
     fprintf(f, "subgroup_size=%u subgroup_arithmetic=%d dot_product=%d\n", dev->subgroup_size,
             dev->has_subgroup_arithmetic, dev->has_dot_product);

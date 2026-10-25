@@ -50,7 +50,7 @@ blockers: none
 
 `queues` 只写任务 id；"为什么是它、做到什么算完"在 `state.json`。
 本节摘要最多 3 行：历史与读数只在 `RESULTS.md` / `DECISIONS.md`，`--lint` 会拦 dated bullet 与任务表。
-焦点：M2-6a 的 KV 精度可配（默认 q8_0 K + q4_0 V）与常驻窗口分页；层链（含 FFN、两次合并提交）已 closed，见 `RESULTS` `m2-6-ffn-two-submits`。
+焦点：M2-6a 已 closed（KV 精度 K/V 双开关、窗口按显存预算推导、主机分页），见 `RESULTS` `m2-6a-kv-precision` / `m2-6a-kv-paging`；下一步是 bench 的 M2-7 整模型 KLD（先答 E-KV2）与 impl 的 X-4 内核回归。
 
 ## 4. 铁律
 

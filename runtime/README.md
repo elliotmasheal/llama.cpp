@@ -119,15 +119,16 @@ Budget rules:
   subtracts a 1000 MiB desktop reserve from the heap.
 - `--vram-tier-mib N` (or `QRT_VRAM_TIER_MIB`) caps the budget, which is how the 4G/6G
   tiers of `bench/README.md` are simulated. 0 means no cap.
-- Fixed buckets: dense 2079 MiB (RESULTS 25), KV `kv_page_tokens x 6336 B` for q4_0 or
-  `x 22528 B` for f16 (RESULTS 25), compute 700 MiB (design 5.5 lower bound), draft 100 MiB.
-  Since M2-6a the KV bucket is per side: `kv_page_tokens x 11 x 2 x (k_row + v_row)` with the
-  row bytes of `QRT_KV_K` / `QRT_KV_V` (q8_0 272, q4_0 144, f16 512 at head_dim 256), so the
-  default pair is `x 9152 B`; the old `x 6336 B` line was the q4_0/q4_0 budget before the K
-  side moved to q8_0.
+- Fixed buckets: dense 2079 MiB (RESULTS 25), compute 700 MiB (design 5.5 lower bound), draft
+  100 MiB, and the KV window. Since M2-6a the window is derived, not configured: it is
+  `min(ctx 262144, whole pages of (budget - the other buckets - the expert cache target))`, where
+  one page is `QRT_KV_PAGE_TOKENS x 11 x 2 x (k_row + v_row)` (row bytes q8_0 272, q4_0 144,
+  f16 512 at head_dim 256; the default pair is 9152 B/token). A bigger card gets a bigger window
+  up to the context; the expert cache keeps its requested size, the window takes the headroom.
 - If the fixed buckets do not fit, the plan fails with a message (exit 2). Otherwise the
   expert cache takes `min(requested, what is left)`, rounded down to whole MiB, and every
-  256 MiB it had to give up is counted in `reductions`.
+  256 MiB it had to give up is counted in `reductions`. When not even one KV page fits, the
+  cache gives one up instead of failing.
 - `qrt_vk_alloc` refuses an allocation larger than the budget and counts every failure in
   `alloc_failures`; it never aborts, so a caller can shrink the cache and retry.
 - On this driver (WDDM) `heapBudget` does not move after a 64 MiB allocation, so the
@@ -323,11 +324,19 @@ build-vulkan/bin/qrt.exe --layer-check <gguf> --layer 3 --layer-tokens 512 --lay
   (default cols, the 32-column recurrence from RESULTS 63).
 - `--layer-check` compares each stage against one CPU double chain. The reference for a stage
   is fed the *device's* previous stage output, so the check validates the wiring; each kernel
-  keeps its own check. For a full-attention layer the reference reads the device's KV cache and
-  dequantises it with the same f16 rounding the attention kernel stages, so the row precision
-  is shared instead of landing in the gate (M2-6a). The
+  keeps its own check. For a full-attention layer the reference reads the KV cache (device
+  planes in direct mode, the host rows when paged) and dequantises it with the same f16
+  rounding the attention kernel stages, so the row precision is shared instead of landing in
+  the gate (M2-6a). The
   FFN reference covers the router and the shared expert over the first 64 tokens and the routed
   experts over their pairs, and reuses the K-quant dequant order of `--moe-check`.
+- KV cache (M2-6a): `QRT_KV_K` / `QRT_KV_V` pick the row format (f16, q8_0, q4_0; default
+  q8_0 + q4_0), `QRT_KV_PAGE_TOKENS` is the swap granularity, and the resident VRAM window is
+  derived from the budget (`qrt_vk_kv_window_tokens`, capped at the context). When the window
+  is smaller than the context the cache pages: the authoritative rows live in host memory and
+  the attention runs one dispatch per page, carrying the running softmax state. `--vk-info`
+  prints `kv_tokens` and `alloc_peak_mib`; `--fullattn-check --fullattn-resident R
+  --fullattn-page P` exercises the paged path (0 = direct) and prints `full_paging`.
 - Cost at 10K (two submits, the expert store read counted apart): 95 ms attention + 93 ms FFN
   for a DeltaNet layer, 328 + 94 ms for a full-attention layer. The 464 MiB expert read per
   layer is host work the prefill scheduler overlaps (M2-5).
@@ -364,7 +373,7 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `weights.h/.cpp` | repacked expert store (index page table, expert reads) and dense residency |
 | `prefill.h/.cpp` | layer-first prefill scheduler, staging ring, read-probe compute leg |
 | `attn_deltanet.h/.cpp`, `attn_deltanet_check.cpp` | DeltaNet delta-rule recurrence (M2-6c) and its CPU reference |
-| `attn_full.h/.cpp`, `attn_full_check.cpp` | full attention: per-head norm + IMRoPE + flash causal + gate (M2-6d) |
+| `attn_full.h/.cpp`, `attn_full_check.cpp` | full attention: per-head norm + IMRoPE + flash causal + gate (M2-6d), KV row formats and host paging (M2-6a) |
 | `kernels/norm.h/.cpp` | RMS norm + Q8_1 activation pack (M2-6), the dense GEMM's activation leg |
 | `kernels/q4k_gemm.*` | Q4_K x Q8_1 int8 GEMM and swiglu+Q8_1 kernels, one submit per call |
 | `kernels/moe_expert.*` | one expert's gate/up/swiglu/down as a prefill compute callback |

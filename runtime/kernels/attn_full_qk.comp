@@ -45,6 +45,7 @@ layout(push_constant) uniform PC {
     uint  kv_cap;     // tokens the KV cache holds
     uint  k_stride_w; // K row stride in 32-bit words
     uint  v_stride_w; // V row stride in 32-bit words
+    uint  kv_row0;    // resident row of the chunk's first token
     float eps;
     float freq_base;
     float freq_scale;
@@ -115,6 +116,7 @@ void head_job(uint tid, uint tok, uint job, uint pos) {
     const uint warp = tid >> 5u;
     const uint lane = tid & 31u;
     const uint d0   = lane * 8u;
+    const uint row  = pc.kv_row0 + tok;
     const bool is_k  = job >= N_HEAD;
     const uint h     = is_k ? job - N_HEAD : job;
     const bool valid = is_k ? (h < N_KV) : (h < N_HEAD);
@@ -190,7 +192,7 @@ void head_job(uint tid, uint tok, uint job, uint pos) {
     // K append: an f16 row takes the pairs as is; a quantised row needs the block
     // extreme first, and the two barriers below are reached by Q warps as well.
     if (is_k && valid && K_TYPE == 0u) {
-        const uint db = (h * pc.kv_cap + pos) * pc.k_stride_w + d0 / 2u;
+        const uint db = (h * pc.kv_cap + row) * pc.k_stride_w + d0 / 2u;
         [[unroll]] for (uint i = 0; i < 8u; i += 2) {
             kc[db + i / 2u] = packHalf2x16(vec2(x[i], x[i + 1]));
         }
@@ -202,7 +204,7 @@ void head_job(uint tid, uint tok, uint job, uint pos) {
             const uint blk = lane >> 2u;
             const float d = block_delta(block_extreme(warp * 32u, blk), K_TYPE);
             const float inv = d != 0.0f ? 1.0f / d : 0.0f;
-            const uint rb = (h * pc.kv_cap + pos) * pc.k_stride_w;
+            const uint rb = (h * pc.kv_cap + row) * pc.k_stride_w;
             if (lane < SCALE_W) {
                 kc[rb + lane] = scale_pair(warp * 32u, lane, K_TYPE);
             }
@@ -229,6 +231,7 @@ void main() {
         return;
     }
     const uint pos  = pc.pos0 + t;
+    const uint row  = pc.kv_row0 + t;
 
     // V is copied, not normed or rotated: two warps, eight channels each. Quantised V
     // needs its block extreme first, so every warp joins the reduction barrier.
@@ -241,7 +244,7 @@ void main() {
     }
     if (V_TYPE == 0u) {
         if (warp < N_KV) {
-            const uint vdst = (warp * pc.kv_cap + pos) * pc.v_stride_w + lane * 4u;
+            const uint vdst = (warp * pc.kv_cap + row) * pc.v_stride_w + lane * 4u;
             [[unroll]] for (uint i = 0; i < 8u; i += 2) {
                 vc[vdst + i / 2u] = packHalf2x16(vec2(vx[i], vx[i + 1]));
             }
@@ -253,7 +256,7 @@ void main() {
             const uint blk = lane >> 2u;
             const float d = block_delta(block_extreme(warp * 32u, blk), V_TYPE);
             const float inv = d != 0.0f ? 1.0f / d : 0.0f;
-            const uint rb = (warp * pc.kv_cap + pos) * pc.v_stride_w;
+            const uint rb = (warp * pc.kv_cap + row) * pc.v_stride_w;
             if (lane < SCALE_W) {
                 vc[rb + lane] = scale_pair(warp * 32u, lane, V_TYPE);
             }

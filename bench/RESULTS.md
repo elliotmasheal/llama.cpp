@@ -2802,3 +2802,76 @@ CPU 双精度，K/V 平面取设备缓存按行格式反量化），`qrt --layer
 - **G-REG n/a**：只动 `runtime/`。
 - 未做：常驻窗口与分页（M2-6a 第二块，`QRT_KV_PAGE_TOKENS` 目前只进预算，缓存仍按 n_ctx 全长
   分配）；256K 的 VRAM 峰值与换页次数；q4_0 K 只作对照臂，不当默认。
+
+## 76. M2-6a 第二块：常驻窗口按显存预算推导 + 主机分页（2026-10-25）
+<!-- slug: m2-6a-kv-paging -->
+
+口径：`qrt --vk-info [--vram-tier-mib N]` 的 plan；`qrt --fullattn-check <gguf> --fullattn-layer 3
+--fullattn-tokens {1024,2048} [--fullattn-resident R --fullattn-page P]`（R/P = 0 时整段常驻），
+参考仍是同串 CPU 双精度，K/V 平面取设备/host 缓存的同一批值；`qrt --layer-check --layer 3
+--layer-tokens 512 --layer-store <前缀>`。RX 6700S，平衡电源 + AC，全部 exit 0。产物
+`bench/raw/m2-6a-page/`。
+
+### 76.1 窗口不再写死 16384
+
+- `QRT_KV_PAGE_TOKENS` 的语义改为**换页粒度**；常驻窗口由预算推导：
+  `window = min(ctx 262144, floor((budget - dense - compute - draft - cache_target) / page_bytes))`，
+  按整页向下取整，至少一页（不够时从专家缓存里拿一页并计入 reductions）。
+  **专家缓存保持优先**（4198 MiB 的 21.7% 前提不变），KV 只用剩下的余量。
+- 本机今天 `heapBudget` 是 7378 MiB（桌面上有进程），plan 读 `kv_mib=286 kv_tokens=32768`
+  （2 页），`cache_mib=4198 total_mib=7363`——即同一张卡上窗口从 16384 涨到 32768。
+  预算 8176 MiB 时同一公式给 7 页 = 114688 token；`--vram-tier-mib 6144/4096` 给 1 页 = 16384
+  （缓存掉到 3122 / 1074 MiB，reductions 5 / 13）。**不同 VRAM 的设备因此拿到不同窗口**。
+- `ctx_tokens=262144` 是模型上限（design 2.2），窗口永远不会超过它。
+
+### 76.2 分页：主机是权威副本，VRAM 是页缓存
+
+- `resident_tokens < n_ctx` 时进入 paged 模式：K/V 的权威行在 host（`[kv][n_ctx][row]`），
+  VRAM 只保留 `resident_tokens` 行，按 `page_tokens` 切成槽位轮转。
+- 追加（qk）写进 chunk scratch（`max_tokens` 行）再 D2H 回 host，并把被写到的页标记为非驻留；
+  `page_writes` 记页次数。
+- 注意力按页循环：每页先换入（`page_ins`），再跑一次 dispatch；running softmax 的 m/l 与未归一化
+  的输出通过 `state_m/state_l/out` 在页之间传递（`carry` / `finalize`），最后一段才除以 l 并乘
+  门。页大小是 32 的倍数，正好对齐内核的 32 键块，所以没有半块边界。
+- 目标工况（ctx <= 窗口）仍是 direct 模式，一次 dispatch，与 75 节逐位相同。
+
+### 76.3 读数
+
+| 臂 | tokens | 窗口 | 页 | 注意力 rel_L1 | page_ins | page_writes | VRAM KV / host KV |
+|---|---:|---:|---:|---:|---:|---:|---|
+| direct q8_0/q4_0 | 1024 | 2112 | - | **1.456e-06** | - | - | 1.68 / 0 MiB |
+| paged q8_0/q4_0 | 1024 | 512 | 128 | **1.456e-06** | 8 | 20 | 0.41 / 1.68 MiB |
+| paged q8_0/q4_0 | 2048 | 256 | 128 | **1.495e-06** | 16 | 40 | 0.20 / 3.30 MiB |
+| direct q8_0/q8_0 | 2048 | 4160 | - | **1.526e-06** | - | - | 4.32 / 0 MiB |
+| paged q8_0/q8_0 | 2048 | 256 | 128 | **1.526e-06** | 16 | 40 | 0.27 / 4.32 MiB |
+| paged f16/f16 | 2048 | 256 | 128 | **1.469e-06** | 16 | 40 | 0.50 / 8.12 MiB |
+
+- **分页与整段常驻的读数逐位相同**（1024 档两条臂都是 1.456e-06）：页循环只是把 m/l 搬到
+  global，不改算术；2048 档的 1.495e-06 是另一个 chunk 的抽行。
+- 窗口 256 token（2 个页槽）对 16 页的序列时 eviction 发生 14 次，结果不变。
+- `--vk-info` 的 `alloc_peak_mib` 是本轮新增的显存峰值读数（check 里 69-141 MiB，整段模型时
+  才到 GiB 量级）。
+
+### 76.4 两个缺陷的回归护栏（RESULTS 75.5 的 1、2 条）
+
+1. **push block 改成具名结构体**：`qrt_qk_pc` / `qrt_attn_pc` 在文件作用域，`make_layout` 用
+   `sizeof(...)`，再加 `static_assert` 钉住 11 / 13 个 uint。范围与写入不可能再各自漂移。
+2. **传输越界变成报错**：`vk_dev` 给每个 `qrt_vk_alloc` 的缓冲登记字节数，`staging_submit` 先查
+   offset+bytes。把 75.5 第 2 条的错下载放回去，读到的是
+   `copy of 282624 bytes at 0 runs past a 278528 byte buffer`（exit 2），不再是 device lost。
+   登记表 4096 项，未登记的句柄放行（模块间共享的缓冲）。
+3. 第 3 条（RNE staging）由 75 节的 318.6 ms 读数钉住；第 4 条（FFN 参考吃设备 Q8_1）由
+   `--layer-check` 的 shexp 列钉住——把它改回 host 重算，q8 臂立刻 5.88e-05 红。
+
+### 76.5 门禁与未做
+
+- **L-KERN pass**：direct/paged 注意力 1.456e-06 / 1.495e-06 / 1.469e-06（门 1e-4），追加、
+  整层、selftest 全过。
+- **L-MODEL n/a**：默认档 U-11 豁免；整模型 KLD 仍归 M2-7。
+- 未做 / 留给下一轮：
+  1. 全模型 256K（M2-7/Q-KV3）还没跑；本轮只证明了分页路径对单层正确。
+  2. 分页的代价没测（每 token 要换入全部页，设计上不计入 TG；长上下文 decode 速度归 Q-KV3）。
+  3. design 7 的 `QRT_KV_PAGE_TOKENS` 行仍写着"常驻窗口"，需要用户改成"换页粒度 + 窗口按预算
+     推导"（design 由用户维护）。
+  4. 预算用的是 `heapBudget`，桌面上有进程时窗口会缩小（今天 7378 vs 8176）；这是预期行为，
+     但读数口径要写清 `budget_mib`。

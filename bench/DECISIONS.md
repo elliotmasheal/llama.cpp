@@ -77,7 +77,7 @@
 | `QRT_PREFILL_CHUNK` | 2048 | prefill 分块；PP 1000 需 >= 1420 | 已解析；引擎待 M2-5 |
 | `QRT_KV_K` | q8_0 | K 缓存精度 {f16, q8_0, q4_0}（U-10/U-11）；q4_0 K 只作对照 | 已实现（M2-6a） |
 | `QRT_KV_V` | q4_0 | V 缓存精度，与 K 独立 | 已实现（M2-6a） |
-| `QRT_KV_PAGE_TOKENS` | 16384 | KV 常驻窗口；窗口外页面放主机（U-3） | 预算已用；分页待 M2-6a 第二块 |
+| `QRT_KV_PAGE_TOKENS` | 16384 | KV 换页粒度；常驻窗口由可用显存推导（上限 ctx，M2-6a） | 已实现（M2-6a 第二块） |
 | `QRT_TELEMETRY` | 0 | 每 pass 记录命中、H2D 字节、耗时、接受数 | 已解析；出口已实现（M2-0） |
 | `QRT_TELEMETRY_PATH` | `qrt-telemetry.csv` | 运行时扩展：sink 路径，不是 design 开关 | 已实现（M2-0） |
 | `QRT_VRAM_TIER_MIB` | 0（auto） | 运行时扩展：把预算压到指定 MiB，模拟 4G/6G 档 | 已实现（M2-2） |
@@ -1988,3 +1988,53 @@ M2-6a 负责迁移成 K/V 两开关并把 q8_0 K + q4_0 V 的 832 B/token/层 �
   2. 256K 档的 VRAM 峰值、换页次数、G-QUAL-LONG 三档读数（Q-KV3）。
   3. `q4_0` K 只是对照臂；`f16/f16` 保留为 G-QUAL 的 A 侧，不是回退默认。
   4. decode 的注意力腿没测：本节全是 prefill 的 10K 块（TG 的注意力在 M3 单步里才量）。
+
+## 76. M2-6a 第二块判决：KV 窗口按显存余量推导，主机分页落地（2026-10-25）
+<!-- slug: m2-6a-page-decision -->
+
+### 76.1 开关语义变更（用户 2026-10-25 指示）
+
+- `QRT_KV_PAGE_TOKENS`（默认 16384）从"常驻窗口"改为**换页粒度**；常驻窗口由
+  `qrt_vk_kv_window_tokens()` 推导：
+  `min(ctx=262144, 整页数 x page_tokens)`，其中整页数 = `(budget - dense - compute - draft -
+  cache_target) / page_bytes`（至少一页；不够时从专家缓存拿，计 reductions）。
+- **优先级**：稠密/计算/草稿固定，**专家缓存保持 4198 MiB 的目标（21.7% 的 TG 前提不变）**，
+  KV 只吃剩下的余量。理由：把缓存让给 KV 会把 TG 的 21.7% 前提改掉，那是目标口径，不能由
+  实现单方面改。若用户要反过来（KV 优先占满 ctx、缓存吃剩余），改 `qrt_vk_kv_window_tokens`
+  里的两行顺序即可，但那需要先改 design 的 TG 前提。
+- 于是同一张 8 GiB 卡：budget 7378 时窗口 32768 token（2 页，286 MiB）；budget 8176 时 7 页
+  = 114688；`--vram-tier-mib 6144/4096` 各 1 页 = 16384。**窗口随可用显存伸缩，上限 ctx。**
+
+### 76.2 分页的实现判决
+
+- 权威副本在 host（`[kv][n_ctx][row]`），VRAM 是 `resident_tokens` 行的页缓存，槽位轮转。
+  追加走 chunk scratch -> D2H；被写到的页失效。注意力**按页 dispatch**，页间用
+  `state_m/state_l`（running max/mass）与未归一化的 `out` 传递，`carry`/`finalize` 两个推常量
+  控制。页是 32 的倍数，与内核 32 键块对齐，没有半块。
+- 为什么不做"整段换入一次"：256K 的 f16 A 侧 5632 MiB 装不下（design 5.5/6.5），跨页只能
+  多趟；多趟的代价是每 token 换入全部页，设计已声明长上下文 decode 不计入 TG。
+- 为什么权威副本放 host 而不是做脏页回写：追加的 chunk 本来就要过一次 host（scratch），
+  回写会让"页在 VRAM 里被追加改写"多一条路径；现在的规则是**页要么来自 host、要么失效**，
+  没有第三种状态。page_outs 因此恒为 0，报告里只有 page_ins / page_writes。
+- paged 模式拒绝 `attach`（层链的合并提交）：一次 pass 里要按页换入，会打破"一次提交"。
+  层链用 n_ctx = chunk（direct），不受影响；真·256K 的引擎（M2-7）走同步路径。
+
+### 76.3 护栏（75.5 第 1、2 条的回归）
+
+1. push block 改成 `qrt_qk_pc` / `qrt_attn_pc` 具名结构体 + `static_assert`，`make_layout` 用
+   `sizeof`。这类"长度忘了跟结构体改"不可能再发生。
+2. `vk_dev` 登记每个 `qrt_vk_alloc` 的字节数，`staging_submit` 校验 offset+bytes；把错误下载
+   放回去会得到 `copy of 282624 bytes ... runs past a 278528 byte buffer`，不再是 device lost。
+   未登记句柄放行，避免误伤池化缓冲。
+
+### 76.4 判决与未结项
+
+- **L-KERN pass**（direct/paged 1.456e-06..1.495e-06，门 1e-4，分页与整段逐位相同），
+  `--selftest` 0 failed，整层 PASS。
+- 未结项：
+  1. design 7 的 `QRT_KV_PAGE_TOKENS` 描述仍是"常驻窗口"，请用户改成"换页粒度 + 窗口按预算
+     推导"；否则文档与代码不一致。
+  2. 全模型 256K 的端到端（M2-7 / Q-KV3）与分页代价读数。
+  3. 分页目前的换入是逐页同步提交（每页一次 submit+wait）；真要跑 256K 可以合并成一次提交
+     里的多个 dispatch + 一次换入大 copy，属于 M4 的优化。
+  4. `heapBudget` 随桌面占用波动（今天 7378），窗口读数必须带 `budget_mib` 与日期。

@@ -45,18 +45,26 @@ layout(constant_id = 1) const uint V_TYPE = 0;
 layout(push_constant) uniform PC {
     uint  pos0;      // position of the first token of the chunk
     uint  tokens;
-    uint  kv_cap;    // tokens the KV cache holds
+    uint  kv_cap;    // KV rows the resident window holds
     uint  qg_ch;     // n_head * 2 * head_dim
     uint  k_stride_w;// K row stride in 32-bit words
     uint  v_stride_w;// V row stride in 32-bit words
+    uint  kv_row_base;// resident row of kv_pos_base (paged mode; 0 in direct mode)
+    uint  kv_pos_base;// absolute position of resident row kv_row_base
+    uint  kb_lo;      // key blocks [kb_lo, kb_hi): one page in paged mode, [0, nkb) direct
+    uint  kb_hi;
+    uint  carry;      // 1 = load the running softmax state and the unnormalised output
+    uint  finalize;   // 1 = divide by the softmax mass and apply the sigmoid gate
     float kq_scale;
 } pc;
 
 layout(binding = 0) readonly  buffer QBuf  { float q[];   };   // [token][NH*HD]
-layout(binding = 1) readonly  buffer KcBuf { uint  kc[];  };   // f16 pairs [kv][cap][HD]
-layout(binding = 2) readonly  buffer VcBuf { uint  vc[];  };   // f16 pairs
-layout(binding = 3) writeonly buffer OutBuf{ float dst[]; };   // [token][NH*HD]
+layout(binding = 1) readonly  buffer KcBuf { uint  kc[];  };   // [kv][cap][K row]
+layout(binding = 2) readonly  buffer VcBuf { uint  vc[];  };   // [kv][cap][V row]
+layout(binding = 3)          buffer OutBuf{ float dst[]; };   // [token][NH*HD], read when carrying
 layout(binding = 4) readonly  buffer QgBuf { float qg[];  };   // [token][qg_ch]
+layout(binding = 5)          buffer MStat { float mstate[]; }; // [head][token] running max
+layout(binding = 6)          buffer LStat { float lstate[]; }; // [head][token] running mass
 
 shared uint  kt[(HD / 4u) * KPAD];  // [d/2][u] of one 128-dim half, transposed pair words
 shared uint  vt[VSUB * (HD / 2u)];  // [u][d/2] of VSUB keys
@@ -82,17 +90,35 @@ void main() {
     const uint sk  = 4u * (tid & 7u);
 
     if (tid < BQ) {
-        ml[tid]      = -1e30f;
-        ml[BQ + tid] = 0.0f;
+        const uint tok = q0 + tid;
+        if (pc.carry != 0u && tok < pc.tokens) {
+            ml[tid]      = mstate[head * pc.tokens + tok];
+            ml[BQ + tid] = lstate[head * pc.tokens + tok];
+        } else {
+            ml[tid]      = -1e30f;
+            ml[BQ + tid] = 0.0f;
+        }
     }
     float o[64];
     [[unroll]] for (uint i = 0; i < 64u; ++i) {
         o[i] = 0.0f;
     }
     barrier();
+    if (pc.carry != 0u) {
+        [[unroll]] for (uint r = 0; r < 8u; ++r) {
+            const uint tok = q0 + r0 + r;
+            if (r0 + r < rows) {
+                [[unroll]] for (uint j = 0; j < 8u; ++j) {
+                    o[r * 8u + j] = dst[(tok * NH + head) * HD + d0 + j];
+                }
+            }
+        }
+    }
 
-    const uint nkb = (pc.pos0 + q0 + rows + BKV - 1u) / BKV;   // causal: keys are absolute
-    for (uint kb = 0; kb < nkb; ++kb) {
+    // causal diagonal of this tile, intersected with the key-block range of the call
+    const uint nkb_tile = (pc.pos0 + q0 + rows + BKV - 1u) / BKV;
+    const uint kb_end = min(pc.kb_hi, nkb_tile);
+    for (uint kb = pc.kb_lo; kb < kb_end; ++kb) {
         const uint kbase = kb * BKV;
 
         // scores in two dim passes; the K half tile is (128 dims) x (32 keys) of pair words
@@ -110,7 +136,8 @@ void main() {
                 const uint kpos = kbase + u;
                 uint pair = 0u;
                 if (kpos < pos_end) {
-                    const uint rb = (kvh * pc.kv_cap + kpos) * pc.k_stride_w;
+                    const uint krow = kpos - pc.kv_pos_base + pc.kv_row_base;
+                    const uint rb = (kvh * pc.kv_cap + krow) * pc.k_stride_w;
                     if (K_TYPE == 0u) {
                         pair = kc[rb + (dbase + 2u * dp) / 2u];
                     } else {
@@ -206,7 +233,8 @@ void main() {
                 const uint kpos = kbase + u0 + u;
                 uint pair = 0u;
                 if (kpos < pos_end) {
-                    const uint rb = (kvh * pc.kv_cap + kpos) * pc.v_stride_w;
+                    const uint krow = kpos - pc.kv_pos_base + pc.kv_row_base;
+                    const uint rb = (kvh * pc.kv_cap + krow) * pc.v_stride_w;
                     if (V_TYPE == 0u) {
                         pair = vc[rb + dp];
                     } else {
@@ -251,15 +279,31 @@ void main() {
         }
     }
 
-    // write out: divide by the softmax mass, then the gate
-    [[unroll]] for (uint r = 0; r < 8u; ++r) {
-        if (r0 + r < rows) {
-            const float inv = 1.0f / ml[BQ + r0 + r];
-            const uint tok = q0 + r0 + r;
-            [[unroll]] for (uint j = 0; j < 8u; ++j) {
-                const uint ch = head * 2u * HD + HD + d0 + j;
-                const float g = 1.0f / (1.0f + exp(-qg[tok * pc.qg_ch + ch]));
-                dst[(tok * NH + head) * HD + d0 + j] = o[r * 8u + j] * inv * g;
+    // write out: the gate and the divide by the softmax mass only on the last page;
+    // otherwise the running state and the unnormalised output go back to memory
+    if (pc.finalize != 0u) {
+        [[unroll]] for (uint r = 0; r < 8u; ++r) {
+            if (r0 + r < rows) {
+                const float inv = 1.0f / ml[BQ + r0 + r];
+                const uint tok = q0 + r0 + r;
+                [[unroll]] for (uint j = 0; j < 8u; ++j) {
+                    const uint ch = head * 2u * HD + HD + d0 + j;
+                    const float g = 1.0f / (1.0f + exp(-qg[tok * pc.qg_ch + ch]));
+                    dst[(tok * NH + head) * HD + d0 + j] = o[r * 8u + j] * inv * g;
+                }
+            }
+        }
+    } else {
+        if (tid < BQ && q0 + tid < pc.tokens) {
+            mstate[head * pc.tokens + q0 + tid] = ml[tid];
+            lstate[head * pc.tokens + q0 + tid] = ml[BQ + tid];
+        }
+        [[unroll]] for (uint r = 0; r < 8u; ++r) {
+            if (r0 + r < rows) {
+                const uint tok = q0 + r0 + r;
+                [[unroll]] for (uint j = 0; j < 8u; ++j) {
+                    dst[(tok * NH + head) * HD + d0 + j] = o[r * 8u + j];
+                }
             }
         }
     }

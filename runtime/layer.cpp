@@ -604,8 +604,13 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_
             qrt_gguf_close(g);
             return fail(err, err_size, "attention.n_embd=%u, the norms are %u", fsh.n_embd, E);
         }
-        if (qrt_full_open(dev, spv_dir, &fsh, T, T, l->cfg.kv_k, l->cfg.kv_v, &l->full,
-                          err, err_size) != 0) {
+        qrt_full_kv_cfg kvcfg;
+        memset(&kvcfg, 0, sizeof(kvcfg));
+        kvcfg.k_type = l->cfg.kv_k;
+        kvcfg.v_type = l->cfg.kv_v;
+        kvcfg.resident_tokens = T;
+        kvcfg.page_tokens = l->cfg.kv_page_tokens;
+        if (qrt_full_open(dev, spv_dir, &fsh, T, T, &kvcfg, &l->full, err, err_size) != 0) {
             qrt_layer_close(dev, l);
             qrt_gguf_close(g);
             return -1;
