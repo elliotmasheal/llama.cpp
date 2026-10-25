@@ -1134,5 +1134,5 @@
     "detail": "backend-ops baseline is 2026-10-23 / 44bd79305 (ctest 32/32 there, 33/33 after 992c2f57a; M1-3c re-ran ctest 33/33). M1-3c touched only common/, so the backend-ops record still stands but is stale; rerun the full set before any ggml or backend change."
   },
   "blockers": [],
-  "escalations": [],
+  "escalations": []
 }
