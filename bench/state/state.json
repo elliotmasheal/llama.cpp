@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-6c",
+      "head": "M2-6d",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "the dense line is closed (12.89 TFLOPS, RESULTS 55). Head is M2-6c step 2 (DeltaNet prep chain + gated RMS norm), then M2-6d and M2-6a"
+      "note": "M2-6c step 2 is running (prep chain + gated norm). The head is the next runnable task, M2-6d (full-attn batch); M2-6a follows and M2-7 closes M2 (bench). X-2 waits for M3-4"
     },
     {
       "lane": "data",
@@ -1191,7 +1191,7 @@
       "id": "M2-6c",
       "milestone": "M2",
       "lane": "impl",
-      "status": "partial",
+      "status": "doing",
       "title": "DeltaNet 算子：conv1d(4) + L2 norm + 递推 + gated RMS norm",
       "deps": [],
       "resources": [
@@ -1207,7 +1207,8 @@
         "runtime/README.md"
       ],
       "done_when": "单层 DeltaNet 前向对 CPU 参考逐元素一致（1e-4）；递推状态在 t 步串行解码与批量一致；conv1d 状态可保存/恢复",
-      "note": "step 1 done 2026-10-25: the delta-rule recurrence kernel matches the double precision CPU reference at rel_L1 2.3e-7, state save/restore and serial-vs-batch are bitwise identical, and the device subgroup size is now queried and specialized (assuming 32 produced garbage on this 64-wide device). Speed is the open item: 4.75-4.83 us/token = 1.46-1.48 s for 30 layers at 10K, which is 1.09x the whole attention budget of RESULTS 45, against an ideal of 0.32 s. Step 2 is the prep chain (conv1d+silu, L2 norm, alpha/beta/dt projections) plus the gated RMS norm and ssm_out; step 3 is token-parallel (chunked/WY) for the speed. Paths were widened for the CMake entry, the qrt subcommand, the switch table, the subgroup query and this runtime doc. RESULTS 52, DECISIONS 48"
+      "note": "step 1 done (RESULTS 52: recurrence matches the CPU reference at rel_L1 2.3e-7, state save/restore and serial-vs-batch bitwise identical, 4.75-4.83 us/token). STEP 2 IS THE CURRENT WORK (user 2026-10-25: proceed from the queue head, one block at a time). Target: the whole linear-attention layer against the CPU reference. Order, each with its own gate: (a) conv1d(4)+silu over the 8192 channels with the 3-token conv state, save/restore included; (b) L2 norm per k-head (rms_norm(x, eps/128) * 1/sqrt(128)) fused into (a) because a workgroup already owns one head; (c) the alpha/beta/dt/a projections: ssm_alpha and ssm_beta are f32 [2048,32], so a small f32 kernel that writes decay = exp(a * softplus(alpha + dt)) and beta = sigmoid(beta_raw) per (token, v-head); (d) gated RMS norm of the recurrence output with ssm_norm and silu(z), then ssm_out (q8_0 GEMM, already in gemm.cpp). Dependencies already in place: the q8_0 dense GEMM at 12.89 TFLOPS (RESULTS 55) for attn_qkv/attn_gate/ssm_out, and the recurrence kernel. Still missing for a real layer: an RMS-norm kernel for attn_norm and a Q8_1 activation quantiser, both shared with the other layers and therefore worth landing here. Paths cover attn_deltanet.*, kernels/deltanet*.comp, CMakeLists, qrt_main, vk_dev",
+      "claimed_at": "2026-10-25T13:26:38"
     },
     {
       "id": "M2-6d",
