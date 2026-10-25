@@ -1207,7 +1207,7 @@
         "runtime/README.md"
       ],
       "done_when": "单层 DeltaNet 前向对 CPU 参考逐元素一致（1e-4）；递推状态在 t 步串行解码与批量一致；conv1d 状态可保存/恢复",
-      "note": "step 2 in progress 2026-10-25: prep passes (q 6.3e-08, k 6.4e-08, v 5.2e-08) and the gate now passes too (decay 1.36e-08, beta 1.24e-07) with the real alpha/beta/dt/a weights; qrt_dn_weights_host() serves the double precision references and qrt_dn_bufs gained norm (the RMS-norm output). The gate shape is correct but slow (12.7 us/token, so 3.9 s for 10K x 30 layers) and must move to the q8_0 GEMM or a 4-lane-per-head reduction before it counts in the PP budget. Remaining: gnorm wiring, the RMS norm + Q8_1 quantiser (qrt_norm.comp written, needs do_norm), the three q8_0 projections (attn_qkv/attn_gate/ssm_out) and the whole-layer reference. RESULTS 58, DECISIONS 56"
+      "note": "step 2 correctness done 2026-10-25: prep (q 6.15e-08, k 6.08e-08, v 5.12e-08), gate (decay 1.37e-08, beta 1.19e-07), gnorm (5.76e-08) and the recurrence (1.48e-07, state save/restore and serial-vs-batch bitwise identical) all match the double precision reference; --deltanet-check exits 0. The gnorm crash lived in the weight loader growth path, not in gnorm: ssm_norm now gets its own buffer at open and is uploaded by the caller. Remaining for M2-6c: (a) performance, recurrence 5.87 us/token (1.80 s per 30 layers at 10K, budget 1.35 s) and gate and gnorm 12.7 us/token each; (b) the whole-layer chain with the q8_0 projections, which needs the GEMM [row][token] layout to land together with the stride=m reads in prep/gnorm. RESULTS 59, DECISIONS 57"
     },
     {
       "id": "M2-6d",
