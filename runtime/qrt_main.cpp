@@ -10,6 +10,7 @@
 #include "attn_deltanet.h"
 #include "attn_full.h"
 #include "layer.h"
+#include "model.h"
 #include "kernels/norm.h"
 #include "kernels/moe_expert.h"
 
@@ -1453,6 +1454,11 @@ int main(int argc, char ** argv) {
     int fullattn_tokens = 1024;
     int fullattn_resident = 0;       // 0 = the whole context in VRAM
     int fullattn_page = 0;           // 0 = the configured page granularity
+    const char * logits_gguf = NULL;
+    const char * logits_out = NULL;
+    const char * logits_tokens = NULL;
+    int logits_layers = 40;
+    int logits_rows = 8;
 
     {
         const char * exe = argc > 0 ? argv[0] : "qrt";
@@ -1793,6 +1799,54 @@ int main(int argc, char ** argv) {
             }
             continue;
         }
+        if (strcmp(argv[i], "--logits-dump") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --logits-dump needs the GGUF path\n");
+                return 2;
+            }
+            logits_gguf = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--logits-out") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --logits-out needs a path\n");
+                return 2;
+            }
+            logits_out = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--logits-tokens") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --logits-tokens needs a token id file\n");
+                return 2;
+            }
+            logits_tokens = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--logits-layers") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --logits-layers needs a count\n");
+                return 2;
+            }
+            logits_layers = atoi(argv[++i]);
+            if (logits_layers < 0) {
+                fprintf(stderr, "qrt: --logits-layers wants 0 or more\n");
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--logits-rows") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --logits-rows needs a count\n");
+                return 2;
+            }
+            logits_rows = atoi(argv[++i]);
+            if (logits_rows < 1) {
+                fprintf(stderr, "qrt: --logits-rows wants at least 1\n");
+                return 2;
+            }
+            continue;
+        }
         if (strcmp(argv[i], "--dense-rows") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "qrt: --dense-rows needs a count\n");
@@ -2003,6 +2057,26 @@ int main(int argc, char ** argv) {
     if (deltanet_gguf != NULL) {
         return qrt_dn_check(deltanet_gguf, (uint32_t) deltanet_layer, (uint32_t) deltanet_tokens,
                             g_spv_dir);
+    }
+    if (logits_gguf != NULL) {
+        if (logits_out == NULL || logits_tokens == NULL) {
+            fprintf(stderr, "qrt: --logits-dump also needs --logits-out and --logits-tokens\n");
+            return 2;
+        }
+        uint32_t * ids = NULL;
+        uint32_t n_ids = 0;
+        if (qrt_model_read_ids(logits_tokens, &ids, &n_ids, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            return 2;
+        }
+        const int rc = qrt_model_logits(logits_gguf, layer_store, g_spv_dir, ids, n_ids,
+                                        (uint32_t) logits_layers, (uint32_t) logits_rows,
+                                        logits_out, err, sizeof(err));
+        if (rc != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+        }
+        free(ids);
+        return rc;
     }
     if (fullattn_gguf != NULL) {
         return qrt_full_check(fullattn_gguf, (uint32_t) fullattn_layer, (uint32_t) fullattn_tokens,

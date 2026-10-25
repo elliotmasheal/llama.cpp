@@ -16,6 +16,7 @@ add_library(qrt_core STATIC
     kernels/norm.cpp
     kernels/moe_expert.cpp
     layer.cpp
+    model.cpp
     ffn.cpp
     vk_dev.cpp)
 

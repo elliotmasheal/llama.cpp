@@ -2875,3 +2875,38 @@ CPU 双精度，K/V 平面取设备缓存按行格式反量化），`qrt --layer
      推导"（design 由用户维护）。
   4. 预算用的是 `heapBudget`，桌面上有进程时窗口会缩小（今天 7378 vs 8176）；这是预期行为，
      但读数口径要写清 `budget_mib`。
+
+## 77. M2-7a 第一步：整模型前向与 QRTLOG1 出口（未收口，2026-10-25）
+<!-- slug: m2-7a-runner-wip -->
+
+口径：`qrt --logits-dump <gguf> --logits-tokens <ids> --logits-out <bin> --logits-layers N
+--logits-rows R --layer-store <前缀>`；token id 取自 `bench/raw/q-kv1/ctx256-f16-f16.bin`
+的前 256 个（`bench/raw/m2-7a/tokens256.txt`）。产物 `bench/raw/m2-7a/`。
+
+### 77.1 已跑通的部分
+
+- `model.*`：embedding（token_embd 是 q8_0，按行 `qrt_gguf_read_range` 反量化）-> 40 层
+  （逐层 open / set_input / zero_state / run / 回读 / close，一次只驻留一层权重）-> final norm
+  -> head（output 也是 q8_0，host 双精度累加）-> QRTLOG1 v1。
+- `--logits-dump` 1 层与 40 层都 exit 0；`qgate.py verify` 对 4 行/16 行 dump 都是 PASS
+  （header/大小/token 流/行质量全部合法）。**出口的格式与工具侧已经对上。**
+
+### 77.2 未收口：logits 明显不对
+
+| 臂 | 行 | PPL | mean NLL | 最后一行 top-1 vs 目标 |
+|---|---:|---:|---:|---|
+| fork f16/f16（同 256 token，A 侧） | 254 | 3.3621 | - | - |
+| rt 40 层 + host head | 16 | **2.60e+06** | **14.77** | 215267 vs 6692 |
+| rt 1 层 + host head（对照） | 2 | - | - | 29173 vs 6692 |
+
+- 40 层的前向链有缺陷，**不是格式问题也不是舍入问题**：NLL 14.8 与"随机词表"同量级。
+- 已排除：dump 格式（verify PASS）、行质量、head/embedding 的行偏移（都是 `t*2176` 的 q8_0 行）。
+- 下一步的排查顺序（下一轮）：(1) 用 1 层切片把 hidden 与 `--layer-check` 的参考对齐，确认
+  逐层串联的输入/输出约定；(2) 检查 embedding 是否还要乘 scale 或走不同的 norm；(3) 对比
+  fork dump 的同一行（j=239..254 与 fork 的重叠区）逐行看 top-1 是否从第 1 层就跑偏。
+- 因此 M2-7a 仍是 `doing`：出口可用，数值未过。
+
+### 77.3 门禁
+
+- L-KERN n/a（本轮不改已有数值路径）；`--selftest` 0 failed；`--layer-check` 仍 PASS。
+- 未做的：CPU 双精度参考的 logits 对比、`--logits-rows 512` 的 10K 档、分块 prefill 与跨 chunk KV。

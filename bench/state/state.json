@@ -150,7 +150,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-7a",
+      "head": "X-4",
       "order": [
         "M2-0",
         "M2-1",
@@ -167,7 +167,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6a is done; M2-7a (the whole-model forward and the QRTLOG1 logits exit) is the critical path to M2-7, then M3-1/M3-2"
+      "note": "M2-7a is doing (runner harness works, logits wrong); X-4 is the next free impl task"
     },
     {
       "lane": "data",
@@ -1118,7 +1118,10 @@
       "id": "M2-7a",
       "milestone": "M2",
       "lane": "impl",
-      "status": "todo",
+      "status": "doing",
+      "owner": "deepseek-v4.1-flash@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-26T00:05:00+08:00",
       "title": "整模型前向 + logits 出口（QRTLOG1 v1）",
       "deps": [
         "M2-5",
@@ -1135,7 +1138,8 @@
         "runtime/CMakeLists.txt",
         "runtime/README.md"
       ],
-      "done_when": "embedding -> 40 层（11 full-attn + 29 DeltaNet）-> final norm -> output head 跑通一个 chunk；--logits-dump 写 QRTLOG1 v1（24 B 头 + tokens[n_pos+1] + f32 rows，格式见 bench/tools/quality/README.md 第 3 节）；相邻层 hidden 与单层链一致，logits 对 CPU 双精度参考 rel_L1 <= 1e-4；10K prompt 一档 exit 0，读数进 RESULTS"
+      "note": "doing 2026-10-26: the harness runs end to end (embedding -> 40 layers -> final norm -> host head -> QRTLOG1 v1, qgate verify PASS on 4 and 16 rows) but the logits are wrong: PPL 2.60e+06 / mean NLL 14.77 against the fork f16 arm 3.3621 on the same 256 tokens. Format and row offsets are ruled out; next is the 1-layer hidden comparison against --layer-check and the fork row overlap (RESULTS m2-7a-runner-wip)",
+      "done_when": "embedding -> 40 层（10 full-attn + 30 DeltaNet）-> final norm -> output head 跑通一个 chunk；--logits-dump 写 QRTLOG1 v1（24 B 头 + tokens[n_pos+1] + f32 rows，格式见 bench/tools/quality/README.md 第 3 节）；相邻层 hidden 与单层链一致，logits 对 CPU 双精度参考 rel_L1 <= 1e-4；10K prompt 一档 exit 0，读数进 RESULTS"
     },
     {
       "id": "M2-6a",
