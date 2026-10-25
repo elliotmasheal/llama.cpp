@@ -3,27 +3,28 @@
 
 // Flash-style causal attention over the f16 KV cache (M2-6d step 2).
 //
-// One workgroup is one (query head, query tile of 32). The KV cache is token major,
-// so the K tile is transposed into shared memory on load (a lane-per-key read of the
-// token-major layout would hit one bank 32 ways); V stays in its own layout because
-// phase 2 reads it eight channels at a time along a row.
+// One workgroup is one (query head, query tile of 64) and 256 threads. The K tile is
+// staged in shared memory as transposed f16 pairs: the cache is token major, so a
+// lane-per-key read of that layout would hit one bank sixteen ways, and storing the
+// pair word against the key removes both the transpose and the conflict. V is read
+// straight from the cache: phase 2 wants one row of 256 channels per key, which is
+// already coalesced.
 //
 // Per KV block of 32 keys:
-//   scores  S[t][u] = qscale * sum_d Q[t][d] K[u][d]     4 rows x 2 keys per thread
+//   scores  S[t][u] = qscale * sum_d Q[t][d] K[u][d]    4 rows x 2 keys per thread
 //   softmax online:  m, l per row, P = exp(S - m), rescale O by exp(m_old - m)
-//   accumulate       O[t][d] += sum_u P[t][u] V[u][d]    8 rows x 8 channels per thread
-// Then O/l and the sigmoid gate that the joint QG projection carries.
+//   accumulate       O[t][d] += sum_u P[t][u] V[u][d]   8 rows x 8 channels per thread
+// then O/l and the sigmoid gate that the joint QG projection carries.
 //
-// head_dim is fixed at 256 and the tiles at 32x32: shared memory is 54 KiB per
-// workgroup, which fits this device's 64 KiB and nothing smaller, so qrt_full_open()
-// checks the device limit and refuses instead of overrunning it.
+// head_dim is fixed at 256 and the tiles at 64 x 32: shared memory is 26 KiB, inside
+// this device's 32768 B. qrt_full_open() checks that limit instead of overrunning it.
 
-layout(local_size_x = 128) in;
+layout(local_size_x = 256) in;
 
 const uint HD  = 256;   // head_dim
-const uint BQ  = 32;    // query rows per workgroup
-const uint BKV = 16;    // keys per tile (see the 32 KiB shared-memory limit)
-const uint KPAD = BKV + 1;              // padding kills the transposed-read conflicts
+const uint BQ  = 64;    // query rows per workgroup
+const uint BKV = 16;    // keys per tile
+const uint KPAD = BKV + 1;              // padding: transposed reads stay conflict free
 const uint NH  = 16;    // n_head
 const uint NKV = 2;     // n_kv
 
@@ -41,10 +42,10 @@ layout(binding = 2) readonly  buffer VcBuf { uint  vc[];  };   // f16 pairs
 layout(binding = 3) writeonly buffer OutBuf{ float dst[]; };   // [token][NH*HD]
 layout(binding = 4) readonly  buffer QgBuf { float qg[];  };   // [token][qg_ch]
 
-shared float kt[HD * KPAD];          // [d][u], transposed
-shared uint  vt[BKV * (HD / 2)];     // [u][d/2]
-shared float sc[BQ * KPAD + BQ];     // [t][u] then the per-row rescale factors
-shared float ml[2 * BQ];             // m[0..BQ), l[BQ..2BQ)
+shared float kt[HD * KPAD];         // [d][u], transposed
+shared uint  vt[BKV * (HD / 2u)];   // [u][d/2]
+shared float sc[BQ * KPAD + BQ];    // [t][u] then the per-row rescale factors
+shared float ml[2 * BQ];            // m[0..BQ), l[BQ..2BQ)
 
 void main() {
     const uint tid  = gl_LocalInvocationID.x;
@@ -60,7 +61,7 @@ void main() {
     // thread -> 8 query rows x 8 channels for the accumulator
     const uint r0 = 8u * (tid >> 5u);
     const uint d0 = 8u * (tid & 31u);
-    // thread -> 4 query rows x 1 key for the scores (8 row groups x 16 keys)
+    // thread -> 4 query rows x 1 key for the scores
     const uint sr0 = 4u * (tid >> 4u);
     const uint sk  = tid & 15u;
 
@@ -74,12 +75,12 @@ void main() {
     }
     barrier();
 
-    const uint nkb = (pc.pos0 + q0 + rows + BKV - 1u) / BKV;   // keys are absolute
+    const uint nkb = (pc.pos0 + q0 + rows + BKV - 1u) / BKV;   // causal: keys are absolute
     for (uint kb = 0; kb < nkb; ++kb) {
         const uint kbase = kb * BKV;
 
-        // one read of the KV tile: token major from the cache, transposed for K
-        for (uint idx = tid; idx < BKV * (HD / 2u); idx += 128u) {
+        // one read of the KV tile: the cache is token major, K is transposed on the way in
+        for (uint idx = tid; idx < BKV * (HD / 2u); idx += 256u) {
             const uint u  = idx / (HD / 2u);
             const uint dp = idx % (HD / 2u);
             const uint kpos = kbase + u;
@@ -96,16 +97,29 @@ void main() {
         }
         barrier();
 
-        // scores: four query rows against one key each
+        // scores: four query rows against two keys, four dims per step so the loads of
+        // a step are independent and overlap their latency
         float s[4];
         [[unroll]] for (uint i = 0; i < 4u; ++i) {
             s[i] = 0.0f;
         }
-        for (uint d = 0; d < HD; ++d) {
-            const float kd = kt[d * KPAD + sk];
-            [[unroll]] for (uint r = 0; r < 4u; ++r) {
-                s[r] += q[((q0 + sr0 + r) * NH + head) * HD + d] * kd;
-            }
+        const uint qb0 = ((q0 + sr0 + 0u) * NH + head) * HD;
+        const uint qb1 = ((q0 + sr0 + 1u) * NH + head) * HD;
+        const uint qb2 = ((q0 + sr0 + 2u) * NH + head) * HD;
+        const uint qb3 = ((q0 + sr0 + 3u) * NH + head) * HD;
+        for (uint d = 0; d < HD; d += 4u) {
+            const float k0 = kt[(d + 0u) * KPAD + sk];
+            const float k1 = kt[(d + 1u) * KPAD + sk];
+            const float k2 = kt[(d + 2u) * KPAD + sk];
+            const float k3 = kt[(d + 3u) * KPAD + sk];
+            const float a0 = q[qb0 + d], a1 = q[qb0 + d + 1u], a2 = q[qb0 + d + 2u], a3 = q[qb0 + d + 3u];
+            const float b0 = q[qb1 + d], b1 = q[qb1 + d + 1u], b2 = q[qb1 + d + 2u], b3 = q[qb1 + d + 3u];
+            const float c0 = q[qb2 + d], c1 = q[qb2 + d + 1u], c2 = q[qb2 + d + 2u], c3 = q[qb2 + d + 3u];
+            const float e0 = q[qb3 + d], e1 = q[qb3 + d + 1u], e2 = q[qb3 + d + 2u], e3 = q[qb3 + d + 3u];
+            s[0] += a0 * k0; s[0] += a1 * k1; s[0] += a2 * k2; s[0] += a3 * k3;
+            s[1] += b0 * k0; s[1] += b1 * k1; s[1] += b2 * k2; s[1] += b3 * k3;
+            s[2] += c0 * k0; s[2] += c1 * k1; s[2] += c2 * k2; s[2] += c3 * k3;
+            s[3] += e0 * k0; s[3] += e1 * k1; s[3] += e2 * k2; s[3] += e3 * k3;
         }
         [[unroll]] for (uint r = 0; r < 4u; ++r) {
             const uint pos_q = pc.pos0 + q0 + sr0 + r;
@@ -142,14 +156,16 @@ void main() {
                 o[r * 8u + j] *= f;
             }
         }
+
         for (uint u = 0; u < BKV; ++u) {
             float v[8];
             const uint base = u * (HD / 2u) + d0 / 2u;
             [[unroll]] for (uint j = 0; j < 4u; ++j) {
                 const vec2 h = unpackHalf2x16(vt[base + j]);
-                v[2u * j]     = h.x;
+                v[2u * j]      = h.x;
                 v[2u * j + 1u] = h.y;
             }
+
             [[unroll]] for (uint r = 0; r < 8u; ++r) {
                 const float p = sc[(r0 + r) * KPAD + u];
                 [[unroll]] for (uint j = 0; j < 8u; ++j) {
@@ -172,4 +188,5 @@ void main() {
             }
         }
     }
+
 }

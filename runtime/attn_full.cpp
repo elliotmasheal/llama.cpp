@@ -307,9 +307,9 @@ int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes 
     // the attention kernel needs 27.5 KiB of shared memory per workgroup
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(dev->phys, &props);
-    if (props.limits.maxComputeSharedMemorySize < 28u * 1024u) {
+    if (props.limits.maxComputeSharedMemorySize < 30u * 1024u) {
         qrt_full_close(dev, f);
-        return fail(err, err_size, "the attention kernel needs 28160 bytes of shared memory, "
+        return fail(err, err_size, "the attention kernel needs 26624 bytes of shared memory, "
                     "this device has %u", props.limits.maxComputeSharedMemorySize);
     }
     if (make_set_layout(dev, 5, &f->attn_dsl, err, err_size) != 0 ||
@@ -535,14 +535,14 @@ int qrt_full_attn(qrt_full * f, uint32_t pos0, uint32_t tokens, char * err, size
                             &f->attn_set, 0, nullptr);
     vkCmdPushConstants(f->cmd, f->attn_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     // one workgroup per (query tile of 32, query head)
-    vkCmdDispatch(f->cmd, (tokens + 31u) / 32u, f->sh.n_head, 1);
+    vkCmdDispatch(f->cmd, (tokens + 63u) / 64u, f->sh.n_head, 1);
 
     // the account the "KV read once" claim is checked against: every query tile scans
     // the KV tiles up to its own diagonal
     uint64_t tiles = 0;
-    for (uint32_t q0 = 0; q0 < tokens; q0 += 32u) {
-        const uint32_t rows = tokens - q0 < 32u ? tokens - q0 : 32u;
-        tiles += (q0 + rows + 31u) / 32u;
+    for (uint32_t q0 = 0; q0 < tokens; q0 += 64u) {
+        const uint32_t rows = tokens - q0 < 64u ? tokens - q0 : 64u;
+        tiles += (pos0 + q0 + rows + 31u) / 32u;
     }
     f->last_kv_reads = tiles * f->sh.n_head * 32ull * f->sh.head_dim * 2ull * 2ull;
 

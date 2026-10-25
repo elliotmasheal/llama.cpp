@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "track": "qwen36-runtime",
-  "updated": "2026-10-25T15:18:03+08:00",
+  "updated": "2026-10-25T15:40:45+08:00",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -1229,7 +1229,7 @@
         "bench/DECISIONS.md"
       ],
       "done_when": "10K 因果注意力对 CPU 参考 rel_L1 <= 1e-4；KV 只读一次（每层一次 K/V 读）；IMRoPE 的 sections/freq 与参考一致",
-      "note": "partial 2026-10-25: both halves are in and correct. Step 1 (per-head RMS norm + IMRoPE + f16 KV append) matches the double reference at 5e-07; step 2 (flash causal attention + online softmax + sigmoid gate) matches at 1.2-2.4e-06 including the 10K case on the longest causal rows. Performance is the open item: 1.60 TFLOPS at 10K (538 ms/layer, 11 layers = 5.9 s against a 1.6 s budget, PP about 812). Diagnosed as instruction/LDS bound, not KV bandwidth (implied 50 GB/s vs DRAM 156) and not FLOPs; the 32768 B shared-memory limit forces Bkv=16 with head_dim 256. Also open: the literal 'KV read once per layer' is not met (1284x plane per layer at 10K); the workable target is DRAM once per layer with L2 for the repeats, which needs the Bq=64 and swizzled-K tiles listed in DECISIONS 63, and a user call on the criterion. RESULTS 64/65, DECISIONS 62/63. Next entries are ranked in DECISIONS 63"
+      "note": "partial 2026-10-25: both halves are in and correct. Step 1 (per-head RMS norm + IMRoPE + f16 KV append) 5e-07 against the double reference; step 2 (flash causal attention + online softmax + sigmoid gate) 1.2-2.4e-06 including 10K on the longest causal rows. Performance after the second round: 1.99 TFLOPS at 10K (431 ms/layer, 11 layers 4.7 s against a 1.6 s budget, PP about 894), 2.57 TFLOPS at 2K. The user dropped the 'KV read once per layer' criterion (DECISIONS 63.1): reads are not the bottleneck (31-50 GB/s implied against DRAM 156), it is reported as a cost column (644x the plane at 10K). The wall is the per-dim load latency in the score loop: a 4-dim unroll alone gave 1.6x, while 8-dim, larger key tiles and vec4 reads were all negative. Next entry needs 8x8 register blocking, which needs either a head_dim split across workgroups or f16 packed arithmetic (DECISIONS 63.1). RESULTS 64/65, DECISIONS 62/63"
     }
   ],
   "last_gate": {

@@ -201,13 +201,13 @@ blockers: none
 - **M2-6d partial（2026-10-25）**：full-attn 两半都通了且正确——qk norm+IMRoPE+f16 KV 追加
   对双精度参考 **5e-07**（10K 的第二 chunk 追加不动第一段，IMRoPE 与 NEOX theta 差 0）；
   flash 因果注意力 + 在线 softmax + sigmoid 门 **1.2-2.4e-06**（含 10K 按最长因果范围抽 8 行）。
-  **性能未达标**：10K 时 **1.60 TFLOPS / 538 ms 每层**，11 层 5.9 s 是 1.6 s 预算的 3.7x，
-  按此 PP 约 812。诊断：**不是 KV 带宽**（反推 50 GB/s，DRAM 156）、不是 FLOPs，
-  而是本机 `maxComputeSharedMemorySize=32768` 逼出 Bkv=16 小 tile + Q 每块重读。
-  已证伪：Q 读改 `vec4` 反而慢 1.7x（22.3 -> 37.5 ms）。**"KV 只读一次"字面口径未满足**
-  （10K 读 1284 倍平面），可行目标是"DRAM 每层一次 + 重复读命中 32 MB L2"，需用户确认口径。
-  下一轮入口按收益排序写在 `DECISIONS.md` 63（swizzled f16 K tile、Bq=64）。
-  见 `RESULTS.md` 第 64-65 节、`DECISIONS.md` 第 62-63 节。
+  **性能未达标但已抬一轮**：10K 时 **1.99 TFLOPS / 431 ms 每层**（先 1.60 / 538），11 层 4.7 s
+  是 1.6 s 预算的 2.9x，按此 PP 约 **894**。**用户已裁定不再把"每层 KV 只读一次"当判据**
+  （读不再是瓶颈：反推 31-50 GB/s，DRAM 156），只作为成本列（10K 重读 644x 平面）。
+  墙是**每维一次装载的串行延迟**：4 维展开单独给 1.6x，而 8 维展开、更大 key tile、V 走全局、
+  Q 读 vec4、扫描不按因果截断**全部更差**（都已撤销并记入已证伪）。下一轮要 8x8 寄存器分块，
+  需要 head_dim 跨 workgroup 切分或 f16 打包算术。见 `RESULTS.md` 第 64-65 节、
+  `DECISIONS.md` 第 62-63 节。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、
