@@ -203,7 +203,6 @@ build-vulkan/bin/qrt.exe --prefill-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL -
   6 readers: no change at all (the read leg stays at 13.6 GB/s), so the default is 1. The read
   and the concurrent H2D copy run at the same rate, which points at shared bandwidth on the
   coherent staging buffer rather than at CPU issue rate (DECISIONS 40).
-- `--prefill-readers N` also needs the pool in `prefill.cpp`; it stops and joins on close.
 - `--prefill-pipeline 1` (default) gives the scheduler two layer buffers and two command rings: layer
   L+1 is read and uploaded while layer L is still computing, which took 0.272 to 0.190 ms per
   block (RESULTS 42). `--prefill-pipeline 0` keeps the single buffer for comparison.
