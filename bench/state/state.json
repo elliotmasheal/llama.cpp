@@ -166,7 +166,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6 is done; M2-6a (q4_0 KV + 16K resident window) is next, then M3-1/M3-2"
+      "note": "M2-6 is done; M2-6a (switchable KV precision, default q8_0 K + q4_0 V, plus the 16K resident window) is next, then M3-1/M3-2"
     },
     {
       "lane": "data",
@@ -1117,7 +1117,7 @@
       "milestone": "M2",
       "lane": "impl",
       "status": "todo",
-      "title": "KV q4_0 量化 + 16384 token 常驻窗口分页",
+      "title": "KV 精度可配（默认 q8_0 K + q4_0 V）+ 16384 token 常驻窗口分页",
       "deps": [
         "M2-6d"
       ],
@@ -1128,7 +1128,7 @@
       "paths": [
         "runtime/attn.*"
       ],
-      "done_when": "q4_0 KV 与窗口可配；窗口外页落主机并可换入；k=1 KLD <= 1e-4、greedy 逐 token 一致（G-QUAL），不过则回退 f16；报 VRAM 峰值与换页次数"
+      "done_when": "QRT_KV_K / QRT_KV_V 可配，q8_0/q4_0（默认）与 q8_0/q8_0 两档都能切；窗口可配，窗口外页落主机并可换入；k=1 KLD <= 1e-4、greedy 逐 token 一致（G-QUAL），不过按 q8_0/q8_0 -> f16/f16 阶梯回退并记录；报两档的 VRAM 峰值与换页次数"
     },
     {
       "id": "U-7",

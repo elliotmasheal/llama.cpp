@@ -32,7 +32,7 @@ RX 6700S 8 GiB（`-dev Vulkan1`）+ Ryzen 7 6800HS + 40172 MiB RAM，平衡电�
 | 指标 | 硬地板 | 口径 | 里程碑 |
 |---|---|---|---|
 | PP | >= 1000 tok/s | 10.4K prompt（10428 tok），ctx 256K，chunk 2048 | M2 |
-| TG | >= 130 tok/s | 单流 greedy，10K 之后 128 tok，k=4，21.9% 缓存，q4 KV | M3 |
+| TG | >= 130 tok/s | 单流 greedy，10K 之后 128 tok，k=4，21.7% 缓存，q8_0 K + q4_0 V | M3 |
 
 每轮另报 0.85 x 绑定腿 roofline 作参照，差距分解成具体优化项。
 非目标：其他模型 / 量化 / 后端、多用户服务化、上游化。跨口径数字不可比。
@@ -50,7 +50,7 @@ blockers: none
 
 `queues` 只写任务 id；"为什么是它、做到什么算完"在 `state.json`。
 本节摘要最多 3 行：历史与读数只在 `RESULTS.md` / `DECISIONS.md`，`--lint` 会拦 dated bullet 与任务表。
-焦点：M2-6a 的 q4_0 KV 与常驻窗口分页；层链（含 FFN、两次合并提交）已 closed，见 `RESULTS` `m2-6-ffn-two-submits`。
+焦点：M2-6a 的 KV 精度可配（默认 q8_0 K + q4_0 V）与常驻窗口分页；层链（含 FFN、两次合并提交）已 closed，见 `RESULTS` `m2-6-ffn-two-submits`。
 
 ## 4. 铁律
 

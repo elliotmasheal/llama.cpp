@@ -17,7 +17,7 @@
 |---|---|
 | 模型 | `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`（21.28 GiB，`qwen35moe`，40 主层 + 1 MTP，256 专家 top-8） |
 | prompt | `bench/prompts/prompt10k.txt` = **10428 token**；文中写 10.4K，不写"10K" |
-| ctx | 256K，由 q4_0 KV + 16384 token 常驻窗口支持（U-3，`RESULTS` 第 10 节）；窗口外页面在主机，不计入 TG |
+| ctx | 256K，由 q8_0 K + q4_0 V + 16384 token 常驻窗口支持（U-10，design 5.5）；窗口外页面在主机，不计入 TG |
 | 采样 | greedy，单流；推测解码按 k=4 验收 |
 | 目标 | PP >= 1000、TG >= 130（硬地板，用户重设前不变） |
 | 环境 | 平衡电源 + AC（`bench/env/power.txt`）、dGPU 无其它推理进程、`-lm none`（resident，>= 27.6 GiB 空闲 RAM）；任一不满足就不跑 |
@@ -49,7 +49,7 @@ date | commit | phase | task | model | ctx | prompt tokens | n_gen | k | draft v
 9. 改完代码先确认二进制含本次改动（看构建时间戳），再做 A/B。
 10. 外部推理进程在 GPU 上时整批数据作废；容量类失败先看 RAM 再怀疑显存。
 11. 编译、repack、第二个模型进程都会扰动计时：跑数前确认 `state_check.py` 的 `lock` 行是 `free`。
-12. q4 KV 改动注意力数值路径：不过 L-MODEL 不许当默认；16K 窗口外页面在主机，长上下文 decode 不计入 TG。
+12. KV 精度（默认 q8_0 K + q4_0 V）改动注意力数值路径：不过 L-MODEL 不许当默认；16K 窗口外页面在主机，长上下文 decode 不计入 TG。
 13. 两臂对比前必须各跑一次预热 pass：首触缺页会造假加速比（`DECISIONS` 35）。
 
 ## 4. 目录
