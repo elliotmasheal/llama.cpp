@@ -18,10 +18,11 @@ layout(push_constant) uniform PC {
     uint  head_dim;   // 128
     uint  m;          // tokens
     float eps;
+    uint  heads;      // n_v_heads; the z row stride is heads * head_dim
 } pc;
 
 layout(binding = 0) readonly  buffer InBuf  { float raw[]; } inb;   // [t][head][head_dim]
-layout(binding = 1) readonly  buffer ZBuf   { float z[]; }   zb;    // [channel][token]
+layout(binding = 1) readonly  buffer ZBuf   { float z[]; }   zb;    // [token][channel]
 layout(binding = 2) readonly  buffer WBuf   { float w[]; }   wb;    // [head_dim]
 layout(binding = 3) writeonly buffer OutBuf { float o[]; }   ob;
 
@@ -57,7 +58,7 @@ void main() {
         [[unroll]] for (uint i = 0; i < 4u; ++i) {
             const uint j = lane + i * 32u;
             const uint ch = h * pc.head_dim + j;
-            const float g = zb.z[ch * pc.m + tok];
+            const float g = zb.z[tok * (pc.heads * pc.head_dim) + ch];
             ob.o[base + j] = v[i] * scale * wb.w[j] * (g / (1.0 + exp(-g)));
         }
         barrier();

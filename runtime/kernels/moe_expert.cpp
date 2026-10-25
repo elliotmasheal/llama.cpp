@@ -455,7 +455,7 @@ static void ref_gemm_row(const unsigned char * w, qrt_quant type, const unsigned
                             const uint32_t q4 = (s < 2) ? (ql & 0x0F0F0F0Fu)
                                                         : ((ql >> 4) & 0x0F0F0F0Fu);
                             const uint32_t h2 = (qh >> (2 * s)) & 0x03030303u;
-                            const uint32_t q6 = (q4 | (h2 << 4)) ^ 0x20202020u;
+                            const uint32_t q6 = ((q4 | (h2 << 4)) ^ 0x20202020u) | ((~(q4 | (h2 << 4)) & 0x20202020u) << 2u);
                             const int sc_idx = (int) (hh * 8 + 2 * s + (i >= 4 ? 1 : 0));
                             int8_t sv = (int8_t) blk[192 + sc_idx];
                             for (uint32_t e = 0; e < 4; ++e) {

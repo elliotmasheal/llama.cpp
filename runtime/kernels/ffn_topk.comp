@@ -39,6 +39,7 @@ void main() {
     }
     const float mx = red[0];
     float e = i < p.n ? exp(v[i] - mx) : 0.0;
+    barrier();
     red[i] = e;
     barrier();
     for (uint s = 128u; s > 0u; s >>= 1u) {

@@ -47,7 +47,7 @@ void main() {
         const int src = int(tok) - int(pc.taps) + 1 + int(j);
         const float val = src < 0 ? stb.st[uint(int(pc.taps) - 1 + src) * pc.conv_ch + c]
                                   : qkvb.qkv[uint(src) * pc.conv_ch + c];
-        acc += cwb.cwv[j * pc.conv_ch + c] * val;
+        acc += cwb.cwv[c * pc.taps + j] * val;
     }
     const float silu = acc / (1.0 + exp(-acc));
 

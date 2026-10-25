@@ -49,7 +49,7 @@ void main() {
     const uint lane = gl_SubgroupInvocationID;
     const uint col  = gl_WorkGroupID.y * COLS_PER_WG + gl_SubgroupID;
     const uint head = gl_WorkGroupID.x;
-    const uint khead = head / pc.k_ratio;
+    const uint khead = head % (pc.heads / pc.k_ratio);
     const uint st_base = (head * S_V + col) * S_V;
 
     float s[ROWS_PER_LANE];

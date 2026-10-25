@@ -1009,10 +1009,11 @@ int qrt_dn_gnorm_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t token
     if (cmd == VK_NULL_HANDLE) {
         return -1;
     }
-    struct { uint32_t head_dim; uint32_t m; float eps; } pcs;
+    struct { uint32_t head_dim; uint32_t m; float eps; uint32_t heads; } pcs;
     pcs.head_dim = dn->sh.head_dim;
     pcs.m        = tokens;
     pcs.eps      = dn->eps;
+    pcs.heads    = dn->sh.n_v_heads;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->gnorm_pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
                             &dn->gnorm_set, 0, nullptr);
@@ -1040,7 +1041,7 @@ void qrt_dn_gnorm_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * y
             }
             const double scale = 1.0 / sqrt(ss / (double) hd + (double) eps);
             for (uint32_t i = 0; i < hd; ++i) {
-                const double g = (double) z[(size_t) (h * hd + i) * tokens + t];
+                const double g = (double) z[(size_t) t * sh->n_v_heads * hd + (size_t) h * hd + i];
                 orow[i] = (float) ((double) yrow[i] * scale * (double) norm_w[i] *
                                    (g / (1.0 + exp(-g))));
             }
@@ -1085,7 +1086,7 @@ void qrt_dn_prep_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * qk
                 const double val = src < 0
                     ? (double) conv_state_in[(size_t) (taps - 1 + (uint32_t) src) * ch + c]
                     : (double) qkv[(size_t) src * ch + c];
-                acc += (double) conv_w[(size_t) j * ch + c] * val;
+                acc += (double) conv_w[(size_t) c * taps + j] * val;
             }
             conv[c] = acc / (1.0 + exp(-acc));      // silu
         }
@@ -1121,7 +1122,7 @@ void qrt_dn_recur_cpu(const qrt_dn_shapes * sh, uint32_t tokens,
     std::vector<double> kcol((size_t) sd), qcol((size_t) sd), acc((size_t) sd);
     for (uint32_t h = 0; h < sh->n_v_heads; ++h) {
         double * s = state + (size_t) h * sd * sd;
-        const uint32_t kh = h / ratio;
+        const uint32_t kh = h % (sh->n_v_heads / ratio);
         for (uint32_t t = 0; t < tokens; ++t) {
             const double d = (double) decay[(size_t) t * sh->n_v_heads + h];
             const double b = (double) beta[(size_t) t * sh->n_v_heads + h];

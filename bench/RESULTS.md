@@ -2946,3 +2946,45 @@ CPU 双精度，K/V 平面取设备缓存按行格式反量化），`qrt --layer
   下一步只剩一条能定性的实验：`--layer-check-input <f32>`（用 embedding 当层输入），把"层内"与
   "层间"分开；再按 logit 尺度差查 final norm 与 head 的约定（现在这两处只有自洽性证据，没有外部
   参考）。**M2-7a 仍未完成。**
+
+## 78. M2-7a 修复四处语义错误：PPL 2.6e6 -> 5.94，top-1 0% -> 56%（2026-10-26）
+<!-- slug: m2-7a-four-fixes -->
+
+口径：同 77 节（256 token，`--logits-layers 40 --logits-rows 16`，默认 q8_0 K + q4_0 V），
+对齐 fork f16 臂的 16 行（offset 239..254）。产物 `bench/raw/m2-7a/l40.bin`。
+
+### 78.1 改了什么（四处 + 一处竞争，参考实现同步修正）
+
+| # | 位置 | 改动 |
+|---|---|---|
+| 1 | `kernels/deltanet_prep.comp` | conv 权重 `[tap][channel]` -> `[channel][tap]`（`c * taps + j`），与 GGML `ssm_conv` 一致 |
+| 2 | `kernels/deltanet_recur{,_cols}.comp` | q/k 头映射 `head / k_ratio` -> `head % (heads / k_ratio)`（repeat 而非 repeat_interleave） |
+| 3 | `kernels/deltanet_gnorm.comp` | 门向量 z 按 token-major 读（新增 `heads` push 常量，行 stride = heads*head_dim） |
+| 4 | `kernels/gemm_q6k.comp` + `moe_expert.cpp` 参考 | Q6_K 负半区：`^0x20` 之后补符号位（`| ((~v & 0x20202020) << 2)`），等价于 `q - 32` |
+| 5 | `kernels/ffn_topk.comp` | `red[0]` 读与 `red[i]` 写之间补 barrier（P2 竞争） |
+
+`attn_deltanet.cpp` 的三处 CPU 参考（conv / head 映射 / z 布局）与 `moe_expert.cpp` 的 Q6_K
+参考复制了同样的错，已同轮修正——这正是局部检查此前全绿的原因。
+
+### 78.2 读数
+
+| 指标 | 修前 | 修后 | 参照 |
+|---|---:|---:|---:|
+| 对齐 16 行 PPL | 2.60e+06 | **5.94** | fork 同 16 行 1.441 |
+| mean NLL | 14.77 | **1.90** | - |
+| same top-1 | 0.0% | **56.25%** | - |
+| mean KLD（对齐） | 6.81 | **1.29** | 门 1e-4 |
+| 末行 top-1 | 215267 | **636**（目标 6692） | - |
+
+- 四处修复都是真实的：PPL 降了 5 个数量级、top-1 从 0 到 56%，且 `--deltanet-check`
+  （参考已同步修正）仍 PASS（y 5.236e-07、cols_vs_ref 2.654e-07）。
+- **但还没到 parity**（KLD 1.29、top-1 56%）。剩余差异不是"温度"能解释的，说明 DeltaNet/专家路径
+  里还有至少一处同类的布局或语义错误，或者 full-attn 的某处与 fork 不同。
+
+### 78.3 下一步
+
+1. 用"改后缀不影响前缀"的因果性测试确认没有未来泄漏（本轮 gnorm 修复后重测）。
+2. 逐层对齐：把 40 层里前 N 层的 logits 与 fork 比，定位第一个 top-1 分叉出现的层号
+   （fork 没有逐层读数，所以用"层数递增时的 KLD 曲线拐点"定位）。
+3. 重点复查仍未被独立参考覆盖的路径：full-attn 的 KV/rope 与 fork 的 fused 路径、router 的
+   top-k 选择、以及 DeltaNet 状态在**跨 chunk**时的保存/恢复（本轮只跑单 chunk）。

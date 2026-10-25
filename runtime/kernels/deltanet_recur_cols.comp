@@ -57,7 +57,7 @@ void main() {
     const uint cl   = tid & 31u;          // column inside the workgroup
     const uint col  = gl_WorkGroupID.y * COLS_PER_WG + cl;
     const uint head = gl_WorkGroupID.x;
-    const uint khead = head / pc.k_ratio;
+    const uint khead = head % (pc.heads / pc.k_ratio);
     const uint st_base = (head * S_V + col) * S_V + sub * ROWS_PER_THREAD;
     // four threads of a column meet here; the slot does not depend on sub
     const uint slot = cl * SPLIT + sub;
