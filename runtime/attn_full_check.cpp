@@ -414,6 +414,21 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
             const double implied = (double) kv_reads / (attn_ms * 1e-3) / 1e9;
             const double ratio = (double) kv_reads / (2.0 * kv_bytes_plane);
             ok_attn = worst_rel <= 1e-4;
+            // the f16-packed probe: same rows, operands rounded to f16 and eight-product
+            // chunks summed in f16. This decides whether the fast path is even allowed.
+            std::vector<float> ref16(ref.size(), 0.0f);
+            qrt_full_attn_rows_cpu_f16(&sh, n_ctx, rows.data(), (uint32_t) rows.size(),
+                                       q_full.data(), kd.data(), vd.data(), qg.data(),
+                                       ref16.data());
+            double worst16 = 0.0, abs16 = 0.0;
+            for (size_t ri = 0; ri < rows.size(); ++ri) {
+                const size_t base = (size_t) rows[ri] * sh.n_head * sh.head_dim;
+                double mx = 0.0;
+                const double r = rel_l1(out_gpu.data() + base, ref16.data() + ri * sh.n_head * sh.head_dim,
+                                        (size_t) sh.n_head * sh.head_dim, &mx);
+                worst16 = fmax(worst16, r);
+                abs16 = fmax(abs16, mx);
+            }
             printf("full_attn    tokens=%u rows=%zu rel_l1=%.3e max_abs=%.3e ms=%.3f "
                    "attn_tflops=%.2f kv_read_gib=%.2f kv_plane_mib=%.1f kv_reads_per_plane=%.1f "
                    "implied_gb_s=%.1f verdict=%s\n",
@@ -424,6 +439,9 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
                    (double) kv_reads / (1024.0 * 1024.0 * 1024.0),
                    2.0 * kv_bytes_plane / (1024.0 * 1024.0), ratio, implied,
                    ok_attn ? "PASS" : "FAIL");
+            printf("full_attn_f16 tokens=%u rows=%zu rel_l1=%.3e max_abs=%.3e "
+                   "gate_1e-4=%s (probe: f16 operands, eight-product chunks in f16)\n",
+                   tokens, rows.size(), worst16, abs16, worst16 <= 1e-4 ? "PASS" : "FAIL");
         }
 
         rc_out = (ok_q && ok_kv && r2 <= 1e-4 && rk2 <= 1e-3 && ok_append && worst == 0.0 &&

@@ -97,5 +97,12 @@ void qrt_full_attn_rows_cpu(const qrt_full_shapes * sh, uint32_t n_ctx,
                             const uint32_t * rows, uint32_t n_rows,
                             const float * q, const float * kcache, const float * vcache,
                             const float * qg, float * out);
+// The same rows with the math done the way packed half arithmetic would: operands rounded
+// to f16 and eight-product chunks summed in f16, then added to the f32 running sum. This
+// is the probe that decides whether f16 packed arithmetic can hold the gate at all.
+void qrt_full_attn_rows_cpu_f16(const qrt_full_shapes * sh, uint32_t n_ctx,
+                                const uint32_t * rows, uint32_t n_rows,
+                                const float * q, const float * kcache, const float * vcache,
+                                const float * qg, float * out);
 
 int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const char * spv_dir);
