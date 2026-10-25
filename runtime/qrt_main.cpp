@@ -8,6 +8,7 @@
 #include "weights.h"
 #include "prefill.h"
 #include "attn_deltanet.h"
+#include "attn_full.h"
 #include "kernels/moe_expert.h"
 
 #include <chrono>
@@ -1093,6 +1094,9 @@ int main(int argc, char ** argv) {
     const char * deltanet_gguf = NULL;
     int deltanet_layer = 0;
     int deltanet_tokens = 256;
+    const char * fullattn_gguf = NULL;
+    int fullattn_layer = 3;          // the first full-attention layer of this model
+    int fullattn_tokens = 1024;
 
     {
         const char * exe = argc > 0 ? argv[0] : "qrt";
@@ -1269,6 +1273,38 @@ int main(int argc, char ** argv) {
             deltanet_tokens = atoi(argv[++i]);
             if (deltanet_tokens < 16) {
                 fprintf(stderr, "qrt: --deltanet-tokens wants at least 16\n");
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--fullattn-check") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --fullattn-check needs the GGUF path\n");
+                return 2;
+            }
+            fullattn_gguf = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--fullattn-layer") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --fullattn-layer needs an index\n");
+                return 2;
+            }
+            fullattn_layer = atoi(argv[++i]);
+            if (fullattn_layer < 0) {
+                fprintf(stderr, "qrt: --fullattn-layer wants a layer index\n");
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--fullattn-tokens") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --fullattn-tokens needs a count\n");
+                return 2;
+            }
+            fullattn_tokens = atoi(argv[++i]);
+            if (fullattn_tokens < 16) {
+                fprintf(stderr, "qrt: --fullattn-tokens wants at least 16\n");
                 return 2;
             }
             continue;
@@ -1454,6 +1490,10 @@ int main(int argc, char ** argv) {
     if (deltanet_gguf != NULL) {
         return qrt_dn_check(deltanet_gguf, (uint32_t) deltanet_layer, (uint32_t) deltanet_tokens,
                             g_spv_dir);
+    }
+    if (fullattn_gguf != NULL) {
+        return qrt_full_check(fullattn_gguf, (uint32_t) fullattn_layer, (uint32_t) fullattn_tokens,
+                              g_spv_dir);
     }
     if (moe_prefix != NULL) {
         std::string dir = argc > 0 ? argv[0] : "qrt";

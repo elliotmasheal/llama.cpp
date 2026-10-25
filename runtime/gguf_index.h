@@ -29,6 +29,10 @@ enum qrt_gguf_hp {
     QRT_HP_VALUE_LENGTH        = 1u << 8,
     QRT_HP_CONTEXT_LENGTH      = 1u << 9,
     QRT_HP_FULL_ATTN_INTERVAL  = 1u << 10,
+    QRT_HP_ROPE_DIMENSION      = 1u << 11,
+    QRT_HP_ROPE_FREQ_BASE      = 1u << 12,
+    QRT_HP_ROPE_SECTIONS       = 1u << 13,
+    QRT_HP_HEAD_COUNT          = 1u << 14,
 };
 
 struct qrt_gguf_hparams {
@@ -40,10 +44,14 @@ struct qrt_gguf_hparams {
     int32_t  expert_ff;
     int32_t  nextn;
     int32_t  head_count_kv;
+    int32_t  head_count;          // attention.head_count
     int32_t  key_length;
     int32_t  value_length;
     int32_t  context_length;
     int32_t  full_attn_interval;
+    int32_t  rope_dimension;      // rope.dimension_count (n_rot)
+    float    rope_freq_base;      // rope.freq_base
+    int32_t  rope_sections[4];    // rope.dimension_sections, the IMRoPE sectors
     uint32_t present;   // enum qrt_gguf_hp bits
 };
 

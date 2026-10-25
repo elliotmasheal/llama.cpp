@@ -196,10 +196,12 @@ int apply_hparam(qrt_gguf * g, const char * key, int64_t v) {
         { ".expert_feed_forward_length", (int32_t) offsetof(qrt_gguf_hparams, expert_ff),          QRT_HP_EXPERT_FF },
         { ".nextn_predict_layers",       (int32_t) offsetof(qrt_gguf_hparams, nextn),              QRT_HP_NEXTN },
         { ".attention.head_count_kv",    (int32_t) offsetof(qrt_gguf_hparams, head_count_kv),      QRT_HP_HEAD_COUNT_KV },
+        { ".attention.head_count",       (int32_t) offsetof(qrt_gguf_hparams, head_count),         QRT_HP_HEAD_COUNT },
         { ".attention.key_length",       (int32_t) offsetof(qrt_gguf_hparams, key_length),         QRT_HP_KEY_LENGTH },
         { ".attention.value_length",     (int32_t) offsetof(qrt_gguf_hparams, value_length),       QRT_HP_VALUE_LENGTH },
         { ".context_length",             (int32_t) offsetof(qrt_gguf_hparams, context_length),     QRT_HP_CONTEXT_LENGTH },
         { ".full_attention_interval",    (int32_t) offsetof(qrt_gguf_hparams, full_attn_interval), QRT_HP_FULL_ATTN_INTERVAL },
+        { ".rope.dimension_count",       (int32_t) offsetof(qrt_gguf_hparams, rope_dimension),     QRT_HP_ROPE_DIMENSION },
     };
     for (size_t i = 0; i < sizeof(ENTRIES) / sizeof(ENTRIES[0]); ++i) {
         if (!ends_with(key, ENTRIES[i].suffix)) {
@@ -278,6 +280,18 @@ int read_value(qrt_reader * r, qrt_gguf * g, const char * key, uint32_t type) {
             return 0;
         }
         case 6:
+            // f32: the rope base is the only float this index needs to keep
+            if (key != NULL && (ends_with(key, ".rope.freq_base") ||
+                                ends_with(key, ".rope.frequency_base"))) {
+                uint64_t bits = 0;
+                if (r_le(r, &bits, 4) != 0) {
+                    return -1;
+                }
+                const uint32_t u32 = (uint32_t) bits;
+                memcpy(&g->hp.rope_freq_base, &u32, sizeof(float));
+                g->hp.present |= QRT_HP_ROPE_FREQ_BASE;
+                return 0;
+            }
             return r_skip(r, 4);
         case 12:
             return r_skip(r, 8);
@@ -316,6 +330,19 @@ int read_value(qrt_reader * r, qrt_gguf * g, const char * key, uint32_t type) {
                     }
                     free(s);
                 }
+                return 0;
+            }
+            // the IMRoPE sectors: up to four integers, kept as the reference has them
+            if (key != NULL && ends_with(key, ".rope.dimension_sections") && count > 0 &&
+                count <= 4 && (elem == 4 || elem == 5)) {
+                for (uint64_t i = 0; i < count; ++i) {
+                    uint64_t v = 0;
+                    if (r_le(r, &v, 4) != 0) {
+                        return -1;
+                    }
+                    g->hp.rope_sections[i] = (int32_t) (uint32_t) v;
+                }
+                g->hp.present |= QRT_HP_ROPE_SECTIONS;
                 return 0;
             }
             const uint32_t esize = elem_size((uint32_t) elem);
@@ -771,10 +798,16 @@ void qrt_gguf_print_report(const qrt_gguf * g, FILE * f) {
     if (hp->present & QRT_HP_N_EMBD)             fprintf(f, " n_embd=%d", hp->n_embd);
     if (hp->present & QRT_HP_EXPERT_FF)          fprintf(f, " expert_ff=%d", hp->expert_ff);
     if (hp->present & QRT_HP_HEAD_COUNT_KV)      fprintf(f, " head_count_kv=%d", hp->head_count_kv);
+    if (hp->present & QRT_HP_HEAD_COUNT)         fprintf(f, " head_count=%d", hp->head_count);
     if (hp->present & QRT_HP_KEY_LENGTH)         fprintf(f, " key_length=%d", hp->key_length);
     if (hp->present & QRT_HP_VALUE_LENGTH)       fprintf(f, " value_length=%d", hp->value_length);
     if (hp->present & QRT_HP_CONTEXT_LENGTH)     fprintf(f, " context_length=%d", hp->context_length);
     if (hp->present & QRT_HP_FULL_ATTN_INTERVAL) fprintf(f, " full_attention_interval=%d", hp->full_attn_interval);
+    if (hp->present & QRT_HP_ROPE_DIMENSION)     fprintf(f, " rope_dimension=%d", hp->rope_dimension);
+    if (hp->present & QRT_HP_ROPE_FREQ_BASE)     fprintf(f, " rope_freq_base=%.9g", hp->rope_freq_base);
+    if (hp->present & QRT_HP_ROPE_SECTIONS)      fprintf(f, " rope_sections=%d/%d/%d/%d",
+                                                         hp->rope_sections[0], hp->rope_sections[1],
+                                                         hp->rope_sections[2], hp->rope_sections[3]);
     fprintf(f, "\n");
 
     qrt_gguf_account a;

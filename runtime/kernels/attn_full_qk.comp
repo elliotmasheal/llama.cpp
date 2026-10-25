@@ -1,0 +1,157 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+// Full-attention Q/K preparation (M2-6d): per-head RMS norm, IMRoPE on the two halves
+// of the first N_ROT channels, then the append into the f16 KV cache.
+//
+// A workgroup is one token. A warp owns one head job: 32 lanes hold eight channels
+// each, so a lane's slice is a 32-byte read. There are 16 Q jobs plus 2 K jobs, run
+// as five rounds of four warps; the two idle warps of the last round still hit the
+// same barriers, which is what keeps the shared-memory reductions legal.
+//
+// IMRoPE with text positions is NEOX rope: pair p of the first N_ROT/2 channels is
+// rotated against channel p + N_ROT/2 with theta = pos * freq_base^(-2p/N_ROT). The
+// mrope sectors only choose which of the four positions feeds a pair, and for text
+// all four are the same, so they drop out; the check compares cos/sin both ways.
+//
+// head_dim is fixed at 256 here (eight channels per lane); qrt_full_open() refuses
+// any other shape instead of computing something wrong.
+
+layout(local_size_x = 128) in;
+
+layout(constant_id = 0) const uint HEAD_DIM = 256;
+layout(constant_id = 1) const uint N_ROT    = 64;
+layout(constant_id = 2) const uint N_HEAD   = 16;
+layout(constant_id = 3) const uint N_KV     = 2;
+
+layout(push_constant) uniform PC {
+    uint  pos0;       // position of the first token of the chunk
+    uint  tokens;
+    uint  qg_ch;      // N_HEAD * 2 * HEAD_DIM
+    uint  kv_ch;      // N_KV * HEAD_DIM
+    uint  kv_cap;     // tokens the KV cache holds
+    float eps;
+    float freq_base;
+    float freq_scale;
+} pc;
+
+layout(binding = 0) readonly  buffer QgBuf  { float qg[];  };   // [token][qg_ch]
+layout(binding = 1) readonly  buffer KiBuf  { float kin[]; };   // [token][kv_ch]
+layout(binding = 2) readonly  buffer ViBuf  { float vin[]; };   // [token][kv_ch]
+layout(binding = 3) writeonly buffer QBuf   { float q[];   };   // [token][N_HEAD*HEAD_DIM]
+layout(binding = 4) writeonly buffer KcBuf  { uint  kc[];  };   // f16 pairs, [kv][cap][HEAD_DIM]
+layout(binding = 5) writeonly buffer VcBuf  { uint  vc[];  };   // f16 pairs
+layout(binding = 6) readonly  buffer QnBuf  { float qnw[]; };   // [HEAD_DIM]
+layout(binding = 7) readonly  buffer KnBuf  { float knw[]; };   // [HEAD_DIM]
+
+shared float red[4 * 32];
+shared float exch[4 * 64];
+
+void head_job(uint tid, uint tok, uint job, uint pos) {
+    const uint warp = tid >> 5u;
+    const uint lane = tid & 31u;
+    const uint d0   = lane * 8u;
+    const bool is_k  = job >= N_HEAD;
+    const uint h     = is_k ? job - N_HEAD : job;
+    const bool valid = is_k ? (h < N_KV) : (h < N_HEAD);
+    const uint qrow = tok * pc.qg_ch;
+    const uint qout = tok * (N_HEAD * HEAD_DIM);
+
+    float x[8];
+    if (valid) {
+        const uint sb = is_k ? tok * pc.kv_ch + h * HEAD_DIM : qrow + h * 2u * HEAD_DIM;
+        [[unroll]] for (uint i = 0; i < 8u; ++i) {
+            x[i] = is_k ? kin[sb + d0 + i] : qg[sb + d0 + i];
+        }
+    }
+    float ss = 0.0;
+    [[unroll]] for (uint i = 0; i < 8u; ++i) {
+        ss += x[i] * x[i];
+    }
+    red[warp * 32u + lane] = ss;
+    barrier();
+    [[unroll]] for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red[warp * 32u + lane] += red[warp * 32u + lane + s];
+        }
+        barrier();
+    }
+    if (valid) {
+        const float inv = 1.0f / sqrt(red[warp * 32u] / float(HEAD_DIM) + pc.eps);
+        [[unroll]] for (uint i = 0; i < 8u; ++i) {
+            x[i] = is_k ? x[i] * inv * knw[d0 + i] : x[i] * inv * qnw[d0 + i];
+        }
+    }
+
+    // rope: lanes 0..3 hold channels 0..N_ROT/2, lanes 4..7 hold the second half.
+    // Both barriers sit outside the lane tests, so every warp reaches them.
+    const uint low_lanes = (N_ROT / 2u) / 8u;               // 4
+    if (valid && lane < low_lanes) {
+        [[unroll]] for (uint i = 0; i < 8u; ++i) {
+            exch[warp * 64u + lane * 8u + i] = x[i];
+        }
+    }
+    barrier();
+    if (valid && lane >= low_lanes && lane < 2u * low_lanes) {
+        const float r = pow(pc.freq_base, -2.0 / float(N_ROT));
+        float theta = float(pos) * pc.freq_scale * pow(r, float((lane - low_lanes) * 8u));
+        [[unroll]] for (uint i = 0; i < 8u; ++i) {
+            const uint p = (lane - low_lanes) * 8u + i;
+            const float c = cos(theta);
+            const float s = sin(theta);
+            const float x0 = exch[warp * 64u + p];
+            const float x1 = x[i];
+            exch[warp * 64u + p] = x0 * c - x1 * s;
+            x[i] = x0 * s + x1 * c;
+            theta *= r;
+        }
+    }
+    barrier();
+    if (valid && lane < low_lanes) {
+        [[unroll]] for (uint i = 0; i < 8u; ++i) {
+            x[i] = exch[warp * 64u + lane * 8u + i];
+        }
+    }
+
+    if (valid) {
+        // the caches hold f16 pairs, so one word covers two channels
+        if (is_k) {
+            const uint db = ((h * pc.kv_cap + pos) * HEAD_DIM + d0) / 2u;
+            [[unroll]] for (uint i = 0; i < 8u; i += 2) {
+                kc[db + i / 2u] = packHalf2x16(vec2(x[i], x[i + 1]));
+            }
+        } else {
+            const uint db = qout + h * HEAD_DIM + d0;
+            [[unroll]] for (uint i = 0; i < 8u; ++i) {
+                q[db + i] = x[i];
+            }
+        }
+    }
+    barrier();
+}
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint warp = tid >> 5u;
+    const uint lane = tid & 31u;
+    const uint t    = gl_WorkGroupID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    const uint pos  = pc.pos0 + t;
+    const uint qout = t * (N_HEAD * HEAD_DIM);
+
+    // V is copied, not normed or rotated: two warps, eight channels each
+    if (warp < N_KV) {
+        const uint vsrc = t * pc.kv_ch + warp * HEAD_DIM + lane * 8u;
+        const uint vdst = ((warp * pc.kv_cap + pos) * HEAD_DIM + lane * 8u) / 2u;
+        [[unroll]] for (uint i = 0; i < 8u; i += 2) {
+            vc[vdst + i / 2u] = packHalf2x16(vec2(vin[vsrc + i], vin[vsrc + i + 1]));
+        }
+    }
+
+    // rounds of four warps: jobs 0..15 are Q heads, 16..17 the two K heads
+    for (uint r = 0u; r < (N_HEAD + N_KV + 3u) / 4u; ++r) {
+        head_job(tid, t, r * 4u + warp, pos);
+    }
+}

@@ -76,7 +76,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M2-6d data=- io=- user=-
+queues: bench=- impl=M3-0 data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->

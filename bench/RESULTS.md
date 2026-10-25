@@ -1990,3 +1990,51 @@ tokens=1024（timing 与 compare 口径一致），q/k 为随机单位向量、v
   理由不是"做不到"而是**不需要**：它要换的正是"3.85 倍"这块收益，而这块收益已经用
   纯并行度改法拿到了，且不必付 U-7 的代价。若将来整层串联后注意力腿重新超预算，
   再按 DECISIONS 60 的三条约束启动（那三条约束仍然有效）。
+
+## 64. M2-6d 第一步：per-head RMS norm + IMRoPE + f16 KV 追加（2026-10-25）
+
+口径：`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` layer 3 / 7（full-attn 层），`qrt --fullattn-check`，
+tokens=1024 + 第二个 chunk 512（pos0=1024），输入是随机 N(0,1) 的 qg/kin/vin、**真实**
+`attn_q_norm`/`attn_k_norm` 权重，RX 6700S，平衡电源 + AC，r=2 x 2 层，exit 0。
+
+### 64.1 形状与 rope 参数（全部来自 GGUF 元数据，不是常量）
+
+| 项 | 值 | 元数据键 |
+|---|---|---|
+| n_head / n_kv | **16 / 2** | `attention.head_count` / `attention.head_count_kv` |
+| head_dim | **256** | `attention.key_length` |
+| n_rot | **64** | `rope.dimension_count` |
+| sections | **11/11/10/0** | `rope.dimension_sections` |
+| freq_base / freq_scale | **1e7 / 1** | `rope.freq_base`（无 scaling 键） |
+| eps | 1e-6 | `attention.layer_norm_rms_epsilon` |
+| qg_ch / kv_ch | 8192 / 512 | 由上面推出（Q 与 gate 合投，每头 512） |
+
+`gguf_index` 为此新增 4 个 hparam（`head_count`、`rope_dimension`、`rope_freq_base`、
+`rope_sections`），报告行同步打印，M2-1 的 python 交叉校验不受影响（多出的键被忽略）。
+
+### 64.2 正确性（门限 1e-4）
+
+| 项 | layer 3 | layer 7 | 说明 |
+|---|---:|---:|---|
+| q（f32 通路）对 CPU 双精度 rel_L1 | 5.6e-07 | 5.0e-07 | 同一个内核做 norm+rope，q 直接验证算术 |
+| q max_abs | 4.2e-04 | 4.2e-04 | q 值量级 ~1，绝对误差就是 fp32 级 |
+| 第二 chunk（pos0=1024）q rel_L1 | 1.3e-06 | 1.2e-06 | 位置偏移正确，不是只对 pos0 成立 |
+| K 缓存（f16）rel_L1 | 3.52e-04 | 3.52e-04 | **= f16 格式界**，不是算术误差 |
+| V 缓存（f16）rel_L1 | 3.51e-04 | 3.51e-04 | 纯拷贝 + f16 舍入 |
+| 第二 chunk 后第一 chunk 的 KV 是否被改动 | **0 个 slot** | **0 个 slot** | 追加语义成立 |
+| IMRoPE 与 NEOX 的 theta 差（text 位置四维相同） | **0.000e+00** | 同 | 4096 个位置 x 32 对全等 |
+
+- **f16 KV 的 3.5e-04 是格式决定的**，与算术无关：f16 相对精度约 2^-11/2 = 2.4e-04，
+  实测 3.5e-04 与之一致。所以门禁分两层：算术走 q（f32，<=1e-4），存储按 f16 界（<=1e-3）；
+  注意力核的参考实现会**用同一份 f16 数据反量化**，保证那一步的 1e-4 只含算术误差。
+- IMRoPE 在纯文本下等价于 NEOX rope（四个位置同值，sector 只决定用哪个位置），
+  实测 theta 差 0；sections/freq_base/n_rot 与参考表单逐项一致。
+
+### 64.3 速度（不是本步的门禁，先记账）
+
+1024 token 一次派发 **1.61-2.07 ms**（4 次读数），即 **1.6-2.0 us/token** → 11 层 10K 约
+**180-225 ms**。数据量是每 token 每层 54 KiB（qg 32 KiB + k/v 4 KiB 进、q 16 KiB + kv 2 KiB 出），
+11 层 10K 共 6.0 GB，DRAM 地板约 39 ms，所以现在离地板还有 4-5 倍：
+每 token 有 5 轮 x（5 次树归约 + 2 次 rope 交换）= 约 30 次 workgroup 屏障。
+下一步（M2-6 整层串联时）可以一个 workgroup 处理 4 个 token 摊掉屏障，或把 5 轮改成
+"一头一 warp、一轮 4 头"以外的形状。**本步不做**，因为整条 qk 腿只占 PP 预算的 2%。
