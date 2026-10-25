@@ -326,9 +326,14 @@ k 默认 4 而不是 5 或 8：k=5 会把近分叉翻过去（U-7 / R9），k=8 
 
 ### 4.5 Prefill（PP）
 
+- **chunk 在层内循环**：一层只上传一次，把 prompt 里所有 chunk 的 token 都在这层算完再进下一层
+  （层优先跨 chunk）。专家搬运因此是**每 prompt 一次**，不是每 chunk 一次；chunk 只影响计算侧的
+  占用率。10K prompt 实测：专家腿 2976-2980 ms（3436 tok/s）、端到端 7.09-7.10 TFLOPS、
+  搬运 18.5 GiB/prompt（RESULTS 第 44 节）。chunk 优先（每 chunk 重读一遍）只有约 1190 tok/s。
 - 层优先分块：chunk 由 R0 曲线定，**默认 2048**；每层的专家只读一次，用双缓冲从 RAM 上传
   （运行时实测：8 槽在飞时 H2D 11.5-12.1 GB/s、等待被完全藏住，`RESULTS.md` 第 35、37 节）。
-  每层专家约 464-476 MiB（按层 1.812-2.195 MiB/专家，`RESULTS.md` 第 35 节），14.17 GB/s 下 33-35 ms；
+  每层专家约 464-476 MiB（按层 1.812-2.195 MiB/专家，`RESULTS.md` 第 35 节），14.17 GB/s 下 33-35 ms
+  （每 prompt 一次，见上一条）；
   PP 1000 要求 chunk >= 1420（6 TFLOPS）或 >= 1190（8 TFLOPS），chunk=512 只能到 361（`RESULTS.md` 第 11 节）。
 - **存储读取是 prefill 的另一条硬腿**：1846 MiB/层的上传被藏住后，从重组文件读进 staging 只有
   2.6 GB/s（`RESULTS.md` 第 37 节），此时 PP 1000 需要 >= 9 GB/s 的读取。读通路（mmap 而非逐专家

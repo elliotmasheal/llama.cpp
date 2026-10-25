@@ -538,7 +538,7 @@
       ],
       "done_when": "chunk 可配；上传与计算重叠；compute 腿是 int8 GEMM（PP 有实测值）；失败可退化",
       "claimed_at": "2026-10-25T13:10:00",
-      "note": "steps 1-4: scheduler, mmap read path, Q4_K/Q5_K/Q6_K int8 GEMM as the compute leg with one submit per layer (RESULTS 37-41). step 5: layer double buffering, 0.190 ms per block (RESULTS 42). step 6: coalesced 16 MiB H2D copies, 0.179 ms per block, 1330 tok/s on the expert leg; multi-threaded reads measured and give nothing, so readers default to 1 (RESULTS 43, DECISIONS 40). The chunk-major loop re-reads every expert per chunk, which design 4.5 forbids; layer-major across the prompt is the next, structural change and needs the user"
+      "note": "steps 1-6: scheduler, mmap read path, Q4_K/Q5_K/Q6_K int8 GEMM, one submit per layer, layer double buffering, coalesced 16 MiB copies (RESULTS 37-43). step 7: the chunk loop moved inside the layer loop as design 4.5 asks, so experts are read once per prompt: 10K prompt expert leg 2976-2980 ms = 3436 tok/s at 7.09-7.10 TFLOPS (RESULTS 44, DECISIONS 41). Missing for a model PP: attention (M2-6) and the dense part; also the MoE output accumulation and the input Q8_1 quantization"
     },
     {
       "id": "M2-6",

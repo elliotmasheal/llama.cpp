@@ -134,6 +134,10 @@ blockers: none
   专家腿推算 **1330 tok/s**。多线程读取实测**无收益**（read 恒定 13.6 GB/s，与 H2D 同速，
   疑似共享 coherent 带宽）。PCIe 地板 1560 tok/s，本路线只剩 17%；下一步是**层优先跨 chunk**
   （专家只读一次/prompt，需用户批准）见 `RESULTS.md` 第 43 节、`DECISIONS.md` 第 40 节。
+- **M2-5 层优先跨 chunk（2026-10-25）**：chunk 循环放进层内（design 4.5 的"每层专家只读一次"），
+  10K prompt 的**专家腿 2976-2980 ms = 3436 tok/s**，端到端 **7.09-7.10 TFLOPS**（0.85 roofline 是 7.06），
+  搬运 92.5 -> 18.5 GiB/prompt。整模型 PP 还差注意力（M2-6）与稠密；
+  见 `RESULTS.md` 第 44 节、`DECISIONS.md` 第 41 节。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、

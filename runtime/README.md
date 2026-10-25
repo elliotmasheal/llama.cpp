@@ -203,6 +203,11 @@ build-vulkan/bin/qrt.exe --prefill-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL -
   6 readers: no change at all (the read leg stays at 13.6 GB/s), so the default is 1. The read
   and the concurrent H2D copy run at the same rate, which points at shared bandwidth on the
   coherent staging buffer rather than at CPU issue rate (DECISIONS 40).
+- `--prefill-chunks C` is how many 2048-token chunks the prompt has. The chunk loop lives inside
+  the layer loop, so a layer is uploaded once and every chunk's tokens go through it, which is
+  what design 4.5 asks for ("each layer's experts are read once"). At C=5 the 10K prompt expert
+  leg takes 2976-2980 ms, 3436 tok/s at 7.09-7.10 TFLOPS, and `prefill_prompt` prints it
+  (RESULTS 44). Chunk-major (re-reading every expert per chunk) was about 1190 tok/s.
 - `--prefill-pipeline 1` (default) gives the scheduler two layer buffers and two command rings: layer
   L+1 is read and uploaded while layer L is still computing, which took 0.272 to 0.190 ms per
   block (RESULTS 42). `--prefill-pipeline 0` keeps the single buffer for comparison.

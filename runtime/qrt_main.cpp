@@ -139,7 +139,7 @@ static int qrt_moe_check(const qrt_config * cfg, const char * prefix, const char
 static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const char * spv,
                              uint32_t slots, uint32_t layers, int use_moe, int layer_batch,
                              int prefill_pipeline, int prefill_group_kib,
-                             int prefill_readers) {
+                             int prefill_readers, int prefill_chunks) {
     char err[QRT_ERR_SIZE] = {0};
     qrt_vk_dev * dev = NULL;
     if (qrt_vk_open((uint32_t) cfg->vram_tier_mib, &dev, err, sizeof(err)) != 0) {
@@ -208,7 +208,9 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
         }
         qrt_moe_cfg mcfg;
         memset(&mcfg, 0, sizeof(mcfg));
-        const uint32_t per_expert = (cfg->prefill_chunk * 8u) / experts;
+        // Layer major over `chunks` chunks: the layer is uploaded once and every chunk's
+        // tokens go through it, so an expert sees chunks x the tokens of one chunk.
+        const uint32_t per_expert = (cfg->prefill_chunk * 8u * (uint32_t) prefill_chunks) / experts;
         mcfg.tokens = per_expert < 32 ? 32 : (per_expert + 31u) / 32u * 32u;
         mcfg.hidden = 2048;
         mcfg.ffn    = 512;
@@ -289,6 +291,10 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
         printf("prefill_speedup serial_ms=%.1f pipelined_ms=%.1f ratio=%.3f "
                "hidden_ms=%.1f\n", arm_ms[0], arm_ms[1], arm_ms[0] / arm_ms[1],
                arm_ms[0] - arm_ms[1]);
+        const double tokens = (double) cfg->prefill_chunk * (double) prefill_chunks;
+        printf("prefill_prompt chunks=%d tokens=%.0f layers=%u pipelined_ms=%.1f "
+               "tokens_per_s=%.0f\n", prefill_chunks, tokens, layers, arm_ms[1],
+               arm_ms[1] > 0.0 ? tokens / (arm_ms[1] / 1000.0) : 0.0);
     }
     qrt_moe_close(dev, moe);
     qrt_weights_close(w);
@@ -826,6 +832,7 @@ int main(int argc, char ** argv) {
     int prefill_pipeline = 1;
     int prefill_group_kib = 16384;
     int prefill_readers = 1;
+    int prefill_chunks = 1;
     const char * moe_prefix = NULL;
     int moe_layer = 0;
     int moe_expert = 0;
@@ -892,6 +899,18 @@ int main(int argc, char ** argv) {
                 prefill_compute_moe = 0;
             } else {
                 fprintf(stderr, "qrt: --prefill-compute wants probe or moe, not '%s'\n", v);
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--prefill-chunks") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --prefill-chunks wants a count\n");
+                return 2;
+            }
+            prefill_chunks = atoi(argv[++i]);
+            if (prefill_chunks < 1 || prefill_chunks > 16) {
+                fprintf(stderr, "qrt: --prefill-chunks wants 1..16\n");
                 return 2;
             }
             continue;
@@ -1105,7 +1124,7 @@ int main(int argc, char ** argv) {
         return qrt_prefill_check(&cfg, prefill_prefix, shader_path.c_str(),
                                  (uint32_t) prefill_slots, (uint32_t) prefill_layers,
                                  prefill_compute_moe, prefill_layer_batch, prefill_pipeline,
-                                 prefill_group_kib, prefill_readers);
+                                 prefill_group_kib, prefill_readers, prefill_chunks);
     }
     if (moe_prefix != NULL) {
         std::string dir = argc > 0 ? argv[0] : "qrt";
