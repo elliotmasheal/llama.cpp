@@ -35,13 +35,32 @@ if(Vulkan_GLSLC_EXECUTABLE)
     set(_qrt_read_spv "${CMAKE_CURRENT_BINARY_DIR}/qrt-read.spv")
     set(_qrt_kernels "${CMAKE_CURRENT_SOURCE_DIR}/kernels")
     set(_qrt_swiglu_spv "${CMAKE_CURRENT_BINARY_DIR}/swiglu_q8.spv")
-    # Tokens per lane: the expert kernels are best at 8 (M2-4 sweep), but the dense
-    # projections run at M=10240 where a wider tile cuts the weight re-reads (RESULTS 46).
+    # Tile shape per kernel. The expert kernels keep the M2-4 choice (2 rows x 8 tokens);
+    # the dense Q8_0 kernel is swept from the command line because its shapes differ:
+    # -DQRt_Q8K_ROWS / -DQRt_Q8K_TOKENS / -DQRt_Q8K_WG (RESULTS 48).
     set(_qrt_tokens_q4k 8)
     set(_qrt_tokens_q5k 8)
     set(_qrt_tokens_q6k 8)
-    set(_qrt_tokens_q8k 8)
+    set(_qrt_rows_q4k 2)
+    set(_qrt_rows_q5k 2)
+    set(_qrt_rows_q6k 2)
+    if(NOT DEFINED QRt_Q8K_ROWS)
+        set(QRt_Q8K_ROWS 2)
+    endif()
+    if(NOT DEFINED QRt_Q8K_TOKENS)
+        set(QRt_Q8K_TOKENS 8)
+    endif()
+    if(NOT DEFINED QRt_Q8K_WG)
+        set(QRt_Q8K_WG 128)
+    endif()
+    set(_qrt_rows_q8k ${QRt_Q8K_ROWS})
+    set(_qrt_tokens_q8k ${QRt_Q8K_TOKENS})
+    set(_qrt_wg_q8k ${QRt_Q8K_WG})
     set(_qrt_gemm_spv "")
+    foreach(_q IN ITEMS q4k q5k q6k q8k)
+        set(_qrt_wg_${_q} 128)
+    endforeach()
+    set(_qrt_wg_q8k ${QRt_Q8K_WG})
     foreach(_q IN ITEMS q4k q5k q6k q8k)
         list(APPEND _qrt_gemm_spv "${CMAKE_CURRENT_BINARY_DIR}/gemm_${_q}.spv")
     endforeach()
@@ -52,10 +71,15 @@ if(Vulkan_GLSLC_EXECUTABLE)
         COMMENT "Compiling proto/qrt-read.comp for --prefill-check"
         VERBATIM)
     foreach(_q IN ITEMS q4k q5k q6k q8k)
+        set(_qrt_wg_${_q} 128)
+    endforeach()
+    set(_qrt_wg_q8k ${QRt_Q8K_WG})
+    foreach(_q IN ITEMS q4k q5k q6k q8k)
         add_custom_command(
             OUTPUT  ${CMAKE_CURRENT_BINARY_DIR}/gemm_${_q}.spv
             COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1 -DQ4K_DOT4
-                    -DQ4K_TOKENS=${_qrt_tokens_${_q}}
+                    -DQ4K_TOKENS=${_qrt_tokens_${_q}} -DQ4K_ROWS=${_qrt_rows_${_q}}
+                    -DQ4K_WG_INVOCATIONS=${_qrt_wg_${_q}}
                     -I${_qrt_kernels} ${_qrt_kernels}/gemm_${_q}.comp
                     -o ${CMAKE_CURRENT_BINARY_DIR}/gemm_${_q}.spv
             DEPENDS ${_qrt_kernels}/gemm_${_q}.comp ${_qrt_kernels}/tiles.h

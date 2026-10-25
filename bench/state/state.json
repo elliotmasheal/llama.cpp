@@ -1177,7 +1177,7 @@
       ],
       "done_when": "q8_0 权重 x q8_1 激活的 GEMM 对 CPU 参考 rel_L1 <= 1e-5；在 N=8192/K=2048/M=10240 的形状上 >= 5 TFLOPS；与 K-quant GEMM 共用记录/提交接口",
       "claimed_at": "2026-10-25T18:00:00",
-      "note": "slice 1: gemm_q8k.comp + the fourth qrt_quant type + --dense-gemm-check, correct at 1.297e-7. slice 2: q8_0 repacked into aligned quants/deltas planes, 2.17 -> 2.64-2.68 TFLOPS at M=2048/4096; M=10240 is 1.18-2.11 and unstable, and the group_m swizzle made it worse (RESULTS 46/47, DECISIONS 44). At 2.65 TFLOPS PP is 563 tok/s, so the next step is an LDS-blocked GEMM (target 6 TFLOPS) plus dense sub-batching inside a layer"
+      "note": "slice 1: gemm_q8k.comp + the fourth qrt_quant type + --dense-gemm-check (rel_L1 1.297e-7). slice 2: q8_0 repacked into aligned quads/delta planes, 2.17 -> 2.65 TFLOPS. slice 3: a six point tile sweep (rows 2/4/8, tokens 8/16/32, wg 128/256) moves nothing, 2.60-2.66. The effective read rate is 74 GB/s against a 20-30 MB working set that cannot fit the 2 MB L2, while the expert kernel at a 1.2 MB working set reaches 7.1 TFLOPS (RESULTS 46-48, DECISIONS 43-45). Next: LDS-blocked K-panel GEMM, target M=4096 >= 5 TFLOPS"
     },
     {
       "id": "M2-6c",

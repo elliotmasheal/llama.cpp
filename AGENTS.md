@@ -149,6 +149,10 @@ blockers: none
 - **M2-6b 平面重排（2026-10-25）**：q8_0 预打散成对齐平面后 M=2048/4096 **2.64-2.68 TFLOPS**（+23%），
   M=10240 仍 1.18-2.11 且抖动；group_m 轮转已否决。按实测 PP 只有 **563 tok/s**，
   要过 1000 必须上 **LDS 分块 GEMM**（RESULTS.md 第 47 节、DECISIONS.md 第 44 节）。
+- **M2-6b tile 扫描（2026-10-25）**：6 组 tile 形状（rows 2/4/8 x tokens 8/16/32 x wg 128/256）
+  全部落在 **2.60-2.66 TFLOPS**，tile 不是瓶颈；反推有效读 74 GB/s，工作集 20-30 MB 装不进 2 MB L2
+  （专家内核工作集 1.2 MB 时是 7.1 TFLOPS）。**LDS 分块是唯一出路**，失败假设与达标线已写进
+  `RESULTS.md` 第 48 节、`DECISIONS.md` 第 45 节。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、
