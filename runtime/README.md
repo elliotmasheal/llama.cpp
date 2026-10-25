@@ -14,7 +14,7 @@ What exists now:
   `bench/README.md` section 2 asks for.
 - `gguf_index.*` - read-only GGUF metadata, tensor table and absolute byte offsets, plus
   the byte account `bench/tools/gguf_dims.py` prints. No abort path: malformed files come
-  back as an error string.
+  back as an error string. Tensor bytes are streamed later through the same handle.
 - `vk_dev.*` - Vulkan device, compute and transfer queues, memory type selection, the
   `VK_EXT_memory_budget` query, the design 5.5 budget planner with a tier cap, and the
   staging buffer with the H2D/D2H copy path.
@@ -158,9 +158,24 @@ Rules the implementation follows:
 - device buffers need `QRT_VK_USAGE_TRANSFER_DST` to be an upload target and
   `QRT_VK_USAGE_TRANSFER_SRC` to be a download source.
 - one copy is one `vkCmdCopyBuffer` plus one submit and one fence wait; that costs a fixed
-  0.065 ms, so a single 1.9 MB copy serializes at only 4.7 GB/s. Use
+  0.065 ms, so a single 1.9 MB copy serializes at a few GB/s. Use
   `qrt_vk_upload_submit` on several staging buffers and wait once for the pipelined rate.
 - failures return a message and bump `io_failures`; nothing aborts (design 9).
+
+## Dense residency
+
+```
+build-vulkan/bin/qrt.exe --dense-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+```
+
+- `qrt_dense_open` puts every non-expert tensor of the GGUF into one device buffer, 256 B
+  aligned, streamed in 8 MiB chunks: 629 tensors, 2079.2 MiB, about 0.9 s warm (RESULTS 36).
+- `token_embd.weight` (515 MiB) and the `_exps` tensors are excluded. Experts come from the
+  repacked store; the design 5.5 dense bucket is 2079 MiB and does not include the embedding,
+  so where it lives is still an M2-5 decision.
+- `qrt_dense_locate` gives the device offset of a tensor and `qrt_dense_buffer` the buffer,
+  which is what M2-5 binds. `qrt_dense_verify` compares evenly spaced probes plus the tail of
+  the last tensor against the file and returns the bytes it compared.
 
 ## Telemetry
 
@@ -187,6 +202,6 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `qrt_telemetry.h/.cpp` | per-pass CSV sink |
 | `gguf_index.h/.cpp` | GGUF metadata, tensor table, absolute offsets, byte account |
 | `vk_dev.h/.cpp` | device, queues, memory types, budget planner, allocator, staging transfers |
-| `weights.h/.cpp` | repacked expert store: index page table, expert ranges, reads |
-| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check` |
+| `weights.h/.cpp` | repacked expert store (index page table, expert reads) and dense residency |
+| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check`, `--dense-check` |
 | `CMakeLists.txt` | `qrt_core`, `qrt`, `qrt_selftest` |

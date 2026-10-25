@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-6",
+      "head": "M2-5",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-3 is doing (VRAM side: H2D staging then dense residency); M2-6 (attention) is the next runnable task in this lane"
+      "note": "M2-3 closed (dense residency + H2D, RESULTS 35/36); M2-5 (prefill) is the head, M2-6 (attention) can run in parallel"
     },
     {
       "lane": "data",
@@ -474,10 +474,10 @@
       "id": "M2-3",
       "milestone": "M2",
       "lane": "impl",
-      "status": "doing",
+      "status": "done",
       "claimed_at": "2026-10-25T10:05:00",
       "title": "weights：稠密常驻 + 专家页表",
-      "note": "host side done: page table for 41x256 and 10496 read backs (RESULTS 34). VRAM side: the staging + H2D/D2H copy path is in and round trips 123/123 real expert blocks, 8 slots pipelined 11.5-12.1 GB/s (RESULTS 35, DECISIONS 30). Left: the 2079 MiB dense residency",
+      "note": "done: host page table 41x256 and 10496 read backs (RESULTS 34); staging + H2D/D2H copy path round trips 123/123 real expert blocks, 8 slots pipelined 11.5-12.1 GB/s (RESULTS 35); dense 629 tensors = 2079.2 MiB resident and 56 MB read back identical (RESULTS 36, DECISIONS 30/31). token_embd (515 MiB) stays on the host and is left to M2-5",
       "deps": [
         "M2-1",
         "M2-2",
@@ -489,6 +489,7 @@
         "runtime/weights.*",
         "runtime/vk_dev.*",
         "runtime/qrt_main.cpp",
+        "runtime/gguf_index.*",
         "runtime/CMakeLists.txt"
       ],
       "done_when": "稠密 2.02 GiB 常驻设备；专家按 [层][专家] 连续偏移可查；未命中走可恢复路径"

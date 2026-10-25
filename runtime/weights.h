@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "vk_dev.h"
+
 // Host side of the repacked expert store (design 5.1 `weights`, M2-3).
 // Reads <prefix>.qwen36rt.idx into a page table and hands out expert byte
 // ranges from <prefix>.qwen36rt.bin. No VRAM is touched here.
@@ -39,3 +41,25 @@ int qrt_weights_locate(const qrt_weights * w, uint32_t layer, uint32_t expert,
 // Reads one expert block (gate||up||down) into dst; cap must hold loc.bytes.
 int qrt_weights_read_expert(const qrt_weights * w, uint32_t layer, uint32_t expert,
                             void * dst, size_t cap, char * err, size_t err_size);
+
+// Dense residency (design 5.5, M2-3): every non-expert tensor of the GGUF lives in
+// one device buffer, streamed up through a staging buffer. token_embd is not part
+// of the design's 2079 MiB dense bucket and is left on the host for now.
+struct qrt_dense;
+
+// staging_bytes caps the transfer chunk; 8 MiB amortizes the 0.065 ms per copy.
+int qrt_dense_open(qrt_vk_dev * dev, const char * gguf_path, uint64_t staging_bytes,
+                   qrt_dense ** out, char * err, size_t err_size);
+void qrt_dense_close(qrt_vk_dev * dev, qrt_dense * d);
+
+uint64_t qrt_dense_bytes(const qrt_dense * d);
+uint32_t qrt_dense_tensor_count(const qrt_dense * d);
+const char * qrt_dense_tensor_name(const qrt_dense * d, uint32_t index);
+int qrt_dense_locate(const qrt_dense * d, const char * name, uint64_t * offset, uint64_t * bytes);
+// Returns the device buffer the dense tensors were streamed into.
+VkBuffer qrt_dense_buffer(const qrt_dense * d);
+
+// Compares up to max_bytes of the resident copy against the file, spread over the
+// whole buffer including the last tensor. Returns the bytes actually compared.
+uint64_t qrt_dense_verify(qrt_vk_dev * dev, qrt_dense * d, qrt_vk_staging * stg,
+                          uint64_t max_bytes, char * err, size_t err_size);

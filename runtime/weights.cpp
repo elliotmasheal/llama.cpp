@@ -1,5 +1,8 @@
 #include "weights.h"
 
+#include "gguf_index.h"
+
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -223,4 +226,215 @@ int qrt_weights_read_expert(const qrt_weights * w, uint32_t layer, uint32_t expe
         return -1;
     }
     return 0;
+}
+
+namespace {
+
+const uint64_t DENSE_ALIGN = 256;   // keeps every tensor on a storage-buffer offset
+
+struct qrt_dense_tensor {
+    char     name[96];
+    uint64_t offset;       // inside the device buffer
+    uint64_t bytes;
+    uint64_t file_offset;
+};
+
+} // namespace
+
+struct qrt_dense {
+    qrt_gguf *        gguf;
+    VkBuffer          buf;
+    VkDeviceMemory    mem;
+    uint64_t          bytes;
+    qrt_dense_tensor * t;
+    uint32_t          n;
+};
+
+int qrt_dense_open(qrt_vk_dev * dev, const char * gguf_path, uint64_t staging_bytes,
+                   qrt_dense ** out, char * err, size_t err_size) {
+    *out = NULL;
+    if (staging_bytes == 0) {
+        snprintf(err, err_size, "dense residency needs a non-zero staging size");
+        return -1;
+    }
+    qrt_dense * d = (qrt_dense *) calloc(1, sizeof(qrt_dense));
+    if (d == NULL) {
+        snprintf(err, err_size, "out of memory for the dense table");
+        return -1;
+    }
+    if (qrt_gguf_open(gguf_path, &d->gguf, err, err_size) != 0) {
+        free(d);
+        return -1;
+    }
+
+    const uint32_t n_all = qrt_gguf_tensor_count(d->gguf);
+    d->t = (qrt_dense_tensor *) calloc(n_all, sizeof(qrt_dense_tensor));
+    if (d->t == NULL) {
+        snprintf(err, err_size, "out of memory for %u dense slots", n_all);
+        qrt_dense_close(dev, d);
+        return -1;
+    }
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < n_all; ++i) {
+        const qrt_gguf_tensor * t = qrt_gguf_tensor_at(d->gguf, i);
+        // Experts go through the repacked store, token_embd is not in the dense
+        // bucket of design 5.5 (it would need 515 MiB more).
+        if (strstr(t->name, "_exps") != NULL || strcmp(t->name, "token_embd.weight") == 0) {
+            continue;
+        }
+        qrt_dense_tensor * s = &d->t[d->n];
+        snprintf(s->name, sizeof(s->name), "%s", t->name);
+        s->bytes       = t->nbytes;
+        s->file_offset = t->offset;
+        s->offset      = total;
+        total = (total + t->nbytes + DENSE_ALIGN - 1) / DENSE_ALIGN * DENSE_ALIGN;
+        ++d->n;
+    }
+    if (d->n == 0 || total == 0) {
+        snprintf(err, err_size, "%s has no dense tensors", gguf_path);
+        qrt_dense_close(dev, d);
+        return -1;
+    }
+    d->bytes = total;
+    if (qrt_vk_alloc(dev, total, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
+                     &d->buf, &d->mem, err, err_size) != 0) {
+        qrt_dense_close(dev, d);
+        return -1;
+    }
+    qrt_vk_staging * stg = NULL;
+    if (qrt_vk_staging_create(dev, staging_bytes, &stg, err, err_size) != 0) {
+        qrt_dense_close(dev, d);
+        return -1;
+    }
+    unsigned char * map = (unsigned char *) qrt_vk_staging_map(stg);
+    int rc = 0;
+    for (uint32_t i = 0; i < d->n && rc == 0; ++i) {
+        const qrt_dense_tensor * s = &d->t[i];
+        for (uint64_t done = 0; done < s->bytes; ) {
+            const uint64_t chunk = (s->bytes - done) < staging_bytes
+                                   ? s->bytes - done : staging_bytes;
+            if (qrt_gguf_read_range(d->gguf, s->file_offset + done, map, (size_t) chunk,
+                                    err, err_size) != 0 ||
+                qrt_vk_upload_mapped(dev, stg, d->buf, s->offset + done, chunk,
+                                     err, err_size) != 0) {
+                rc = -1;
+                break;
+            }
+            done += chunk;
+        }
+    }
+    qrt_vk_staging_destroy(dev, stg);
+    if (rc != 0) {
+        qrt_dense_close(dev, d);
+        return -1;
+    }
+    *out = d;
+    return 0;
+}
+
+void qrt_dense_close(qrt_vk_dev * dev, qrt_dense * d) {
+    if (d == NULL) {
+        return;
+    }
+    if (dev != NULL) {
+        if (d->mem != VK_NULL_HANDLE) {
+            qrt_vk_free(dev, d->buf, d->mem);
+        }
+    }
+    if (d->gguf != NULL) {
+        qrt_gguf_close(d->gguf);
+    }
+    free(d->t);
+    free(d);
+}
+
+uint64_t qrt_dense_bytes(const qrt_dense * d) { return d != NULL ? d->bytes : 0; }
+uint32_t qrt_dense_tensor_count(const qrt_dense * d) { return d != NULL ? d->n : 0; }
+
+const char * qrt_dense_tensor_name(const qrt_dense * d, uint32_t index) {
+    if (d == NULL || index >= d->n) {
+        return "";
+    }
+    return d->t[index].name;
+}
+
+int qrt_dense_locate(const qrt_dense * d, const char * name, uint64_t * offset, uint64_t * bytes) {
+    if (d == NULL || name == NULL) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < d->n; ++i) {
+        if (strcmp(d->t[i].name, name) == 0) {
+            if (offset != NULL) {
+                *offset = d->t[i].offset;
+            }
+            if (bytes != NULL) {
+                *bytes = d->t[i].bytes;
+            }
+            return 0;
+        }
+    }
+    return -1;
+}
+
+VkBuffer qrt_dense_buffer(const qrt_dense * d) { return d != NULL ? d->buf : VK_NULL_HANDLE; }
+
+uint64_t qrt_dense_verify(qrt_vk_dev * dev, qrt_dense * d, qrt_vk_staging * stg,
+                          uint64_t max_bytes, char * err, size_t err_size) {
+    if (d == NULL || stg == NULL) {
+        snprintf(err, err_size, "dense verify needs the residency and a staging buffer");
+        return 0;
+    }
+    const uint64_t chunk = qrt_vk_staging_bytes(stg);
+    if (chunk == 0) {
+        snprintf(err, err_size, "staging buffer is empty");
+        return 0;
+    }
+    unsigned char * map = (unsigned char *) qrt_vk_staging_map(stg);
+    unsigned char * host = (unsigned char *) malloc((size_t) chunk);
+    if (host == NULL || map == NULL) {
+        free(host);
+        snprintf(err, err_size, "out of memory for a %llu byte compare buffer",
+                 (unsigned long long) chunk);
+        return 0;
+    }
+    // Evenly spaced probes over the tensor table plus the tail of the last tensor:
+    // a stop-on-first-error stream would leave the end of the buffer unchecked.
+    uint64_t checked = 0;
+    const uint32_t stride = d->n > 16 ? d->n / 16 : 1;
+    for (uint32_t i = 0; i < d->n && checked < max_bytes; i += stride) {
+        const qrt_dense_tensor * s = &d->t[i];
+        const uint64_t want = s->bytes < chunk ? s->bytes : chunk;
+        if (qrt_gguf_read_range(d->gguf, s->file_offset, host, (size_t) want, err, err_size) != 0 ||
+            qrt_vk_download_mapped(dev, stg, d->buf, s->offset, want, err, err_size) != 0) {
+            free(host);
+            return checked;
+        }
+        if (memcmp(host, map, (size_t) want) != 0) {
+            snprintf(err, err_size, "dense tensor %s differs in its first %llu bytes",
+                     s->name, (unsigned long long) want);
+            free(host);
+            return checked;
+        }
+        checked += want;
+    }
+    {
+        const qrt_dense_tensor * s = &d->t[d->n - 1];
+        const uint64_t want = s->bytes < chunk ? s->bytes : chunk;
+        const uint64_t at = s->bytes - want;
+        if (qrt_gguf_read_range(d->gguf, s->file_offset + at, host, (size_t) want,
+                                err, err_size) != 0 ||
+            qrt_vk_download_mapped(dev, stg, d->buf, s->offset + at, want, err, err_size) != 0) {
+            free(host);
+            return checked;
+        }
+        if (memcmp(host, map, (size_t) want) != 0) {
+            snprintf(err, err_size, "dense tensor %s differs in its last %llu bytes",
+                     s->name, (unsigned long long) want);
+            free(host);
+            return checked;
+        }
+        checked += want;
+    }
+    free(host);
+    return checked;
 }

@@ -1033,3 +1033,30 @@ staging 内存类型 = `HOST_VISIBLE|HOST_COHERENT|HOST_CACHED`（heap 0 系统�
 - miss H2D 时延：8 个 miss 专家/pass，流水 1.55 ms/pass（0.19 ms/专家，稳定）；串行最好 1.7 ms、
   最坏 3.4 ms（单拷贝唤醒抖动，见上），design 6.5(c) 的 1-1.5 ms 只有**流水**能守。
 - 该通路已可用于 M2-5 的双缓冲上传与 M3-0 的槽填充；稠密 2079 MiB 常驻仍未做（M2-3 的另一半）。
+
+## 36. M2-3 稠密常驻：629 个张量 2079 MiB 一次上显存（2026-10-25）
+
+口径：`qrt --dense-check <gguf>`；RX 6700S、平衡电源 + AC、dGPU 无其它进程；staging 8 MiB
+（`HOST_CACHED`），每张量按 256 B 对齐后连续放进**一个**设备缓冲；r=2（另有一次冷盘首跑）。
+原始输出 `bench/raw/m23-vkio-20261025/dense-check-r{1,2}.out`，`status = ok`。
+
+| 项 | 读数 |
+|---|---|
+| 上传张量 | **629 个**（753 总数 - 10496 专家所在 123 个 `_exps` - 1 个 `token_embd`） |
+| 设备缓冲 | **2 180 161 536 B = 2079.2 MiB**（张量账 dense 2 180 153 856 B + 7680 B 对齐填充） |
+| 与 design 5.5 的 dense 桶 | 2079 MiB，**对齐** |
+| 上传耗时（热页缓存） | **897.7 / 910.1 ms** -> 2.40-2.43 GB/s |
+| 上传耗时（冷盘首跑） | 1768.6 ms -> 1.23 GB/s |
+| 回读校验 | 56.46 MB（17 个等距探针 + 最后一个张量的尾块），`match=1` |
+| `io_failures` / `alloc_failures` | 0 / 0 |
+| 显存占用 | `alloc_mib=2079` |
+
+- 瓶颈是主机侧：8 MiB 串行拷贝在 RESULTS 35 是 12.7 GB/s，而这里端到端只有 2.4 GB/s，
+  差额在"页缓存 -> 映射"的一次 fread/拷贝上；启动 0.9 s 可接受，M2-5 若要更快就双缓冲读与 DMA。
+- `token_embd.weight`（540 344 320 B = 515 MiB，q8_0）**不进 device dense 桶**：design 5.5 的
+  2079 MiB 不含它，8 GiB 预算（1000+2079+4198+99+700+100 = 8176）也放不下。
+  它的用法（主机侧按 token 取行，或放显存另算预算）留给 M2-5/M3 决定，未擅自改 design。
+- 张量账与 `--gguf-index` 的 `dense_bytes` 一致，说明桶的划分和 `bench/tools/gguf_dims.py` 同口径。
+
+**结论**：M2-3 的 done_when 三条全部满足（稠密常驻、专家 `[层][专家]` 偏移可查、未知专家/未知张量
+返回错误而不 abort），任务记 done。

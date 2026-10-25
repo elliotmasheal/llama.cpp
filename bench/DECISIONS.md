@@ -560,3 +560,32 @@ write-combined 9.1 ms、cached 0.12 ms；H2D 侧三者差别在噪声内（0.38-
    8 槽流水才有 12 GB/s 以上的空间。
 3. **专家槽尺寸**（E-1，等用户裁决）：层间尺寸不同，最大 2.195 MiB，design 的 1.84 MiB 常数不成立。
 4. D2H 只在验证路径用；将来若 KV 回读上主机，直接用 cached 映射（0.12 ms/1.9 MB）。
+
+## 31. M2-3 done：稠密常驻接上 H2D 通路（2026-10-25）
+
+`runtime/weights.*` 里新增 `qrt_dense_open/close/verify`：把 GGUF 里所有非专家张量（629 个）按
+256 B 对齐流进**一个**设备缓冲，`token_embd` 与 `_exps` 排除。读数见 `RESULTS.md` 第 36 节。
+
+| done_when | 证据 | 结果 |
+|---|---|---|
+| 稠密 2.02 GiB 常驻设备 | 2079.2 MiB、629 张量、回读 56.46 MB 一致（RESULTS 36） | **PASS** |
+| 专家按 `[层][专家]` 连续偏移可查 | 10496/10496（RESULTS 34）+ 123 个真实块往返（RESULTS 35） | **PASS** |
+| 未命中走可恢复路径 | 未知专家/未知张量/超容量分配都返回错误串并计数，无 abort | **PASS** |
+
+**新增接口与开关**
+
+| 名字 | 作用 | 默认 |
+|---|---|---|
+| `--dense-check <gguf>` | 上传稠密并抽样回读校验（占 2079 MiB 显存） | 不跑 |
+| `qrt_dense_open/close/verify/bytes/locate/buffer` | M2-5 取稠密张量偏移与设备缓冲 | - |
+| `qrt_gguf_read_tensor/read_range` | 索引只解析元数据；读时按需重开文件一次 | - |
+
+**判决**：M2-3 done。队列头前移到 **M2-5**（prefill 引擎），M3-0 也随之解锁（但桩尺寸等 E-1）。
+
+**未结项**
+
+1. **token_embd 515 MiB 放哪里**：design 5.5 的 2079 MiB dense 桶不含它，预算也放不下。
+   M2-5 用 embedding 时要定：主机取行（每 token 一行 q8_0 ~2.2 KB）或另算显存。**不改 design**。
+2. 稠密上传端到端 2.40 GB/s，瓶颈是主机 fread 而不是 DMA；启动 0.9 s 可接受，双缓冲读+DMA
+   留给 M2-5 的启动优化。
+3. 回读只抽 56 MB；全量校验（2 GiB，约 0.35 s）留给 X-4 的一次性回归。

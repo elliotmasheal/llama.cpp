@@ -77,6 +77,13 @@ const char * qrt_gguf_type_name(uint32_t type);
 int qrt_gguf_require(const qrt_gguf * g, const char * name, const qrt_gguf_tensor ** out,
                      char * err, size_t err_size);
 
+// The index parses metadata and closes the file; a read reopens it once and keeps
+// it open until qrt_gguf_close. Both are short reads and seek failures, never aborts.
+int qrt_gguf_read_tensor(qrt_gguf * g, const qrt_gguf_tensor * t, void * dst,
+                         size_t cap, char * err, size_t err_size);
+int qrt_gguf_read_range(qrt_gguf * g, uint64_t file_offset, void * dst, size_t bytes,
+                        char * err, size_t err_size);
+
 int qrt_gguf_account_compute(const qrt_gguf * g, qrt_gguf_account * out, char * err, size_t err_size);
 
 // Machine-readable report: '#' lines, then one CSV row per tensor.

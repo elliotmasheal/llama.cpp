@@ -269,6 +269,52 @@ static double median_ms(double * v, int n) {
     return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
+// M2-3 dense residency: streams every non-expert tensor into one device buffer and
+// compares a sample back against the file. Reports bytes, rate and the check result.
+static int qrt_dense_check(const qrt_config * cfg, const char * gguf_path) {
+    char err[QRT_ERR_SIZE] = {0};
+    qrt_vk_dev * dev = NULL;
+    if (qrt_vk_open((uint32_t) cfg->vram_tier_mib, &dev, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        return 2;
+    }
+    const uint64_t staging_bytes = 8ull << 20;
+    const double t0 = now_ms();
+    qrt_dense * d = NULL;
+    if (qrt_dense_open(dev, gguf_path, staging_bytes, &d, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        qrt_vk_close(dev);
+        return 2;
+    }
+    const double t1 = now_ms();
+    const uint64_t bytes = qrt_dense_bytes(d);
+    printf("dense_upload tensors=%u bytes=%llu mib=%.1f staging_kib=%llu ms=%.1f gbs=%.2f\n",
+           qrt_dense_tensor_count(d), (unsigned long long) bytes, (double) bytes / (1024.0 * 1024.0),
+           (unsigned long long) (staging_bytes >> 10), t1 - t0,
+           (t1 - t0) > 0.0 ? (double) bytes / (t1 - t0) / 1e6 : 0.0);
+
+    qrt_vk_staging * stg = NULL;
+    if (qrt_vk_staging_create(dev, staging_bytes, &stg, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        qrt_dense_close(dev, d);
+        qrt_vk_close(dev);
+        return 2;
+    }
+    const double t2 = now_ms();
+    const uint64_t checked = qrt_dense_verify(dev, d, stg, 64ull << 20, err, sizeof(err));
+    const double t3 = now_ms();
+    const bool ok = checked > 0 && err[0] == '\0';
+    printf("dense_verify compared_bytes=%llu ms=%.1f match=%d %s%s\n",
+           (unsigned long long) checked, t3 - t2, ok ? 1 : 0, ok ? "" : "err=",
+           ok ? "" : err);
+    qrt_vk_staging_destroy(dev, stg);
+    printf("dense_check io_failures=%u alloc_mib=%llu\n", dev->io_failures,
+           (unsigned long long) (dev->alloc_bytes >> 20));
+    qrt_dense_close(dev, d);
+    qrt_vk_close(dev);
+    return ok ? 0 : 1;
+}
+
 // M2-3 VRAM side: proves the staging round trip works before dense residency and
 // prefill come near it. With a repack prefix it also round trips real expert
 // blocks, which is the exact case that faulted in DECISIONS 29.
@@ -544,6 +590,7 @@ int main(int argc, char ** argv) {
     int vk_info = 0;
     int vk_probe_mib = 0;
     int vk_io_check = 0;
+    const char * dense_gguf = NULL;
     const char * repack_prefix = NULL;
     const char * gguf_path = NULL;
     const char * require_tensor = NULL;
@@ -568,6 +615,14 @@ int main(int argc, char ** argv) {
         }
         if (strcmp(argv[i], "--vk-io-check") == 0) {
             vk_io_check = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--dense-check") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --dense-check needs the GGUF path\n");
+                return 2;
+            }
+            dense_gguf = argv[++i];
             continue;
         }
         if (strcmp(argv[i], "--repack") == 0) {
@@ -660,6 +715,9 @@ int main(int argc, char ** argv) {
 
     if (vk_io_check) {
         return qrt_vk_io_check(&cfg, repack_prefix);
+    }
+    if (dense_gguf != NULL) {
+        return qrt_dense_check(&cfg, dense_gguf);
     }
 
     if (vk_info || vk_probe_mib > 0) {

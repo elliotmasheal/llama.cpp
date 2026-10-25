@@ -14,6 +14,7 @@
 
 struct qrt_gguf {
     FILE *            f;
+    char              path[1024];
     uint64_t          file_size;
     uint32_t          version;
     uint32_t          alignment;
@@ -548,8 +549,10 @@ int qrt_gguf_open(const char * path, qrt_gguf ** out, char * err, size_t err_siz
         }
     }
 
+    // The index is metadata only; a later read reopens the file once (read_range).
     fclose(f);
     g->f = NULL;
+    snprintf(g->path, sizeof(g->path), "%s", path);
     *out = g;
     return 0;
 
@@ -625,6 +628,52 @@ int qrt_gguf_require(const qrt_gguf * g, const char * name, const qrt_gguf_tenso
         *out = t;
     }
     return 0;
+}
+
+int qrt_gguf_read_range(qrt_gguf * g, uint64_t file_offset, void * dst, size_t bytes,
+                        char * err, size_t err_size) {
+    if (bytes > 0 && dst == NULL) {
+        snprintf(err, err_size, "read of %llu bytes needs a destination",
+                 (unsigned long long) bytes);
+        return -1;
+    }
+    if (file_offset > g->file_size || bytes > g->file_size - file_offset) {
+        snprintf(err, err_size, "read of %llu bytes at %llu runs past the %llu byte file",
+                 (unsigned long long) bytes, (unsigned long long) file_offset,
+                 (unsigned long long) g->file_size);
+        return -1;
+    }
+    if (g->f == NULL) {
+        g->f = fopen(g->path, "rb");
+        if (g->f == NULL) {
+            snprintf(err, err_size, "cannot reopen %s for reading", g->path);
+            return -1;
+        }
+    }
+    if (QRT_FSEEK(g->f, (long long) file_offset, SEEK_SET) != 0) {
+        snprintf(err, err_size, "cannot seek to %llu", (unsigned long long) file_offset);
+        return -1;
+    }
+    if (bytes > 0 && fread(dst, 1, bytes, g->f) != bytes) {
+        snprintf(err, err_size, "short read of %llu bytes at %llu",
+                 (unsigned long long) bytes, (unsigned long long) file_offset);
+        return -1;
+    }
+    return 0;
+}
+
+int qrt_gguf_read_tensor(qrt_gguf * g, const qrt_gguf_tensor * t, void * dst,
+                         size_t cap, char * err, size_t err_size) {
+    if (t == NULL) {
+        snprintf(err, err_size, "no tensor given");
+        return -1;
+    }
+    if (t->nbytes > cap) {
+        snprintf(err, err_size, "tensor %s needs %llu bytes, the buffer holds %llu", t->name,
+                 (unsigned long long) t->nbytes, (unsigned long long) cap);
+        return -1;
+    }
+    return qrt_gguf_read_range(g, t->offset, dst, (size_t) t->nbytes, err, err_size);
 }
 
 int qrt_gguf_account_compute(const qrt_gguf * g, qrt_gguf_account * out, char * err, size_t err_size) {

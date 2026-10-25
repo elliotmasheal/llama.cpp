@@ -12,6 +12,9 @@
 typedef struct VkBuffer_T *      VkBuffer;
 typedef struct VkDeviceMemory_T *VkDeviceMemory;
 typedef uint32_t                 VkBufferUsageFlags;
+#ifndef VK_NULL_HANDLE
+#define VK_NULL_HANDLE 0
+#endif
 #endif
 
 // VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, spelled here so the CLI builds without the SDK.
