@@ -113,6 +113,9 @@ blockers: none
   上传与计算重叠（wait 352->2 ms，每块 0.86->0.73 ms）；但 compute 腿还是带宽读核，
   **PP 无实测值**，且主机读重组文件只有 2.6 GB/s（`RESULTS.md` 第 37 节、`DECISIONS.md` 第 33 节）。
   下一步：读通路（mmap）与 int8 GEMM 接入。
+- **M2-5 读取通路（2026-10-25）**：重组文件改只读映射后，每专家读是一次 memcpy，端到端
+  **2.6 -> 7.05 GB/s**（每块 0.73 -> 0.27 ms，read 段 13.5 GB/s）；见 `RESULTS.md` 第 38 节、
+  `DECISIONS.md` 第 35 节。新增纪律：两臂对比前必须跑预热 pass（首触缺页会造假加速比）。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、
@@ -383,6 +386,3 @@ change  : <one line, single variable>
 - 新增模型：`docs/development/HOWTO-add-model.md`。
 - 构建：`docs/build.md`；解析/模板：`docs/development/parsing.md`、`common/jinja/README.md`。
 - 可复用工作流：`skills/` 目录，其中 `skills/code-review/SKILL.md` 在写代码前必读。
-- **M2-5 读取通路（2026-10-25）**：重组文件改只读映射后，每专家读是一次 memcpy，端到端
-  **2.6 -> 7.05 GB/s**（每块 0.73 -> 0.27 ms，read 段 13.5 GB/s）；见 `RESULTS.md` 第 38 节、
-  `DECISIONS.md` 第 35 节。新增纪律：两臂对比前必须跑预热 pass（首触缺页会造假加速比）。
