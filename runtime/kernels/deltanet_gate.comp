@@ -1,40 +1,82 @@
 #version 450
-// DeltaNet per-token gate (M2-6c step 2): alpha and beta are f32 [n_embd, n_v_heads]
-// matrices, so this is a small f32 GEMV rather than a quantised GEMM. One workgroup per
-// token, one thread per v-head:
-//   decay = exp(ssm_a * softplus(alpha + ssm_dt))
-//   beta  = sigmoid(beta_raw)
-// ssm_a already holds -exp(A_log), so decay <= 1.
+#extension GL_EXT_control_flow_attributes : require
+// DeltaNet per-token gate, coalesced shape (M2-6c). The earlier shapes were bound by the
+// access pattern, not by the math: with four lanes per head a wave touched eight different
+// heads, i.e. eight 16-byte segments 8 KiB apart, and the measured 3.9 us/token equalled the
+// DRAM roofline of that pattern (512 KiB of alpha+beta weights re-read per token).
+//
+// Now a whole warp owns one head: lane k reads element k, k+32, ... so every instruction
+// loads 128 contiguous bytes, and the 32 lanes reduce in shared memory. Workgroup = one
+// token, four warps, eight heads each.
+//
+//   decay = exp(ssm_a * softplus(alpha + ssm_dt)), beta = sigmoid(beta_raw)
 
-layout(local_size_x = 32) in;
+layout(local_size_x = 128) in;
 
 layout(push_constant) uniform PC {
     uint n_embd;
-    uint heads;
-    uint xbase;   // first element of token 0 in the normalised input
+    uint heads;      // 32 here
+    uint xbase;
 } pc;
 
-layout(binding = 0) readonly buffer XBuf     { float x[]; }    xb;
-layout(binding = 1) readonly buffer AlphaBuf { float aw[]; }   ab;
-layout(binding = 2) readonly buffer BetaBuf  { float bw[]; }   bb;
-layout(binding = 3) readonly buffer DtBuf    { float dt[]; }   dtb;
-layout(binding = 4) readonly buffer ABuf     { float aa[]; }   aab;
-layout(binding = 5) writeonly buffer DecayBuf { float decay[]; } db;
-layout(binding = 6) writeonly buffer OutBetaBuf { float beta[]; } ob;
+layout(binding = 0) readonly  buffer XBuf      { float x[]; }     xb;
+layout(binding = 1) readonly  buffer AlphaBuf  { float aw[]; }    ab;
+layout(binding = 2) readonly  buffer BetaBuf   { float bw[]; }    bb;
+layout(binding = 3) readonly  buffer DtBuf     { float dt[]; }    dtb;
+layout(binding = 4) readonly  buffer ABuf      { float aa[]; }    aab;
+layout(binding = 5) writeonly buffer DecayBuf  { float decay[]; } db;
+layout(binding = 6) writeonly buffer OutBetaBuf{ float beta[]; }  ob;
+
+shared float red[128];
+shared float red2[128];
+
+// Sum the 32 lanes of this warp through shared memory (the device subgroup is 64 wide, so a
+// 32-lane group is half a subgroup and subgroupAdd cannot be used).
+float warp_sum(float v, uint tid) {
+    const uint lane = tid & 31u;
+    red[tid] = v;
+    barrier();
+    [[unroll]] for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red[tid] += red[tid + s];
+        }
+        barrier();
+    }
+    return red[tid];
+}
 
 void main() {
-    const uint h = gl_LocalInvocationID.x;
+    const uint tid = gl_LocalInvocationID.x;
     const uint tok = gl_WorkGroupID.x;
+    const uint warp = tid >> 5u;
+    const uint lane = tid & 31u;
+    const uint warps = 128u >> 5u;
     const uint base = pc.xbase + tok * pc.n_embd;
 
-    float alpha = 0.0;
-    float beta = 0.0;
-    for (uint c = 0; c < pc.n_embd; ++c) {
-        const float xv = xb.x[base + c];
-        alpha += xv * ab.aw[c + h * pc.n_embd];
-        beta  += xv * bb.bw[c + h * pc.n_embd];
+    for (uint h = warp; h < pc.heads; h += warps) {
+        float pa = 0.0;
+        float pb = 0.0;
+        for (uint c = lane; c < pc.n_embd; c += 32u) {
+            const float xv = xb.x[base + c];
+            pa += xv * ab.aw[c + h * pc.n_embd];
+            pb += xv * bb.bw[c + h * pc.n_embd];
+        }
+        // two arrays so the alpha and beta reductions do not serialise on one another
+        red[tid] = pa;
+        red2[tid] = pb;
+        barrier();
+        [[unroll]] for (uint s = 16u; s > 0u; s >>= 1u) {
+            if (lane < s) {
+                red[tid] += red[tid + s];
+                red2[tid] += red2[tid + s];
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            const float sp = log(1.0 + exp(red[tid] + dtb.dt[h]));
+            db.decay[tok * pc.heads + h] = exp(aab.aa[h] * sp);
+            ob.beta[tok * pc.heads + h] = 1.0 / (1.0 + exp(-red2[tid]));
+        }
+        barrier();
     }
-    const float sp = log(1.0 + exp(alpha + dtb.dt[h]));
-    db.decay[tok * pc.heads + h] = exp(aab.aa[h] * sp);
-    ob.beta[tok * pc.heads + h] = 1.0 / (1.0 + exp(-beta));
 }
