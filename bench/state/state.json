@@ -139,13 +139,14 @@
       "head": null,
       "order": [
         "M2-7",
+        "Q-KV3",
         "M2-8",
         "M4-1",
         "M4-2",
         "M4-3",
         "M4-4"
       ],
-      "note": "M2-7 needs M2-6a (KV precision) before the 256K-context KLD run"
+      "note": "Q-KV1 closed: the fork cannot gate KV precision (1.5e-2 path floor); M2-7 needs M2-6a (KV precision) before the 256K-context KLD run"
     },
     {
       "lane": "impl",
@@ -169,8 +170,9 @@
     },
     {
       "lane": "data",
-      "head": null,
+      "head": "Q-KV2",
       "order": [
+        "Q-KV2",
         "R0",
         "M1-2a",
         "M1-3a",
@@ -1258,6 +1260,66 @@
       ],
       "done_when": "10K 因果注意力对 CPU 参考 rel_L1 <= 1e-4；KV 只读一次（每层一次 K/V 读）；IMRoPE 的 sections/freq 与参考一致",
       "note": "done 2026-10-25: per-head RMS norm + IMRoPE + f16 KV append and the flash causal attention with the sigmoid gate, both against double precision references (5e-07 and 1.2-2.4e-06, the 10K case on the longest causal rows). Attention body 3.18 TFLOPS at 10K (270 ms/layer) after the two-128-dim-pass rewrite; summing the measured legs gives PP about 1052. f16 packed arithmetic is closed by measurement (1.0e-03 against a 1e-4 gate), cross-workgroup dim splitting is rejected for the reason in DECISIONS 63.3, and the 'KV read once per layer' criterion was dropped by the user (DECISIONS 63.1). Performance tuning left for M4: Bkv 40 and Bq 128 with 512 threads. RESULTS 64-68, DECISIONS 62-63.4"
+    },
+    {
+      "id": "Q-KV1",
+      "milestone": "cross",
+      "lane": "bench",
+      "status": "done",
+      "title": "KV 格式质量排序（q8_0 K + q4_0 V）与 256K 质量门定义",
+      "deps": [
+        "X-1"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/q-kv1/**",
+        "bench/tools/quality/**"
+      ],
+      "done_when": "ctx 256 与 ctx 4096 两档下 f16 / q8_0K+q4_0V / q8_0+q8_0 / q4_0+q4_0 / 单侧 q4_0 的 KLD 与 top-1 进 RESULTS；256K 质量门的命令、A 侧口径与判据写进 docs/agent/gates.md",
+      "owner": "deepseek-v4.1-flash@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-25T21:02:14+08:00",
+      "note": "done 2026-10-25: fork 的 -ctk/-ctv 不能给 KV 精度做门。六臂 ctx 256 矩阵里 f16->f32 逐位相同（KLD 0.0），而 q8_0 K 单侧就跳 1.411e-02、q8_0K+q4_0V 2.121e-02、q4_0/q4_0 2.725e-02，与 -fa on/off 的 1.468e-02 同量级；同臂 r=3 与 --moe-cache-mib 3000/3678 都逐位相同，排除噪声与专家缓存。地板 1.5e-2 比 1e-4 大两个数量级，任何数值正确的实现都会被判红。ctx 4096/128K/256K 档不再用该工具跑。G-QUAL 的 A 侧改为同引擎 f16，新增 G-QUAL-LONG（10K/128K/256K + needle）。done_when 的 ctx 4096 档作废：工具已被判不合格（DECISIONS 72.2），长上下文档改由 Q-KV3 用 runtime 跑。RESULTS q-kv1-fork-floor, DECISIONS kv-quality-instrument"
+    },
+    {
+      "id": "Q-KV2",
+      "milestone": "cross",
+      "lane": "data",
+      "status": "todo",
+      "title": "256K prompt + needle 探针文本",
+      "deps": [],
+      "resources": [
+        "prompt-file"
+      ],
+      "paths": [
+        "bench/prompts/**"
+      ],
+      "done_when": "bench/prompts/prompt256k.txt 恰好 262144 token（sha256 + token 数进 RESULTS 口径行），另给 needle 探针文本：唯一 key 在 0.9N 处，问题在同一 prompt 尾部"
+    },
+    {
+      "id": "Q-KV3",
+      "milestone": "cross",
+      "lane": "bench",
+      "status": "todo",
+      "title": "G-QUAL-LONG：KV 精度的长上下文质量（10K / 128K / 256K）",
+      "deps": [
+        "M2-6a",
+        "M2-7",
+        "Q-KV2"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "bench/raw/q-kv3/**"
+      ],
+      "done_when": "A = runtime f16 KV、B = q8_0 K + q4_0 V，三档各报 tail-512 mean KLD / same top-1 / needle；按 docs/agent/gates.md 的 G-QUAL-LONG 判 pass/fail"
     }
   ],
   "last_gate": {

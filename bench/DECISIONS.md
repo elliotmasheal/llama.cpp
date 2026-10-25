@@ -1831,3 +1831,36 @@ h 平面，所以"gate/up 行主序 + swiglu 读 token-major"这类错**在任�
 - 单槽与层批两条腿现在由同一个 `--moe-check` 覆盖，但它们共享 `moe_expert` 的缓冲与 ring：
   多条链同时跑（例如 prefill 的层批 + 单槽混用）仍未测。
 
+
+## 判决：fork 的质量转储不能给 KV 精度做门（Q-KV1，2026-10-25）
+<!-- slug: kv-quality-instrument -->
+
+### 72.1 判决
+
+1. **revert**：用 `llama-perplexity -ctk/-ctv` 排序 KV 格式这条路**关掉**。它对 f16->f32 逐位无差，
+   却对 q8_0 K 单侧跳 1.4e-2，与 `-fa on/off` 同量级（`RESULTS.md#q-kv1-fork-floor`）。
+   地板 1.5e-2 比门的 1e-4 大两个数量级，任何数值正确的实现都会被判红。
+2. **adopt**：`G-QUAL` 的 A 侧一律是**同一引擎的 f16 KV**（runtime 自己），转储走 rt fp32 格式；
+   fork 只保留"整模型参考 logits"这一用途，且必须两臂同后端、同 kernel、同 `-fa`。
+3. **abandon**：M2-7 原计划的"runtime 对 fork 转储做 1e-4 KLD"**不成立**，改为
+   "runtime f16 vs runtime 候选 + fork 只做 sanity（量级 1e-2 即可，不进门）"。
+
+### 72.2 已证伪（别再试）
+
+| 做法 | 读数 | 为什么不行 |
+|---|---|---|
+| `-ctk/-ctv q8_0` 当质量参考 | 1.41e-02 | 路径地板，不是量化 |
+| `-ctk/-ctv f32` 当更高精度参考 | 与 f16 逐位相同 | 内核内部统一格式，f32 轴不存在 |
+| 用 PPL 排序 KV 格式 | q8k-q4v 最低（3.2905） | 512 token 的 PPL 在 ~1% 内乱序，无判别力 |
+| 固定 `--moe-cache-mib` 消掉混淆 | 逐位相同 | 缓存不是混淆源（排除项） |
+
+### 72.3 未结项
+
+- **q8_0 K + q4_0 V 的绝对质量未知**。已知的只有：q4 单侧约 +0.6e-2 KLD（同族差分），
+  q8 单侧与地板不可分。要判决必须等 runtime 的 rt 转储（M2-7）。
+- 256K 档的 A 侧（runtime f16 KV @256K）需要分页才能装下，依赖 M2-6a；128K 档不需要（2816 MiB）。
+- 256K 的 prompt 文件（262144 token）尚不存在，见 Q-KV2。
+
+### 72.4 开关表
+
+无新开关；本轮不动 `runtime/`。gate 变更见 `docs/agent/gates.md` 的 G-QUAL-LONG。
