@@ -23,6 +23,8 @@ struct qrt_prefill_cfg {
     uint32_t chunk;        // tokens per chunk (QRT_PREFILL_CHUNK), reported only
     uint32_t slots;        // staging buffers in flight; 1 is the serial baseline
     uint32_t slot_bytes;   // 0 = largest expert block in the store
+    uint32_t group_bytes;  // coalesce consecutive experts into one copy of about this size
+    uint32_t readers;      // host threads that copy the store into the staging mapping
     uint32_t pipeline;     // 1 = two layer buffers, upload L+1 during compute of L
     uint32_t slot_reductions; // out: slots given up because allocation failed
 };
@@ -31,6 +33,7 @@ struct qrt_prefill_stats {
     uint32_t pipeline;        // 1 when the two layer buffers were used
     uint32_t layers;
     uint32_t blocks;          // blocks the router asked for
+    uint32_t groups;          // copies actually submitted (coalesced blocks)
     uint32_t blocks_done;
     uint32_t blocks_failed;
     uint32_t slot_reductions; // staging slots given up because allocation failed

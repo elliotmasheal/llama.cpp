@@ -138,7 +138,8 @@ static int qrt_moe_check(const qrt_config * cfg, const char * prefix, const char
 // twice, serial (1 slot) and pipelined (slots), so the overlap is a single variable.
 static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const char * spv,
                              uint32_t slots, uint32_t layers, int use_moe, int layer_batch,
-                             int prefill_pipeline) {
+                             int prefill_pipeline, int prefill_group_kib,
+                             int prefill_readers) {
     char err[QRT_ERR_SIZE] = {0};
     qrt_vk_dev * dev = NULL;
     if (qrt_vk_open((uint32_t) cfg->vram_tier_mib, &dev, err, sizeof(err)) != 0) {
@@ -230,6 +231,8 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
         pcfg.slots = arms[a];
         pcfg.slot_bytes = 0;
         pcfg.pipeline = (uint32_t) prefill_pipeline;
+        pcfg.group_bytes = (uint32_t) prefill_group_kib * 1024u;
+        pcfg.readers = (uint32_t) prefill_readers;
         qrt_prefill * p = NULL;
         if (qrt_prefill_open(dev, w, &pcfg, &p, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
@@ -264,7 +267,8 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
             printf("prefill mode=%s pipe=%d slots=%u chunk=%u layers=%u of %u blocks=%u done=%u failed=%u "
                    "bytes=%llu slot_mib=%.2f total_ms=%.1f per_block_ms=%.3f "
                    "read_ms=%.1f upload_ms=%.1f wait_ms=%.1f compute_ms=%.1f "
-                   "gflop=%.1f tflops_wall=%.2f tflops_rec=%.2f down_skipped=%u reductions=%u\n",
+                   "readers=%d groups=%u gflop=%.1f tflops_wall=%.2f tflops_rec=%.2f down_skipped=%u "
+                   "reductions=%u\n",
                    layer_batch ? "layer" : "perexpert", prefill_pipeline, pcfg.slots,
                    pcfg.chunk, (layers),
                    st.layers, st.blocks, st.blocks_done,
@@ -272,7 +276,7 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
                    (double) (layer_batch ? 0 : qrt_prefill_slot_bytes(p)) / (1024.0 * 1024.0),
                    st.total_ms,
                    st.total_ms / blocks, st.read_ms, st.upload_ms, st.wait_ms, st.compute_ms,
-                   flops / 1e9,
+                   prefill_readers, st.groups, flops / 1e9,
                    st.total_ms > 0.0 ? flops / st.total_ms / 1e9 : 0.0,
                    st.compute_ms > 0.0 ? flops / st.compute_ms / 1e9 : 0.0,
                    use_moe && moe != NULL ? qrt_moe_down_skipped(moe) - skipped_before : 0,
@@ -820,6 +824,8 @@ int main(int argc, char ** argv) {
     int prefill_compute_moe = 1;
     int prefill_layer_batch = 1;
     int prefill_pipeline = 1;
+    int prefill_group_kib = 16384;
+    int prefill_readers = 1;
     const char * moe_prefix = NULL;
     int moe_layer = 0;
     int moe_expert = 0;
@@ -886,6 +892,30 @@ int main(int argc, char ** argv) {
                 prefill_compute_moe = 0;
             } else {
                 fprintf(stderr, "qrt: --prefill-compute wants probe or moe, not '%s'\n", v);
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--prefill-readers") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --prefill-readers wants a count\n");
+                return 2;
+            }
+            prefill_readers = atoi(argv[++i]);
+            if (prefill_readers < 1 || prefill_readers > 16) {
+                fprintf(stderr, "qrt: --prefill-readers wants 1..16\n");
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--prefill-group-kib") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --prefill-group-kib wants a size in KiB (0 = one per expert)\n");
+                return 2;
+            }
+            prefill_group_kib = atoi(argv[++i]);
+            if (prefill_group_kib < 0) {
+                fprintf(stderr, "qrt: --prefill-group-kib wants a non-negative size\n");
                 return 2;
             }
             continue;
@@ -1074,7 +1104,8 @@ int main(int argc, char ** argv) {
         }
         return qrt_prefill_check(&cfg, prefill_prefix, shader_path.c_str(),
                                  (uint32_t) prefill_slots, (uint32_t) prefill_layers,
-                                 prefill_compute_moe, prefill_layer_batch, prefill_pipeline);
+                                 prefill_compute_moe, prefill_layer_batch, prefill_pipeline,
+                                 prefill_group_kib, prefill_readers);
     }
     if (moe_prefix != NULL) {
         std::string dir = argc > 0 ? argv[0] : "qrt";

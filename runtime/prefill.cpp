@@ -8,7 +8,77 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+namespace {
+
+// Copies one group of experts into the staging mapping across the workers. The job is a
+// plain function pointer so no allocation or std::function dispatch happens per group.
+struct par_job {
+    const qrt_weights * w;
+    uint32_t layer;
+    const uint32_t * experts;
+    const uint64_t * offsets;
+    const uint64_t * sizes;
+    uint32_t first;
+    uint32_t last;
+    uint64_t span_off;
+    unsigned char * map;
+    std::atomic<int> failed;
+    char err[256];
+};
+
+struct thread_pool {
+    std::vector<std::thread> workers;
+    std::mutex mu;
+    std::condition_variable cv_start;
+    std::condition_variable cv_done;
+    par_job * job = nullptr;
+    int epoch = 0;
+    int done = 0;
+    int readers = 1;
+    bool stop = false;
+};
+
+void pool_worker(thread_pool * pool, int id) {
+    int seen = 0;
+    for (;;) {
+        par_job * job = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(pool->mu);
+            pool->cv_start.wait(lk, [&] { return pool->stop || pool->epoch != seen; });
+            if (pool->stop) {
+                return;
+            }
+            seen = pool->epoch;
+            job = pool->job;
+        }
+        // Strided by the worker count, so every worker copies whole experts.
+        for (uint32_t i = job->first + (uint32_t) id; i < job->last; i += (uint32_t) pool->readers) {
+            if (job->failed.load(std::memory_order_relaxed) != 0) {
+                break;
+            }
+            if (qrt_weights_read_expert(job->w, job->layer, job->experts[i],
+                                        job->map + (job->offsets[i] - job->span_off),
+                                        (size_t) job->sizes[i], job->err,
+                                        sizeof(job->err)) != 0) {
+                job->failed.store(1);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(pool->mu);
+            ++pool->done;
+        }
+        pool->cv_done.notify_one();
+    }
+}
+
+} // namespace
 
 struct qrt_prefill {
     qrt_vk_dev *    dev;
@@ -16,6 +86,8 @@ struct qrt_prefill {
     qrt_prefill_cfg cfg;
     uint64_t        slot_bytes;
     uint32_t        slots;
+    thread_pool     pool;
+    par_job         job;
     VkBuffer        buf;      // slots x slot_bytes of scratch for the compute leg
     VkDeviceMemory  mem;
     VkBuffer        layer_buf[2];   // whole layer of experts, for the batch path
@@ -71,6 +143,10 @@ int qrt_prefill_open(qrt_vk_dev * dev, qrt_weights * w, const qrt_prefill_cfg * 
     p->w   = w;
     p->cfg = *cfg;
     p->slot_bytes = cfg->slot_bytes != 0 ? cfg->slot_bytes : qrt_weights_max_expert_bytes(w);
+    if (cfg->group_bytes > p->slot_bytes) {
+        // A coalesced copy is a run of experts plus the one that crosses the group edge.
+        p->slot_bytes = (cfg->group_bytes / 64 + 1) * 64 + qrt_weights_max_expert_bytes(w);
+    }
     if (p->slot_bytes == 0) {
         free(p);
         return fail(err, err_size, "expert store reports zero-byte experts");
@@ -132,6 +208,16 @@ int qrt_prefill_open(qrt_vk_dev * dev, qrt_weights * w, const qrt_prefill_cfg * 
 void qrt_prefill_close(qrt_vk_dev * dev, qrt_prefill * p) {
     if (p == NULL) {
         return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(p->pool.mu);
+        p->pool.stop = true;
+    }
+    p->pool.cv_start.notify_all();
+    for (std::thread & t : p->pool.workers) {
+        if (t.joinable()) {
+            t.join();
+        }
     }
     if (p->stg != NULL) {
         for (uint32_t i = 0; i < p->slots; ++i) {
@@ -653,20 +739,49 @@ int ensure_layer_buffer(qrt_prefill * p, uint32_t slot, uint64_t need, char * er
     return 0;
 }
 
-// Streams one layer's experts into the given buffer through the staging ring.
-int upload_layer(qrt_prefill * p, uint32_t layer, VkBuffer dst, const uint32_t * ids,
+// Streams one layer's experts into the given buffer through the staging ring. Consecutive
+// experts share one copy when group_bytes is set, because a 1.8 MiB vkCmdCopyBuffer only
+// reaches 11.6 GB/s while an 8-16 MiB one reaches 13.8-14.0 (RESULTS 35/43).
+int upload_layer(qrt_prefill * p, uint32_t layer, uint32_t slot_index, const uint32_t * ids,
                  uint32_t stride, uint32_t count, uint32_t * experts, uint64_t * offsets,
                  uint64_t * sizes, qrt_prefill_stats * out, char * err, size_t err_size) {
     qrt_vk_dev * dev = p->dev;
+    const VkBuffer dst = p->layer_buf[slot_index];
+    const uint64_t group = p->cfg.group_bytes;
+
+    // The destination layout has to be known before a group can be assembled.
     uint64_t off = 0;
     for (uint32_t e = 0; e < count; ++e) {
-        const uint32_t expert = ids[(size_t) layer * stride + e];
         qrt_expert_loc loc;
-        if (qrt_weights_locate(p->w, layer, expert, &loc, err, err_size) != 0) {
+        if (qrt_weights_locate(p->w, layer, ids[(size_t) layer * stride + e], &loc,
+                               err, err_size) != 0) {
             return -1;
         }
-        const uint32_t slot = e % p->slots;
-        if (e >= p->slots) {
+        experts[e] = ids[(size_t) layer * stride + e];
+        sizes[e] = loc.bytes;
+        offsets[e] = off;
+        off += (loc.bytes + 63) / 64 * 64;
+    }
+
+    uint32_t e = 0;
+    while (e < count) {
+        uint32_t last = e;
+        if (group == 0) {
+            ++last;
+        } else {
+            const uint64_t start = offsets[e];
+            while (last < count && offsets[last] + sizes[last] - start < group) {
+                ++last;
+            }
+            if (last == e) {
+                ++last;
+            }
+        }
+        const uint64_t span_off = offsets[e];
+        const uint64_t span_bytes = offsets[last - 1] + sizes[last - 1] - span_off;
+
+        const uint32_t slot = (uint32_t) (out->groups % p->slots);
+        if (out->groups >= p->slots) {
             const double w0 = now_ms();
             if (qrt_vk_staging_wait(dev, p->stg[slot], err, err_size) != 0) {
                 return -1;
@@ -674,28 +789,72 @@ int upload_layer(qrt_prefill * p, uint32_t layer, VkBuffer dst, const uint32_t *
             out->wait_ms += now_ms() - w0;
         }
         unsigned char * map = (unsigned char *) qrt_vk_staging_map(p->stg[slot]);
-        const double r0 = now_ms();
-        const int read = qrt_weights_read_expert(p->w, layer, expert, map,
-                                                 (size_t) p->slot_bytes, err, err_size);
-        out->read_ms += now_ms() - r0;
-        if (read != 0) {
-            ++out->blocks_failed;
-            continue;
+        if (span_bytes > p->slot_bytes) {
+            return fail(err, err_size, "group of %llu bytes exceeds the %llu byte staging slot",
+                        (unsigned long long) span_bytes, (unsigned long long) p->slot_bytes);
         }
+        const double r0 = now_ms();
+        if (p->pool.readers <= 1) {
+            for (uint32_t i = e; i < last; ++i) {
+                if (qrt_weights_read_expert(p->w, layer, experts[i],
+                                            map + (offsets[i] - span_off),
+                                            (size_t) sizes[i], err, err_size) != 0) {
+                    ++out->blocks_failed;
+                }
+            }
+        } else {
+            par_job * job = &p->job;
+            job->w = p->w;
+            job->layer = layer;
+            job->experts = experts;
+            job->offsets = offsets;
+            job->sizes = sizes;
+            job->first = e;
+            job->last = last;
+            job->span_off = span_off;
+            job->map = map;
+            job->failed.store(0);
+            job->err[0] = '\0';
+            {
+                std::lock_guard<std::mutex> lk(p->pool.mu);
+                p->pool.job = job;
+                p->pool.done = 0;
+                ++p->pool.epoch;
+            }
+            p->pool.cv_start.notify_all();
+            // The main thread is worker 0 and must finish its share before it submits.
+            for (uint32_t i = e; i < last; i += p->pool.readers) {
+                if (qrt_weights_read_expert(p->w, layer, experts[i],
+                                            map + (offsets[i] - span_off),
+                                            (size_t) sizes[i], err, err_size) != 0) {
+                    job->failed.store(1);
+                }
+            }
+            const int want = (int) p->pool.readers - 1;
+            {
+                std::unique_lock<std::mutex> lk(p->pool.mu);
+                p->pool.cv_done.wait(lk, [&] { return p->pool.done >= want; });
+            }
+            if (job->failed.load() != 0) {
+                ++out->blocks_failed;
+                snprintf(err, err_size, "%s", job->err[0] != '\0' ? job->err : "group read failed");
+            }
+        }
+        out->read_ms += now_ms() - r0;
         const double u0 = now_ms();
-        if (qrt_vk_upload_submit(dev, p->stg[slot], dst, off, loc.bytes, err, err_size) != 0) {
-            ++out->blocks_failed;
-            continue;
+        if (qrt_vk_upload_submit(dev, p->stg[slot], dst, span_off, span_bytes,
+                                 err, err_size) != 0) {
+            return -1;
         }
         out->upload_ms += now_ms() - u0;
-        experts[e] = expert;
-        offsets[e] = off;
-        sizes[e] = loc.bytes;
-        out->bytes += loc.bytes;
-        ++out->blocks_done;
-        off += (loc.bytes + 63) / 64 * 64;
+        for (uint32_t i = e; i < last; ++i) {
+            out->bytes += sizes[i];
+        }
+        out->blocks_done += last - e;
+        ++out->groups;
+        e = last;
     }
-    for (uint32_t k = 0; k < p->slots && k < count; ++k) {
+    for (uint32_t k = 0; k < p->slots && k < out->groups; ++k) {
         const double w0 = now_ms();
         if (qrt_vk_staging_wait(dev, p->stg[k], err, err_size) != 0) {
             return -1;
@@ -793,7 +952,7 @@ int qrt_prefill_run_layers(qrt_prefill * p, const uint32_t * ids, uint32_t strid
             }
             out->wait_ms += now_ms() - w0;
         }
-        if (upload_layer(p, layer, p->layer_buf[slot], ids, stride, counts[layer], experts,
+        if (upload_layer(p, layer, slot, ids, stride, counts[layer], experts,
                          offsets, sizes, out, err, err_size) != 0) {
             rc = -1;
             break;

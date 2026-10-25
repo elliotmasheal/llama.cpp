@@ -196,6 +196,14 @@ build-vulkan/bin/qrt.exe --prefill-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL -
   swiglu, a barrier and down for every expert of the layer into one command buffer. That took
   the compute leg from 2.0 to 3.7 TFLOPS (RESULTS 41). `--prefill-mode perexpert` is the
   earlier one-submit-per-expert shape, kept for comparison.
+- `--prefill-group-kib 16384` (default) coalesces consecutive experts into one ~16 MiB copy: 1024
+  copies become 128 and a block costs 0.179 ms instead of 0.191 (RESULTS 43). `0` keeps one
+  copy per expert for comparison.
+- `--prefill-readers N` splits the copy of a group across host threads. Measured at 2, 3, 4 and
+  6 readers: no change at all (the read leg stays at 13.6 GB/s), so the default is 1. The read
+  and the concurrent H2D copy run at the same rate, which points at shared bandwidth on the
+  coherent staging buffer rather than at CPU issue rate (DECISIONS 40).
+- `--prefill-readers N` also needs the pool in `prefill.cpp`; it stops and joins on close.
 - `--prefill-pipeline 1` (default) gives the scheduler two layer buffers and two command rings: layer
   L+1 is read and uploaded while layer L is still computing, which took 0.272 to 0.190 ms per
   block (RESULTS 42). `--prefill-pipeline 0` keeps the single buffer for comparison.
