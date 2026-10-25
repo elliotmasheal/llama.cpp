@@ -1,501 +1,76 @@
-# Instructions for llama.cpp
+# Instructions for llama.cpp (qwen36 专用 MoE 运行时)
 
-**除关键术语等之外，尽可能用中文回复**
+除术语外中文回复；解释求简，结合目标给进度与影响。
+本仓库是剪裁 + 二次优化的 llama.cpp fork，仅供参考：核心目标是**重写**专用运行时，不是优化上游。
 
-> 本仓库是 `elliotmasheal/llama.cpp` fork，基线是 ggml-org/llama.cpp 的上游 master。
-> `origin` 指向本 fork，未配置 `upstream` remote。**本项目不考虑"能否上游化"，追求小 VRAM 设备下的指定模型的极致性能。**
-> 只有一条主线：`design/qwen36-moe-runtime-design.md`（qwen36 专用 MoE 运行时，里程碑 M0-M5）。
-> 解释、归纳、总结时请简单一些，易于非专业人士阅读，并结合目标给出进度及影响。
-> 时刻谨记本仓库(llama.cpp剪裁+二次优化版)仅供参考，核心目标依然是重写而非优化。
-> 保持良好的架构和分包习惯，高内聚低耦合。
+## 0. 入口（每次会话按序）
 
-## 0. 怎么开始
+1. `python bench/tools/state_check.py` 退出 0，否则停。
+2. 读下面 STATE 块，取自己 lane 的队列头。
+3. `python bench/tools/state_check.py --brief <task-id>`：拿任务、**必读清单**、`done_when`。
+4. 按第 1 节路由表读对应文档。不要通读历史日志。
 
-本文件是 agent 的唯一入口与执行契约。性能规格与数学模型在 `design/qwen36-moe-runtime-design.md`（下称 design）。
-任务图与资源占用在 `bench/state/state.json`，与第 2 节的 STATE 块必须一致，由
-`python bench/tools/state_check.py` 校验（退出码 0 才允许开跑）。
+## 1. 路由表（"要做什么 -> 先读什么"）
 
-**启动顺序**：`state_check.py` -> 本文件第 2 节 -> 自己 lane 的队列头 -> design 里与该任务对应的章节。
-看全量任务用 `state_check.py --board`，只看一条 lane 用 `--lane impl`。不要通读历史日志。
+| 你要做 | 先读 |
+|---|---|
+| 写或改 `runtime/` 代码 | `runtime/AGENTS.md` |
+| 跑数、报读数、填口径 | `bench/README.md` |
+| 判 pass/fail、动门禁 | `docs/agent/gates.md` |
+| 走完一轮、写报告、加节锚点 | `docs/agent/cycle.md` |
+| 编排多 agent、抢资源、开 worktree | `docs/agent/resources.md` |
+| 重试、要停问用户 | `docs/agent/failures.md` |
+| 构建、ctest、找不到 DLL | `docs/agent/build.md` |
+| 仓库还剩什么、能复用哪些内核 | `docs/agent/repo-facts.md` |
+| 两处说法冲突、找不到该读哪篇 | `docs/agent/INDEX.md` |
 
-**文档权威（冲突时按此顺序裁决）**
+## 2. 目标（唯一；模型细节与开关默认值在 design）
 
-| 优先级 | 文件 | 只放什么 | 谁能改 |
-|---:|---|---|---|
-| 1 | `design/qwen36-moe-runtime-design.md` | 目标、非目标、硬约束、性能模型、里程碑与验收阈值 | 用户；agent 只读 |
-| 2 | `AGENTS.md` | 执行契约、并行规则、门禁、循环 | agent 每轮更新状态块 |
-| 3 | `bench/state/state.json` | 任务图、依赖、资源、队列头、当前状态 | agent 领任务/交接时改 |
-| 4 | `bench/RESULTS.md` | 实测数字的唯一来源（含口径头） | 有新读数时追加 |
-| 5 | `bench/DECISIONS.md` | 判决、已证伪、开关表、未结项 | 有判决时追加 |
-| 6 | `bench/README.md` | 口径、必报列、测量陷阱 | 口径变化时才改 |
+`F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`（21.28 GiB，`qwen35moe`，40 主层 + 1 MTP，256 专家 top-8）。
+RX 6700S 8 GiB（`-dev Vulkan1`）+ Ryzen 7 6800HS + 40172 MiB RAM，平衡电源 + AC 供电。
 
-规则：`RESULTS.md` 的实测优先于 design 的估计；design 里的数字必须在 `RESULTS.md` 有回链。
-design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不可比。
-一次提交只改一层：先数字来源，再判决，再状态。
-
-## 1. 目标（唯一）
-
-模型 `F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`（21.28 GiB，arch `qwen35moe`，40 主层 + 1 MTP 层，
-256 专家 top-8）。硬件：RX 6700S 8 GiB（`-dev Vulkan1`）+ Ryzen 7 6800HS + 40172 MiB RAM，
-笔记本「平衡」电源 + AC 供电。
-
-统一工况：10K prompt，greedy，单流；ctx 256K 由 q4_0 KV + 16384 token 常驻窗口支持
-（U-3，`RESULTS.md` 第 10 节），窗口外页面放主机，不计入 TG 目标。
-
-| 指标 | 目标 | 口径 | 判定里程碑 |
+| 指标 | 硬地板 | 口径 | 里程碑 |
 |---|---|---|---|
-| PP | >= 1000 tok/s | 10K prompt，ctx 256K，chunk 2048；需 int8 >= 6.0 TFLOPS 且 chunk >= 1420 | M2 |
-| TG | >= 130 tok/s | 单流，greedy，10K prompt 之后 128 token；k=4（验收），21.9% 缓存，q4 KV | M3 |
+| PP | >= 1000 tok/s | 10.4K prompt（10428 tok），ctx 256K，chunk 2048 | M2 |
+| TG | >= 130 tok/s | 单流 greedy，10K 之后 128 tok，k=4，21.9% 缓存，q4 KV | M3 |
 
-**目标由硬件推算（用户 2026-10-24 定）**
+每轮另报 0.85 x 绑定腿 roofline 作参照，差距分解成具体优化项。
+非目标：其他模型 / 量化 / 后端、多用户服务化、上游化。跨口径数字不可比。
 
-- 每轮报告两个数：硬地板（130 / 1000）与 **0.85 x 绑定腿 roofline**（PP 7.06 TFLOPS；TG 126，
-  已低于硬地板，故 TG 报 130 与实测 roofline 148 —— 130 是它的 88%），差距分解成具体优化项，
-  不许用"当前实现就这样"当结论。
-- 硬件极限（不可越）：GDDR6 224 GB/s（128-bit x 14 Gbps；本机实测读上限 156.5，R1a）、
-  PCIe 4.0 x8 15.75 GB/s、DDR5-4800 双通道 76.8 GB/s、RDNA2 FP32 7.9 TFLOPS、8176 MiB 显存、
-  SSD 随机读 0.81 GB/s。
-- 当前软件读数（**优化目标，不是约束**）：显存读 156.5 GB/s（规格的 70%，190 已被 R1a 证伪）、
-  CPU 4 线程读 39-41（52%）、CPU 每专家 0.115-0.118 ms（R1b，需求 <= 0.090；code 需 0.059）、
-  H2D 单跑 14.17（90%）、并发 10.8（-24%）、解码 miss 18-23%。
-- 显存预算（design 5.5）：桌面 1000 + 稠密 2079 + 专家缓存 4198（21.9%）+ q4 KV 16K 窗口 99
-  + 计算缓冲 700-1100 + 草稿 100 = 7176 MiB；计算缓冲每多 100 MiB，缓存覆盖降约 0.5 pp。
-- 开关默认值以 design 第 7 节为准：`QRT_SPEC_K=4`、`QRT_DRAFT_VOCAB=16384`、
-  `QRT_EXPERT_CACHE_MIB=4198`、`QRT_CACHE_POLICY=slru`、`QRT_PREFILL_CHUNK=2048`、
-  `QRT_MISS_SPLIT=auto`、`QRT_KV_PRECISION=q4_0`、`QRT_KV_PAGE_TOKENS=16384`；
-  k=8 实现但默认关闭（design 3.1），`QRT_TELEMETRY=0` 关闭时零开销。
-- 运行时不走 fork：fork 只作参考（greedy 基准、接受率口径、硬件探针），内核拷进 `runtime/kernels`。
-- 不改变量化格式；不改变输出：k=1 路径 logits KLD <= 1e-4，推测路径接受的 token 与参考 greedy 一致。
-- 非目标：其他模型 / 量化 / 后端、多用户服务化（design 1.2）。
-- 以实际硬件上限为基准，尽全力优化软件以达到理论上限。
-- 需要考虑不同硬件下的表现，不能仅适配本机。
-
-## 2. 当前状态
+## 3. 当前状态
 
 <!-- STATE:BEGIN -->
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
 queues: bench=- impl=M2-6 data=- io=- user=-
-last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
+last_gate: G-REG unknown (2026-10-23)
 blockers: none
 <!-- STATE:END -->
 
-`queues` 是每条 lane 的下一个可跑任务，`-` 表示该 lane 暂停。只改这一块与 `state.json`，两者必须同一次提交。
-队列头只写"任务 id"，"为什么是它、做到什么算完"在 `state.json` 里，避免两处叙述漂移。
+`queues` 只写任务 id；"为什么是它、做到什么算完"在 `state.json`。
+本节摘要最多 3 行：历史与读数只在 `RESULTS.md` / `DECISIONS.md`，`--lint` 会拦 dated bullet 与任务表。
+焦点：M2-6 整层链路，用 `--brief M2-6` 看必读清单。
 
-**现状摘要（人读，不参与机器校验）**
+## 4. 铁律
 
-- M0 完成：张量账、10K + 128 token 路由 trace、局部性与命中率（`RESULTS.md` 第 1-2、7 节）。
-- M0 完成。**M1 已条件通过（用户 2026-10-24 选 A）**：9 条判据 8 过，唯一缺口 code 的 CPU 0.059
-  留作 M3-1a 的硬门（M3-6 卡它，不达走 U-2）。R0 / R1 完成，语料、词表、E、保真、显存预算都已收口。
-- **phase = M2（prefill）**。队列：bench 空（等运行时），impl M2-4，data M5-1，io 等 M5-1，user 空。
-- **M2-0 完成（2026-10-24）**：`qrt` 脚手架解析 design 第 7 节全部 10 个开关（默认值可读、坏值 exit 2、
-  `--selftest` 14 项、ctest 34/34），telemetry CSV 出口已可用；见 `runtime/README.md`、`DECISIONS.md` 第 17 节。
-- **M2-1 完成（2026-10-24）**：`gguf_index` 与 `gguf_dims.py` 逐项一致（753 张量、11 个 hparam、张量账），
-  9 类畸形文件全部返回错误不崩溃；`--gguf-index` 可打印张量表；见 `RESULTS.md` 第 25 节、`DECISIONS.md` 第 18 节。
-- **M2-2 完成（2026-10-24）**：`vk_dev` 打开 RX 6700S（Vulkan 1.2 + timeline），heapBudget 7378 MiB，
-  design 5.5 的 7176 MiB 计划可复现（缓存 4198 MiB = 21.87%）；tier 可注入、预算不足按 256 MiB 回退并计数；
-  见 `RESULTS.md` 第 26 节、`DECISIONS.md` 第 19 节。
-- **M3-1a done（2026-10-24）**：CPU 专家核 0.115-0.118 -> 0.0908 -> 0.0661 -> **0.0575-0.0587**
-  （8 线程首轮，门禁口径），code 的 0.059 达到、技术类 0.0665 中位；t=1..5 曲线在 `RESULTS.md` 第 31 节。
-  遗留：design 6.2 回填（用户）、逐 token（X-4）。U-2 不再需要。
-- **M2-3 partial（2026-10-25）**：`runtime/weights.*` 解析索引建 41x256 页表，10496/10496 专家
-  全量读回通过、64 KiB 对齐全通过。
-- **M2-3 done（2026-10-25）**：两半都完成。主机侧页表 41x256、10496/10496 读回；
-  VRAM 侧 staging + H2D/D2H 通路（真实专家块 123/123 往返，串行 0.24-0.43 ms/专家、
-  **8 槽流水 11.5-12.1 GB/s**）+ **稠密 629 张量 2079.2 MiB 常驻**（回读 56 MB 一致）。
-  见 `RESULTS.md` 第 34-36 节、`DECISIONS.md` 第 30-31 节。队列头 -> **M2-5（prefill）**。
-  遗留：`token_embd` 515 MiB 的归属（design 的 2079 MiB 不含它）。
-- **E-1 已决（用户 2026-10-25）**：专家槽**按层分尺寸**（1.812 / 1.945 / 2.195 MiB），4198 MiB 按层切分，
-  仍只有一个预算器；见 `DECISIONS.md` 第 32 节。design 5.1/5.3 的 1.84 MiB 常数**等用户改**。
-- **M2-5 partial（2026-10-25）**：`runtime/prefill.*` 的层优先调度 + 环形 staging 槽起来了，
-  上传与计算重叠（wait 352->2 ms，每块 0.86->0.73 ms）；但 compute 腿还是带宽读核，
-  **PP 无实测值**，且主机读重组文件只有 2.6 GB/s（`RESULTS.md` 第 37 节、`DECISIONS.md` 第 33 节）。
-  下一步：读通路（mmap）与 int8 GEMM 接入。
-- **M2-5 读取通路（2026-10-25）**：重组文件改只读映射后，每专家读是一次 memcpy，端到端
-  **2.6 -> 7.05 GB/s**（每块 0.73 -> 0.27 ms，read 段 13.5 GB/s）；见 `RESULTS.md` 第 38 节、
-  `DECISIONS.md` 第 35 节。新增纪律：两臂对比前必须跑预热 pass（首触缺页会造假加速比）。
-- **M2-5 int8 GEMM（2026-10-25）**：`runtime/kernels/` 的 Q4_K x Q8_1 GEMM 接成 prefill 的
-  compute 腿，gate 对 CPU 双精度参考 **rel_L1 1.6e-7**；但只有 **1.51-1.55 TFLOPS**
-  （每专家一次提交、16 个 workgroup），且 down 是 Q5_K/Q6_K 被跳过（`RESULTS.md` 第 39 节、
-  `DECISIONS.md` 第 36 节）。下一步：整层单次提交，再补 Q5_K/Q6_K 内核。
-- **M2-5 三型 GEMM（2026-10-25）**：Q5_K 与 Q6_K 也进运行时，gate/up/down **全跑**
-  （三型 rel_L1 <= 2.5e-7），算力 **1.90-2.16 TFLOPS**，每块 0.35 ms（`RESULTS.md` 第 40 节、
-  `DECISIONS.md` 第 37 节）。瓶颈仍是每专家一次提交；下一步做**整层单次提交**。
-- **M2-5 整层单次提交（2026-10-25）**：prefill 从"每专家一次提交"改成**整层一个命令缓冲**，
-  算力 **2.02 -> 3.69-3.71 TFLOPS**，每块 0.351 -> 0.272 ms。构成变成 read 50% / compute 40%，
-  层间双缓冲是下一个大头（推算 734 -> 1250 tok/s，`RESULTS.md` 第 41 节、`DECISIONS.md` 第 38 节）。
-- **M2-5 层间双缓冲（2026-10-25）**：两层缓冲交替，层 L+1 的读取上传与层 L 的计算重叠，
-  每块 0.272 -> **0.190-0.193 ms**（1.42x），专家腿推算 **1226 tok/s**（40 层、三矩阵、
-  不含注意力/稠密）。显存按 **U-9** 复用 decode 缓存区。下一步：H2D 分块合并
-  （`RESULTS.md` 第 42 节、`DECISIONS.md` 第 39 节）。
-- **M2-5 H2D 分块合并（2026-10-25）**：相邻专家拼成 16 MiB 一次拷贝，每块 0.190 -> **0.179 ms**，
-  专家腿推算 **1330 tok/s**。多线程读取实测**无收益**（read 恒定 13.6 GB/s，与 H2D 同速，
-  疑似共享 coherent 带宽）。PCIe 地板 1560 tok/s，本路线只剩 17%；下一步是**层优先跨 chunk**
-  （专家只读一次/prompt，需用户批准）见 `RESULTS.md` 第 43 节、`DECISIONS.md` 第 40 节。
-- **M2-5 层优先跨 chunk（2026-10-25）**：chunk 循环放进层内（design 4.5 的"每层专家只读一次"），
-  10K prompt 的**专家腿 2976-2980 ms = 3436 tok/s**，端到端 **7.09-7.10 TFLOPS**（0.85 roofline 是 7.06），
-  搬运 92.5 -> 18.5 GiB/prompt。整模型 PP 还差注意力（M2-6）与稠密；
-  见 `RESULTS.md` 第 44 节、`DECISIONS.md` 第 41 节。
-- **M2-6 形状账（2026-10-25）**：10K prompt 三条腿 = 稠密投影 **30.9 TFLOP（50%）**、
-  注意力本体 9.45（15%）、路由专家 21.1（34%）。按 6 TFLOPS 稠密速率 PP = **1055 tok/s**（余量 5%）。
-  M2-6 切成 M2-6b（Q8_0 GEMM，最大块）/6c（DeltaNet）/6d（full-attn）；见 RESULTS.md 第 45 节、
-  DECISIONS.md 第 42 节。
-- **M2-6b Q8_0 GEMM（2026-10-25）**：稠密投影内核进运行时、正确（rel_L1 1.3e-7），但只 **1.10-2.17 TFLOPS**
-  （真实形状 M=10240 是 1.10）。按实测速率 PP 只有 **258-474 tok/s** -> **PP 的绑定腿已从专家腿
-  换成稠密 GEMM**，差 4-6 倍。下一步：q8_0 块预打散成对齐平面（M2-4 在 Q4_K 上 3.66->6.08 的同一招）。
-  见 `RESULTS.md` 第 46 节、`DECISIONS.md` 第 43 节。
-- **M2-6b 平面重排（2026-10-25）**：q8_0 预打散成对齐平面后 M=2048/4096 **2.64-2.68 TFLOPS**（+23%），
-  M=10240 仍 1.18-2.11 且抖动；group_m 轮转已否决。按实测 PP 只有 **563 tok/s**，
-  要过 1000 必须上 **LDS 分块 GEMM**（RESULTS.md 第 47 节、DECISIONS.md 第 44 节）。
-- **M2-6b tile 扫描（2026-10-25）**：6 组 tile 形状（rows 2/4/8 x tokens 8/16/32 x wg 128/256）
-  全部落在 **2.60-2.66 TFLOPS**，tile 不是瓶颈；反推有效读 74 GB/s，工作集 20-30 MB 装不进 2 MB L2
-  （专家内核工作集 1.2 MB 时是 7.1 TFLOPS）。**LDS 分块是唯一出路**，失败假设与达标线已写进
-  `RESULTS.md` 第 48 节、`DECISIONS.md` 第 45 节。
-- **M2-6b 更正（2026-10-25）**：稠密 GEMM 停在 **3.50 TFLOPS**（工作集落 L2 时），tile 形状无效、
-  L2 只值 33%。真因是 **q8_0 每位宽的 MAC 数只有 Q4_K 的一半**（3.5 vs 7.1），已接近上限 4.3。
-  **LDS 分块撤销为未验证假设**；按实测 PP = **706 tok/s**，缺口要动稠密 FLOPs 或位宽（需用户）。
-  见 `RESULTS.md` 第 48 节、`DECISIONS.md` 第 45 节。
-- **M2-6b 可信扫描 + PP 反算（2026-10-25）**：修好 tile 变量透传后，rows 2/4/8 x wg 128/256 全部
-  **2.63-2.64**（稠密）/ 3.2-3.5（落 L2），寄存器 tile 不是出路。PP 预算反算：专家 2.98 s +
-  注意力 1.35 s 之后，稠密投影只剩 5.9 s -> 需 **5.2-5.4 TFLOPS**（现状 2.64）。用户已定
-  **稠密不许降到 4 bit**，只能靠专用内核提高复用（RESULTS.md 第 49 节）。
-- **路径 3 已选（用户 2026-10-25）**：先不做稠密优化，把 M2-6c/6d/6a 与 M2-7 做完，拿到整模型
-  PP 与 KLD 再决定数值方案。队列头改为 **X-1**（质量门工具，M2-7 的前置）：读 fork 的
-  --save-all-logits 转储并输出 KLD / same top-1 / PPL / PASS，计划写在 state.json 的 X-1 note。
-- **X-1 完成（2026-10-25）**：`bench/tools/quality/` 一条命令出 `PPL | mean KLD | same top p |
-  PASS/FAIL`，读 fork u16 量化转储与 rt fp32 转储两套格式，`selftest` 9/9；参考基线
-  `bench/raw/x-1/ref-t5-a.bin`（254 行，PPL 3.360686，同配置 r=2 **逐字节相同**，`-t` 不是扰动源），
-  `-fa on/off` 对照 KLD 1.47e-2 / same top 93.7% -> FAIL，区分度成立。口径判决：fork 的 16 nat
-  地板会给尖峰行凭空加最多 2.8% 质量，**PPL 与 KLD 都必须按保留词表重新归一**，fork 打印的 PPL
-  不能当门禁读数。见 `RESULTS.md` 第 51 节、`DECISIONS.md` 第 47 节。队列头 -> **X-2**。
-- **X-2 不可跑（2026-10-25）**：它的 CSV schema 由 M3-4 定义，已补 `deps: [M3-4]`；impl 队首改回内核线。
-- **M2-6b 重开（用户 2026-10-25）**：稠密是最大的一块（30.9 TFLOP / 11.5 s of 16 s），先解决它。
-  第六步实测：**权重带宽不是墙**（折算只有 39-59 GB/s，读上限 156.5；`TOKENS` 8->16 把流量减半，
-  速率 3.35-3.43 -> 3.37 不变），墙在**指令发射**（2.5 MAC/指令，只有上限的 19%；同一个 dot4
-  在 Q4_K 专家核上有 6.08-6.20）。下一步 D-1 抄专家核的内层形状（`uvec4` 读权重、2 行/lane、
-  K 面板加深），目标 5 TFLOPS；5 TFLOPS 意味着稠密腿 11.5 -> 6.2 s、PP 约 780-800。
-  见 `RESULTS.md` 第 53 节、`DECISIONS.md` 第 49 节。
-- **M2-6b 第七步 D-1（2026-10-25）**：换专家核内层形状（2 行/lane、`uvec4` 读权重、K 面板 256）
-  仍然 **3.38 TFLOPS**（原 3.35-3.43）。五个数据流改法都落在同一条线上，而权重落 L2 时 4.34、
-  专家核 6.08-6.20，所以墙是**散列读延迟**（一个 wave 32 条 lane 各自读相距 2-4 KiB 的 32 B），
-  不是带宽也不是发射率。最后一招纯布局改动 **D-3：块主序重排**（128 行 x 128 元素连续 16 KiB）；
-  再不过 5 就测 dot4 上限（D-2）然后请你定数值方案。见 `RESULTS.md` 第 54 节、`DECISIONS.md` 第 50 节。
-- **M2-6b 完成（2026-10-25）**：权重块主序重排（64 行块 x 32 字节 k 块 + 独立 delta 平面）把稠密
-  q8_0 GEMM 从 **3.38 提到 12.89 TFLOPS**（k=4096 时 14.81），正确性 rel_L1 1.3e-07/1.8e-07，
-  数值方案未变。稠密腿 30.9 TFLOP -> **约 2.4 s**（原 11.5 s），**PP 1000 重新变为可达**。
-  `RESULTS 46-50` 的"q8_0 位宽是上限"结论作废；12.9 TFLOPS 高于 design 的 fp32 roofline 7.06
-  （int8 dot4 每条指令 4 次乘加），**要不要改 roofline 口径请你定**。见 `RESULTS.md` 第 55 节、
-  `DECISIONS.md` 第 51 节。
-- **M2-6c done（2026-10-25）**：递推 **4.75 -> 1.23-1.26 us/token（3.85x）**，30 层 10K
-  **1458-1479 -> 377-388 ms**。改法是纯并行度：原版一个 workgroup 只管 2 列、一个头要 64 个
-  workgroup，于是每 token 每层重复读 **2 MiB** 的 k/q（4.75 us 折 419 GB/s，等于 L2 实测上限），
-  新版一个 workgroup 管 32 列、1 列 4 个线程各 32 行、共享内存合 4 片，读降到 128 KiB。
-  **批量 ≡ 串行仍逐位相同（0.000e+00，两个变体都测）**，所以 M2-6c 的 done_when 不用降级；
-  用户提的 **chunked WY 判定为不需要**（同一收益不用付 U-7 代价），三条约束留在 `DECISIONS` 60。
-  中间负结果入账：一线程一整列（128 寄存器）= 6.77 us/token，只 1 wave/SIMD，慢 1.4x。
-  见 `RESULTS.md` 第 63 节、`DECISIONS.md` 第 61 节。队列头 -> **M2-6d（full-attn 批量）**。
-  遗留（给 M2-6 整层串联）：递推变体开关目前只有 C API（`qrt_dn_set_recur`），要补
-  `--dn-recur serial|cols`；整层 q8_0 投影串联未做。
-- **M2-6d done / M2-6 开始（2026-10-25）**：**DeltaNet 四段串起来了**——prep→gate→recur→gnorm
-  一条命令，对"同一串"CPU 双精度 5.8e-07（y）/ 4.9e-07（输出），每 token **4.94-5.19 us**，
-  30 层 10K **1.52-1.59 s**。**M2-6d 记 done**（注意力 3.18 TFLOPS、PP 反算 1052）。
-  串联**抓到一个真实缺陷**：`weights_load` 之后 conv 权重缓冲不一定是真权重（分段测试自己又传了一遍
-  所以蒙住），显式重传即恢复；补 staging_wait 没修好，根因（分配器别名 vs 时序）留给 M2-6 收口——
-  **不许当已知无害绕过**（每层都要用这块权重）。教训：**分段全绿 ≠ 串联全绿，串联本身是一个测试**。
-  下一步（M2-6 整模型调度）**先补 rmsnorm + Q8_1 激活量化内核**（q8_0 GEMM 要预量化的 qs/ds 平面，
-  现在只有 check 在 host 上做）。见 `RESULTS.md` 第 68 节、`DECISIONS.md` 第 63.4 节。
-- **M2-6 第一块（2026-10-25）**：`kernels/norm.*` + `qrt_norm.comp` 进运行时，**rmsnorm + Q8_1 平面对
-  CPU 双精度 3.93e-08**，平面 80/655360 块差 1（真数值差），**链上 GEMM 吃设备端平面 1.25e-07**；
-  10K 每层 **1.37-1.72 ms（111-140 GB/s）**，比稠密投影腿（13.4 TFLOPS）只多 5.5%。抓到真实缺陷：
-  **本驱动 `packHalf2x16` 是向零取整**（326917 个字低 1 ULP），改显式 RNE 后降到 38；
-  纪律入 `DECISIONS` 64.1。下一步：整层命令缓冲 + conv 权重缺陷收口
-  （`RESULTS.md` 第 69 节、`DECISIONS.md` 第 64 节）。
-- **M2-6 第二块（2026-10-25）**：conv 权重缺陷按**根因**修好——上传读了被 gate 循环覆盖的临时向量
-  （512 B 堆块读 128 KiB），不是别名也不是时序；新增 `qrt_dn_weights_verify()`，六个权重缓冲
-  **加载时全部回读逐字节比对**，check 里"重传 conv 权重"的补丁删除后整层仍
-  **y 5.79e-07 / gnorm 4.95e-07（512 token）、8.27e-07 / 6.88e-07（1024）**，与修复前逐位相同。
-  顺带发现 `qrt_gemm_record` 的**两个固定 descriptor set 在同一命令缓冲里会互相覆盖**（规范层面错，
-  本驱动靠 bind 快照蒙过），列为下轮先做的结构性修复。见 `RESULTS.md` 第 70 节、`DECISIONS.md` 第 65 节。
-- **M2-6 第四块（2026-10-25）**：`runtime/layer.*` 把**一层注意力前半段**接通（norm -> 投影 ->
-  注意力 -> 注意力输出的 Q8_1 -> 输出投影 -> 残差 -> post norm，全程无 host 往返），投影直接写
-  token-major；10K 每层 **DeltaNet 8.7 us/token、full-attn 31.3 us/token**（41 层 6.0-6.2 s）。
-  `--layer-check` 逐阶段对 CPU 双精度：**四个层（两种类型各两层，512 token）全部 PASS**——norm 3.9e-08、
-  投影 1.2e-07~9.7e-06、注意力 4.4-5.3e-07、输出投影 1.6-1.8e-07、残差 3.3-4.1e-08、post norm 6.0-6.4e-08。
-  首版那 1e-3 的"缺陷"是**检查自己的 f16 次正规数解码错了 2 倍**（指数 102+k 应为 103+k），内核一直是对的。
-  仍缺：FFN 半边（共享专家 + 路由 MoE）不在本链路里，一层仍是每个模块一次提交。
-  见 `RESULTS.md` 第 72 节、`DECISIONS.md` 第 67 节。
-- **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
-  逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
-- **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、
-  每专家 SHA-256、索引即 journal）；io 队首解到 M5-2。
-- **M2-4 完成（2026-10-24）**：int8 专家 GEMM 3.66 -> **6.08-6.20 TFLOPS（1.68x）**，达到 6.0 硬门；
-  关键改动是激活分 `qs`/`ds` 平面（16 次标量加载 -> 4 次 `uvec4`）+ int16 `sum(qs)` 代替 f16 `s`；
-  `max_rel_l1` 同时从 6.65e-6 降到 2.48e-8；见 `RESULTS.md` 第 28 节、`DECISIONS.md` 第 20.1 节。
-- M1 的判据与证据见 `state.json` 的 `decision_gate` 与 `DECISIONS.md` 第 16 节。
-- 已定（用户 2026-10-24）：独立运行时，fork 只作参考；目标 = 0.85 x 硬件 roofline，
-  硬地板 130 / 1000 在用户重设前不变。
-- 未决：无。U-1（独立运行时）、U-3（q4 KV + 16K 窗口）、U-4（平衡电源为基准）、
-  U-5（code 纳入 130）、U-6（M3-1a 提前到门内）、U-7（近分叉 0.05 口径）均已闭环。
-- 目标：TG 可行点 21.9% 缓存（4198 MiB，技术类命中约 79%；chat 81.6 / multi 87.3 / code 66.0）、**k=4**；
-  实测 16K E=2.850；E_min k=4 为 2.90（CPU 0.118）/ 2.72（0.090），即 CPU 约 0.10 时到 130。
-  k=5 的 E=3.055 只作速度上限（保真不过，见 U-7）。
-  **U-5：code 纳入 130**；code 66% 命中 -> 需 CPU **0.059**（目标 0.055），当前 0.118 只到 82。
-  PP 现状：专家 GEMM 3.66 TFLOPS -> 约 610 tok/s；**PP >= 1000 保留为硬目标**，M2-4 必须做到 6.0（1.64x）。
-- M1-3b 实测（`RESULTS.md` 第 19 节）：16K 词表 k=4 E=2.850、k=5 E=3.055；按 0.118 的 E_min
-  分别差 1.7% / 5.4%，按 0.090 都过。**k=5 与 greedy 在第 26 个 token 分叉**（受限与完整词表同样）
-  -> M1-3d 已定位：这是 **0.0136 nats 的近分叉数值**，不是掩码/接受缺陷；口径待 U-7。
-- M3-1a 实测（`RESULTS.md` 第 20 节，U-6 门内）：专用 Q4_K x Q8_1 核，预热后首轮 4 线程 0.091、
-  8 线程 0.082-0.084 ms/专家（fork 通用核 0.115-0.118）；中位受持续满载热漂移影响（0.089-0.118）。
-  **code 的 0.059 未达到（partial）**；技术类 0.090 在 8 线程达到。E 的 CPU 前提按 ~0.09 满足。
-  第三轮（`RESULTS.md` 第 29 节）：fma 累加链 2 -> 4 条，8 线程中位 0.0795-0.0825、首轮 0.0661，
-  code 目标还差 12%；多 token t=5 从 0.199 降到 0.1349 ms/专家，正确性不变。
-- **N15 已测（`RESULTS.md` 第 22 节）**：同一权重重读一次时，t=1/2/4/5 的每专家代价 8T 为
-  0.079 / 0.106 / 0.160 / 0.199 ms。k=4 的 miss 专家平均服务 1.61 个 token，期望约 **0.10 ms**；
-  **最坏 t=4 是均值的 1.6 倍**。运行时必须按多重度算，不许对每个 miss 专家都跑满 k 个 token。
-- M1-4b 实测（`RESULTS.md` 第 24 节）：GPU 腿 -1.0..+5.8%、submit 0.065-0.084 ms 已过；
-  解码计算缓冲按形状推算只有 **9.1 MiB（k=4）**，5.5 的 700-1100 是驱动/prefill 的保守余量。
-  21.9% 缓存 + 9.1 MiB 后仍余 691 MiB；若 M2-2 实测驱动瞬时够小，缓存可到约 25%（命中 +2.6 pp）。
-- **M1 评审（DECISIONS 第 16 节）：8 过 1 不过**。唯一硬缺口是 code 文本的 CPU 专家核
-  （0.079-0.082，需 0.059，差约 1.5x）。等用户在 A（条件通过进 M2）/ B（U-2 降 code 目标）/
-  C（留 M1 继续攻）之间选择。
-- M1-3d 实测（`RESULTS.md` 第 21 节）：同 prompt 下 greedy 与 k=5 在位置 0-25 完全一致，
-  logprob 平均差 0.0030；位置 26 的 top-1 margin 从 0.1192 降到 0.0136 后翻转。
-- **U-7 已决（用户 2026-10-24）**：greedy top-1 margin < 0.05 nats 的位置允许分叉，其余逐 token 一致。
-- M1-3e 实测（`RESULTS.md` 第 23 节）：k=4 在技术类与 code 两份 prompt x 128 token **无分叉**，
-  最大 logprob 扰动 0.0808、最紧 margin 0.1192/0.1286 -> 按 U-7 **PASS**；k=5 在 0.1192 处翻转 -> fail。
-  **验收配置取 k=4**（E=2.850，CPU 0.10 时 E_min 2.81，余 1.4%）；扰动上限（0.081）大于 0.05，
-  M3-5 必须把分叉率与分叉处 margin 作为必报列。
-- design 6.5 的前提：(a) 受限词表 E（已测，见上）；(b) miss 自适应分配（M3-2a）；
-  (c) 每 pass submit+sync < 1 ms（**已测 0.065-0.084**，M1-4b）；(d) q4 KV + 21.9% 缓存塞进 8 GiB
-  （U-3 已定，q4 待 M2-6a 过 G-QUAL）；(e) code 的 CPU 核 0.059（M3-1a）。
+1. 并行 = 写代码并行、执行串行；同一资源同时只有一个持有者，锁由 `state.json` 的 `doing + resources` 派生。
+2. 数字只认 `RESULTS.md`；跨口径不可比；同口径 r >= 3，相对极差 > 15% 该批作废，报中位与极差。
+3. 门禁不许为过门改判据、缩 prompt、跳档位、改 seed；失败留复现命令与已排除项。
+4. 改数值路径合入需 L-KERN（rel_L1 <= 1e-6）；要成为默认值需 L-MODEL（KLD <= 1e-4）。
+5. 一轮一个提交，含读数 + 判决 + 状态；`state_check.py` 必须回 0 才能交接。
+6. 结论只进三份 bench 文档；`design/` 由用户改，agent 只读。
+7. 代码只用 ASCII（`-` `->` `x` `...`）；注释 1-2 行；新行为必须带 CLI 开关。
+8. 同一任务第 5 次尝试前先写"失败假设 + 排查思路"；连续两次没有新读数即视为无效尝试。
+9. 待用户决策一律进 `state.json` 的 `escalations`，不写在散文里等用户看到。
+10. 资源冲突写 `blockers` 等 bench 队首；不许 force push，不许改别人的提交。
+11. 不用 `GGML_ABORT` 处理运行期条件；SSD 不进 decode 单步；不许第二套调度器 / 缓存 / 预算器。
+12. 必须停问用户的六类见 `docs/agent/failures.md`（改目标口径 design、换模型后端、删实测数字、超时超大、联网）。
 
-## 3. 每轮自主循环
+## 5. 文档权威（冲突裁决顺序）
 
-一轮 = 一个单变量改动（或一次测量）+ 一次证据采集 + 三份 bench 文档的必要更新 + 状态同步 + 一个提交。
+1 `design/qwen36-moe-runtime-design.md`（用户改，agent 只读） 2 `AGENTS.md` 3 `bench/state/state.json`
+4 `bench/RESULTS.md` 5 `bench/DECISIONS.md` 6 `bench/README.md`
 
-0. **preflight**（任一不过就停，不跑数）
-   - `python bench/tools/state_check.py` 退出码 0
-   - `git status --short` 只剩本轮预期改动；不带着上一轮的半成品开跑
-   - 自己 lane 的队列头没有被别人领走（`state.json` 里该任务不是 doing，或 doing 但 `claimed_at` 在 4 小时内）
-   - 没有别人的 quiet 锁（`state_check.py` 的 `quiet` 行是 `free`，或是本轮自己的）
-   - 机器条件：平衡电源 + AC、dGPU 上无其它推理进程、空闲 RAM 满足当前臂
-1. **领任务**：取自己 lane 的队首，按第 4 节第 5 条的领用协议改状态；不许跨 lane 抢任务。
-2. **读规格**：design 对应章节 + `README.md` 口径 + `DECISIONS.md` 已证伪清单。
-3. **单变量改动**：改动必须可回退、必须有开关、必须能用一个命令复现。
-4. **采证**：用 `bench/tools/` 的脚本，不写一次性命令进报告；原始产物落 `bench/raw/`（不进 git）。
-5. **判定**：按第 6 节逐条给 `pass / fail / n-a`。禁止"看起来更快"、"趋势一致"这类结论。
-6. **落文档**：`RESULTS.md` 加读数（带口径头）、`DECISIONS.md` 加判决/开关/未结项、
-   本文件状态块 + `state.json` 同步。
-7. **提交**：小而可回退。提交信息写"改了什么 + 跑了哪些门禁 + 读数出处"。
-8. **交接**：把任务置 `done`，队列头前移，`state_check.py` 必须回到 0；下一个人只读状态与证据文件。
-
-## 4. 并行推进与资源独占
-
-本机只有一张 GPU、40 GiB 内存、一块盘。**"并行"指写代码与写文档并行，执行（跑数、编译、repack）串行。**
-任何时刻，同一资源最多一个持有者；冲突由 `state_check.py` 拦截，不靠口头约定。
-
-**资源（互斥量，容量都是 1）**
-
-| 资源 | 含义 | 典型任务 |
-|---|---|---|
-| `gpu` | dGPU 与显存，一次只能一个进程 | 任何跑模型或内核的测量 |
-| `host-ram` | 驻留 21.28 GiB 模型（约 28 GiB 空闲内存） | bench 跑 llama-cli / 运行时 |
-| `machine-quiet` | 计时、`-j8` 全量构建、内存/磁盘探针、repack | bench/io 整段持有；impl 构建时用 quiet 锁瞬时占用 |
-| `disk-io` | 超过 1 GiB 读写或 SSD 带宽测量 | repack 与校验 |
-| `trace-bin` | 重新生成路由 trace 文件 | M1-1、M1-2b |
-| `prompt-file` | 修改 `bench/prompts/` 下的文件（只读共享） | M1-2a |
-
-**lane（固定编组，任务在 `state.json` 里指定）**
-
-| lane | 默认占用 | 并发度 | 说明 |
-|---|---|---|---|
-| `bench` | gpu + host-ram + machine-quiet | 1 | 只做测量；全项目只有这一条执行队，串行消费 |
-| `impl` | quiet 锁（构建/微基准时） | 2-3 | 写代码；路径不重叠时真正并行，编译要等 bench 空闲 |
-| `data` | 无 | 任意 | 语料、词表、GGUF 元数据、汇总、文档；不阻塞任何人 |
-| `io` | machine-quiet + disk-io | 1 | 重组与逐字节校验，和 bench、构建互斥 |
-| `user` | 无 | 1 | 只有用户能做的决定；agent 准备选项后停 |
-
-**跑数纪律**：bench 任务运行时不许编译、不许 repack、不许跑第二个模型。
-impl agent 在 bench 运行期间只写代码与测试；要编译或跑微基准时先取 quiet 锁：
-
-```
-touch bench/state/quiet-<task>     # 取锁，跑完立刻删
-rm bench/state/quiet-<task>
-```
-
-`state_check.py` 会在"quiet 锁与 bench/io 任务同时存在"或"锁超过 2 小时"时报错。
-bench/io 任务的 `doing` 状态本身就是整台机器的独占。
-
-**工作树与构建隔离**
-
-- 每个 impl agent 一个 worktree：`git worktree add ../fastLlama-<id> -b <id>/<task>`。
-- 每个 worktree 一个构建目录 `build-<id>`；**不许共用 `build-vulkan`**，也不许两个 agent 同时构建。
-- 共享只读：模型文件、`bench/prompts/`、已有 `bench/raw/` 证据、`design/`。
-
-**路径所有权与合入**
-
-- `task.paths` 是该任务的写权限，glob 前缀重叠即冲突；改别人的路径前先改 `state.json` 的归属并记录原因。
-- 合入顺序按 `deps`；一个任务一个提交；冲突由后合入者解决，不许 force push，不许改别人的提交。
-- 发现任务拆分不对：先改 `state.json`（拆任务、改 deps/paths），跑通 `state_check.py`，再动手。
-
-**领用协议（每个任务照做）**
-
-1. `state_check.py` 退出 0，且该任务 `status` 是 `todo` / `partial`。
-2. 把它改成 `doing`；同一 `resources` 或重叠 `paths` 的另一个 doing 必须已经结束。
-3. 把本 lane 的队列头前移到下一个可跑任务（没有就写 `-`）。
-4. 再跑一次 `state_check.py`，退出 0 才开始。
-5. 完成时 `status = done`，读数进 `RESULTS.md`，判决进 `DECISIONS.md`，队列头前移，再校验、再提交。
-
-**排班建议**：1 个 bench agent + 2-3 个 impl agent + 1 个 data agent。data 先产出 bench 需要的输入
-（非技术语料、受限词表、KV 预算），bench 才不会空转；impl 在决策门未过时只做工具与原型。
-
-## 5. 任务与看板
-
-任务图的唯一来源是 `bench/state/state.json`（当前 51 项，M1-M5 + U/X），本文不复制全表。查看方式：
-
-```
-python bench/tools/state_check.py --board         # 全部，按 lane 分组
-python bench/tools/state_check.py --lane bench    # 只看一条 lane
-```
-
-**M1（决策门，进行中）**
-
-| id | lane | 内容 | 验收要点 |
-|---|---|---|---|
-| M1-1 | bench | 补齐 10 个 full-attention 层与 layer 39 的解码路由 | 40 层 x 128 token 都有记录；根因进 DECISIONS |
-| M1-2a | data | 非技术语料：对话 / 代码 / 多语言各 10K | 10002 / 10149 / 9636 token；shingle 97.7-100% |
-| M1-2b | bench | 三类文本局部性复测 | **已完成**：chat 81.6%（+2.7 pp）、multi 87.3%、code 66.0%；code 偏差已解释并由 U-5 裁决 |
-| M1-3a | data | 受限草稿词表（16K）与生成脚本 | 16384 ids；prompt 覆盖 100%，generated 143/143（弱） |
-| M1-3c | impl | draft-mtp 受限候选集（16K，默认关闭） | 16K 掩码生效；token 与 greedy 一致；空/坏文件回退；ctest 33/33 |
-| M1-3b | bench | 受限词表 MTP 接受率 E | k=4 E=2.850、k=5 E=3.055（完整词表 2.829 / 3.243）；按 0.118 的 E_min 差 1.7% / 5.4%，按 0.090 都过 |
-| M1-3d | impl | 定位 k=5 验证批与 greedy 的分叉 | **已完成**：0.0136 nats 近分叉（token 0-25 全同，logprob 平均差 0.0030）；非掩码/接受缺陷，容差待 U-7 |
-| M1-4a | impl | Vulkan 原型（k=1/2/4/5/8） | 每 pass 的 submit/sync 与计算缓冲可测 |
-| M1-4b | bench | GPU 腿与每 pass 开销 | 偏差 <=5.8%、submit 0.065-0.084 ms；计算缓冲未隔离（partial） |
-| M1-5 | bench | 带宽同口径复测 | 偏差 <= 5% 或更新 RESULTS |
-| M1-6 | data | full-attention 层数与 256K KV 预算 | 10 主层 + 1 nextn；U-3 定 q4_0 + 16K 窗口 |
-| M1-7 | bench | H2D 与 CPU 读并发 + 每专家代价 | 聚合 33.5-41.0 GB/s，0.123-0.137 ms/专家 |
-| R0 | data | roofline 模型与目标推导 | TG_max / PP_max 曲线，0.85 x roofline 的目标值 |
-| R1 | bench | 腿级 roofline 探针 | 显存 156.5（190 不可达）、CPU 0.115-0.118（需求 0.090）、H2D 10.8、int8 3.66（需求 6.0） |
-| M1-GATE | user | 决策门评审 | `decision_gate.criteria` 全过才进 M2 |
-
-**决策门 M1 的通过条件**（以 `state.json` 的 `decision_gate.criteria` 为准）：
-E 用公式（16K 实测 k=4 2.850 / k=5 3.055）、GPU 腿对 roofline（偏差 <= 10%）、
-两腿并发重算、显存预算收敛（q4 KV + 21.9%）、局部性 <= 5 pp、
-PP 可行性（int8 ALU 8.67 / 专家 GEMM 3.66，M2-4 到 6.0）、code 纳入 130（CPU 0.059）、
-**推测输出保真（U-7：margin < 0.05 才允许分叉；k=4 抽样 PASS，k=5 fail）**；CPU 腿实测 0.091（4T）/ 0.082（8T），
-技术类 0.090 已到，code 0.059 未到。
-任一项不过：`phase_status=blocked`，走 U-2（改 TG）或 U-3（改 ctx/KV），不许自行改阈值。
-
-**门后**：M2 prefill（M2-0..8，含 M2-6a q4 KV + 16K 窗口）、M3 decode（M3-0..6，含 M3-1a CPU 专家核、
-M3-2a miss_split）、M4 调优（M4-1..5）、M5 重组（M5-1..4）、
-横切工具（X-1 质量门、X-2 汇总器、X-4 runtime 内核回归）。它们已登记 deps 与路径，
-未过门前只允许写工具与微基准。
-
-## 6. 门禁
-
-| id | 触发条件 | 命令 | 通过标准 | 不通过怎么办 |
-|---|---|---|---|---|
-| **G-CONS** | 每轮 | `python bench/tools/state_check.py`；`git diff` 自查 ASCII 与注释规范 | 退出码 0，diff 只含本轮改动 | 不提交 |
-| **G-EVID** | 每轮有读数 | `bench/tools/` 里的统一脚本 | 必报列齐全，`status = ok`，r >= 2，口径头齐全 | 该批作废，重建口径后重跑 |
-| **G-REG** | 改 fork 源代码（vendoring 或修 fork 工具） | 见下方六条 | 全部 100% 通过 | 回退改动，记未结项 |
-| **G-QUAL** | 改数值路径、精度、注意力实现 | 逐 token 对比参考实现；k=1 路径另测 logits KLD | token 全同且 KLD <= 1e-4（工具由 X-1 交付） | 不许合入 |
-| **G-DEC** | 里程碑 | design 第 8/9 节 | 阈值全过且证据可复核 | 停，问用户 |
-
-**G-REG 的固化数字**（`build-vulkan/bin/` 下；backend-ops 是 2026-10-23 / 44bd79305 的记录，
-动 ggml 或 backend 前必须整组重跑；只改 `common/` 时至少重跑 ctest）：
-
-- `test-backend-ops -o MUL_MAT_ID -b CPU` = 945/945
-- `test-backend-ops -o MUL_MAT_ID_MASK -b CPU` = 4/4；`-b Vulkan1` = 0/0（Vulkan 侧没有这个 op）
-- `test-backend-ops -o MUL_MAT_ID -b Vulkan1` = 939/939
-- `test-backend-ops -o MUL_MAT -b Vulkan1` = 2275/2275
-- `test-backend-ops -o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332
-- `ctest --test-dir build-vulkan` = 34/34（M2-0 实测；33 原有 + `qrt_selftest`；M1-3c 时为 33/33，
-  2026-10-23 的 32/32 早于 992c2f57a）
-
-`runtime/` 里的内核不走 G-REG：它们的回归门是 X-4（对照 CPU 参考 + 逐 token）。从 fork 拷代码时，
-先在上面这套门禁上留一次源基线，之后只对拷进 runtime 的版本跑 X-4。
-
-**门禁纪律**
-
-- 门禁数字由 design 或本节规定，agent 不得为了过门而改判据、缩 prompt、跳档位、改 seed。
-- 门禁失败必须留复现命令与已排除项，"配置不对"不是结论。
-
-## 7. 每轮报告格式
-
-固定字段，缺一行视为本轮未完成：
-
-```
-round   : <date> <commit>
-lane    : <bench|impl|data|io|user> [resources]
-task    : <task id>
-change  : <one line, single variable>
-口径    : model | ctx | prompt tokens | n_gen | k | draft vocab | cache MiB | VRAM tier | load | power
-证据    : <command or raw path> | r=<n>
-结果    : <必报列>
-门禁    : G-CONS pass | G-EVID pass/fail/n-a | G-REG pass/fail/n-a | G-QUAL pass/fail/n-a
-判决    : adopt | revert | partial(<why>)
-文档    : RESULTS <section> | DECISIONS <item> | queue=<lane>:<next id>
-阻塞    : none | <what blocks, unblock condition>
-```
-
-## 8. 失败处理与升级
-
-- **同一任务第 5 次尝试前，必须先写"失败假设 + 排查计划"进 `DECISIONS.md` 未结项，再动手**。
-  额度放大到 5 次不等于允许重复试错：每次尝试必须写明"它证伪什么、产出什么证据"，
-  同一族假设（同一个变量的同方向微调）不许连试两次；连续两次没拿到新读数就视为无效尝试。
-  归因到硬件之前先排除内核结构性问题（`RESULTS` 第 51-55 节的教训：六次微优化建立在错误读数上）。
-- 失败留三样：复现命令、已排除项、下一步判据。
-- **必须停下来问用户的 8 类**：改目标或阈值；改 design；换模型 / 量化 / 后端；删改已有实测数字；
-  改口径；新增 design 第 5.1 节未登记的模块或第二套调度器；预计 > 2 小时或 > 20 GiB 磁盘；需要联网下载。
-- 不得用"跳过某个臂""只跑一次""把两档平均"之类的手段让门禁变绿。
-- 资源冲突时不许自行抢占：把冲突写进 `state.json` 的 `blockers`，由 bench 队首优先。
-
-## 9. 工程红线
-
-1. **不得用 `GGML_ABORT` 处理运行期条件**（容量不足、内存不足、路由过散）。必须回退到慢但正确的路径并计数告警。
-2. **SSD 只做容量层，绝不进 decode 单步关键路径**：随机 1.95 MiB = 0.81 GB/s，206 MiB/token 要 258 ms。
-3. **新行为一律带开关**：CLI 参数 + `DECISIONS.md` 开关表；默认值由目标工况实测决定；
-   只靠 env 而不上 CLI 的行为不得成为默认路径。
-4. **新模块必须先登记**：design 第 5.1 节列出允许的模块。不允许出现未登记的第二套调度器、缓存或预算器。
-5. **数字必须带口径**：日期、提交、电源态、显存档位、专家缓存 MiB、k、草稿词表。跨口径比较视为错误。
-6. **结论只写进三份 bench 文档**，design 由用户改（agent 只读）；原始产物写 `bench/raw/`（不进 git）。
-7. **代码只用 ASCII**：不要 `—`、`→`、`×`、`…`，改用 `-`、`->`、`x`、`...`。
-8. **注释 1-2 行**，只写不显然的约定；不复述代码；不按固定列宽硬换行；先写代码后写注释。
-
-## 10. 机器事实与构建
-
-- RX 6700S 8 GiB（`-dev Vulkan1`），设备总量 8176 MiB，桌面常占 0.5-1.4 GiB。
-- Ryzen 7 6800HS，RAM 40172 MiB（`bench/env/machine.txt`），电源「平衡」（`bench/env/power.txt`，AC）。
-- resident 门槛约 `21.28 x 1.25 + 1 = 27.6 GiB` 空闲内存；不足时 mmap，性能不可比。
-- 构建（MinGW + Ninja，不是 MSVC preset；目录按第 4 节每 agent 一份）：
-
-  ```
-  cmake -B build-<id> -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF \
-    -DCMAKE_C_COMPILER=D:/Scoop/apps/mingw/current/bin/gcc.exe \
-    -DCMAKE_CXX_COMPILER=D:/Scoop/apps/mingw/current/bin/g++.exe
-  cmake --build build-<id> -j 8
-  ```
-
-- Git Bash 里跑 `build-*/bin/*.exe` 前要 `export PATH="/d/Scoop/apps/mingw/current/bin:$PATH"`，
-  否则找不到 libstdc++/libgcc DLL，直接 exit 127。
-- 性能一律 Release/RelWithDebInfo。测试：`ctest --test-dir build-<id> --output-on-failure -C Release`。
-
-## 11. 仓库事实
-
-- backend 只有 **CPU 与 Vulkan**，两者之外的东西已物理删除，不要去找。
-- 模型只支持 **qwen35moe**（目标模型就是它），`llama_model_mapping()` 只有一个 case。
-- 仍在的组件：`src/` 的模型加载 / 图 / KV / 采样 / C API，`ggml/src/ggml-{cpu,vulkan}` 与调度器，
-  `common/` 的 CLI 与 `fit.cpp`，`tools/` 的 cli / server / llama-bench / mtmd / perplexity。
-- decode 主路径**不走**通用 `llama_context` 图（design 3.3）；可复用 GGUF 解析、Vulkan 设备初始化、
-  tokenizer 与块格式定义。`llama-moe-cache` 的调度与预取不复用（静态驻留不如动态 LRU）。
-- 可复用的内核与格式：Vulkan `mul_mat_vec` / `mul_mat_id`（要改成批量 k 版本）、
-  Q4_K / Q5_K / Q6_K / Q8_0 的块格式定义（`ggml-common.h`）。
-- tools 里的 `quantize`、`completion`、`batched-bench`、`fit-params`、`imatrix`、`tokenize` 等已删除。
-
-## 12. 参考
-
-- 新增模型：`docs/development/HOWTO-add-model.md`。
-- 构建：`docs/build.md`；解析/模板：`docs/development/parsing.md`、`common/jinja/README.md`。
-- 可复用工作流：`skills/` 目录，其中 `skills/code-review/SKILL.md` 在写代码前必读。
+`RESULTS.md` 的实测优先于 design 的估计；design 的数字必须在 `RESULTS.md` 有回链。
+完整表与"谁能改"在 `docs/agent/INDEX.md`；分层理由（L0 常驻 / L1 作用域 / L3 按需）与迁移记录在 `docs/agent/LAYOUT.md`。

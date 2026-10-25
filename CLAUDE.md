@@ -1,1 +1,1 @@
-IMPORTANT: Ensure you’ve thoroughly reviewed the [AGENTS.md](AGENTS.md) file before beginning any work.
+`AGENTS.md` 已由 harness 自动注入，本文件仅为兼容保留：内容一律以上述文件为准，此处不再重复。

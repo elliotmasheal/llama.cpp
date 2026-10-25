@@ -166,3 +166,7 @@ AGENTS.local.md
 /bench/longctx/
 /bench/state/quiet-*
 
+
+# agent local overlay (machine-specific, never shared)
+/AGENTS.local.md
+/CLAUDE.local.md

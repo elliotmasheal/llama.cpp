@@ -1,5 +1,5 @@
 {
-  "schema": 2,
+  "schema": 3,
   "track": "qwen36-runtime",
   "updated": "2026-10-25",
   "phase": "M2",
@@ -48,6 +48,22 @@
       "source": "bench/RESULTS.md sections 13-14 (R1b/R1c)"
     }
   },
+  "doc_budget": {
+    "agents_md_bytes": 8192,
+    "agents_md_lines": 140,
+    "docs": {
+      "runtime/AGENTS.md": 4096,
+      "docs/agent/INDEX.md": 4608,
+      "docs/agent/cycle.md": 4096,
+      "docs/agent/gates.md": 4096,
+      "docs/agent/resources.md": 5120,
+      "docs/agent/failures.md": 2560,
+      "docs/agent/build.md": 2048,
+      "docs/agent/repo-facts.md": 2048,
+      "bench/README.md": 6144
+    },
+    "note": "L0 AGENTS.md is injected every session; L1 <dir>/AGENTS.md is subtree scope; L3 docs/agent is read on demand. state_check.py --lint enforces every cap here plus index coverage."
+  },
   "resources": {
     "gpu": {
       "cap": 1,
@@ -81,16 +97,24 @@
         "host-ram",
         "machine-quiet"
       ],
+      "reads": [
+        "bench/README.md"
+      ],
       "desc": "runs the model or measures the machine; strictly serialized, one agent, one process at a time"
     },
     "impl": {
       "resources": [
         "machine-quiet"
       ],
+      "reads": [
+        "runtime/AGENTS.md",
+        "skills/code-review/SKILL.md"
+      ],
       "desc": "writes code and builds it; parallel across agents if paths are disjoint and no bench is running"
     },
     "data": {
       "resources": [],
+      "reads": [],
       "desc": "pure text and light CPU: prompts, vocab list, GGUF metadata, analysis, docs; never blocks anyone"
     },
     "io": {
@@ -98,10 +122,14 @@
         "machine-quiet",
         "disk-io"
       ],
+      "reads": [
+        "runtime/AGENTS.md"
+      ],
       "desc": "repack and large-file verification; exclusive with both bench and builds"
     },
     "user": {
       "resources": [],
+      "reads": [],
       "desc": "decisions only the user can make; an agent may prepare a one-page choice set, then stop"
     }
   },
@@ -1239,5 +1267,24 @@
     "detail": "backend-ops baseline is 2026-10-23 / 44bd79305 (ctest 32/32 there, 33/33 after 992c2f57a; M1-3c re-ran ctest 33/33). M1-3c touched only common/, so the backend-ops record still stands but is stale; rerun the full set before any ggml or backend change."
   },
   "blockers": [],
-  "escalations": []
+  "escalations": [
+    {
+      "id": "E-R1",
+      "state": "closed",
+      "resolved": "2026-10-25",
+      "decision": "DECISIONS.md#roofline-int8",
+      "question": "roofline 口径按 fp32 还是 int8 dot4 重算？M2-6b 实测稠密 GEMM 12.89 TFLOPS 已高于 design 的 fp32 roofline 7.06，而 0.85 x roofline 与 PP 判据都用它当分母",
+      "needs_by": "M2-7 整模型 PP 收口前",
+      "outcome": "int8 腿 roofline = 15.8 TOPS（FP32 7.9 x 2），0.85 x = 13.4；FP32 腿 7.9 / 6.7；纯算力 PP 上限 1936 tok/s，硬地板 1000 只要 45%"
+    },
+    {
+      "id": "E-E1",
+      "state": "closed",
+      "resolved": "2026-10-25",
+      "decision": "DECISIONS.md#expert-slot-per-layer",
+      "question": "design 5.1/5.3 的专家槽常数 1.84 MiB 是否改成按层分尺寸（1.812 / 1.945 / 2.195 MiB）？E-1 已定按层切分，但 design 仍是单一常数",
+      "needs_by": "M3 decode 开工前",
+      "outcome": "design 5.1（116-118）与 5.3（314/326）已按层分尺寸；1.84 只作摊平估算口径，不用于分配"
+    }
+  ]
 }
