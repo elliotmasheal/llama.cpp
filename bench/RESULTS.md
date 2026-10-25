@@ -2915,3 +2915,9 @@ CPU 双精度，K/V 平面取设备缓存按行格式反量化），`qrt --layer
   两端的幅度正常、逐层串联才发散；下一轮的第一件事是给 `--layer-check` 加"两层串联"用例
   （现在的检查每层都用自己的一份输入，串联本身没被验证过），第二件是用独立解码器复核
   `token_embd` 的行布局（gguf-py 因缺 pyyaml 未能直接导入，改用 numpy 手写）。
+- 2026-10-26 独立解码复核：用 gguf-py 的官方 q8_0 反量化（补一个 yaml 桩）重算 0 层 logits，
+  与 C++ 的 `--logits-layers 0` dump **逐元素相同**（max |py-rt| = 0.0000，top-1 172089，
+  logit 11.1927）。脚本 `bench/raw/m2-7a/refcheck.py`。**结论：embedding 行布局、final norm、
+  head 行布局与 q8_0 反量化都正确**，缺陷在"层与层之间"（每层自己的检查全过，但串联从未被验证）。
+  下一轮唯一入口：给 `--layer-check` 加一条两层串联腿（layer i 的 `qrt_layer_out` 直接喂 layer i+1，
+  对同一条 CPU 双精度链比），先把 2 层跑绿，再拉长到 40 层。
