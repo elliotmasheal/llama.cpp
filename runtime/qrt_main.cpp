@@ -1061,6 +1061,10 @@ static int qrt_vk_io_check(const qrt_config * cfg, const char * prefix) {
 }
 
 int main(int argc, char ** argv) {
+    // Unbuffered stdout: a device loss or an access violation kills the process before
+    // the CRT flushes, and every line already printed was being lost. That turned three
+    // debugging rounds on M2-6c into guesses (DECISIONS 56.1/56.2).
+    setvbuf(stdout, NULL, _IONBF, 0);
     int print_config = 0;
     int vk_info = 0;
     int vk_probe_mib = 0;
