@@ -1226,3 +1226,23 @@ qrt_dn_open 阶段以 0xC0000005 退出，**连 dn_device 一行都没输出**�
 
 **纪律**：本轮按新规约第 1 次失败即回滚到最后一个绿提交（313767f9d），未留半成品；
 gnorm 的 shader（含 m 字段）、host 侧缓冲与 CPU 参考的写法已在 RESULTS 57/58 与本节记录中可复原。
+
+### 56.2 gnorm 接线第 2 次尝试：仍崩溃，回滚（2026-10-25）
+
+**做了什么**：按 56.1 的首选怀疑（描述符池恰好用满）改成**复用 `prep_set`**（不再申请第 4 个 set，
+把池容量问题彻底绕开），同时给 prep/gate/gnorm 三个 pipeline 显式置 `pSpecializationInfo = nullptr`
+（它们此前继承了递推核的 spec 常量），并补齐 z / gnorm 两个缓冲与 `ssm_norm` 权重。
+
+**结果**：仍是 0xC0000005，且**没有任何输出**（stdout 缓冲吞掉了前半段，无法定位到行）。
+按新规约回滚到 313767f9d，工作树干净、检查仍全绿（递推 1.48e-07、prep、gate 均 PASS）。
+
+**第 3 次尝试前的排查计划（每条只做一件事，按代价排序）**
+1. **先把 stdout 变成无缓冲**（`setvbuf(stdout, NULL, _IONBF, 0)`），让崩溃点可见。
+   现在完全靠猜，这是最大的浪费，必须先做。
+2. `--vk-info` 与 `--deltanet-check --deltanet-tokens 16` 对比，确认崩溃是否只在 DeltaNet 路径。
+3. 二分：依次注释掉（a）gnorm pipeline 创建、（b）z 缓冲分配、（c）`ssm_norm` 权重加载。
+4. 若定位到 pipeline/描述符：同一个 set 被两个 pipeline 以不同 binding 语义复用是合法的，
+   但**必须先写完描述符再绑定**；检查 gnorm 的 4 个 binding 与 prep 残留绑定的先后顺序。
+
+**纪律备注**：两次尝试同属"结构性崩溃"这一族。第 3 次必须先拿到崩溃点（第 1 条），
+否则属盲试，按 DECISIONS 54 的约束不占额度。
