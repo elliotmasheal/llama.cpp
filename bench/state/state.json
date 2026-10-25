@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-6b",
+      "head": "X-1",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6b (Q8_0 dense GEMM) is the head; 6c/6d are the other two kernel slices, then M3-0"
+      "note": "X-1 (quality gate tool) is the head: it is the prerequisite for M2-7 and for any numerics decision. M2-6b stays partial (dense GEMM at 3.5 TFLOPS, cap is the q8_0 bit width); M2-6c/6d/6a are the other kernel slices"
     },
     {
       "lane": "data",
@@ -400,7 +400,8 @@
       "paths": [
         "bench/tools/quality/**"
       ],
-      "done_when": "一条命令输出 PPL | mean KLD | same top p | PASS/FAIL；基线落 bench/raw（不进 git）"
+      "done_when": "一条命令输出 PPL | mean KLD | same top p | PASS/FAIL；基线落 bench/raw（不进 git）",
+      "note": "plan (path 3 chosen by the user on 2026-10-25: finish M2-6c/6d/6a and M2-7 to get a real whole-model PP and KLD before any numerics decision). Layer 1 of the tool: read the fork's --save-all-logits dump (tools/perplexity/perplexity.cpp:144 process_logits(std::ostream&...), uint16 quantised log-probs, read that function before writing the parser) and compare two dumps: mean KLD, same top-1, PPL, first divergence + margin, PASS/FAIL at 1e-4. Layer 2: a runtime side dump (qwen36rt logits, binary f32). Layer 3: one command that runs the fork reference and the runtime and prints the report"
     },
     {
       "id": "X-2",

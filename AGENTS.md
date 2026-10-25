@@ -76,7 +76,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M2-6b data=- io=- user=-
+queues: bench=- impl=X-1 data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -161,6 +161,9 @@ blockers: none
   **2.63-2.64**（稠密）/ 3.2-3.5（落 L2），寄存器 tile 不是出路。PP 预算反算：专家 2.98 s +
   注意力 1.35 s 之后，稠密投影只剩 5.9 s -> 需 **5.2-5.4 TFLOPS**（现状 2.64）。用户已定
   **稠密不许降到 4 bit**，只能靠专用内核提高复用（RESULTS.md 第 49 节）。
+- **路径 3 已选（用户 2026-10-25）**：先不做稠密优化，把 M2-6c/6d/6a 与 M2-7 做完，拿到整模型
+  PP 与 KLD 再决定数值方案。队列头改为 **X-1**（质量门工具，M2-7 的前置）：读 fork 的
+  --save-all-logits 转储并输出 KLD / same top-1 / PPL / PASS，计划写在 state.json 的 X-1 note。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、
