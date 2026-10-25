@@ -1134,6 +1134,17 @@
         "bench/raw/m1-3e/**"
       ],
       "done_when": "按 U-7 的 0.05 nats 口径，两份 prompt x 128 token 的分叉率与分叉处 greedy margin 落表；任一 margin >= 0.05 的分叉即 fail"
+    },
+    {
+      "id": "U-8",
+      "milestone": "M2",
+      "lane": "user",
+      "status": "done",
+      "title": "U-8 已决：专家槽按层分尺寸（E-1）",
+      "deps": [],
+      "resources": [],
+      "paths": [],
+      "done_when": "用户 2026-10-25 定 B：槽字节 = 该层专家实际字节（1.812 / 1.945 / 2.195 MiB），4198 MiB 按层切分，仍只有一个缓存预算器；design 2.1/4.3/4.4 与 5.1 已按此改"
     }
   ],
   "last_gate": {
