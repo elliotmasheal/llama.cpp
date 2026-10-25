@@ -465,19 +465,13 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
             }
         }
 
-        // 5c) gated RMS norm against the reference; the norm vector comes straight from
-        // the GGUF into the layer's own device buffer
+        // 5c) gated RMS norm against the reference
         {
-            qrt_gguf * ng = NULL;
-            snprintf(name, sizeof(name), "blk.%u.ssm_norm.weight", layer);
-            std::vector<float> nw;
-            if (qrt_gguf_open(gguf_path, &ng, err, sizeof(err)) != 0 ||
-                read_tensor_f32(ng, name, &nw, err, sizeof(err)) != 0) {
+            qrt_dn_weights * gw = NULL;
+            if (qrt_dn_weights_load(dev, gguf_path, layer, &sh, &gw, err, sizeof(err)) != 0) {
                 fprintf(stderr, "qrt: %s\n", err);
-                qrt_gguf_close(ng);
                 break;
             }
-            qrt_gguf_close(ng);
             std::vector<float> yv((size_t) tokens * sh.d_inner), zv((size_t) sh.d_inner * tokens);
             for (size_t i = 0; i < yv.size(); ++i) {
                 yv[i] = (float) rng.gauss();
@@ -486,20 +480,21 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
                 zv[i] = (float) rng.gauss();
             }
             std::vector<float> og((size_t) tokens * sh.d_inner, 0.0f), oc(og.size());
-            if (qrt_vk_upload(dev, stg, b->ssm_norm_w, 0, nw.data(), nw.size() * 4, err,
-                              sizeof(err)) != 0 ||
-                qrt_vk_upload(dev, stg, b->y, 0, yv.data(), yv.size() * 4, err, sizeof(err)) != 0 ||
+            if (qrt_vk_upload(dev, stg, b->y, 0, yv.data(), yv.size() * 4, err, sizeof(err)) != 0 ||
                 qrt_vk_upload(dev, stg, b->z, 0, zv.data(), zv.size() * 4, err, sizeof(err)) != 0 ||
-                qrt_dn_gnorm_run(dn, tokens, err, sizeof(err)) != 0 ||
+                qrt_dn_gnorm_run(dn, gw, tokens, err, sizeof(err)) != 0 ||
                 qrt_vk_download(dev, stg, b->gnorm, 0, og.data(), og.size() * 4, err,
                                 sizeof(err)) != 0) {
+                qrt_dn_weights_free(dev, gw);
                 fprintf(stderr, "qrt: %s\n", err);
                 break;
             }
-            qrt_dn_gnorm_cpu(&sh, tokens, yv.data(), zv.data(), nw.data(), 1e-6f, oc.data());
+            qrt_dn_gnorm_cpu(&sh, tokens, yv.data(), zv.data(), qrt_dn_weights_host(gw, 5), 1e-6f,
+                             oc.data());
             double mo = 0.0;
             const double ro = rel_l1(og.data(), oc.data(), oc.size(), &mo);
             const double gn_ms = qrt_dn_last_ms(dn);
+            qrt_dn_weights_free(dev, gw);
             printf("dn_gnorm tokens=%u rel_l1=%.3e max_abs=%.3e ms=%.3f verdict=%s\n", tokens, ro,
                    mo, gn_ms, ro <= 1e-4 ? "PASS" : "FAIL");
             if (ro > 1e-4) {

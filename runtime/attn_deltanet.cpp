@@ -534,16 +534,23 @@ int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size
              : fail(err, err_size, "vkResetFences (deltanet) failed");
 }
 
+// Every device buffer a layer weight can own lives in one table, and the same table is
+// walked on free. The bug that cost five attempts on M2-6c was exactly this: the
+// allocation side grew while the free side kept a shorter table, so count 6 walked past
+// the end of it (DECISIONS 58).
+#define QRT_DN_MAX_WEIGHTS 8
+
 struct qrt_dn_weights {
     VkBuffer       conv_w;    // f32 [taps][conv_ch]
     VkBuffer       alpha_w;   // f32 [n_embd][n_v_heads]
     VkBuffer       beta_w;
     VkBuffer       dt;        // f32 [n_v_heads]
     VkBuffer       a;         // f32 [n_v_heads]
-    VkDeviceMemory mem[5];
+    VkBuffer       ssm_norm;  // f32 [head_dim], the sixth buffer
+    VkDeviceMemory mem[QRT_DN_MAX_WEIGHTS];
     uint32_t       count;
     // host copies, for the double precision references only
-    std::vector<float> h_conv, h_alpha, h_beta, h_dt, h_a;
+    std::vector<float> h_conv, h_alpha, h_beta, h_dt, h_a, h_norm;
 };
 
 static int dn_read_f32(qrt_gguf * g, const char * name, std::vector<float> * out, char * err,
@@ -590,6 +597,11 @@ int qrt_dn_weights_load(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer
         return -1;
     }
     const uint64_t bytes = buf.size() * 4;
+    if (w->count >= QRT_DN_MAX_WEIGHTS) {
+        snprintf(err, err_size, "the weight table holds %u buffers", QRT_DN_MAX_WEIGHTS);
+        free(w);
+        return -1;
+    }
     if (qrt_vk_alloc(dev, bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST |
                      QRT_VK_USAGE_TRANSFER_SRC, &w->conv_w, &w->mem[w->count], err,
                      err_size) != 0) {
@@ -609,14 +621,20 @@ int qrt_dn_weights_load(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer
         { ".ssm_beta.weight",  &w->beta_w,  &w->h_beta  },
         { ".ssm_dt.bias",      &w->dt,      &w->h_dt    },
         { ".ssm_a",            &w->a,       &w->h_a     },
+        { ".ssm_norm.weight",  &w->ssm_norm, &w->h_norm },
     };
-    for (uint32_t i = 0; i < 4 && grc == 0; ++i) {
+    for (uint32_t i = 0; i < 5 && grc == 0; ++i) {
         snprintf(name, sizeof(name), "blk.%u%s", layer, gate_w[i].suffix);
         grc = dn_read_f32(g, name, &buf, err, err_size);
         if (grc != 0) {
             break;
         }
         *gate_w[i].host = buf;
+        if (w->count >= QRT_DN_MAX_WEIGHTS) {
+            snprintf(err, err_size, "the weight table holds %u buffers", QRT_DN_MAX_WEIGHTS);
+            grc = -1;
+            break;
+        }
         if (qrt_vk_alloc(dev, buf.size() * 4, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
                          gate_w[i].dst, &w->mem[w->count], err, err_size) != 0) {
             grc = -1;
@@ -635,9 +653,10 @@ int qrt_dn_weights_load(qrt_vk_dev * dev, const char * gguf_path, uint32_t layer
             qrt_dn_weights_free(dev, w);
             return -1;
         }
-        const VkBuffer dsts[4] = { w->alpha_w, w->beta_w, w->dt, w->a };
-        const std::vector<float> * srcs[4] = { &w->h_alpha, &w->h_beta, &w->h_dt, &w->h_a };
-        for (uint32_t i = 0; i < 4 && grc == 0; ++i) {
+        const VkBuffer dsts[5] = { w->alpha_w, w->beta_w, w->dt, w->a, w->ssm_norm };
+        const std::vector<float> * srcs[5] = { &w->h_alpha, &w->h_beta, &w->h_dt, &w->h_a,
+                                               &w->h_norm };
+        for (uint32_t i = 0; i < 5 && grc == 0; ++i) {
             grc = qrt_vk_upload(dev, gstg, dsts[i], 0, srcs[i]->data(), srcs[i]->size() * 4,
                                 err, err_size);
         }
@@ -674,6 +693,7 @@ const float * qrt_dn_weights_host(const qrt_dn_weights * w, uint32_t which) {
         case 2: return w->h_beta.empty() ? NULL : w->h_beta.data();
         case 3: return w->h_dt.empty() ? NULL : w->h_dt.data();
         case 4: return w->h_a.empty() ? NULL : w->h_a.data();
+        case 5: return w->h_norm.empty() ? NULL : w->h_norm.data();
     }
     return NULL;
 }
@@ -682,8 +702,9 @@ void qrt_dn_weights_free(qrt_vk_dev * dev, qrt_dn_weights * w) {
     if (w == NULL) {
         return;
     }
-    const VkBuffer bufs[5] = { w->conv_w, w->alpha_w, w->beta_w, w->dt, w->a };
-    for (uint32_t i = 0; i < w->count && i < 5; ++i) {
+    const VkBuffer bufs[QRT_DN_MAX_WEIGHTS] = { w->conv_w, w->alpha_w, w->beta_w, w->dt, w->a,
+                                                w->ssm_norm };
+    for (uint32_t i = 0; i < w->count && i < QRT_DN_MAX_WEIGHTS; ++i) {
         if (w->mem[i] != VK_NULL_HANDLE) {
             qrt_vk_free(dev, bufs[i], w->mem[i]);
         }
@@ -837,12 +858,13 @@ int qrt_dn_gate_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens
              : fail(err, err_size, "vkResetFences (deltanet gate) failed");
 }
 
-int qrt_dn_gnorm_run(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size) {
+int qrt_dn_gnorm_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
+                     char * err, size_t err_size) {
     if (tokens == 0 || tokens > dn->max_tokens) {
         return fail(err, err_size, "gnorm chunk of %u tokens does not fit %u", tokens,
                     dn->max_tokens);
     }
-    const VkBuffer bufs[4] = { dn->bufs.y, dn->bufs.z, dn->bufs.ssm_norm_w, dn->gnorm_out };
+    const VkBuffer bufs[4] = { dn->bufs.y, dn->bufs.z, w->ssm_norm, dn->gnorm_out };
     VkDescriptorBufferInfo info[4];
     VkWriteDescriptorSet wr[4];
     memset(info, 0, sizeof(info));

@@ -88,9 +88,9 @@ int qrt_dn_prep_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens
 //   decay = exp(ssm_a * softplus(alpha + ssm_dt)), beta = sigmoid(beta_raw)
 int qrt_dn_gate_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
                     char * err, size_t err_size);
-// gnorm: out = rms_norm(y, eps) * ssm_norm * silu(z). The norm vector is a device buffer
-// owned by the layer object (qrt_dn_bufs.ssm_norm_w) so the weight loader never grows.
-int qrt_dn_gnorm_run(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size);
+// gnorm: out = rms_norm(y, eps) * ssm_norm * silu(z)
+int qrt_dn_gnorm_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
+                     char * err, size_t err_size);
 
 void qrt_dn_gnorm_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * y,
                       const float * z, const float * norm_w, float eps, float * out);
