@@ -1343,3 +1343,55 @@ r=2；`--prefill-chunks C` 是 prompt 的 chunk 数（C=5 即 10240 token 的 10
 **对 design 4.5 的影响**：那张"chunk vs PP"的表是按"每个 chunk 搬一次 480 MiB/层"算的；
 层优先跨 chunk 之后，专家搬运是**每 prompt 一次**，chunk 只影响计算侧的 tile 占用率。
 design 4.5 已按此加了一句说明（agent 按用户授权改）。
+
+## 45. M2-6 第一步：注意力与稠密部分的形状账，PP 口径补齐（2026-10-25）
+
+工具：`bench/tools/attn_account.py`（读 `qrt --gguf-index` 的张量表，纯形状乘积，不含测量）；
+输入 `bench/raw/m26-attn-20261025/gguf-tensors.csv`。这一步**不是**实现注意力内核，
+而是把"整模型 PP 还差多少、差在哪"用真实形状算清楚，避免继续用"注意力占比低"这类未经核对的说法。
+
+**形状（从张量表反推，全部可复核）**
+
+| 项 | 值 | 来源 |
+|---|---|---|
+| n_embd / head_dim | 2048 / 256 | `attn_norm`、`attn_q_norm` |
+| full-attn：n_head / n_kv | **16 / 2** | `attn_q` 输出 8192 = 2 x 16 x 256（QG 合投）、`attn_k` 512 |
+| DeltaNet：head_k / head_v / n_k_heads / n_v_heads | **128 / 128 / 16 / 32** | `ssm_norm`、`ssm_alpha`、`attn_qkv` 8192 |
+| DeltaNet conv1d | kernel **4**、通道 **8192** | `ssm_conv1d` ne0/ne1 |
+| 层数 | 41 = **30 DeltaNet + 11 full-attn** | 有 `ssm_a` / 有 `attn_k` |
+| 稠密权重 | DeltaNet 层 1195 MiB + full-attn 层 369 MiB = **1564 MiB** | 各层非 `_exps` 张量之和 |
+
+**每 token 的稠密 FLOPs（不含路由专家）**
+
+| 层类型 | MFLOP/token | 主要项 |
+|---|---:|---|
+| DeltaNet | **77.9** | qkv 33.6 + z 16.8 + out 16.8 + 共享专家 6.3 + 路由 1.0 + 递推 1.6 |
+| full-attn | **61.9** | QG 33.6 + KV 4.2 + o 16.8 + 共享专家 6.3 + 路由 1.0 |
+
+**10K prompt（10240 token）的三条腿**
+
+| 腿 | TFLOP | 占比 |
+|---|---:|---:|
+| 稠密投影（30 DeltaNet + 11 full-attn） | **30.91** | 50% |
+| 注意力本体（11 层 x 因果 QK^T + PV） | **9.45** | 15% |
+| 路由专家（实测，RESULTS 44） | **21.13** | 34% |
+| 合计 | **61.49** | 100% |
+
+**PP 口径（速率是假设，FLOPs 是形状乘积）**
+
+| 腿 | TFLOP | 假设速率 | 时间 |
+|---|---:|---:|---:|
+| 稠密 + 注意力 | 40.36 | 6.0 TFLOPS | 6.73 s |
+| 专家（实测 2976-2980 ms） | 21.13 | 7.1（实测） | 2.98 s |
+| **合计** | 61.49 | - | **9.70 s -> 1055 tok/s** |
+
+**结论（对 M2-6 的直接影响）**
+
+1. **稠密投影占 50% 的 FLOPs，是最大的一条腿**，比专家腿（34%）还大。design 4.5 的
+   "注意力占比低"只对**注意力本体**（15%）成立，对稠密投影不成立。
+2. 稠密权重是 **q8_0**，而运行时的 int8 GEMM 目前只有 Q4_K/Q5_K/Q6_K 三个变体 ——
+   **缺一个 Q8_0 x Q8_1 GEMM**，这是 M2-6 里最大的一块（30.9 TFLOP），必须补。
+3. 按 6 TFLOPS 的稠密速率，PP 只有 **1055 tok/s**，离 1000 的余量只有 5%；
+   稠密腿的实际速率决定 PP 能不能站稳，这要在内核落地后实测（现在是假设）。
+4. 注意力本体 9.45 TFLOP 在 10K prompt 上不算小（15%），flash 式批量内核仍然必要；
+   DeltaNet 的递推 FLOPs 很小（1.6 MFLOP/token）但**是串行的**，属于时延而非吞吐问题。

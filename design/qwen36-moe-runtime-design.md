@@ -341,7 +341,11 @@ k 默认 4 而不是 5 或 8：k=5 会把近分叉翻过去（U-7 / R9），k=8 
 - 计算量约 6 GFLOP/token，1000 tok/s 需要约 6 TFLOPS 有效算力，超过 RDNA2 FP32 实际能力，**必须用 int8 点积**（`V_DOT4_I32_I8`）的 Q4_K × Q8_1 GEMM。
 - 2048 token 时每层计算约 51 ms（6 TFLOPS 有效），大于上传 35.5 ms，传输被覆盖。
   **6 TFLOPS 有效算力是 PP 1000 的硬前提**；int8 点积已测到 6.08-6.20 TFLOPS（`RESULTS.md` 第 28 节）。
-- 注意力：DeltaNet 层为线性复杂度；full-attention 层的 10K 注意力计算占比低。
+- 注意力与稠密：按张量形状核算（`RESULTS.md` 第 45 节），10K prompt 的三条腿是
+  **稠密投影 30.9 TFLOP（50%）**、注意力本体 9.45 TFLOP（15%）、路由专家 21.1 TFLOP（34%）。
+  "full-attention 层的注意力计算占比低"只对注意力本体成立；**稠密投影是最大的一条腿**，
+  且稠密权重是 q8_0，需要单独的 Q8_0 x Q8_1 GEMM（M2-6b）。
+  DeltaNet 的递推 FLOPs 很小（1.6 MFLOP/token）但是串行的，属于时延问题。
 
 ### 4.6 每 pass 的执行模型
 

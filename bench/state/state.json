@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-6",
+      "head": "M3-0",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-5 is doing (prefill scheduler); M2-6 (attention) is the next runnable task in this lane"
+      "note": "M2-6 is doing (attention slices); M3-0 (expert cache) is the next runnable impl task since M2-3 is done"
     },
     {
       "lane": "data",
@@ -518,7 +518,7 @@
       "id": "M2-5",
       "milestone": "M2",
       "lane": "impl",
-      "status": "doing",
+      "status": "done",
       "title": "prefill 引擎：层优先分块 + 双缓冲上传",
       "deps": [
         "M2-3",
@@ -538,23 +538,28 @@
       ],
       "done_when": "chunk 可配；上传与计算重叠；compute 腿是 int8 GEMM（PP 有实测值）；失败可退化",
       "claimed_at": "2026-10-25T13:10:00",
-      "note": "steps 1-6: scheduler, mmap read path, Q4_K/Q5_K/Q6_K int8 GEMM, one submit per layer, layer double buffering, coalesced 16 MiB copies (RESULTS 37-43). step 7: the chunk loop moved inside the layer loop as design 4.5 asks, so experts are read once per prompt: 10K prompt expert leg 2976-2980 ms = 3436 tok/s at 7.09-7.10 TFLOPS (RESULTS 44, DECISIONS 41). Missing for a model PP: attention (M2-6) and the dense part; also the MoE output accumulation and the input Q8_1 quantization"
+      "note": "done: layer-first prefill with a staging ring (RESULTS 37), the store mmapped (38), Q4_K/Q5_K/Q6_K int8 GEMM as the compute leg (39/40), one submit per layer (41), layer double buffering (42), coalesced 16 MiB copies (43), and the chunk loop inside the layer loop so experts are read once per prompt (44). 10K prompt expert leg 2976-2980 ms = 3436 tok/s at 7.09-7.10 TFLOPS. The full-model PP number is M2-8; attention is M2-6"
     },
     {
       "id": "M2-6",
       "milestone": "M2",
       "lane": "impl",
-      "status": "todo",
+      "status": "doing",
       "title": "注意力路径：DeltaNet 递推 + full-attn 批量",
       "deps": [
         "M2-2",
         "M2-4"
       ],
-      "resources": [],
+      "resources": [
+        "gpu",
+        "machine-quiet"
+      ],
       "paths": [
         "runtime/attn.*"
       ],
-      "done_when": "k=1 prefill 与参考一致；full-attn 的 KV 只读一次；DeltaNet 状态与串行解码一致"
+      "done_when": "k=1 prefill 与参考一致；full-attn 的 KV 只读一次；DeltaNet 状态与串行解码一致；M2-6b/6c/6d 全部 done",
+      "claimed_at": "2026-10-25T16:30:00",
+      "note": "slice 1 done: the shape account in bench/tools/attn_account.py and RESULTS 45 shows the dense projections are 50% of the prompt FLOPs and the attention body 15%, so PP is 1055 tok/s at an assumed 6 TFLOPS dense rate. The kernel work is split into M2-6b (Q8_0 GEMM, the biggest), M2-6c (DeltaNet ops) and M2-6d (full attention); M2-6a is the KV quantisation"
     },
     {
       "id": "M2-7",
@@ -1158,6 +1163,57 @@
       "resources": [],
       "paths": [],
       "done_when": "用户 2026-10-25 定：层间双缓冲需要两块层缓冲（约 952 MiB），从 4198 MiB 的 decode 专家缓存区里借，prefill 不新增预算桶；decode 启动时按原计划重建缓存。design 5.5 已加这条复用说明"
+    },
+    {
+      "id": "M2-6b",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "Q8_0 x Q8_1 GEMM：稠密投影（30.9 TFLOP，PP 的最大一条腿）",
+      "deps": [
+        "M2-6"
+      ],
+      "resources": [
+        "gpu"
+      ],
+      "paths": [
+        "runtime/kernels/q8k_gemm.*"
+      ],
+      "done_when": "q8_0 权重 x q8_1 激活的 GEMM 对 CPU 参考 rel_L1 <= 1e-5；在 N=8192/K=2048/M=10240 的形状上 >= 5 TFLOPS；与 K-quant GEMM 共用记录/提交接口"
+    },
+    {
+      "id": "M2-6c",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "DeltaNet 算子：conv1d(4) + L2 norm + 递推 + gated RMS norm",
+      "deps": [
+        "M2-6b"
+      ],
+      "resources": [
+        "gpu"
+      ],
+      "paths": [
+        "runtime/attn_deltanet.*"
+      ],
+      "done_when": "单层 DeltaNet 前向对 CPU 参考逐元素一致（1e-4）；递推状态在 t 步串行解码与批量一致；conv1d 状态可保存/恢复"
+    },
+    {
+      "id": "M2-6d",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "full-attn 批量：per-head RMS norm + IMRoPE + flash 因果注意力 + sigmoid 门",
+      "deps": [
+        "M2-6b"
+      ],
+      "resources": [
+        "gpu"
+      ],
+      "paths": [
+        "runtime/attn_full.*"
+      ],
+      "done_when": "10K 因果注意力对 CPU 参考 rel_L1 <= 1e-4；KV 只读一次（每层一次 K/V 读）；IMRoPE 的 sections/freq 与参考一致"
     }
   ],
   "last_gate": {

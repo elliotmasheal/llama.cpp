@@ -76,7 +76,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M2-6 data=- io=- user=-
+queues: bench=- impl=M3-0 data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -138,6 +138,10 @@ blockers: none
   10K prompt 的**专家腿 2976-2980 ms = 3436 tok/s**，端到端 **7.09-7.10 TFLOPS**（0.85 roofline 是 7.06），
   搬运 92.5 -> 18.5 GiB/prompt。整模型 PP 还差注意力（M2-6）与稠密；
   见 `RESULTS.md` 第 44 节、`DECISIONS.md` 第 41 节。
+- **M2-6 形状账（2026-10-25）**：10K prompt 三条腿 = 稠密投影 **30.9 TFLOP（50%）**、
+  注意力本体 9.45（15%）、路由专家 21.1（34%）。按 6 TFLOPS 稠密速率 PP = **1055 tok/s**（余量 5%）。
+  M2-6 切成 M2-6b（Q8_0 GEMM，最大块）/6c（DeltaNet）/6d（full-attn）；见 RESULTS.md 第 45 节、
+  DECISIONS.md 第 42 节。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、
