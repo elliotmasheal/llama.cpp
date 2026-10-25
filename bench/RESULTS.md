@@ -2910,3 +2910,8 @@ CPU 双精度，K/V 平面取设备缓存按行格式反量化），`qrt --layer
 
 - L-KERN n/a（本轮不改已有数值路径）；`--selftest` 0 failed；`--layer-check` 仍 PASS。
 - 未做的：CPU 双精度参考的 logits 对比、`--logits-rows 512` 的 10K 档、分块 prefill 与跨 chunk KV。
+- 补充隔离（2026-10-26）：`qgate compare --align` 对 fork f16 臂读 **same top 0.000%、KLD 6.81**，
+  即完全错位而不是缩放错。0 / 1 / 40 层的 top logit 都在 11.2-11.3（量级稳定），说明 embedding+head
+  两端的幅度正常、逐层串联才发散；下一轮的第一件事是给 `--layer-check` 加"两层串联"用例
+  （现在的检查每层都用自己的一份输入，串联本身没被验证过），第二件是用独立解码器复核
+  `token_embd` 的行布局（gguf-py 因缺 pyyaml 未能直接导入，改用 numpy 手写）。
