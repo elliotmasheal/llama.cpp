@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "track": "qwen36-runtime",
-  "updated": "2026-10-25T15:48:08+08:00",
+  "updated": "2026-10-25T15:57:09+08:00",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -1229,7 +1229,7 @@
         "bench/DECISIONS.md"
       ],
       "done_when": "10K 因果注意力对 CPU 参考 rel_L1 <= 1e-4；KV 只读一次（每层一次 K/V 读）；IMRoPE 的 sections/freq 与参考一致",
-      "note": "partial 2026-10-25: correct and 1.99 TFLOPS at 10K (431-445 ms/layer, PP about 894). f16 packed arithmetic is CLOSED by measurement: a CPU probe that rounds operands to f16 and sums 8-product chunks in f16 gives rel_L1 9.1e-04 to 1.1e-03 against the 1e-4 gate (256/512 every row, 10240 sampled), i.e. 9-10x over, independent of length; the 1e-4 gate locks attention to f32 accumulation, whose peak is 7.2 TFLOPS. Also falsified this round: 2-row x 2-key register tiles (loads/FMA 1.25 -> 0.75) are neutral at 13.40 vs 13.38 ms at 2K, and 8-dim unroll, Bkv=32 with f16 K tile plus V from global, and vec4 Q reads are all worse. Load-count work is exhausted; the 2K wall is the per-block fixed cost (tile load, two barriers, 64-row softmax, a 16-key tile). Next entry: split head_dim across workgroups, but first measure the fixed cost per block with a load-and-barrier-only variant. RESULTS 64-66, DECISIONS 62/63/63.1/63.2"
+      "note": "partial 2026-10-25: correct, and the attention body is now 3.18 TFLOPS at 10K (270.5 ms/layer) by walking head_dim in two 128-dim passes inside one workgroup: the partial dots stay in registers, so the K tile holds half the dims and the key tile goes from 16 to 32; V is staged 8 keys at a time. Summing the legs (experts 2.98 + dense 2.4 + DeltaNet 1.37 + attention 2.98 = 9.73 s) puts PP at about 1052 tok/s, the first time the sum is over 1000. Cross-workgroup dim splitting was rejected with the reason recorded (the two partial dots would have to be summed through global memory per score block). f16 packed arithmetic stays closed (probe 9.1e-04 against the 1e-4 gate). Next candidates: Bkv 40 (28.4 KiB of shared memory, loads/FMA 0.50 -> 0.45) and Bq 128 with 512 threads. RESULTS 64-67, DECISIONS 62/63/63.1/63.2/63.3"
     }
   ],
   "last_gate": {

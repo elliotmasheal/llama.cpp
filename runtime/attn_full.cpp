@@ -307,9 +307,9 @@ int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes 
     // the attention kernel needs 27.5 KiB of shared memory per workgroup
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(dev->phys, &props);
-    if (props.limits.maxComputeSharedMemorySize < 30u * 1024u) {
+    if (props.limits.maxComputeSharedMemorySize < 22u * 1024u) {
         qrt_full_close(dev, f);
-        return fail(err, err_size, "the attention kernel needs 26624 bytes of shared memory, "
+        return fail(err, err_size, "the attention kernel needs 21760 bytes of shared memory, "
                     "this device has %u", props.limits.maxComputeSharedMemorySize);
     }
     if (make_set_layout(dev, 5, &f->attn_dsl, err, err_size) != 0 ||

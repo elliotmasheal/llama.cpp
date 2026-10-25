@@ -3,28 +3,29 @@
 
 // Flash-style causal attention over the f16 KV cache (M2-6d step 2).
 //
-// One workgroup is one (query head, query tile of 64) and 256 threads. The K tile is
-// staged in shared memory as transposed f16 pairs: the cache is token major, so a
-// lane-per-key read of that layout would hit one bank sixteen ways, and storing the
-// pair word against the key removes both the transpose and the conflict. V is read
-// straight from the cache: phase 2 wants one row of 256 channels per key, which is
-// already coalesced.
+// One workgroup is one (query head, query tile of 64) with 256 threads. head_dim is 256,
+// which does not fit two shared-memory tiles at once on this device (32768 B), so the
+// 256 dims are walked as **two 128-dim passes**: the partial dot products stay in
+// registers, the K tile holds one half at a time (8.4 KiB for 32 keys), and the space
+// that frees lets the key tile be 32 instead of 16. The same trick keeps V cheap: V is
+// staged in sub-blocks of 8 keys (4 KiB), which is what the accumulate phase needs at a
+// time. Splitting the dims across *workgroups* instead would need the two partial dots
+// summed across workgroups, i.e. a global round trip per score block, so the split is
+// inside one workgroup on purpose.
 //
 // Per KV block of 32 keys:
-//   scores  S[t][u] = qscale * sum_d Q[t][d] K[u][d]    4 rows x 2 keys per thread
+//   scores  S[t][u] = qscale * sum_d Q[t][d] K[u][d]    2 rows x 4 keys, two dim passes
 //   softmax online:  m, l per row, P = exp(S - m), rescale O by exp(m_old - m)
-//   accumulate       O[t][d] += sum_u P[t][u] V[u][d]   8 rows x 8 channels per thread
+//   accumulate       O[t][d] += sum_u P[t][u] V[u][d]   8 rows x 8 channels, 8-key V blocks
 // then O/l and the sigmoid gate that the joint QG projection carries.
-//
-// head_dim is fixed at 256 and the tiles at 64 x 32: shared memory is 26 KiB, inside
-// this device's 32768 B. qrt_full_open() checks that limit instead of overrunning it.
 
 layout(local_size_x = 256) in;
 
 const uint HD  = 256;   // head_dim
 const uint BQ  = 64;    // query rows per workgroup
-const uint BKV = 16;    // keys per tile
+const uint BKV = 32;    // keys per tile
 const uint KPAD = BKV + 1;              // padding: transposed reads stay conflict free
+const uint VSUB = 8;    // keys staged at a time for the accumulate phase
 const uint NH  = 16;    // n_head
 const uint NKV = 2;     // n_kv
 
@@ -42,8 +43,8 @@ layout(binding = 2) readonly  buffer VcBuf { uint  vc[];  };   // f16 pairs
 layout(binding = 3) writeonly buffer OutBuf{ float dst[]; };   // [token][NH*HD]
 layout(binding = 4) readonly  buffer QgBuf { float qg[];  };   // [token][qg_ch]
 
-shared float kt[HD * KPAD];         // [d][u], transposed
-shared uint  vt[BKV * (HD / 2u)];   // [u][d/2]
+shared uint  kt[(HD / 4u) * KPAD];  // [d/2][u] of one 128-dim half, transposed pair words
+shared uint  vt[VSUB * (HD / 2u)];  // [u][d/2] of VSUB keys
 shared float sc[BQ * KPAD + BQ];    // [t][u] then the per-row rescale factors
 shared float ml[2 * BQ];            // m[0..BQ), l[BQ..2BQ)
 
@@ -61,9 +62,9 @@ void main() {
     // thread -> 8 query rows x 8 channels for the accumulator
     const uint r0 = 8u * (tid >> 5u);
     const uint d0 = 8u * (tid & 31u);
-    // thread -> 4 query rows x 1 key for the scores
-    const uint sr0 = 4u * (tid >> 4u);
-    const uint sk  = tid & 15u;
+    // thread -> 2 query rows x 4 keys for the scores
+    const uint sr0 = 2u * (tid >> 3u);
+    const uint sk  = 4u * (tid & 7u);
 
     if (tid < BQ) {
         ml[tid]      = -1e30f;
@@ -79,52 +80,54 @@ void main() {
     for (uint kb = 0; kb < nkb; ++kb) {
         const uint kbase = kb * BKV;
 
-        // one read of the KV tile: the cache is token major, K is transposed on the way in
-        for (uint idx = tid; idx < BKV * (HD / 2u); idx += 256u) {
-            const uint u  = idx / (HD / 2u);
-            const uint dp = idx % (HD / 2u);
-            const uint kpos = kbase + u;
-            uint word = 0u;
-            uint wordv = 0u;
-            if (kpos < pos_end) {
-                word  = kc[(kvh * pc.kv_cap + kpos) * (HD / 2u) + dp];
-                wordv = vc[(kvh * pc.kv_cap + kpos) * (HD / 2u) + dp];
-            }
-            vt[idx] = wordv;
-            const vec2 h = unpackHalf2x16(word);
-            kt[(2u * dp) * KPAD + u]      = h.x;
-            kt[(2u * dp + 1u) * KPAD + u] = h.y;
-        }
-        barrier();
-
-        // scores: four query rows against two keys, four dims per step so the loads of
-        // a step are independent and overlap their latency
-        float s[4];
-        [[unroll]] for (uint i = 0; i < 4u; ++i) {
+        // scores in two dim passes; the K half tile is (128 dims) x (32 keys) of pair words
+        float s[8];
+        [[unroll]] for (uint i = 0; i < 8u; ++i) {
             s[i] = 0.0f;
         }
         const uint qb0 = ((q0 + sr0 + 0u) * NH + head) * HD;
         const uint qb1 = ((q0 + sr0 + 1u) * NH + head) * HD;
-        const uint qb2 = ((q0 + sr0 + 2u) * NH + head) * HD;
-        const uint qb3 = ((q0 + sr0 + 3u) * NH + head) * HD;
-        for (uint d = 0; d < HD; d += 4u) {
-            const float k0 = kt[(d + 0u) * KPAD + sk];
-            const float k1 = kt[(d + 1u) * KPAD + sk];
-            const float k2 = kt[(d + 2u) * KPAD + sk];
-            const float k3 = kt[(d + 3u) * KPAD + sk];
-            const float a0 = q[qb0 + d], a1 = q[qb0 + d + 1u], a2 = q[qb0 + d + 2u], a3 = q[qb0 + d + 3u];
-            const float b0 = q[qb1 + d], b1 = q[qb1 + d + 1u], b2 = q[qb1 + d + 2u], b3 = q[qb1 + d + 3u];
-            const float c0 = q[qb2 + d], c1 = q[qb2 + d + 1u], c2 = q[qb2 + d + 2u], c3 = q[qb2 + d + 3u];
-            const float e0 = q[qb3 + d], e1 = q[qb3 + d + 1u], e2 = q[qb3 + d + 2u], e3 = q[qb3 + d + 3u];
-            s[0] += a0 * k0; s[0] += a1 * k1; s[0] += a2 * k2; s[0] += a3 * k3;
-            s[1] += b0 * k0; s[1] += b1 * k1; s[1] += b2 * k2; s[1] += b3 * k3;
-            s[2] += c0 * k0; s[2] += c1 * k1; s[2] += c2 * k2; s[2] += c3 * k3;
-            s[3] += e0 * k0; s[3] += e1 * k1; s[3] += e2 * k2; s[3] += e3 * k3;
+        for (uint hf = 0; hf < 2u; ++hf) {
+            const uint dbase = hf * 128u;
+            for (uint idx = tid; idx < (HD / 4u) * BKV; idx += 256u) {
+                const uint dp = idx / BKV;          // pair index inside the half
+                const uint u  = idx % BKV;
+                const uint kpos = kbase + u;
+                kt[dp * KPAD + u] = kpos < pos_end
+                    ? kc[(kvh * pc.kv_cap + kpos) * (HD / 2u) + dbase / 2u + dp]
+                    : 0u;
+            }
+            barrier();
+            for (uint dl = 0; dl < 128u; dl += 4u) {
+                const vec2 a0 = unpackHalf2x16(kt[(dl / 2u) * KPAD + sk + 0u]);
+                const vec2 a1 = unpackHalf2x16(kt[(dl / 2u) * KPAD + sk + 1u]);
+                const vec2 a2 = unpackHalf2x16(kt[(dl / 2u) * KPAD + sk + 2u]);
+                const vec2 a3 = unpackHalf2x16(kt[(dl / 2u) * KPAD + sk + 3u]);
+                const vec2 b0 = unpackHalf2x16(kt[(dl / 2u + 1u) * KPAD + sk + 0u]);
+                const vec2 b1 = unpackHalf2x16(kt[(dl / 2u + 1u) * KPAD + sk + 1u]);
+                const vec2 b2 = unpackHalf2x16(kt[(dl / 2u + 1u) * KPAD + sk + 2u]);
+                const vec2 b3 = unpackHalf2x16(kt[(dl / 2u + 1u) * KPAD + sk + 3u]);
+                const uint g = dbase + dl;
+                const float a_0 = q[qb0 + g], a_1 = q[qb0 + g + 1u], a_2 = q[qb0 + g + 2u], a_3 = q[qb0 + g + 3u];
+                const float b_0 = q[qb1 + g], b_1 = q[qb1 + g + 1u], b_2 = q[qb1 + g + 2u], b_3 = q[qb1 + g + 3u];
+                s[0] += a_0 * a0.x; s[0] += a_1 * a0.y; s[0] += a_2 * b0.x; s[0] += a_3 * b0.y;
+                s[1] += a_0 * a1.x; s[1] += a_1 * a1.y; s[1] += a_2 * b1.x; s[1] += a_3 * b1.y;
+                s[2] += a_0 * a2.x; s[2] += a_1 * a2.y; s[2] += a_2 * b2.x; s[2] += a_3 * b2.y;
+                s[3] += a_0 * a3.x; s[3] += a_1 * a3.y; s[3] += a_2 * b3.x; s[3] += a_3 * b3.y;
+                s[4] += b_0 * a0.x; s[4] += b_1 * a0.y; s[4] += b_2 * b0.x; s[4] += b_3 * b0.y;
+                s[5] += b_0 * a1.x; s[5] += b_1 * a1.y; s[5] += b_2 * b1.x; s[5] += b_3 * b1.y;
+                s[6] += b_0 * a2.x; s[6] += b_1 * a2.y; s[6] += b_2 * b2.x; s[6] += b_3 * b2.y;
+                s[7] += b_0 * a3.x; s[7] += b_1 * a3.y; s[7] += b_2 * b3.x; s[7] += b_3 * b3.y;
+            }
+            barrier();
         }
-        [[unroll]] for (uint r = 0; r < 4u; ++r) {
+        [[unroll]] for (uint r = 0; r < 2u; ++r) {
             const uint pos_q = pc.pos0 + q0 + sr0 + r;
-            const uint pos_k = kbase + sk;
-            sc[(sr0 + r) * KPAD + sk] = (pos_k <= pos_q) ? s[r] * pc.kq_scale : -1e30f;
+            [[unroll]] for (uint j = 0; j < 4u; ++j) {
+                const uint pos_k = kbase + sk + j;
+                sc[(sr0 + r) * KPAD + sk + j] =
+                    (pos_k <= pos_q) ? s[4u * r + j] * pc.kq_scale : -1e30f;
+            }
         }
         barrier();
 
@@ -149,31 +152,40 @@ void main() {
         }
         barrier();
 
-        // rescale the running output, then O += P V
+        // rescale the running output once per block, then add this block's keys in
+        // sub-blocks of VSUB so V needs only 4 KiB of shared memory
         [[unroll]] for (uint r = 0; r < 8u; ++r) {
             const float f = sc[BQ * KPAD + r0 + r];
             [[unroll]] for (uint j = 0; j < 8u; ++j) {
                 o[r * 8u + j] *= f;
             }
         }
-
-        for (uint u = 0; u < BKV; ++u) {
-            float v[8];
-            const uint base = u * (HD / 2u) + d0 / 2u;
-            [[unroll]] for (uint j = 0; j < 4u; ++j) {
-                const vec2 h = unpackHalf2x16(vt[base + j]);
-                v[2u * j]      = h.x;
-                v[2u * j + 1u] = h.y;
+        for (uint vs = 0; vs < BKV / VSUB; ++vs) {
+            const uint u0 = vs * VSUB;
+            for (uint idx = tid; idx < VSUB * (HD / 2u); idx += 256u) {
+                const uint u  = idx / (HD / 2u);
+                const uint dp = idx % (HD / 2u);
+                const uint kpos = kbase + u0 + u;
+                vt[idx] = kpos < pos_end ? vc[(kvh * pc.kv_cap + kpos) * (HD / 2u) + dp] : 0u;
             }
-
-            [[unroll]] for (uint r = 0; r < 8u; ++r) {
-                const float p = sc[(r0 + r) * KPAD + u];
-                [[unroll]] for (uint j = 0; j < 8u; ++j) {
-                    o[r * 8u + j] += p * v[j];
+            barrier();
+            for (uint u = 0; u < VSUB; ++u) {
+                float v[8];
+                const uint base = u * (HD / 2u) + d0 / 2u;
+                [[unroll]] for (uint j = 0; j < 4u; ++j) {
+                    const vec2 h = unpackHalf2x16(vt[base + j]);
+                    v[2u * j]      = h.x;
+                    v[2u * j + 1u] = h.y;
+                }
+                [[unroll]] for (uint r = 0; r < 8u; ++r) {
+                    const float p = sc[(r0 + r) * KPAD + u0 + u];
+                    [[unroll]] for (uint j = 0; j < 8u; ++j) {
+                        o[r * 8u + j] += p * v[j];
+                    }
                 }
             }
+            barrier();
         }
-        barrier();
     }
 
     // write out: divide by the softmax mass, then the gate
@@ -188,5 +200,4 @@ void main() {
             }
         }
     }
-
 }
