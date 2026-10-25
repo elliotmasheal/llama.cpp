@@ -262,6 +262,31 @@ build-vulkan/bin/qrt.exe --deltanet-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL.
   passed as a specialization constant, and the kernel refuses shapes it cannot tile. The
   `cols` variant is only built for `head_dim % 32 == 0`; otherwise the serial one is used.
 
+## RMS norm and Q8_1 pack (M2-6, first piece of the layer chain)
+
+```
+build-vulkan/bin/qrt.exe --norm-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+build-vulkan/bin/qrt.exe --norm-check <gguf> --norm-tensor blk.0.attn_norm.weight --dense-tokens 512
+```
+
+- `--norm-check` runs the three steps the layer chain will run in this order and gates all
+  three: the normalised row against a double reference, the Q8_1 planes against the same
+  quantiser, and the dense projection computed from the device planes
+  (`--dense-tensor`, default `blk.3.attn_q.weight`; `--norm-tensor`, default
+  `blk.3.attn_norm.weight`; `--dense-tokens`, default 10240).
+- Output layout is the one `kernels/gemm.h` documents: `qs` is 32 int8 per 32-element block
+  in uvec4 pairs, `ds` is one word per block with the f16 delta low and `sum(q) + 32768`
+  high, so the GEMM reads the planes without a repack.
+- **Never use `packHalf2x16` for a delta here.** This driver lowers it to `v_cvt_pkrtz`,
+  which rounds toward zero: half the deltas came out one half ULP below ggml's
+  `quantize_row_q8_1` before the shader started converting with an explicit
+  round-to-nearest-even sequence (RESULTS 69, DECISIONS 64.1).
+- Speed at 10K tokens: 1.37-1.72 ms per call (0.134-0.168 us per token, 111-140 GB/s moved),
+  512 tokens is launch bound at 0.19 ms. Two norm sites per layer cost about 0.12 s of a
+  10K prompt, i.e. under 1% of the PP budget.
+- The caller owns every buffer, so the chain passes the same planes to the GEMM; the module
+  only owns its pipeline and two command rings.
+
 ## Telemetry
 
 `--telemetry 1 --telemetry-path <file>` writes a CSV with this header:
@@ -290,7 +315,9 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `weights.h/.cpp` | repacked expert store (index page table, expert reads) and dense residency |
 | `prefill.h/.cpp` | layer-first prefill scheduler, staging ring, read-probe compute leg |
 | `attn_deltanet.h/.cpp`, `attn_deltanet_check.cpp` | DeltaNet delta-rule recurrence (M2-6c) and its CPU reference |
+| `attn_full.h/.cpp`, `attn_full_check.cpp` | full attention: per-head norm + IMRoPE + flash causal + gate (M2-6d) |
+| `kernels/norm.h/.cpp` | RMS norm + Q8_1 activation pack (M2-6), the dense GEMM's activation leg |
 | `kernels/q4k_gemm.*` | Q4_K x Q8_1 int8 GEMM and swiglu+Q8_1 kernels, one submit per call |
 | `kernels/moe_expert.*` | one expert's gate/up/swiglu/down as a prefill compute callback |
-| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check`, `--dense-check`, `--prefill-check`, `--moe-check` |
+| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check`, `--dense-check`, `--prefill-check`, `--moe-check`, `--dense-gemm-check`, `--norm-check` |
 | `CMakeLists.txt` | `qrt_core`, `qrt`, `qrt_selftest` |

@@ -1,16 +1,22 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : enable
 // RMS norm of one token row, optionally followed by the Q8_1 activation packing the dense
-// GEMM eats (M2-6c step 2). One workgroup per token: 128 threads reduce the row, scale it,
-// then each thread quantises one 32-element block. The planes match kernels/gemm.h:
-// qs is 32 int8 per block in uvec4 pairs, ds is one word per block with the f16 delta in
-// the low half and sum(q) + 32768 in the high half.
+// GEMM eats (M2-6 layer chain, first piece). One workgroup per token: 128 threads reduce
+// the row, scale it, then each thread quantises one 32-element block. The planes match
+// kernels/gemm.h: qs is 32 int8 per block in uvec4 pairs, ds is one word per block with the
+// f16 delta in the low half and sum(q) + 32768 in the high half.
+//
+// The rounding is round-half-away-from-zero, the rule ggml's quantize_row_q8_1 uses; GLSL
+// round() is round-half-to-even and would disagree on exact ties.
 
 layout(local_size_x = 128) in;
 
 layout(push_constant) uniform PC {
-    uint  k;        // row length, multiple of 128 * 32
+    uint  k;        // row length, multiple of 32
     uint  xbase;    // first element of token 0 in x
     uint  obase;    // first element of token 0 in xnorm
+    uint  qsbase;   // first uvec4 of token 0 in qs
+    uint  dsbase;   // first word of token 0 in ds
     float eps;
     uint  do_quant; // 0 = norm only
 } pc;
@@ -22,6 +28,50 @@ layout(binding = 3) writeonly buffer QsBuf  { uvec4 qs[]; } qsb;
 layout(binding = 4) writeonly buffer DsBuf  { uint ds[]; } dsb;
 
 shared float red[128];
+
+// Round-to-nearest-even fp32 -> binary16. packHalf2x16 is not usable here: this driver
+// lowers it to v_cvt_pkrtz, which rounds toward zero, and the delta then sits one half
+// ULP below what ggml's quantize_row_q8_1 writes (RESULTS 69).
+uint f32_to_f16_rne(float f) {
+    const uint x    = floatBitsToUint(f);
+    const uint sign = (x >> 16) & 0x8000u;
+    const uint mag  = x & 0x7FFFFFFFu;
+    if (mag >= 0x7F800000u) {
+        return sign | (mag > 0x7F800000u ? 0x7E00u : 0x7C00u);
+    }
+    if (mag >= 0x47800000u) {
+        return sign | 0x7C00u;
+    }
+    if (mag < 0x38800000u) {
+        if (mag < 0x33000000u) {
+            return sign;
+        }
+        const uint shift = 126u - (mag >> 23);
+        const uint mant  = (mag & 0x7FFFFFu) | 0x800000u;
+        uint q = mant >> shift;
+        const uint rem  = mant & ((1u << shift) - 1u);
+        const uint hstep = 1u << (shift - 1u);
+        if (rem > hstep || (rem == hstep && (q & 1u) != 0u)) {
+            q++;
+        }
+        return sign | q;
+    }
+    uint mant = mag & 0x7FFFFFu;
+    uint exp  = ((mag >> 23) - 127u) + 15u;
+    const uint rem = mant & 0x1FFFu;
+    mant >>= 13;
+    if (rem > 0x1000u || (rem == 0x1000u && (mant & 1u) != 0u)) {
+        mant++;
+        if (mant == 0x400u) {
+            mant = 0u;
+            exp++;
+            if (exp >= 31u) {
+                return sign | 0x7C00u;
+            }
+        }
+    }
+    return sign | (exp << 10u) | mant;
+}
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
@@ -43,30 +93,33 @@ void main() {
     }
     const float scale = 1.0 / sqrt(red[0] / float(pc.k) + pc.eps);
 
-    const uint ob = pc.obase + tok * pc.k;
+    const uint o0 = pc.obase + tok * pc.k;
     for (uint i = tid; i < pc.k; i += 128u) {
-        ob.o[ob + i] = xb.x[base + i] * scale * wb.w[i];
+        ob.o[o0 + i] = xb.x[base + i] * scale * wb.w[i];
     }
     if (pc.do_quant == 0u) {
         return;
     }
 
-    // one thread per 32-element block of the normalised row
-    barrier();
+    // One thread per 32-element block of the normalised row. The row is recomputed
+    // instead of read back: out is writeonly, and another invocation wrote those slots.
     const uint blocks = pc.k / 32u;
     for (uint b = tid; b < blocks; b += 128u) {
         float v[32];
         float mx = 0.0;
         [[unroll]] for (uint i = 0; i < 32u; ++i) {
-            v[i] = ob.o[ob + b * 32u + i];
+            const uint j = b * 32u + i;
+            v[i] = xb.x[base + j] * scale * wb.w[j];
             mx = max(mx, abs(v[i]));
         }
         const float d = mx / 127.0;
         const float inv = d > 0.0 ? 1.0 / d : 0.0;
         int sum = 0;
         [[unroll]] for (uint i = 0; i < 32u; ++i) {
-            v[i] = clamp(round(v[i] * inv), -127.0, 127.0);
-            sum += int(v[i]);
+            float y = clamp(v[i] * inv, -127.0, 127.0);
+            y = sign(y) * floor(abs(y) + 0.5);
+            v[i] = y;
+            sum += int(y);
         }
         uvec4 lo;
         uvec4 hi;
@@ -80,10 +133,10 @@ void main() {
                     ((uint(int(v[16u + i * 4u + 2u])) & 0xFFu) << 16) |
                     ((uint(int(v[16u + i * 4u + 3u])) & 0xFFu) << 24);
         }
-        const uint ab = tok * blocks + b;
+        const uint ab = pc.qsbase + tok * blocks + b;
         qsb.qs[ab * 2u] = lo;
         qsb.qs[ab * 2u + 1u] = hi;
-        const uint dh = packHalf2x16(vec2(d, 0.0));
-        dsb.ds[ab] = (dh & 0xFFFFu) | (uint(sum + 32768) << 16);
+        const uint dh = f32_to_f16_rne(d);
+        dsb.ds[pc.dsbase + tok * blocks + b] = (dh & 0xFFFFu) | (uint(sum + 32768) << 16);
     }
 }

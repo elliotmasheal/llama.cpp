@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "track": "qwen36-runtime",
-  "updated": "2026-10-25T16:05:51+08:00",
+  "updated": "2026-10-25",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -560,8 +560,8 @@
         "runtime/attn.*"
       ],
       "done_when": "k=1 prefill 与参考一致；full-attn 的 KV 只读一次；DeltaNet 状态与串行解码一致；M2-6b/6c/6d 全部 done",
-      "claimed_at": "2026-10-25T16:30:00",
-      "note": "running 2026-10-25: the three slices are done (6b q8_0 dense GEMM 12.89 TFLOPS, 6c DeltaNet 4.94-5.19 us/token chained, 6d full-attn 3.18 TFLOPS). The cement is the layer chain: for each layer rmsnorm -> projections (q8_0 GEMM) -> linear or full attention path -> post norm -> shared expert + routed MoE -> residual. It needs one missing piece first: an rmsnorm + Q8_1 activation quantize kernel, because the q8_0 GEMM takes pre-quantized qs/ds planes and today only the checks build those on the host. The chain must be verified per layer against a CPU reference, not only per kernel (DECISIONS 63.4). Also open: the conv weight buffer defect from 63.4"
+      "claimed_at": "2026-10-25T16:27:06",
+      "note": "running 2026-10-25: the three slices are done (6b q8_0 dense GEMM 12.89 TFLOPS, 6c DeltaNet 4.94-5.19 us/token chained, 6d full-attn 3.18 TFLOPS). First piece of the cement landed: kernels/norm.* + qrt_norm.comp do rmsnorm plus the Q8_1 pack in the gemm.h layout, checked as a chain against one double reference (row 3.93e-08, planes 80/655360 blocks off by 1, GEMM on the device planes 1.25e-07) at 1.37-1.72 ms per 10K layer, 13.4 TFLOPS for the projection it feeds. It also closed a real defect: packHalf2x16 is v_cvt_pkrtz on this driver (326917 deltas one half ULP low), fixed with an explicit RNE conversion (RESULTS 69, DECISIONS 64/64.1). Still open: one command buffer per layer (norm and GEMM submit separately today), the conv weight buffer defect from 63.4, and the per-layer chain against a CPU reference for blk.0 and blk.3"
     },
     {
       "id": "M2-7",
