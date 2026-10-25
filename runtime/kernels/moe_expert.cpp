@@ -100,6 +100,16 @@ struct qrt_moe {
     VkDeviceMemory u_out_mem;
     VkBuffer      o_out;
     VkDeviceMemory o_out_mem;
+    // Layer batch: one plane buffer for every expert's swiglu output and a handful of
+    // output slices, so the dispatches of a whole layer can share one submit.
+    VkBuffer      hb_qs;
+    VkDeviceMemory hb_qs_mem;
+    VkBuffer      hb_ds;
+    VkDeviceMemory hb_ds_mem;
+    VkBuffer      o_multi;
+    VkDeviceMemory o_multi_mem;
+    uint32_t      max_experts;
+    uint32_t      o_slices;
 };
 
 static int make_dev_buffer(qrt_vk_dev * dev, uint64_t bytes, VkBuffer * buf,
@@ -135,6 +145,11 @@ int qrt_moe_open(qrt_vk_dev * dev, qrt_weights * w, const char * spv_dir,
     const uint64_t h_ds_bytes = (uint64_t) t * (cfg->ffn / 32) * 4;
     const uint64_t g_bytes    = (uint64_t) t * cfg->ffn * 4;
     const uint64_t o_bytes    = (uint64_t) t * cfg->hidden * 4;
+    m->max_experts = qrt_weights_experts(w);
+    m->o_slices    = 8;
+    const uint64_t hb_qs_bytes = (uint64_t) m->max_experts * t * cfg->ffn;
+    const uint64_t hb_ds_bytes = (uint64_t) m->max_experts * t * (cfg->ffn / 32) * 4;
+    const uint64_t om_bytes    = (uint64_t) m->o_slices * o_bytes;
     const struct {
         uint64_t bytes;
         VkBuffer * buf;
@@ -148,6 +163,9 @@ int qrt_moe_open(qrt_vk_dev * dev, qrt_weights * w, const char * spv_dir,
         { g_bytes,    &m->g_out, &m->g_out_mem, "gate output" },
         { g_bytes,    &m->u_out, &m->u_out_mem, "up output" },
         { o_bytes,    &m->o_out, &m->o_out_mem, "expert output" },
+        { hb_qs_bytes, &m->hb_qs, &m->hb_qs_mem, "layer hidden qs planes" },
+        { hb_ds_bytes, &m->hb_ds, &m->hb_ds_mem, "layer hidden ds plane" },
+        { om_bytes,    &m->o_multi, &m->o_multi_mem, "layer output slices" },
     };
     for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); ++i) {
         // The plane buffers are rounded up to the allocation granularity the driver asks
@@ -201,6 +219,8 @@ void qrt_moe_close(qrt_vk_dev * dev, qrt_moe * m) {
             { &m->h_qs, &m->h_qs_mem }, { &m->h_ds, &m->h_ds_mem },
             { &m->g_out, &m->g_out_mem }, { &m->u_out, &m->u_out_mem },
             { &m->o_out, &m->o_out_mem },
+            { &m->hb_qs, &m->hb_qs_mem }, { &m->hb_ds, &m->hb_ds_mem },
+            { &m->o_multi, &m->o_multi_mem },
         };
         for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); ++i) {
             if (*bufs[i].mem != VK_NULL_HANDLE) {
@@ -296,7 +316,7 @@ int qrt_moe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
     if (qrt_gemm_begin(m->gemm, err, err_size) != 0 ||
         qrt_gemm_record(m->gemm, &gate, err, err_size) != 0 ||
         qrt_gemm_record(m->gemm, &up, err, err_size) != 0 ||
-        qrt_gemm_record_swiglu(m->gemm, m->g_out, m->u_out, m->h_qs, m->h_ds, t, ffn,
+        qrt_gemm_record_swiglu(m->gemm, m->g_out, m->u_out, m->h_qs, m->h_ds, t, ffn, 0, 0,
                               err, err_size) != 0 ||
         qrt_gemm_record(m->gemm, &down, err, err_size) != 0) {
         return -1;
@@ -306,6 +326,88 @@ int qrt_moe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
     }
     ++m->experts_run;
     return 0;
+}
+
+int qrt_moe_compute_batch(void * user, uint32_t layer, VkBuffer buf, const uint32_t * experts,
+                          const uint64_t * offsets, const uint64_t * bytes, uint32_t count,
+                          char * err, size_t err_size) {
+    qrt_moe * m = (qrt_moe *) user;
+    if (m == NULL || buf == VK_NULL_HANDLE || experts == NULL || offsets == NULL) {
+        return fail(err, err_size, "the batch needs a slot buffer and the expert list");
+    }
+    if (count > m->max_experts) {
+        return fail(err, err_size, "layer %u has %u experts, the batch holds %u", layer, count,
+                    m->max_experts);
+    }
+    const uint32_t t = m->cfg.tokens;
+    const uint32_t hidden = m->cfg.hidden;
+    const uint32_t ffn = m->cfg.ffn;
+    const uint32_t h_qs_stride = t * ffn;              // bytes per expert's qs plane
+    const uint32_t h_ds_stride = t * (ffn / 32);       // words per expert's ds plane
+    const uint32_t o_stride = t * hidden;              // floats per output slice
+
+    if (qrt_gemm_begin(m->gemm, err, err_size) != 0) {
+        return -1;
+    }
+    for (uint32_t e = 0; e < count; ++e) {
+        qrt_expert_loc loc;
+        if (qrt_weights_locate(m->w, layer, experts[e], &loc, err, err_size) != 0) {
+            return -1;
+        }
+        const int t_gate = qrt_gemm_type_of(ffn, hidden, loc.gate);
+        const int t_up = qrt_gemm_type_of(ffn, hidden, loc.up);
+        const int t_down = qrt_gemm_type_of(hidden, ffn, loc.down);
+        if (t_gate < 0 || t_up < 0 || t_down < 0) {
+            return fail(err, err_size, "expert %u,%u has an unknown quant type", layer,
+                        experts[e]);
+        }
+        const uint64_t base = offsets[e];
+        qrt_gemm_args gate;
+        memset(&gate, 0, sizeof(gate));
+        gate.w = buf;
+        gate.a_qs = m->a_qs;
+        gate.a_ds = m->a_ds;
+        gate.out = m->g_out;
+        gate.n = ffn;
+        gate.k = hidden;
+        gate.m = t;
+        gate.type = (qrt_quant) t_gate;
+        gate.wbase = gate.type == QRT_QUANT_Q6K ? (uint32_t) base : (uint32_t) (base / 4);
+
+        qrt_gemm_args up = gate;
+        up.type = (qrt_quant) t_up;
+        up.out = m->u_out;
+        const uint32_t off_up = (uint32_t) (base + loc.gate);
+        up.wbase = up.type == QRT_QUANT_Q6K ? off_up : off_up / 4;
+
+        qrt_gemm_args down = gate;
+        down.type = (qrt_quant) t_down;
+        down.a_qs = m->hb_qs;
+        down.a_ds = m->hb_ds;
+        down.abase = e * h_ds_stride;
+        down.out = m->o_multi;
+        down.obase = (e % m->o_slices) * o_stride;
+        down.n = hidden;
+        down.k = ffn;
+        const uint32_t off_down = (uint32_t) (base + loc.gate + loc.up);
+        down.wbase = down.type == QRT_QUANT_Q6K ? off_down : off_down / 4;
+
+        // gate and up fill g_out/u_out, swiglu turns them into this expert's hidden
+        // planes, down consumes those. Two barriers per expert keep the three steps in
+        // order while the GPU still runs hundreds of workgroups back to back.
+        if (qrt_gemm_record(m->gemm, &gate, err, err_size) != 0 ||
+            qrt_gemm_record(m->gemm, &up, err, err_size) != 0 ||
+            qrt_gemm_record_barrier(m->gemm, err, err_size) != 0 ||
+            qrt_gemm_record_swiglu(m->gemm, m->g_out, m->u_out, m->hb_qs, m->hb_ds, t, ffn,
+                                   e * (h_qs_stride / 16), e * h_ds_stride,
+                                   err, err_size) != 0 ||
+            qrt_gemm_record_barrier(m->gemm, err, err_size) != 0 ||
+            qrt_gemm_record(m->gemm, &down, err, err_size) != 0) {
+            return -1;
+        }
+        ++m->experts_run;
+    }
+    return qrt_gemm_submit(m->gemm, err, err_size);
 }
 
 // Canonical dequant of the three K-quants (ggml dequantize_row_q*_K order) times the

@@ -18,6 +18,8 @@ layout(push_constant) uniform PC {
     uint m;      // tokens
     uint nk32;   // 32-element subblocks per token
     uint hid;    // elements per token of the gate/up output
+    uint qsbase; // first uvec4 of this expert's qs plane
+    uint dsbase; // first word of this expert's ds plane
 } pc;
 
 void main() {
@@ -51,9 +53,9 @@ void main() {
 
     const float d = amax * (1.0 / 127.0);
     const uint dh = packHalf2x16(vec2(d, 0.0)) & 0xFFFFu;
-    ds.s[blk] = dh | ((uint(sum + 32768) & 0xFFFFu) << 16);
+    ds.s[pc.dsbase + blk] = dh | ((uint(sum + 32768) & 0xFFFFu) << 16);
 
-    const uint o = blk * 2u;
+    const uint o = pc.qsbase + blk * 2u;
     qs.q[o]      = uvec4(word[0], word[1], word[2], word[3]);
     qs.q[o + 1u] = uvec4(word[4], word[5], word[6], word[7]);
 }

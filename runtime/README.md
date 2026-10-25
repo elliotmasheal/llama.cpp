@@ -191,6 +191,15 @@ build-vulkan/bin/qrt.exe --prefill-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL -
   `kernels/moe_expert.*`: gate, up, swiglu and down for the block that just landed, all in
   one command buffer. `--prefill-compute probe` plugs in the M1-4a read kernel instead, which
   isolates the scheduler from the math.
+- `--prefill-mode layer` (default) uploads a whole layer of experts into one layer buffer and
+  runs the layer as a single submit: `qrt_moe_compute_batch` records gate, up, a barrier,
+  swiglu, a barrier and down for every expert of the layer into one command buffer. That took
+  the compute leg from 2.0 to 3.7 TFLOPS (RESULTS 41). `--prefill-mode perexpert` is the
+  earlier one-submit-per-expert shape, kept for comparison.
+- In the layer batch every expert gets its own slice of the hidden planes, because a shared
+  plane would be overwritten by the next expert's swiglu before this expert's down reads it.
+  Expert outputs rotate over eight slices since accumulation into the token rows is not
+  implemented yet.
 - The Q4_K x Q8_1 GEMM is `kernels/q4k_gemm.comp` (the M2-4 kernel plus base offsets) and
   reaches only ~1.5 TFLOPS at 64 tokens per expert because each expert is a 16 workgroup
   dispatch behind its own submit (RESULTS 39). One submit per layer is the fix that is in.

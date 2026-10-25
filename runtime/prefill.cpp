@@ -18,6 +18,9 @@ struct qrt_prefill {
     uint32_t        slots;
     VkBuffer        buf;      // slots x slot_bytes of scratch for the compute leg
     VkDeviceMemory  mem;
+    VkBuffer        layer_buf;   // whole layer of experts, for the batch path
+    VkDeviceMemory  layer_mem;
+    uint64_t        layer_bytes;
     qrt_vk_staging ** stg;    // one staging buffer per slot, all slot_bytes long
     uint32_t *      pend_layer;
     uint32_t *      pend_expert;
@@ -138,6 +141,9 @@ void qrt_prefill_close(qrt_vk_dev * dev, qrt_prefill * p) {
     }
     if (dev != NULL && p->mem != VK_NULL_HANDLE) {
         qrt_vk_free(dev, p->buf, p->mem);
+    }
+    if (dev != NULL && p->layer_mem != VK_NULL_HANDLE) {
+        qrt_vk_free(dev, p->layer_buf, p->layer_mem);
     }
     free(p->pend_layer);
     free(p->pend_expert);
@@ -618,3 +624,141 @@ int qrt_prefill_probe_compute(void * user, uint32_t layer, uint32_t expert, VkBu
 }
 
 #endif // QRT_HAVE_VULKAN
+
+int qrt_prefill_run_layers(qrt_prefill * p, const uint32_t * ids, uint32_t stride,
+                           const uint32_t * counts, qrt_prefill_batch_fn batch, void * user,
+                           qrt_prefill_stats * out, char * err, size_t err_size) {
+    if (p == NULL || ids == NULL || counts == NULL || out == NULL || batch == NULL) {
+        return fail(err, err_size, "the layer batch needs ids, counts and a callback");
+    }
+    qrt_vk_dev * dev = p->dev;
+    memset(out, 0, sizeof(*out));
+    out->slot_reductions = p->cfg.slot_reductions;
+    const uint32_t layers = qrt_weights_layers(p->w);
+
+    // One buffer has to hold the largest layer, so size it from the table, not a guess.
+    uint64_t need = 0;
+    for (uint32_t l = 0; l < layers; ++l) {
+        if (counts[l] == 0) {
+            continue;
+        }
+        uint64_t layer = 0;
+        for (uint32_t e = 0; e < counts[l]; ++e) {
+            qrt_expert_loc loc;
+            if (qrt_weights_locate(p->w, l, ids[(size_t) l * stride + e], &loc,
+                                   err, err_size) != 0) {
+                return -1;
+            }
+            layer += (loc.bytes + 63) / 64 * 64;
+        }
+        if (layer > need) {
+            need = layer;
+        }
+    }
+    if (need == 0) {
+        return fail(err, err_size, "the router asked for no experts");
+    }
+    if (p->layer_bytes < need) {
+        if (p->layer_mem != VK_NULL_HANDLE) {
+            qrt_vk_free(dev, p->layer_buf, p->layer_mem);
+            p->layer_buf = VK_NULL_HANDLE;
+            p->layer_mem = VK_NULL_HANDLE;
+            p->layer_bytes = 0;
+        }
+        if (qrt_vk_alloc(dev, need, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
+                         &p->layer_buf, &p->layer_mem, err, err_size) != 0) {
+            return -1;
+        }
+        p->layer_bytes = need;
+    }
+
+    uint32_t max_count = 0;
+    for (uint32_t l = 0; l < layers; ++l) {
+        if (counts[l] > max_count) {
+            max_count = counts[l];
+        }
+    }
+    uint64_t * offsets = (uint64_t *) malloc((size_t) max_count * sizeof(uint64_t));
+    uint64_t * sizes = (uint64_t *) malloc((size_t) max_count * sizeof(uint64_t));
+    uint32_t * experts = (uint32_t *) malloc((size_t) max_count * sizeof(uint32_t));
+    if (offsets == NULL || sizes == NULL || experts == NULL) {
+        free(offsets); free(sizes); free(experts);
+        return fail(err, err_size, "out of memory for %u slot offsets", max_count);
+    }
+
+    const double t_start = now_ms();
+    int rc = 0;
+    for (uint32_t l = 0; l < layers && rc == 0; ++l) {
+        if (counts[l] == 0) {
+            continue;
+        }
+        uint64_t off = 0;
+        for (uint32_t e = 0; e < counts[l]; ++e) {
+            const uint32_t expert = ids[(size_t) l * stride + e];
+            qrt_expert_loc loc;
+            if (qrt_weights_locate(p->w, l, expert, &loc, err, err_size) != 0) {
+                rc = -1;
+                break;
+            }
+            const uint32_t slot = e % p->slots;
+            if (e >= p->slots) {
+                const double w0 = now_ms();
+                if (qrt_vk_staging_wait(dev, p->stg[slot], err, err_size) != 0) {
+                    rc = -1;
+                    break;
+                }
+                out->wait_ms += now_ms() - w0;
+            }
+            unsigned char * map = (unsigned char *) qrt_vk_staging_map(p->stg[slot]);
+            const double r0 = now_ms();
+            const int read = qrt_weights_read_expert(p->w, l, expert, map,
+                                                     (size_t) p->slot_bytes, err, err_size);
+            out->read_ms += now_ms() - r0;
+            if (read != 0) {
+                ++out->blocks_failed;
+                continue;
+            }
+            const double u0 = now_ms();
+            if (qrt_vk_upload_submit(dev, p->stg[slot], p->layer_buf, off, loc.bytes,
+                                     err, err_size) != 0) {
+                ++out->blocks_failed;
+                continue;
+            }
+            out->upload_ms += now_ms() - u0;
+            experts[e] = expert;
+            offsets[e] = off;
+            sizes[e] = loc.bytes;
+            out->bytes += loc.bytes;
+            ++out->blocks_done;
+            off += (loc.bytes + 63) / 64 * 64;
+        }
+        if (rc != 0) {
+            break;
+        }
+        for (uint32_t k = 0; k < p->slots && k < counts[l]; ++k) {
+            const double w0 = now_ms();
+            if (qrt_vk_staging_wait(dev, p->stg[k], err, err_size) != 0) {
+                rc = -1;
+                break;
+            }
+            out->wait_ms += now_ms() - w0;
+        }
+        if (rc != 0) {
+            break;
+        }
+        const double c0 = now_ms();
+        if (batch(user, l, p->layer_buf, experts, offsets, sizes, counts[l],
+                  err, err_size) != 0) {
+            rc = -1;
+            break;
+        }
+        out->compute_ms += now_ms() - c0;
+        ++out->layers;
+    }
+    out->blocks = out->blocks_done + out->blocks_failed;
+    out->total_ms = now_ms() - t_start;
+    free(offsets);
+    free(sizes);
+    free(experts);
+    return rc;
+}

@@ -58,7 +58,13 @@ int qrt_gemm_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs, V
 // each, which is the same order as the math at 64 tokens (RESULTS 39).
 int qrt_gemm_begin(qrt_gemm * g, char * err, size_t err_size);
 int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t err_size);
+// The plane bases let one buffer hold every expert's swiglu output of a layer: qs is
+// counted in uvec4, ds in words.
 int qrt_gemm_record_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs,
-                           VkBuffer out_ds, uint32_t m, uint32_t hid, char * err, size_t err_size);
+                           VkBuffer out_ds, uint32_t m, uint32_t hid, uint32_t qsbase,
+                           uint32_t dsbase, char * err, size_t err_size);
+// Compute-to-compute barrier: the next dispatch sees the writes of the previous ones.
+// One layer of prefill records hundreds of these instead of going back to the CPU.
+int qrt_gemm_record_barrier(qrt_gemm * g, char * err, size_t err_size);
 int qrt_gemm_submit(qrt_gemm * g, char * err, size_t err_size);
 uint32_t qrt_gemm_dispatches(const qrt_gemm * g);

@@ -50,6 +50,19 @@ int qrt_prefill_run(qrt_prefill * p, const uint32_t * ids, uint32_t stride,
                     const uint32_t * counts, qrt_prefill_compute_fn compute, void * user,
                     qrt_prefill_stats * out, char * err, size_t err_size);
 
+// Layer batch (design 4.6): every expert of a layer is uploaded into one layer buffer,
+// then the whole layer runs as a single submit. The callback records all of the layer's
+// dispatches into one command buffer and submits once, so the GPU keeps 512 workgroups
+// busy instead of 16 (RESULTS 39).
+typedef int (*qrt_prefill_batch_fn)(void * user, uint32_t layer, VkBuffer buf,
+                                    const uint32_t * experts, const uint64_t * offsets,
+                                    const uint64_t * bytes, uint32_t count,
+                                    char * err, size_t err_size);
+
+int qrt_prefill_run_layers(qrt_prefill * p, const uint32_t * ids, uint32_t stride,
+                           const uint32_t * counts, qrt_prefill_batch_fn batch, void * user,
+                           qrt_prefill_stats * out, char * err, size_t err_size);
+
 // Expected unique experts per layer for `chunk` tokens of top-k routing over
 // `experts`, uniform: the prefill byte volume of RESULTS 11 and design 4.5.
 uint32_t qrt_prefill_unique_experts(uint32_t chunk, uint32_t top_k, uint32_t experts);

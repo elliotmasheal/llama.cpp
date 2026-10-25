@@ -209,7 +209,7 @@ int qrt_gemm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_gemm ** out,
     pc[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pc[0].size       = 6 * sizeof(uint32_t);   // n, k, m, wbase, obase, abase
     pc[1]            = pc[0];
-    pc[1].size       = 3 * sizeof(uint32_t);   // m, nk32, hid
+    pc[1].size       = 5 * sizeof(uint32_t);   // m, nk32, hid, qsbase, dsbase
     VkPipelineLayoutCreateInfo plci;
     memset(&plci, 0, sizeof(plci));
     plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -425,7 +425,8 @@ int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t er
 }
 
 int qrt_gemm_record_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs,
-                          VkBuffer out_ds, uint32_t m, uint32_t hid, char * err, size_t err_size) {
+                           VkBuffer out_ds, uint32_t m, uint32_t hid, uint32_t qsbase,
+                           uint32_t dsbase, char * err, size_t err_size) {
     if (g == NULL || gate == VK_NULL_HANDLE || up == VK_NULL_HANDLE ||
         out_qs == VK_NULL_HANDLE || out_ds == VK_NULL_HANDLE) {
         return fail(err, err_size, "swiglu needs gate, up and both output planes");
@@ -447,10 +448,24 @@ int qrt_gemm_record_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer ou
     vkCmdBindPipeline(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_pipe);
     vkCmdBindDescriptorSets(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->swiglu_layout, 0, 1,
                             &g->swiglu_set, 0, nullptr);
-    const uint32_t pc[3] = { m, nk32, hid };
+    const uint32_t pc[5] = { m, nk32, hid, qsbase, dsbase };
     vkCmdPushConstants(g->cmd, g->swiglu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
     vkCmdDispatch(g->cmd, (m * nk32 + 63u) / 64u, 1, 1);
     ++g->dispatches;
+    return 0;
+}
+
+int qrt_gemm_record_barrier(qrt_gemm * g, char * err, size_t err_size) {
+    if (g == NULL) {
+        return fail(err, err_size, "no GEMM context");
+    }
+    VkMemoryBarrier mb;
+    memset(&mb, 0, sizeof(mb));
+    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(g->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     return 0;
 }
 
@@ -490,7 +505,7 @@ int qrt_gemm_dispatch(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t 
 int qrt_gemm_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs, VkBuffer out_ds,
                    uint32_t m, uint32_t hid, char * err, size_t err_size) {
     if (qrt_gemm_begin(g, err, err_size) != 0 ||
-        qrt_gemm_record_swiglu(g, gate, up, out_qs, out_ds, m, hid, err, err_size) != 0) {
+        qrt_gemm_record_swiglu(g, gate, up, out_qs, out_ds, m, hid, 0, 0, err, err_size) != 0) {
         return -1;
     }
     return qrt_gemm_submit(g, err, err_size);
