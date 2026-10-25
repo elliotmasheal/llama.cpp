@@ -474,8 +474,10 @@
       "id": "M2-3",
       "milestone": "M2",
       "lane": "impl",
-      "status": "todo",
+      "status": "partial",
+      "claimed_at": "2026-10-25T00:20:00",
       "title": "weights：稠密常驻 + 专家页表",
+      "note": "host side done: runtime/weights.* parses the index into a 41x256 page table and reads all 10496 experts back (RESULTS 34); VRAM residency and the expert cache wait for the M2-5 shapes",
       "deps": [
         "M2-1",
         "M2-2",
