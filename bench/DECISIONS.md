@@ -1787,6 +1787,47 @@ DeltaNet 层 296 ms、full 层 538 ms（含 107-110 ms 的专家库读，M2-5 �
    `qrt_moe_compute_batch` 录 gate/up 时用默认行主序，而 swiglu 读 token-major。
    `--prefill-check` 只计时不校验输出，所以没红。修它要给 `qrt_moe_check` 的参考也换布局，
    留给下一次动 M2-5 的人；在那之前 prefill 的专家 leg **不能用于正确性**。
+   （已于 2026-10-25 关闭：RESULTS 74 / DECISIONS 71。）
 2. router tile 的 16 ms/层（10K）：x tile 每个 row block 重读一次（2.7 GB）。
 3. 真·一次提交：GPU 侧分组 + indirect dispatch + 本层专家常驻（M3/M4）。
 4. 专家槽 464 MiB/层要由 M2-5 的双缓冲重叠掉；本轮的层检查是串行量到的。
+
+## 71. M2-6 缺陷收尾判决：专家腿统一 token-major，`--moe-check` 改成串联校验（2026-10-25）
+<!-- slug: m2-6-moe-token-major -->
+
+**采纳**：`qrt_moe_compute` 与 `qrt_moe_compute_batch` 的 gate/up/down 全部带
+`token_major = 1`（`swiglu_q8.comp` 读 `[token][row]`，与 `ffn.cpp` 的层链一致）；
+`--moe-check` 的参考换 token-major，并直接调这两个生产入口各跑一条链。RESULTS 74。
+
+### 71.1 为什么检查要跑生产入口
+
+旧 `--moe-check` 自己组 args（行主序）、只比 gate 与 down，而且 down 的参考输入就是设备刚写出的
+h 平面，所以"gate/up 行主序 + swiglu 读 token-major"这类错**在任何读数上都不出现**；up 的 arm
+还漏了 type/wbase（读的是 gate 矩阵）。这就是 runtime/AGENTS.md 第 5、6 条的实例：分段全绿
+不等于串联全绿，检查器自己也会错。现在 chain / batch 两条腿的输入是 CPU 参考（不是设备平面），
+布局错就是 rel_L1 的 O(1)。
+
+### 71.2 判据与读数
+
+- 门：gate / down / chain / batch 四个 rel_L1 均 <= 1e-4（与 RESULTS 71 同口径，没有放宽）。
+- 实测：gate 1.6e-07，down 5.6e-08..1.1e-07，chain/batch 5.95e-08..1.46e-05；两条链腿逐位
+  相同，r=3 逐位相同。
+- 自检：批处理 / 单槽分别改回行主序时，batch 变 **1.212e+00**、chain 变 **1.445e+00** 并 FAIL，
+  另一条腿不动 —— 两条腿分别盯着一个生产入口。
+- **L-KERN pass**；**L-MODEL n/a**（专家腿仍未接默认路径，模型门是 M2-7 的 KLD）；**G-REG n/a**。
+- 回归：`--selftest` 0 failed；`--layer-check` layer 3 / 256 token / store 全阶段 PASS
+  （`layer_moe` 1.252e-05，与 RESULTS 73 一致）；`--prefill-check --prefill-compute moe
+  --prefill-mode layer` exit 0。
+
+### 71.3 开关表
+
+无新开关。`--moe-check` 的输出多了 `chain_rel_l1` / `batch_rel_l1` 两列；`--moe-rows` 仍只
+限制 gate / down 的比较行数，链腿固定比全部行（一次约 0.29 s，主要花在 CPU 双精度参考上）。
+
+### 71.4 遗留
+
+- `--prefill-check` 仍只计时，不再承担正确性；"整层 256 个专家的加权累加"只有
+  `--layer-check` 的 `layer_moe` 覆盖，端到端要 M2-7。
+- 单槽与层批两条腿现在由同一个 `--moe-check` 覆盖，但它们共享 `moe_expert` 的缓冲与 ring：
+  多条链同时跑（例如 prefill 的层批 + 单槽混用）仍未测。
+

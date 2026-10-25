@@ -2558,7 +2558,7 @@ norm(x, attn_norm) -> 投影（attn_qkv+attn_gate（DeltaNet）或 attn_q/attn_k
    计时腿全绿。修法：三个内核加 `token_major` push 常量（与 dense q8k 一致），
    `--moe-check` 的读数不变（它走默认 0）。**同一个缺陷也存在于 `moe_expert` 的批处理路径**
    （它录 gate/up 时用默认行主序，再交给 swiglu），只是 `--prefill-check` 只计时不校验输出，
-   所以没暴露——列为未结项（DECISIONS 68.4）。
+   所以没暴露——列为未结项（DECISIONS 70.4；已在 RESULTS 74 / DECISIONS 71 关闭）。
 2. **`swiglu_q8.comp` 的 f16 delta 用 `packHalf2x16`（向零取整）**：共享专家 4.793e-04，
    `--moe-check` 不经过 swiglu 所以看不出来。按 DECISIONS 64.1 把 RNE 位运算移到
    `kernels/common.glsl`（`qrt_f32_to_f16_rne`）并用它之后 **5.9e-08**。
@@ -2583,3 +2583,75 @@ norm 与残差一致。差的是"f32 累加 vs 双精度"那一档，所有门�
 - GPU 侧分组 + indirect dispatch（真·一次提交的前提）与 kv 的 q4_0 / 分页（M2-6a）。
 - 多 chunk 的 KV append 在层链里没有复现（`--fullattn-check` 的 pos0=512 append 用例覆盖了内核）。
 - M2-7 的整模型 KLD（本轮的参考是单层 CPU 链，不是端到端 logits）。
+
+## 74. M2-6 缺陷收尾：专家腿统一 token-major，`--moe-check` 补上串联校验（2026-10-25）
+<!-- slug: m2-6-moe-token-major -->
+
+口径：`qrt --moe-check <repack 前缀> [--moe-layer N --moe-expert K]`，tokens per expert 64、
+hidden 2048、ffn 512；参考是同一条链的 CPU 双精度（K-quant 反量化 x Q8_1 -> silu*up ->
+同一 Q8_1 规则 -> down）。gate / down 只比前 64 行，两条链腿比全部 64 x 2048。r=3 逐位相同
+（`bench/raw/m2-6-moe-token-major/`）。RX 6700S，平衡电源 + AC，exit 0。
+
+### 74.1 结构
+
+- `qrt_moe_compute`（单槽，`--prefill-mode perexpert`）与 `qrt_moe_compute_batch`（层批，
+  `--prefill-mode layer`）录 gate/up 时都带 `token_major = 1`；down 的输出沿用同一布局
+  （层批的 8 片轮转基址不变）。修前两处都是默认行主序，而 `swiglu_q8.comp` 读 `[token][row]`：
+  RESULTS 73.4 第 1 条只修了层链（`ffn.cpp`），专家腿留成了未结项。
+- `--moe-check` 的参考改成 token-major，并新增两条**串联**腿：直接调 `qrt_moe_compute` 与
+  `qrt_moe_compute_batch`（生产入口，不是检查自己重组的 args），把 `o_out` / `o_multi` 与
+  CPU 链比。判据仍是 1e-4，四条腿各一列。
+- 顺带修掉旧检查自身的缺陷：up 的 arm 没设 type/wbase，读的是 gate 矩阵（up 输出当时没人
+  校验，所以一直没红）。
+- `--prefill-check` 依旧只计时，不设第二套判据；专家腿的正确性归 `--moe-check`。
+
+### 74.2 读数
+
+| 层 / 专家 | gate | gate_rel_l1 | down | down_rel_l1 | chain_rel_l1 | batch_rel_l1 | 判决 |
+|---|---|---:|---|---:|---:|---:|---|
+| 0 / 0（r1-r3，逐位相同） | q4k | 1.607e-07 | q5k | 9.880e-08 | 1.460e-05 | 1.460e-05 | PASS |
+| 0 / 7 | q4k | 1.603e-07 | q5k | 1.052e-07 | 1.038e-07 | 1.038e-07 | PASS |
+| 3 / 0 | q4k | 1.649e-07 | q5k | 1.086e-07 | 2.927e-06 | 2.927e-06 | PASS |
+| 3 / 7 | q4k | 1.687e-07 | q5k | 1.104e-07 | 1.120e-07 | 1.120e-07 | PASS |
+| 34 / 0 | q4k | 1.684e-07 | q6k | 6.091e-08 | 7.354e-06 | 7.354e-06 | PASS |
+| 34 / 7 | q4k | 1.679e-07 | q6k | 6.124e-08 | 6.166e-08 | 6.166e-08 | PASS |
+| 39 / 0 | q5k | 1.615e-07 | q6k | 5.637e-08 | 5.952e-08 | 5.952e-08 | PASS |
+| 39 / 7 | q5k | 1.624e-07 | q6k | 5.888e-08 | 6.078e-08 | 6.078e-08 | PASS |
+
+- 两条链腿（单槽 / 层批）读数**逐位相同**：同一串 dispatch、同一份 CPU 参考。r=3 也逐位相同。
+- gate 1.6e-07 与 RESULTS 71 的 1.607e-07 逐位相同（布局只改写的地址，不改算术）。
+- down 从 2.590e-07 变成 9.880e-08：旧检查喂给 down 的 h 平面是"gate x gate"（up 的 arm 读错
+  矩阵），现在换成了真正的 up。**旧读数不是同口径**，不可直接比大小。
+- 层 0 / 专家 0 的 1.46e-05 是链上唯一超过 1e-6 的读数：gate/up 的 f32 累加误差（1.6e-07）
+  让 h 的 Q8_1 量化在若干个 0.5 边界上多进/少进一档，再经 down 摊到 1e-5 量级。同层专家 7
+  是 1.0e-07，说明它是"边界命中个数"的偶然量，不是系统性偏差；门 1e-4 留了 7 倍余量。
+
+### 74.3 检查器自检：把缺陷放回去，两条腿各自能抓住
+
+| 人为改回 | gate / down | chain_rel_l1 | batch_rel_l1 | 判决 |
+|---|---|---|---|---|
+| 批处理 gate/up 行主序 | 1.607e-07 / 9.880e-08 | 1.460e-05 | **1.212e+00** | FAIL |
+| 单槽 gate/up 行主序 | 1.607e-07 / 9.880e-08 | **1.445e+00** | 1.460e-05 | FAIL |
+
+旧检查（行主序参考、不跑链路、down 吃设备平面）对这两个缺陷都是 PASS；新检查红在对应的
+那条腿、另一条腿不动，说明两条腿分别盯着一个生产入口。产物：`defect-batch-relayout.out`、
+`defect-single-relayout.out`（改回后重建、跑完再由脚本把源码写回并重建，`moe-check-restored.out`
+与 r1-r3 逐位相同）。
+
+### 74.4 门禁
+
+- **L-KERN pass**：四条腿全部 5.6e-08..1.46e-05（门 1e-4），r=3 逐位相同；布局改动对 gate 读数
+  逐位无影响。没有放宽任何判据。
+- **L-MODEL n/a**：专家腿还没接默认路径；整模型 KLD 仍是 M2-7。
+- **G-REG n/a**：只动 `runtime/`。
+- 回归：`--selftest` 0 failed；`--layer-check --layer 3 --layer-tokens 256 --layer-store <前缀>`
+  全阶段 PASS（`layer_moe` 1.252e-05，与 RESULTS 73 一致）；`--prefill-check --prefill-compute moe
+  --prefill-mode layer --prefill-layers 2` exit 0（`total_ms` 109.8-192.8 ms，r=1，不作性能读数）。
+
+### 74.5 未做
+
+- `--prefill-check` 仍不校验输出；"整层 256 个专家的加权累加"只有 `--layer-check` 的
+  `layer_moe` 覆盖，端到端要 M2-7 的 KLD。
+- 链腿固定比全部行（`--moe-rows` 只限制 gate/down 的比较行数），一次 `--moe-check` 约 0.29 s，
+  基本都花在 CPU 双精度参考上。
+

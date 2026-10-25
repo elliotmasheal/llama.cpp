@@ -1,6 +1,7 @@
 #include "kernels/moe_expert.h"
 
 #include "kernels/gemm.h"
+#include "kernels/norm.h"
 #include "weights.h"
 
 #include <math.h>
@@ -276,6 +277,8 @@ int qrt_moe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
     gate.n = ffn;
     gate.k = hidden;
     gate.m = t;
+    // swiglu reads [token][row], so every output of this leg is token-major (RESULTS 73.4).
+    gate.token_major = 1;
 
     qrt_gemm_args up = gate;
     up.out = m->u_out;
@@ -373,6 +376,7 @@ int qrt_moe_compute_batch(void * user, uint32_t layer, uint32_t ring, VkBuffer b
         gate.n = ffn;
         gate.k = hidden;
         gate.m = t;
+        gate.token_major = 1;   // swiglu reads [token][row]; down keeps the same layout
         gate.type = (qrt_quant) t_gate;
         gate.wbase = gate.type == QRT_QUANT_Q6K ? (uint32_t) base : (uint32_t) (base / 4);
 
@@ -510,20 +514,45 @@ void qrt_moe_ref_row(const void * w_row, qrt_quant type, const unsigned char * a
     ref_gemm_row((const unsigned char *) w_row, type, a_qs, a_ds, 0, k, tokens, out);
 }
 
+// The kernels write [token][row] (gemm.h token_major), so the reference is built the same
+// way: a layout slip then reads as a rel_L1 near 1 instead of passing on the other stride.
+static void ref_matrix(const unsigned char * w, qrt_quant type, const unsigned char * a_qs,
+                       const uint32_t * a_ds, uint32_t rows, uint32_t k, uint32_t tokens,
+                       float * out) {
+    std::vector<double> ref_row(tokens);
+    for (uint32_t r = 0; r < rows; ++r) {
+        ref_gemm_row(w, type, a_qs, a_ds, r, k, tokens, ref_row.data());
+        for (uint32_t tok = 0; tok < tokens; ++tok) {
+            out[(size_t) tok * rows + r] = (float) ref_row[tok];
+        }
+    }
+}
+
+static double rel_l1_token_major(const float * gpu, const float * want, uint32_t n,
+                                 uint32_t rows, uint32_t tokens) {
+    double num = 0.0;
+    double den = 0.0;
+    for (uint32_t tok = 0; tok < tokens; ++tok) {
+        for (uint32_t r = 0; r < rows; ++r) {
+            const double a = gpu[(size_t) tok * n + r];
+            const double b = want[(size_t) tok * n + r];
+            num += fabs(a - b);
+            den += fabs(b);
+        }
+    }
+    return den > 0.0 ? num / den : num;
+}
+
 struct check_arm {
     qrt_gemm_args args;
-    const unsigned char * host;     // host copy of the matrix block
-    uint64_t bytes;
     uint32_t rows;
-    qrt_quant type;
     float * gpu;
-    float * want;
+    const float * want;
 };
 
-// Runs one matrix of the expert and compares it against the reference. Rotation of the
-// output buffer and the scratch planes is shared with qrt_moe_compute.
-static int check_one(qrt_vk_dev * dev, qrt_moe * m, check_arm * arm, const unsigned char * a_qs,
-                     const uint32_t * a_ds, double * rel_l1, char * err, size_t err_size) {
+// Runs one matrix of the expert and compares it against the caller's token-major reference.
+static int check_one(qrt_vk_dev * dev, qrt_moe * m, check_arm * arm, double * rel_l1,
+                     char * err, size_t err_size) {
     const uint32_t t = m->cfg.tokens;
     if (qrt_gemm_dispatch(m->gemm, &arm->args, err, err_size) != 0) {
         return -1;
@@ -535,25 +564,7 @@ static int check_one(qrt_vk_dev * dev, qrt_moe * m, check_arm * arm, const unsig
     int rc = -1;
     if (qrt_vk_download(dev, stg, arm->args.out, (uint64_t) arm->args.obase * 4, arm->gpu,
                         (uint64_t) t * arm->args.n * 4, err, err_size) == 0) {
-        for (uint32_t row = 0; row < arm->rows; ++row) {
-            std::vector<double> ref_row(t);
-            ref_gemm_row(arm->host, arm->type, a_qs, a_ds, row, arm->args.k, t,
-                         ref_row.data());
-            for (uint32_t tok = 0; tok < t; ++tok) {
-                arm->want[(size_t) row * t + tok] = (float) ref_row[tok];
-            }
-        }
-        double num = 0.0;
-        double den = 0.0;
-        for (uint32_t row = 0; row < arm->rows; ++row) {
-            for (uint32_t tok = 0; tok < t; ++tok) {
-                const double a = arm->gpu[(size_t) row * t + tok];
-                const double b = arm->want[(size_t) row * t + tok];
-                num += fabs(a - b);
-                den += fabs(b);
-            }
-        }
-        *rel_l1 = den > 0.0 ? num / den : num;
+        *rel_l1 = rel_l1_token_major(arm->gpu, arm->want, arm->args.n, arm->rows, t);
         rc = 0;
     }
     qrt_vk_staging_destroy(dev, stg);
@@ -578,8 +589,9 @@ int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer
         rows = ffn;
     }
     const int t_gate = qrt_gemm_type_of(ffn, hidden, loc.gate);
+    const int t_up   = qrt_gemm_type_of(ffn, hidden, loc.up);
     const int t_down = qrt_gemm_type_of(hidden, ffn, loc.down);
-    if (t_gate < 0 || t_down < 0) {
+    if (t_gate < 0 || t_up < 0 || t_down < 0) {
         return fail(err, err_size, "layer %u expert %u has an unknown quant type", layer, expert);
     }
     out->gate_type = (uint32_t) t_gate;
@@ -592,9 +604,17 @@ int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer
     uint32_t * h_ds = (uint32_t *) malloc((size_t) t * (ffn / 32) * 4);
     float * gpu = (float *) malloc((size_t) t * hidden * 4);
     float * want = (float *) malloc((size_t) t * hidden * 4);
+    float * g_ref = (float *) malloc((size_t) t * ffn * 4);
+    float * u_ref = (float *) malloc((size_t) t * ffn * 4);
+    float * h_val = (float *) malloc((size_t) t * ffn * 4);
+    // The chain reference quantizes its own h row, so it needs the Q8_1 planes of it.
+    signed char * hqs_ref = (signed char *) malloc((size_t) t * ffn);
+    uint32_t * hds_ref = (uint32_t *) malloc((size_t) t * (ffn / 32) * 4);
     if (blk == NULL || a_qs == NULL || a_ds == NULL || h_qs == NULL || h_ds == NULL ||
-        gpu == NULL || want == NULL) {
+        gpu == NULL || want == NULL || g_ref == NULL || u_ref == NULL || h_val == NULL ||
+        hqs_ref == NULL || hds_ref == NULL) {
         free(blk); free(a_qs); free(a_ds); free(h_qs); free(h_ds); free(gpu); free(want);
+        free(g_ref); free(u_ref); free(h_val); free(hqs_ref); free(hds_ref);
         return fail(err, err_size, "out of memory for the check buffers");
     }
     int rc = -1;
@@ -620,11 +640,14 @@ int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer
         }
         fill_acts(t, hidden, a_qs, a_ds);
 
-        // Gate: the matrix type varies by layer, the reference follows it.
+        // Gate and up references: the matrix type varies by layer, the reference follows it.
+        ref_matrix(blk, (qrt_quant) t_gate, a_qs, a_ds, ffn, hidden, t, g_ref);
+        ref_matrix(blk + loc.gate, (qrt_quant) t_up, a_qs, a_ds, ffn, hidden, t, u_ref);
+
         check_arm gate;
         memset(&gate, 0, sizeof(gate));
         gate.args.w = tmp;
-        gate.args.wbase = (t_gate == QRT_QUANT_Q6K) ? 0u : 0u;
+        gate.args.wbase = 0u;
         gate.args.a_qs = m->a_qs;
         gate.args.a_ds = m->a_ds;
         gate.args.out = m->g_out;
@@ -632,18 +655,19 @@ int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer
         gate.args.k = hidden;
         gate.args.m = t;
         gate.args.type = (qrt_quant) t_gate;
-        gate.host = blk;
+        gate.args.token_major = 1;   // the production layout, so the check sees the same
         gate.rows = rows > ffn ? ffn : rows;
-        gate.type = (qrt_quant) t_gate;
         gate.gpu = gpu;
-        gate.want = want;
-        if (check_one(dev, m, &gate, a_qs, a_ds, &out->gate_rel_l1, err, err_size) != 0) {
+        gate.want = g_ref;
+        if (check_one(dev, m, &gate, &out->gate_rel_l1, err, err_size) != 0) {
             break;
         }
 
-        // Down needs the swiglu output planes, so run gate, up and swiglu first and read
-        // the hidden planes back, then check down against those exact planes.
+        // Down needs the swiglu output planes, so run up and swiglu first, read the hidden
+        // planes back, then check down against those exact planes (isolates the down GEMM).
         qrt_gemm_args up = gate.args;
+        up.type = (qrt_quant) t_up;
+        up.wbase = (t_up == QRT_QUANT_Q6K) ? (uint32_t) loc.gate : (uint32_t) loc.gate / 4u;
         up.out = m->u_out;
         if (qrt_gemm_dispatch(m->gemm, &up, err, err_size) != 0 ||
             qrt_gemm_swiglu(m->gemm, m->g_out, m->u_out, m->h_qs, m->h_ds, t, ffn,
@@ -653,11 +677,13 @@ int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer
                             err, err_size) != 0) {
             break;
         }
+        const uint32_t off_down = (uint32_t) (loc.gate + loc.up);
+        ref_matrix(blk + loc.gate + loc.up, (qrt_quant) t_down, h_qs, h_ds, hidden, ffn, t,
+                   want);
         check_arm down;
         memset(&down, 0, sizeof(down));
         down.args.w = tmp;
-        down.args.wbase = (t_down == QRT_QUANT_Q6K) ? (uint32_t) loc.gate + (uint32_t) loc.up
-                                                    : (uint32_t) (loc.gate + loc.up) / 4;
+        down.args.wbase = (t_down == QRT_QUANT_Q6K) ? off_down : off_down / 4u;
         down.args.a_qs = m->h_qs;
         down.args.a_ds = m->h_ds;
         down.args.out = m->o_out;
@@ -665,14 +691,42 @@ int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer
         down.args.k = ffn;
         down.args.m = t;
         down.args.type = (qrt_quant) t_down;
-        down.host = blk + loc.gate + loc.up;
+        down.args.token_major = 1;
         down.rows = rows > hidden ? hidden : rows;
-        down.type = (qrt_quant) t_down;
         down.gpu = gpu;
         down.want = want;
-        if (check_one(dev, m, &down, h_qs, h_ds, &out->down_rel_l1, err, err_size) != 0) {
+        if (check_one(dev, m, &down, &out->down_rel_l1, err, err_size) != 0) {
             break;
         }
+
+        // Chain: gate -> silu*up -> Q8_1 -> down, all from the CPU reference, then the same
+        // four steps through qrt_moe_compute (one slot) and qrt_moe_compute_batch (a layer).
+        // --prefill-check only times those legs, so this is the only place their layout is
+        // checked; both must reproduce the reference, not just each other.
+        for (size_t i = 0; i < (size_t) t * ffn; ++i) {
+            const double g = g_ref[i];
+            h_val[i] = (float) (g / (1.0 + exp(-g)) * (double) u_ref[i]);
+        }
+        qrt_norm_quant_cpu(t, ffn, h_val, NULL, hqs_ref, hds_ref);
+        ref_matrix(blk + loc.gate + loc.up, (qrt_quant) t_down,
+                   (const unsigned char *) hqs_ref, hds_ref, hidden, ffn, t, want);
+        if (qrt_moe_compute(m, layer, expert, tmp, 0, loc.bytes, err, err_size) != 0 ||
+            qrt_vk_download(dev, stg, m->o_out, 0, gpu, (uint64_t) t * hidden * 4,
+                            err, err_size) != 0) {
+            break;
+        }
+        out->chain_rel_l1 = rel_l1_token_major(gpu, want, hidden, hidden, t);
+        uint32_t be = expert;
+        uint64_t boff = 0;
+        uint64_t bbytes = loc.bytes;
+        if (qrt_moe_compute_batch(m, layer, 0, tmp, &be, &boff, &bbytes, 1,
+                                  err, err_size) != 0 ||
+            qrt_moe_wait(m, 0, err, err_size) != 0 ||
+            qrt_vk_download(dev, stg, m->o_multi, 0, gpu, (uint64_t) t * hidden * 4,
+                            err, err_size) != 0) {
+            break;
+        }
+        out->batch_rel_l1 = rel_l1_token_major(gpu, want, hidden, hidden, t);
         rc = 0;
     } while (0);
     qrt_vk_staging_destroy(dev, stg);
@@ -680,6 +734,7 @@ int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer
         qrt_vk_free(dev, tmp, tmp_mem);
     }
     free(blk); free(a_qs); free(a_ds); free(h_qs); free(h_ds); free(gpu); free(want);
+    free(g_ref); free(u_ref); free(h_val); free(hqs_ref); free(hds_ref);
     return rc;
 }
 

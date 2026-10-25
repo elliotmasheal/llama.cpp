@@ -223,8 +223,12 @@ build-vulkan/bin/qrt.exe --prefill-check F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL -
 - The store mixes quant types: gate/up are Q4_K on most layers, down is Q5_K, layers 34/38
   have Q6_K down and layer 39 Q5_K gate/up, so a matrix of another type is skipped and counted
   (`down_skipped`) instead of being read as garbage.
-- `--moe-check <prefix>` compares the gate output of one expert against a double-precision
-  dequant reference (rel L1 1.6e-7) and exits non-zero above 1e-4.
+- `--moe-check <prefix>` compares one expert against a double-precision dequant reference in
+  the token-major layout the kernels write: the gate matrix (rel L1 1.6e-7), the down matrix,
+  and the whole gate -> silu*up -> Q8_1 -> down chain through both `qrt_moe_compute` and
+  `qrt_moe_compute_batch` (5.9e-08..1.5e-05, all four gates 1e-4, RESULTS 74). The chain legs
+  call the production entry points, so a missing `token_major` turns the check red instead of
+  passing silently in `--prefill-check`, which only times that leg.
 - A failed slot halves the ring and bumps `slot_reductions`; a read, locate or upload failure
   counts `blocks_failed` and moves on (design 9, no aborts).
 - `qrt_prefill_unique_experts` gives the unique experts a chunk of `chunk` tokens touches, so

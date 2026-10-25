@@ -126,12 +126,14 @@ static int qrt_moe_check(const qrt_config * cfg, const char * prefix, const char
             rc = 2;
         } else {
             const double dt = now_ms() - t0;
-            const int pass = res.gate_rel_l1 <= 1e-4 && res.down_rel_l1 <= 1e-4;
+            const int pass = res.gate_rel_l1 <= 1e-4 && res.down_rel_l1 <= 1e-4 &&
+                             res.chain_rel_l1 <= 1e-4 && res.batch_rel_l1 <= 1e-4;
             printf("moe_matrix_check layer=%u expert=%u rows=%u tokens=%u "
-                   "gate=%s gate_rel_l1=%.3e down=%s down_rel_l1=%.3e ms=%.1f verdict=%s\n",
+                   "gate=%s gate_rel_l1=%.3e down=%s down_rel_l1=%.3e "
+                   "chain_rel_l1=%.3e batch_rel_l1=%.3e ms=%.1f verdict=%s\n",
                    layer, expert, rows, mcfg.tokens, type_name[res.gate_type],
-                   res.gate_rel_l1, type_name[res.down_type], res.down_rel_l1, dt,
-                   pass ? "PASS" : "FAIL");
+                   res.gate_rel_l1, type_name[res.down_type], res.down_rel_l1,
+                   res.chain_rel_l1, res.batch_rel_l1, dt, pass ? "PASS" : "FAIL");
             if (!pass) {
                 rc = 1;
             }

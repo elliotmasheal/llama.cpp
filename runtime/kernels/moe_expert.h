@@ -50,13 +50,18 @@ int qrt_moe_wait(void * user, uint32_t ring, char * err, size_t err_size);
 struct qrt_moe_check_result {
     double   gate_rel_l1;
     double   down_rel_l1;
+    // gate -> silu*up -> Q8_1 -> down against a CPU chain: qrt_moe_compute (one slot) and
+    // qrt_moe_compute_batch (a whole layer) must both reproduce it.
+    double   chain_rel_l1;
+    double   batch_rel_l1;
     uint32_t gate_type;   // qrt_quant of the gate matrix of this expert
     uint32_t down_type;
 };
 
-// Compares the gate and down outputs of one expert against double-precision dequant
+// Compares the gate, down and whole-expert outputs against double-precision dequant
 // references (the canonical ggml dequant orders for all three K-quants) over the first
-// `rows` output rows. Returns -1 with a message on a structural failure.
+// `rows` output rows; the two chain legs use every row. The reference is token-major,
+// the layout the kernels write. Returns -1 with a message on a structural failure.
 int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer,
                   uint32_t expert, uint32_t rows, qrt_moe_check_result * out, char * err,
                   size_t err_size);

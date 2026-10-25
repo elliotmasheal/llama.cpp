@@ -18,7 +18,8 @@
 | `--dense-gemm-check` | 稠密 Q8_0 GEMM 对 CPU 双精度；含"两个 dispatch 写不同输出"用例 |
 | `--dn-weights-verify` | 六个 DeltaNet 权重缓冲加载时回读逐字节比对 |
 | `--layer-check` | 一层的逐阶段对 CPU 双精度（norm / 投影 / 注意力 / 残差 / post norm / router / 共享专家 / 路由 MoE / 层输出） |
-| `--prefill-check` | 专家腿与层优先调度；预热 pass 之后才计时 |
+| `--moe-check` | 一个专家的 gate / down，以及两条专家链（`qrt_moe_compute` 单槽、`qrt_moe_compute_batch` 层批）对同一条 CPU 双精度链；参考是内核实际写的 token-major |
+| `--prefill-check` | 专家腿与层优先调度；预热 pass 之后才计时（**只计时，不校验输出**） |
 
 ## 3. 已踩过的坑（写代码前读一遍，别再复现）
 
@@ -28,6 +29,8 @@
 4. **预热 pass 不可省**：首次触页会造假加速比，两臂对比前各跑一次预热（`DECISIONS` 35）。
 5. **分段测试会蒙住真缺陷**：检查里自己重传一遍权重，把"上传读了脏缓冲"掩盖了；串联才暴露（`DECISIONS` 63.4）。
 6. **检查器本身也会错**：一层 1e-3 的"缺陷"实际是检查自己的 f16 次正规数解码错了 2 倍（`DECISIONS` 67）。
+7. **检查只比自己组的 args 时，生产入口的布局错看不见**：`--moe-check` 现在直接跑两个专家入口，
+   布局退回行主序会红（`DECISIONS` 71）。
 
 ## 4. 红线
 
