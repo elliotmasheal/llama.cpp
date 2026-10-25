@@ -39,6 +39,7 @@ layout(push_constant) uniform PC {
     uint wbase;   // byte offset of this matrix inside the prepared buffer
     uint obase;
     uint abase;
+    uint token_major; // 0 = [row][token] (the expert legs), 1 = [token][row] (the layer chain)
 } pc;
 
 shared uint s_q[QWORDS];
@@ -127,9 +128,16 @@ void main() {
         barrier();
     }
 
+    // Row-major is what the expert legs and their checks read; the layer chain wants
+    // [token][row], and a wave's lanes are consecutive rows, so those stores stay coalesced.
     [[unroll]] for (uint r = 0; r < ROWS; ++r) {
         [[unroll]] for (uint t = 0; t < TOKENS; ++t) {
-            ob.o[pc.obase + row[r] * pc.m + tok0 + my_token + t] = acc[r][t];
+            const float v = acc[r][t];
+            if (pc.token_major != 0u) {
+                ob.o[pc.obase + (tok0 + my_token + t) * pc.n + row[r]] = v;
+            } else {
+                ob.o[pc.obase + row[r] * pc.m + tok0 + my_token + t] = v;
+            }
         }
     }
 }

@@ -238,7 +238,7 @@ int qrt_gemm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_gemm ** out,
     VkPushConstantRange pc[2];
     memset(pc, 0, sizeof(pc));
     pc[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pc[0].size       = 6 * sizeof(uint32_t);   // n, k, m, wbase, obase, abase
+    pc[0].size       = 7 * sizeof(uint32_t);   // n, k, m, wbase, obase, abase, token_major
     pc[1]            = pc[0];
     pc[1].size       = 5 * sizeof(uint32_t);   // m, nk32, hid, qsbase, dsbase
     VkPipelineLayoutCreateInfo plci;
@@ -477,7 +477,8 @@ int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t er
     vkCmdBindPipeline(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_pipe[a->type]);
     vkCmdBindDescriptorSets(g->cmd[g->cur], VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_layout, 0, 1,
                             &set, 0, nullptr);
-    const uint32_t pc[6] = { a->n, a->k, a->m, a->wbase, a->obase, a->abase };
+    const uint32_t pc[7] = { a->n, a->k, a->m, a->wbase, a->obase, a->abase,
+                             a->token_major != 0 ? 1u : 0u };
     vkCmdPushConstants(g->cmd[g->cur], g->gemm_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(pc), pc);
     vkCmdDispatch(g->cmd[g->cur], a->n / Q4K_TILE_N, a->m / Q4K_TILE_M, 1);

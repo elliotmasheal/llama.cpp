@@ -53,6 +53,7 @@ struct qrt_gemm_args {
     uint32_t k;             // reduction length, multiple of 256
     uint32_t m;             // tokens, multiple of 32
     qrt_quant type;
+    int token_major;        // 0 = out[row][token] (default), 1 = out[token][row] (layer chain)
 };
 
 int qrt_gemm_dispatch(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t err_size);

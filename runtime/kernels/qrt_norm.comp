@@ -19,6 +19,8 @@ layout(push_constant) uniform PC {
     uint  dsbase;   // first word of token 0 in ds
     float eps;
     uint  do_quant; // 0 = norm only
+    uint  do_norm;  // 0 = copy x to out and only quantise (the layer's post-attention input)
+    uint  do_out;   // 0 = skip the f32 row (the GEMM only needs the planes)
 } pc;
 
 layout(binding = 0) readonly  buffer XBuf   { float x[]; } xb;
@@ -78,24 +80,31 @@ void main() {
     const uint tok = gl_WorkGroupID.x;
     const uint base = pc.xbase + tok * pc.k;
 
-    float ss = 0.0;
-    for (uint i = tid; i < pc.k; i += 128u) {
-        const float v = xb.x[base + i];
-        ss += v * v;
-    }
-    red[tid] = ss;
-    barrier();
-    [[unroll]] for (uint s = 64u; s > 0u; s >>= 1u) {
-        if (tid < s) {
-            red[tid] += red[tid + s];
+    // do_norm = 0 is the pure quantise path: the layer feeds projections whose input is not
+    // an rms norm output (the attention output before ssm_out / attn_output).
+    float scale = 1.0;
+    if (pc.do_norm != 0u) {
+        float ss = 0.0;
+        for (uint i = tid; i < pc.k; i += 128u) {
+            const float v = xb.x[base + i];
+            ss += v * v;
         }
+        red[tid] = ss;
         barrier();
+        [[unroll]] for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                red[tid] += red[tid + s];
+            }
+            barrier();
+        }
+        scale = 1.0 / sqrt(red[0] / float(pc.k) + pc.eps);
     }
-    const float scale = 1.0 / sqrt(red[0] / float(pc.k) + pc.eps);
 
     const uint o0 = pc.obase + tok * pc.k;
-    for (uint i = tid; i < pc.k; i += 128u) {
-        ob.o[o0 + i] = xb.x[base + i] * scale * wb.w[i];
+    if (pc.do_out != 0u) {
+        for (uint i = tid; i < pc.k; i += 128u) {
+            ob.o[o0 + i] = xb.x[base + i] * scale * (pc.do_norm != 0u ? wb.w[i] : 1.0);
+        }
     }
     if (pc.do_quant == 0u) {
         return;
@@ -109,7 +118,7 @@ void main() {
         float mx = 0.0;
         [[unroll]] for (uint i = 0; i < 32u; ++i) {
             const uint j = b * 32u + i;
-            v[i] = xb.x[base + j] * scale * wb.w[j];
+            v[i] = xb.x[base + j] * scale * (pc.do_norm != 0u ? wb.w[j] : 1.0);
             mx = max(mx, abs(v[i]));
         }
         const float d = mx / 127.0;

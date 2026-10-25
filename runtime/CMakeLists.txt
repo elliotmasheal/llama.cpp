@@ -15,6 +15,7 @@ add_library(qrt_core STATIC
     kernels/gemm.cpp
     kernels/norm.cpp
     kernels/moe_expert.cpp
+    layer.cpp
     vk_dev.cpp)
 
 target_include_directories(qrt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -107,6 +108,15 @@ if(Vulkan_GLSLC_EXECUTABLE)
         DEPENDS ${_qrt_kernels}/qrt_norm.comp
         COMMENT "Compiling kernels/qrt_norm.comp"
         VERBATIM)
+    # The layer chain (M2-6) needs its residual add as its own kernel.
+    set(_qrt_layer_add_spv "${CMAKE_CURRENT_BINARY_DIR}/layer_add.spv")
+    add_custom_command(
+        OUTPUT  ${_qrt_layer_add_spv}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1
+                ${_qrt_kernels}/layer_add.comp -o ${_qrt_layer_add_spv}
+        DEPENDS ${_qrt_kernels}/layer_add.comp
+        COMMENT "Compiling kernels/layer_add.comp"
+        VERBATIM)
     # The DeltaNet recurrence (M2-6c) keeps the 128x128 state in registers and
     # reduces within 32-lane subgroups, so it needs SPIR-V 1.3 (Vulkan 1.1).
     set(_qrt_deltanet_spv "${CMAKE_CURRENT_BINARY_DIR}/deltanet_recur.spv")
@@ -170,7 +180,8 @@ if(Vulkan_GLSLC_EXECUTABLE)
         COMMENT "Compiling kernels/attn_full_attn.comp"
         VERBATIM)
     add_custom_target(qrt_shaders DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv}
-                      ${_qrt_norm_spv} ${_qrt_deltanet_spv} ${_qrt_dn_cols_spv}
+                      ${_qrt_norm_spv} ${_qrt_layer_add_spv} ${_qrt_deltanet_spv}
+                      ${_qrt_dn_cols_spv}
                       ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv}
                       ${_qrt_dn_gnorm_spv} ${_qrt_full_qk_spv} ${_qrt_full_attn_spv})
 endif()
@@ -189,11 +200,11 @@ if(TARGET qrt_shaders)
     add_custom_target(qrt_spv_copy ALL
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_norm_spv}
-                ${_qrt_deltanet_spv}
+                ${_qrt_layer_add_spv} ${_qrt_deltanet_spv}
                 ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv}
                 ${_qrt_full_qk_spv} ${_qrt_full_attn_spv} $<TARGET_FILE_DIR:qrt>
         DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_norm_spv}
-                ${_qrt_deltanet_spv}
+                ${_qrt_layer_add_spv} ${_qrt_deltanet_spv}
                 ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv}
                 ${_qrt_full_qk_spv} ${_qrt_full_attn_spv}
         COMMENT "Copying the runtime shaders next to qrt")

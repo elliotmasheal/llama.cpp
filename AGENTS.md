@@ -218,6 +218,14 @@ blockers: none
   **y 5.79e-07 / gnorm 4.95e-07（512 token）、8.27e-07 / 6.88e-07（1024）**，与修复前逐位相同。
   顺带发现 `qrt_gemm_record` 的**两个固定 descriptor set 在同一命令缓冲里会互相覆盖**（规范层面错，
   本驱动靠 bind 快照蒙过），列为下轮先做的结构性修复。见 `RESULTS.md` 第 70 节、`DECISIONS.md` 第 65 节。
+- **M2-6 第四块（2026-10-25）**：`runtime/layer.*` 把**一层注意力前半段**接通（norm -> 投影 ->
+  注意力 -> 注意力输出的 Q8_1 -> 输出投影 -> 残差 -> post norm，全程无 host 往返），投影直接写
+  token-major；10K 每层 **DeltaNet 8.7 us/token、full-attn 31.3 us/token**（41 层 6.0-6.2 s）。
+  `--layer-check` 逐阶段对 CPU 双精度：layer 3 的 norm 4.1e-08、注意力 4.4e-07、输出投影 1.6e-05、
+  残差 3.7e-06 全过。**未结项**：`attn_v` 2.2e-03、`ssm_out` 5.1e-04 两个投影对参考差 1e-3，
+  已排除存储布局/权重字节/prepare/平面/tile/m，**未找到根因**，M2-6 不记 done；下一步是
+  "用层里的真实平面在 `--dense-gemm-check` 里复现再按 row 二分"。见 `RESULTS.md` 第 72 节、
+  `DECISIONS.md` 第 67 节。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、

@@ -9,6 +9,7 @@
 #include "prefill.h"
 #include "attn_deltanet.h"
 #include "attn_full.h"
+#include "layer.h"
 #include "kernels/norm.h"
 #include "kernels/moe_expert.h"
 
@@ -148,7 +149,8 @@ static int qrt_moe_check(const qrt_config * cfg, const char * prefix, const char
 // it against a double-precision dequant reference at a small token count, then times the
 // real prefill shape so the dense leg stops being an assumption (RESULTS 46).
 static int qrt_dense_gemm_check(const qrt_config * cfg, const char * gguf_path,
-                                const char * tensor_name, uint32_t tokens) {
+                                const char * tensor_name, uint32_t tokens,
+                                uint32_t dense_rows) {
     char err[QRT_ERR_SIZE] = {0};
     qrt_vk_dev * dev = NULL;
     if (qrt_vk_open((uint32_t) cfg->vram_tier_mib, &dev, err, sizeof(err)) != 0) {
@@ -310,7 +312,7 @@ static int qrt_dense_gemm_check(const qrt_config * cfg, const char * gguf_path,
             fprintf(stderr, "qrt: %s\n", err);
             break;
         }
-        const uint32_t rows = 32;
+        const uint32_t rows = dense_rows;   // rows 32..63 were never checked before (RESULTS 72)
         // One reference, two outputs: a mismatch between A and B means the two dispatches
         // did not each see their own descriptor set.
         auto rel_of = [&](const std::vector<float> & g, double * num_out) -> double {
@@ -1419,8 +1421,12 @@ int main(int argc, char ** argv) {
     const char * dense_gguf_check = NULL;
     const char * dense_tensor = "blk.3.attn_q.weight";
     int dense_tokens = 10240;
+    int dense_rows = 64;
     const char * norm_gguf_check = NULL;
     const char * norm_tensor = "blk.3.attn_norm.weight";
+    const char * layer_gguf_check = NULL;
+    int layer_index = 3;
+    int layer_tokens = 256;
     const char * moe_prefix = NULL;
     int moe_layer = 0;
     int moe_expert = 0;
@@ -1566,6 +1572,38 @@ int main(int argc, char ** argv) {
             }
             continue;
         }
+        if (strcmp(argv[i], "--layer-check") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --layer-check needs the GGUF path\n");
+                return 2;
+            }
+            layer_gguf_check = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--layer") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --layer needs an index\n");
+                return 2;
+            }
+            layer_index = atoi(argv[++i]);
+            if (layer_index < 0) {
+                fprintf(stderr, "qrt: --layer wants a non-negative index\n");
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--layer-tokens") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --layer-tokens needs a count\n");
+                return 2;
+            }
+            layer_tokens = atoi(argv[++i]);
+            if (layer_tokens < 64) {
+                fprintf(stderr, "qrt: --layer-tokens wants at least 64\n");
+                return 2;
+            }
+            continue;
+        }
         if (strcmp(argv[i], "--norm-check") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "qrt: --norm-check needs the GGUF path\n");
@@ -1658,6 +1696,18 @@ int main(int argc, char ** argv) {
             fullattn_tokens = atoi(argv[++i]);
             if (fullattn_tokens < 16) {
                 fprintf(stderr, "qrt: --fullattn-tokens wants at least 16\n");
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--dense-rows") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --dense-rows needs a count\n");
+                return 2;
+            }
+            dense_rows = atoi(argv[++i]);
+            if (dense_rows < 1) {
+                fprintf(stderr, "qrt: --dense-rows wants at least 1\n");
                 return 2;
             }
             continue;
@@ -1837,12 +1887,17 @@ int main(int argc, char ** argv) {
                                  prefill_compute_moe, prefill_layer_batch, prefill_pipeline,
                                  prefill_group_kib, prefill_readers, prefill_chunks);
     }
+    if (layer_gguf_check != NULL) {
+        return qrt_layer_check(layer_gguf_check, (uint32_t) layer_index, (uint32_t) layer_tokens,
+                               g_spv_dir);
+    }
     if (norm_gguf_check != NULL) {
         return qrt_norm_check(&cfg, norm_gguf_check, norm_tensor, dense_tensor,
                               (uint32_t) dense_tokens, g_spv_dir);
     }
     if (dense_gguf_check != NULL) {
-        return qrt_dense_gemm_check(&cfg, dense_gguf_check, dense_tensor, (uint32_t) dense_tokens);
+        return qrt_dense_gemm_check(&cfg, dense_gguf_check, dense_tensor, (uint32_t) dense_tokens,
+                                    (uint32_t) dense_rows);
     }
     if (deltanet_gguf != NULL) {
         return qrt_dn_check(deltanet_gguf, (uint32_t) deltanet_layer, (uint32_t) deltanet_tokens,

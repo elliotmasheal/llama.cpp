@@ -30,6 +30,8 @@ struct qrt_norm_args {
     uint32_t tokens;
     float eps;
     int quant;          // 0 = norm only
+    int no_norm;        // 1 = copy the row and quantise it, no rms scaling and no weight
+    int no_out;         // 1 = do not write the f32 row (the GEMM only needs the planes)
 };
 
 int qrt_norm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_norm ** out,
@@ -53,3 +55,7 @@ double qrt_norm_last_ms(const qrt_norm * n);
 // packing as the shader. Either output may be NULL.
 void qrt_norm_cpu(uint32_t tokens, uint32_t k, const float * x, const float * w, float eps,
                   float * out, signed char * qs_out, uint32_t * ds_out);
+// The no_norm path: out = x, then the same Q8_1 packing (the attention output that feeds
+// ssm_out / attn_output). weight and eps are not used.
+void qrt_norm_quant_cpu(uint32_t tokens, uint32_t k, const float * x, float * out,
+                        signed char * qs_out, uint32_t * ds_out);

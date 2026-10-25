@@ -86,6 +86,8 @@ struct qrt_norm_pc {
     uint32_t dsbase;
     float    eps;
     uint32_t do_quant;
+    uint32_t do_norm;
+    uint32_t do_out;
 };
 
 struct qrt_norm_ring {
@@ -299,7 +301,8 @@ int qrt_norm_record(qrt_norm * n, uint32_t ring, const qrt_norm_args * a,
         return fail(err, err_size, "norm shape tokens=%u k=%u does not fit (k must be a "
                     "multiple of 32)", a->tokens, a->k);
     }
-    if (a->x == VK_NULL_HANDLE || a->w == VK_NULL_HANDLE || a->out == VK_NULL_HANDLE) {
+    if (a->x == VK_NULL_HANDLE || a->w == VK_NULL_HANDLE ||
+        (a->out == VK_NULL_HANDLE && a->no_out == 0)) {
         return fail(err, err_size, "norm needs x, w and out buffers");
     }
     if (a->quant != 0 && (a->qs == VK_NULL_HANDLE || a->ds == VK_NULL_HANDLE)) {
@@ -310,7 +313,7 @@ int qrt_norm_record(qrt_norm * n, uint32_t ring, const qrt_norm_args * a,
         return fail(err, err_size, "norm ring %u is still in flight; wait before recording",
                     ring);
     }
-    VkBuffer bufs[5] = { a->x, a->w, a->out,
+    VkBuffer bufs[5] = { a->x, a->w, a->no_out != 0 ? a->x : a->out,
                          a->quant != 0 ? a->qs : a->out,
                          a->quant != 0 ? a->ds : a->out };
     write_set(n->dev, g->set, bufs, 5);
@@ -332,6 +335,8 @@ int qrt_norm_record(qrt_norm * n, uint32_t ring, const qrt_norm_args * a,
     pc.dsbase   = a->dsbase;
     pc.eps      = a->eps;
     pc.do_quant = a->quant != 0 ? 1u : 0u;
+    pc.do_norm  = a->no_norm != 0 ? 0u : 1u;
+    pc.do_out   = a->no_out != 0 ? 0u : 1u;
     vkCmdBindPipeline(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, n->pipe);
     vkCmdBindDescriptorSets(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, n->layout, 0, 1, &g->set,
                             0, nullptr);
@@ -506,6 +511,39 @@ void qrt_norm_cpu(uint32_t tokens, uint32_t k, const float * x, const float * w,
                 float y = norm[b * 32u + i] * inv;
                 y = y > 127.0f ? 127.0f : (y < -127.0f ? -127.0f : y);
                 const int v = (int) roundf(y);   // half away from zero, the same rule
+                q[i] = (signed char) v;
+                sum += v;
+            }
+            const uint32_t dh = f32_to_f16(d);
+            ds_out[(size_t) t * blocks + b] = dh | ((uint32_t) (uint16_t) (sum + 32768) << 16);
+        }
+    }
+}
+
+void qrt_norm_quant_cpu(uint32_t tokens, uint32_t k, const float * x, float * out,
+                        signed char * qs_out, uint32_t * ds_out) {
+    const uint32_t blocks = k / 32u;
+    for (uint32_t t = 0; t < tokens; ++t) {
+        const float * row = x + (size_t) t * k;
+        if (out != NULL) {
+            memcpy(out + (size_t) t * k, row, (size_t) k * sizeof(float));
+        }
+        if (qs_out == NULL || ds_out == NULL) {
+            continue;
+        }
+        for (uint32_t b = 0; b < blocks; ++b) {
+            float mx = 0.0f;
+            for (uint32_t i = 0; i < 32u; ++i) {
+                mx = fmaxf(mx, fabsf(row[b * 32u + i]));
+            }
+            const float d = mx / 127.0f;
+            const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+            int sum = 0;
+            signed char * q = qs_out + ((size_t) t * blocks + b) * 32u;
+            for (uint32_t i = 0; i < 32u; ++i) {
+                float y = row[b * 32u + i] * inv;
+                y = y > 127.0f ? 127.0f : (y < -127.0f ? -127.0f : y);
+                const int v = (int) roundf(y);
                 q[i] = (signed char) v;
                 sum += v;
             }
