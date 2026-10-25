@@ -1,0 +1,102 @@
+#version 450
+// Q8_0 (weights) x Q8_1 (activations) int8 dot GEMM for the dense projections. A Q8_0
+// block is 34 bytes (f16 delta + 32 int8), so rows are not word aligned and this kernel
+// addresses the weight buffer as bytes, like the Q6_K one. There is no min term: each
+// 32-element block contributes d * aq * sum(q * qa), one dot per block.
+
+#extension GL_EXT_control_flow_attributes : enable
+#ifdef Q4K_DOT4
+#extension GL_EXT_integer_dot_product : require
+#endif
+
+#include "tiles.h"
+#include "common.glsl"
+
+layout(local_size_x = Q4K_WG_INVOCATIONS) in;
+
+layout(binding = 0) readonly  buffer WeightWords { uint w[]; } wt;
+layout(binding = 1) readonly  buffer ActQs       { uvec4 aq[]; } aq;
+layout(binding = 2) writeonly buffer Out         { float o[]; } ob;
+layout(binding = 3) readonly  buffer ActDs       { uint ads[]; } ads;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint k;
+    uint m;
+    uint wbase;   // byte offset of row 0
+    uint obase;
+    uint abase;
+} pc;
+
+const uint BLOCK = QRT_BLOCK_Q8_0;   // 34 bytes
+
+uint load4(uint off) {
+    const uint i = off >> 2u;
+    const uint q = (off & 3u) * 8u;
+    const uint lo = wt.w[i];
+    return q == 0u ? lo : ((lo >> q) | (wt.w[i + 1u] << (32u - q)));
+}
+
+void main() {
+    const uint nsb  = pc.k / Q4K_QK;
+    const uint nk32 = pc.k / 32u;
+    const uint lane = gl_LocalInvocationID.x % Q4K_SUBGROUP;
+    const uint sub  = gl_LocalInvocationID.x / Q4K_SUBGROUP;
+
+    uint row[Q4K_ROWS];
+    [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+        row[r] = gl_WorkGroupID.x * Q4K_TILE_N + r * Q4K_SUBGROUP + lane;
+    }
+    const uint tok0 = gl_WorkGroupID.y * Q4K_TILE_M + sub * Q4K_TOKENS;
+    if (row[Q4K_ROWS - 1u] >= pc.n || tok0 + Q4K_TOKENS > pc.m) {
+        return;
+    }
+
+    float acc[Q4K_ROWS][Q4K_TOKENS];
+    [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+        [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
+            acc[r][t] = 0.0;
+        }
+    }
+
+    const uint w_stride = (pc.k / 32u) * BLOCK;
+    const uint a_tok    = pc.abase + tok0 * nk32;
+
+    // 8 blocks of 32 elements per 256-element superblock, each with its own delta.
+    for (uint sb = 0; sb < nsb; ++sb) {
+        [[unroll]] for (uint j = 0; j < 8u; ++j) {
+            uint q[Q4K_ROWS][8];
+            float d[Q4K_ROWS];
+            [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+                const uint b = pc.wbase + row[r] * w_stride + (sb * 8u + j) * BLOCK;
+                d[r] = unpackHalf2x16(load4(b) & 0xFFFFu).x;
+                [[unroll]] for (uint i = 0; i < 8u; ++i) {
+                    q[r][i] = load4(b + 2u + 4u * i);
+                }
+            }
+            const uint bi = a_tok + sb * 8u + j;
+            [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
+                const uint ab = bi + t * nk32;
+                const uvec4 alo = aq.aq[ab * 2u];
+                const uvec4 ahi = aq.aq[ab * 2u + 1u];
+                const float aq_scale = unpackHalf2x16(ads.ads[ab]).x;
+                uint aw[8];
+                aw[0] = alo.x; aw[1] = alo.y; aw[2] = alo.z; aw[3] = alo.w;
+                aw[4] = ahi.x; aw[5] = ahi.y; aw[6] = ahi.z; aw[7] = ahi.w;
+                [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+                    int sum = 0;
+                    [[unroll]] for (uint i = 0; i < 8u; ++i) {
+                        sum += qrt_dot4(q[r][i], aw[i]);
+                    }
+                    acc[r][t] += d[r] * aq_scale * float(sum);
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+        [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
+            ob.o[pc.obase + row[r] * pc.m + tok0 + t] = acc[r][t];
+        }
+    }
+}

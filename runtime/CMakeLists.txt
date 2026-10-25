@@ -35,8 +35,14 @@ if(Vulkan_GLSLC_EXECUTABLE)
     set(_qrt_read_spv "${CMAKE_CURRENT_BINARY_DIR}/qrt-read.spv")
     set(_qrt_kernels "${CMAKE_CURRENT_SOURCE_DIR}/kernels")
     set(_qrt_swiglu_spv "${CMAKE_CURRENT_BINARY_DIR}/swiglu_q8.spv")
+    # Tokens per lane: the expert kernels are best at 8 (M2-4 sweep), but the dense
+    # projections run at M=10240 where a wider tile cuts the weight re-reads (RESULTS 46).
+    set(_qrt_tokens_q4k 8)
+    set(_qrt_tokens_q5k 8)
+    set(_qrt_tokens_q6k 8)
+    set(_qrt_tokens_q8k 8)
     set(_qrt_gemm_spv "")
-    foreach(_q IN ITEMS q4k q5k q6k)
+    foreach(_q IN ITEMS q4k q5k q6k q8k)
         list(APPEND _qrt_gemm_spv "${CMAKE_CURRENT_BINARY_DIR}/gemm_${_q}.spv")
     endforeach()
     add_custom_command(
@@ -45,10 +51,11 @@ if(Vulkan_GLSLC_EXECUTABLE)
         DEPENDS ${_qrt_read_comp}
         COMMENT "Compiling proto/qrt-read.comp for --prefill-check"
         VERBATIM)
-    foreach(_q IN ITEMS q4k q5k q6k)
+    foreach(_q IN ITEMS q4k q5k q6k q8k)
         add_custom_command(
             OUTPUT  ${CMAKE_CURRENT_BINARY_DIR}/gemm_${_q}.spv
             COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1 -DQ4K_DOT4
+                    -DQ4K_TOKENS=${_qrt_tokens_${_q}}
                     -I${_qrt_kernels} ${_qrt_kernels}/gemm_${_q}.comp
                     -o ${CMAKE_CURRENT_BINARY_DIR}/gemm_${_q}.spv
             DEPENDS ${_qrt_kernels}/gemm_${_q}.comp ${_qrt_kernels}/tiles.h

@@ -16,10 +16,12 @@
 struct qrt_gemm;
 
 enum qrt_quant {
-    QRT_QUANT_Q4K = 0,
-    QRT_QUANT_Q5K = 1,
-    QRT_QUANT_Q6K = 2,
+    QRT_QUANT_Q4K  = 0,
+    QRT_QUANT_Q5K  = 1,
+    QRT_QUANT_Q6K  = 2,
+    QRT_QUANT_Q8_0 = 3,   // the dense projections; 34-byte blocks, so byte addressed
 };
+#define QRT_QUANT_TYPES 4
 
 // spv_dir holds gemm_q4k.spv, gemm_q5k.spv, gemm_q6k.spv and swiglu_q8.spv, as the
 // build puts them next to qrt.

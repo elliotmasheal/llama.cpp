@@ -76,7 +76,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M3-0 data=- io=- user=-
+queues: bench=- impl=M2-6b data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -142,6 +142,10 @@ blockers: none
   注意力本体 9.45（15%）、路由专家 21.1（34%）。按 6 TFLOPS 稠密速率 PP = **1055 tok/s**（余量 5%）。
   M2-6 切成 M2-6b（Q8_0 GEMM，最大块）/6c（DeltaNet）/6d（full-attn）；见 RESULTS.md 第 45 节、
   DECISIONS.md 第 42 节。
+- **M2-6b Q8_0 GEMM（2026-10-25）**：稠密投影内核进运行时、正确（rel_L1 1.3e-7），但只 **1.10-2.17 TFLOPS**
+  （真实形状 M=10240 是 1.10）。按实测速率 PP 只有 **258-474 tok/s** -> **PP 的绑定腿已从专家腿
+  换成稠密 GEMM**，差 4-6 倍。下一步：q8_0 块预打散成对齐平面（M2-4 在 Q4_K 上 3.66->6.08 的同一招）。
+  见 `RESULTS.md` 第 46 节、`DECISIONS.md` 第 43 节。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、

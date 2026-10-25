@@ -26,5 +26,6 @@
 #define QRT_BLOCK_Q4K 144
 #define QRT_BLOCK_Q5K 176
 #define QRT_BLOCK_Q6K 210
+#define QRT_BLOCK_Q8_0 34
 
 #endif

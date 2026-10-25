@@ -12,6 +12,7 @@ size_t qrt_gemm_block_bytes(qrt_quant type) {
         case QRT_QUANT_Q4K: return QRT_BLOCK_Q4K;
         case QRT_QUANT_Q5K: return QRT_BLOCK_Q5K;
         case QRT_QUANT_Q6K: return QRT_BLOCK_Q6K;
+        case QRT_QUANT_Q8_0: return QRT_BLOCK_Q8_0;
     }
     return 0;
 }
@@ -21,7 +22,7 @@ uint64_t qrt_gemm_matrix_bytes(qrt_quant type, uint32_t n, uint32_t k) {
 }
 
 int qrt_gemm_type_of(uint32_t n, uint32_t k, uint64_t bytes) {
-    for (int t = 0; t < 3; ++t) {
+    for (int t = 0; t < QRT_QUANT_TYPES; ++t) {
         if (qrt_gemm_matrix_bytes((qrt_quant) t, n, k) == bytes) {
             return t;
         }
@@ -108,7 +109,7 @@ VkShaderModule load_module(VkDevice dev, const char * dir, const char * name, ch
 
 struct qrt_gemm {
     qrt_vk_dev *    dev;
-    VkPipeline      gemm_pipe[3];   // Q4_K, Q5_K, Q6_K
+    VkPipeline      gemm_pipe[QRT_QUANT_TYPES];
     VkPipeline      swiglu_pipe;
     VkPipelineLayout gemm_layout;
     VkPipelineLayout swiglu_layout;
@@ -231,8 +232,9 @@ int qrt_gemm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_gemm ** out,
         return vk_fail(err, err_size, "vkCreatePipelineLayout (swiglu)", r);
     }
 
-    const char * names[3] = { "gemm_q4k.spv", "gemm_q5k.spv", "gemm_q6k.spv" };
-    for (int i = 0; i < 3; ++i) {
+    const char * names[QRT_QUANT_TYPES] = { "gemm_q4k.spv", "gemm_q5k.spv", "gemm_q6k.spv",
+                                           "gemm_q8k.spv" };
+    for (int i = 0; i < QRT_QUANT_TYPES; ++i) {
         VkShaderModule mod = load_module(dev->device, spv_dir, names[i], err, err_size);
         if (mod == VK_NULL_HANDLE) {
             qrt_gemm_close(dev, g);
@@ -351,7 +353,7 @@ void qrt_gemm_close(qrt_vk_dev * dev, qrt_gemm * g) {
         if (g->swiglu_pipe != VK_NULL_HANDLE) {
             vkDestroyPipeline(dev->device, g->swiglu_pipe, nullptr);
         }
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < QRT_QUANT_TYPES; ++i) {
             if (g->gemm_pipe[i] != VK_NULL_HANDLE) {
                 vkDestroyPipeline(dev->device, g->gemm_pipe[i], nullptr);
             }
@@ -426,7 +428,7 @@ int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t er
         return fail(err, err_size, "n=%u must be a multiple of %d, m=%u of %d, k=%u of %d",
                     a->n, Q4K_TILE_N, a->m, Q4K_TILE_M, a->k, Q4K_QK);
     }
-    if (a->type != QRT_QUANT_Q4K && a->type != QRT_QUANT_Q5K && a->type != QRT_QUANT_Q6K) {
+    if (a->type < 0 || a->type >= QRT_QUANT_TYPES) {
         return fail(err, err_size, "unknown quant type %d", (int) a->type);
     }
     VkDescriptorSet set = VK_NULL_HANDLE;

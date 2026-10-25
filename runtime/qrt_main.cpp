@@ -10,6 +10,7 @@
 #include "kernels/moe_expert.h"
 
 #include <chrono>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,12 @@
 static const char QRT_VERSION[] = "0.1-m2-0";
 
 static int g_failures = 0;
+
+// SPIR-V directory resolved from argv[0]; every check that needs a shader uses it.
+static char g_spv_dir[1024] = ".";
+
+static float f16_to_f32_local(uint32_t h);
+static double median_ms(double * v, int n);
 
 // Defined with the measurement helpers below; the MoE check needs it earlier.
 static double now_ms(void);
@@ -130,6 +137,209 @@ static int qrt_moe_check(const qrt_config * cfg, const char * prefix, const char
     qrt_weights_close(w);
     printf("moe_io_failures=%u alloc_mib=%llu\n", dev->io_failures,
            (unsigned long long) (dev->alloc_bytes >> 20));
+    qrt_vk_close(dev);
+    return rc;
+}
+
+// M2-6b: the Q8_0 dense projection kernel. Reads one q8_0 matrix out of the GGUF, checks
+// it against a double-precision dequant reference at a small token count, then times the
+// real prefill shape so the dense leg stops being an assumption (RESULTS 46).
+static int qrt_dense_gemm_check(const qrt_config * cfg, const char * gguf_path,
+                                const char * tensor_name, uint32_t tokens) {
+    char err[QRT_ERR_SIZE] = {0};
+    qrt_vk_dev * dev = NULL;
+    if (qrt_vk_open((uint32_t) cfg->vram_tier_mib, &dev, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        return 2;
+    }
+    qrt_gguf * g = NULL;
+    if (qrt_gguf_open(gguf_path, &g, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        qrt_vk_close(dev);
+        return 2;
+    }
+    const qrt_gguf_tensor * t = NULL;
+    if (qrt_gguf_require(g, tensor_name, &t, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        qrt_gguf_close(g);
+        qrt_vk_close(dev);
+        return 2;
+    }
+    if (t->type != 8) {
+        fprintf(stderr, "qrt: %s is %s, the dense kernel reads q8_0\n", tensor_name,
+                qrt_gguf_type_name(t->type));
+        qrt_gguf_close(g);
+        qrt_vk_close(dev);
+        return 2;
+    }
+    const uint32_t k = (uint32_t) t->ne[0];
+    const uint32_t n = (uint32_t) t->ne[1];
+    const uint32_t check_tokens = 64;
+    if (tokens < check_tokens) {
+        tokens = check_tokens;
+    }
+    tokens = (tokens + 31u) / 32u * 32u;
+    if (k % 256 != 0 || n % 64 != 0) {
+        fprintf(stderr, "qrt: shape k=%u n=%u does not fit the tiles\n", k, n);
+        qrt_gguf_close(g);
+        qrt_vk_close(dev);
+        return 2;
+    }
+
+    // The tensor pointer dies with the index, so snapshot what the run needs first.
+    const uint64_t wbytes_n = t->nbytes;
+    std::vector<unsigned char> wbytes((size_t) wbytes_n);
+    if (qrt_gguf_read_tensor(g, t, wbytes.data(), wbytes.size(), err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        qrt_gguf_close(g);
+        qrt_vk_close(dev);
+        return 2;
+    }
+    qrt_gguf_close(g);
+
+    int rc = 2;
+    qrt_gemm * gemm = NULL;
+    VkBuffer wbuf = VK_NULL_HANDLE;
+    VkDeviceMemory wmem = VK_NULL_HANDLE;
+    VkBuffer aqs = VK_NULL_HANDLE;
+    VkDeviceMemory aqs_mem = VK_NULL_HANDLE;
+    VkBuffer ads = VK_NULL_HANDLE;
+    VkDeviceMemory ads_mem = VK_NULL_HANDLE;
+    VkBuffer out = VK_NULL_HANDLE;
+    VkDeviceMemory out_mem = VK_NULL_HANDLE;
+    qrt_vk_staging * stg = NULL;
+    unsigned char * host_qs = NULL;
+    uint32_t * host_ds = NULL;
+    do {
+        char dir[1024];
+        snprintf(dir, sizeof(dir), "%s", g_spv_dir);
+        if (qrt_gemm_open(dev, dir, &gemm, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            break;
+        }
+        const uint64_t qs_bytes = (uint64_t) tokens * k;
+        const uint64_t ds_bytes = (uint64_t) tokens * (k / 32) * 4;
+        const uint64_t out_bytes = (uint64_t) tokens * n * 4;
+        if (qrt_vk_alloc(dev, wbytes_n, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
+                         &wbuf, &wmem, err, sizeof(err)) != 0 ||
+            qrt_vk_alloc(dev, qs_bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
+                         &aqs, &aqs_mem, err, sizeof(err)) != 0 ||
+            qrt_vk_alloc(dev, ds_bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
+                         &ads, &ads_mem, err, sizeof(err)) != 0 ||
+            qrt_vk_alloc(dev, out_bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC,
+                         &out, &out_mem, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            break;
+        }
+        host_qs = (unsigned char *) malloc((size_t) qs_bytes);
+        host_ds = (uint32_t *) malloc((size_t) ds_bytes);
+        if (host_qs == NULL || host_ds == NULL) {
+            fprintf(stderr, "qrt: out of memory for the activation planes\n");
+            break;
+        }
+        // Deterministic Q8_1 activations, same generator as the MoE harness.
+        uint32_t seed = 99991u;
+        for (uint64_t b = 0; b < (uint64_t) tokens * (k / 32); ++b) {
+            unsigned char * q = host_qs + b * 32;
+            int32_t sum = 0;
+            for (uint32_t j = 0; j < 32; ++j) {
+                seed = seed * 1664525u + 1013904223u;
+                const int32_t v = (int32_t) ((seed >> 8) % 255u) - 127;
+                q[j] = (unsigned char) (int8_t) v;
+                sum += v;
+            }
+            seed = seed * 1664525u + 1013904223u;
+            const uint32_t d = 0x2800u + ((seed >> 8) & 0x0FFFu);
+            host_ds[b] = d | ((uint32_t) (uint16_t) (sum + 32768) << 16);
+        }
+        if (qrt_vk_staging_create(dev, qs_bytes > wbytes_n ? qs_bytes : wbytes_n, &stg,
+                                  err, sizeof(err)) != 0 ||
+            qrt_vk_upload(dev, stg, wbuf, 0, wbytes.data(), wbytes_n, err, sizeof(err)) != 0 ||
+            qrt_vk_upload(dev, stg, aqs, 0, host_qs, qs_bytes, err, sizeof(err)) != 0 ||
+            qrt_vk_upload(dev, stg, ads, 0, host_ds, ds_bytes, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            break;
+        }
+
+        qrt_gemm_args args;
+        memset(&args, 0, sizeof(args));
+        args.w = wbuf;
+        args.wbase = 0;            // q8_0 is byte addressed
+        args.a_qs = aqs;
+        args.a_ds = ads;
+        args.out = out;
+        args.n = n;
+        args.k = k;
+        args.m = check_tokens;
+        args.type = QRT_QUANT_Q8_0;
+
+        // Correctness: first 32 rows x check_tokens, against the canonical q8_0 dequant.
+        if (qrt_gemm_dispatch(gemm, &args, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            break;
+        }
+        std::vector<float> got((size_t) check_tokens * n);
+        if (qrt_vk_download(dev, stg, out, 0, got.data(), (uint64_t) check_tokens * n * 4,
+                            err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            break;
+        }
+        const uint32_t rows = 32;
+        double num = 0.0, den = 0.0;
+        for (uint32_t row = 0; row < rows; ++row) {
+            const unsigned char * wrow = wbytes.data() + (size_t) row * (k / 32) * 34;
+            for (uint32_t tok = 0; tok < check_tokens; ++tok) {
+                double acc = 0.0;
+                for (uint32_t b = 0; b < k / 32; ++b) {
+                    const unsigned char * blk = wrow + (size_t) b * 34;
+                    const uint32_t dh = (uint32_t) blk[0] | ((uint32_t) blk[1] << 8);
+                    const float d = f16_to_f32_local(dh);
+                    const uint32_t ab = tok * (k / 32) + b;
+                    const float aq = f16_to_f32_local(host_ds[ab] & 0xFFFFu);
+                    double sub = 0.0;
+                    for (uint32_t e = 0; e < 32; ++e) {
+                        const int8_t qv = (int8_t) blk[2 + e];
+                        const int8_t qa = (int8_t) host_qs[(size_t) ab * 32 + e];
+                        sub += (double) qv * (double) qa;
+                    }
+                    acc += (double) d * (double) aq * sub;
+                }
+                const double a = got[(size_t) row * check_tokens + tok];
+                num += fabs(a - acc);
+                den += fabs(acc);
+            }
+        }
+        const double rel = den > 0.0 ? num / den : num;
+        printf("dense_gemm_check tensor=%s type=q8_0 k=%u n=%u rows=%u tokens=%u rel_l1=%.3e "
+               "verdict=%s\n", tensor_name, k, n, rows, check_tokens, rel,
+               rel <= 1e-5 ? "PASS" : "FAIL");
+
+        // Timing at the prefill shape.
+        args.m = tokens;
+        double t[5];
+        for (int i = 0; i < 5; ++i) {
+            const double t0 = now_ms();
+            if (qrt_gemm_dispatch(gemm, &args, err, sizeof(err)) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                break;
+            }
+            t[i] = now_ms() - t0;
+        }
+        const double med = median_ms(t, 5);
+        const double flops = 2.0 * (double) tokens * n * k;
+        printf("dense_gemm m=%u n=%u k=%u median_ms=%.3f tflops=%.2f out_mib=%.0f\n",
+               tokens, n, k, med, med > 0.0 ? flops / med / 1e9 : 0.0,
+               (double) tokens * n * 4.0 / (1024.0 * 1024.0));
+        rc = rel <= 1e-5 ? 0 : 1;
+    } while (0);
+    free(host_qs);
+    free(host_ds);
+    qrt_vk_staging_destroy(dev, stg);
+    if (wmem != VK_NULL_HANDLE) qrt_vk_free(dev, wbuf, wmem);
+    if (aqs_mem != VK_NULL_HANDLE) qrt_vk_free(dev, aqs, aqs_mem);
+    if (ads_mem != VK_NULL_HANDLE) qrt_vk_free(dev, ads, ads_mem);
+    if (out_mem != VK_NULL_HANDLE) qrt_vk_free(dev, out, out_mem);
+    qrt_gemm_close(dev, gemm);
     qrt_vk_close(dev);
     return rc;
 }
@@ -478,6 +688,33 @@ static int pattern_compare(const unsigned char * a, const unsigned char * b, siz
         }
     }
     return 0;
+}
+
+static float f16_to_f32_local(uint32_t h) {
+    const uint32_t sign = (h & 0x8000u) << 16;
+    const uint32_t exp  = (h >> 10) & 0x1Fu;
+    const uint32_t man  = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) {
+            bits = sign;
+        } else {
+            uint32_t e = 127 - 15 + 1;
+            uint32_t m = man;
+            while ((m & 0x400u) == 0) {
+                m <<= 1;
+                --e;
+            }
+            bits = sign | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000u | (man << 13);
+    } else {
+        bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+    }
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
 }
 
 static double now_ms(void) {
@@ -833,6 +1070,9 @@ int main(int argc, char ** argv) {
     int prefill_group_kib = 16384;
     int prefill_readers = 1;
     int prefill_chunks = 1;
+    const char * dense_gguf_check = NULL;
+    const char * dense_tensor = "blk.3.attn_q.weight";
+    int dense_tokens = 10240;
     const char * moe_prefix = NULL;
     int moe_layer = 0;
     int moe_expert = 0;
@@ -841,6 +1081,15 @@ int main(int argc, char ** argv) {
     const char * gguf_path = NULL;
     const char * require_tensor = NULL;
 
+    {
+        const char * exe = argc > 0 ? argv[0] : "qrt";
+        const char * cut = strrchr(exe, '/');
+        const char * cutb = strrchr(exe, '\\');
+        const char * slash = cut > cutb ? cut : cutb;
+        if (slash != NULL) {
+            snprintf(g_spv_dir, sizeof(g_spv_dir), "%.*s", (int) (slash - exe), exe);
+        }
+    }
     std::vector<char *> args;
     args.push_back(argc > 0 ? argv[0] : lit("qrt"));
     for (int i = 1; i < argc; ++i) {
@@ -959,6 +1208,34 @@ int main(int argc, char ** argv) {
                 prefill_layer_batch = 0;
             } else {
                 fprintf(stderr, "qrt: --prefill-mode wants perexpert or layer, not '%s'\n", v);
+                return 2;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--dense-gemm-check") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --dense-gemm-check needs the GGUF path\n");
+                return 2;
+            }
+            dense_gguf_check = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--dense-tensor") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --dense-tensor needs a tensor name\n");
+                return 2;
+            }
+            dense_tensor = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--dense-tokens") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "qrt: --dense-tokens needs a count\n");
+                return 2;
+            }
+            dense_tokens = atoi(argv[++i]);
+            if (dense_tokens < 64) {
+                fprintf(stderr, "qrt: --dense-tokens wants at least 64\n");
                 return 2;
             }
             continue;
@@ -1125,6 +1402,9 @@ int main(int argc, char ** argv) {
                                  (uint32_t) prefill_slots, (uint32_t) prefill_layers,
                                  prefill_compute_moe, prefill_layer_batch, prefill_pipeline,
                                  prefill_group_kib, prefill_readers, prefill_chunks);
+    }
+    if (dense_gguf_check != NULL) {
+        return qrt_dense_gemm_check(&cfg, dense_gguf_check, dense_tensor, (uint32_t) dense_tokens);
     }
     if (moe_prefix != NULL) {
         std::string dir = argc > 0 ? argv[0] : "qrt";

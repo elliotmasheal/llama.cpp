@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M3-0",
+      "head": "M2-6b",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6 is doing (attention slices); M3-0 (expert cache) is the next runnable impl task since M2-3 is done"
+      "note": "M2-6b (Q8_0 dense GEMM) is the head; 6c/6d are the other two kernel slices, then M3-0"
     },
     {
       "lane": "data",
@@ -544,22 +544,20 @@
       "id": "M2-6",
       "milestone": "M2",
       "lane": "impl",
-      "status": "doing",
+      "status": "todo",
       "title": "注意力路径：DeltaNet 递推 + full-attn 批量",
       "deps": [
-        "M2-2",
-        "M2-4"
+        "M2-6b",
+        "M2-6c",
+        "M2-6d"
       ],
-      "resources": [
-        "gpu",
-        "machine-quiet"
-      ],
+      "resources": [],
       "paths": [
         "runtime/attn.*"
       ],
       "done_when": "k=1 prefill 与参考一致；full-attn 的 KV 只读一次；DeltaNet 状态与串行解码一致；M2-6b/6c/6d 全部 done",
       "claimed_at": "2026-10-25T16:30:00",
-      "note": "slice 1 done: the shape account in bench/tools/attn_account.py and RESULTS 45 shows the dense projections are 50% of the prompt FLOPs and the attention body 15%, so PP is 1055 tok/s at an assumed 6 TFLOPS dense rate. The kernel work is split into M2-6b (Q8_0 GEMM, the biggest), M2-6c (DeltaNet ops) and M2-6d (full attention); M2-6a is the KV quantisation"
+      "note": "umbrella: done when the three kernel slices below are in and the full-attention KV is read once per layer. The shape account is in bench/tools/attn_account.py and RESULTS 45: dense projections 50% of the prompt FLOPs, attention body 15%"
     },
     {
       "id": "M2-7",
@@ -1087,7 +1085,7 @@
       "status": "todo",
       "title": "KV q4_0 量化 + 16384 token 常驻窗口分页",
       "deps": [
-        "M2-6"
+        "M2-6d"
       ],
       "resources": [
         "gpu",
@@ -1170,16 +1168,16 @@
       "lane": "impl",
       "status": "todo",
       "title": "Q8_0 x Q8_1 GEMM：稠密投影（30.9 TFLOP，PP 的最大一条腿）",
-      "deps": [
-        "M2-6"
-      ],
+      "deps": [],
       "resources": [
         "gpu"
       ],
       "paths": [
         "runtime/kernels/q8k_gemm.*"
       ],
-      "done_when": "q8_0 权重 x q8_1 激活的 GEMM 对 CPU 参考 rel_L1 <= 1e-5；在 N=8192/K=2048/M=10240 的形状上 >= 5 TFLOPS；与 K-quant GEMM 共用记录/提交接口"
+      "done_when": "q8_0 权重 x q8_1 激活的 GEMM 对 CPU 参考 rel_L1 <= 1e-5；在 N=8192/K=2048/M=10240 的形状上 >= 5 TFLOPS；与 K-quant GEMM 共用记录/提交接口",
+      "claimed_at": "2026-10-25T18:00:00",
+      "note": "slice 1: gemm_q8k.comp + the fourth qrt_quant type + --dense-gemm-check. Correct at rel_L1 1.297e-7, but 2.12-2.17 TFLOPS at M=1024/2048 and only 1.10 at the real prefill shape M=10240, so the dense leg would make PP 258-474 tok/s instead of 1055 (RESULTS 46, DECISIONS 43). Next: prepack the 34-byte q8_0 blocks into aligned qs/ds planes the way M2-4 did for Q4_K, then fix the output layout and K blocking"
     },
     {
       "id": "M2-6c",
@@ -1187,9 +1185,7 @@
       "lane": "impl",
       "status": "todo",
       "title": "DeltaNet 算子：conv1d(4) + L2 norm + 递推 + gated RMS norm",
-      "deps": [
-        "M2-6b"
-      ],
+      "deps": [],
       "resources": [
         "gpu"
       ],
@@ -1204,9 +1200,7 @@
       "lane": "impl",
       "status": "todo",
       "title": "full-attn 批量：per-head RMS norm + IMRoPE + flash 因果注意力 + sigmoid 门",
-      "deps": [
-        "M2-6b"
-      ],
+      "deps": [],
       "resources": [
         "gpu"
       ],
