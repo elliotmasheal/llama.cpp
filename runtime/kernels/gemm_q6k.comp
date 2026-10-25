@@ -1,0 +1,145 @@
+#version 450
+// Q6_K (weights) x Q8_1 (activations) int8 dot GEMM. Block layout is ql[128], qh[64],
+// scales[16] (int8), d (half) = 210 bytes, so a row is not a whole number of words and
+// this kernel addresses the weight buffer as bytes (dequantize_row_q6_K,
+// ggml-quants.c:1940). There is no min term; the 6-bit value is centred by flipping bit
+// 5, which turns 0..63 into -32..31 and keeps the dot on signed int8 bytes.
+
+#extension GL_EXT_control_flow_attributes : enable
+#ifdef Q4K_DOT4
+#extension GL_EXT_integer_dot_product : require
+#endif
+
+#include "tiles.h"
+#include "common.glsl"
+
+layout(local_size_x = Q4K_WG_INVOCATIONS) in;
+
+layout(binding = 0) readonly  buffer WeightWords { uint w[]; } wt;
+layout(binding = 1) readonly  buffer ActQs       { uvec4 aq[]; } aq;
+layout(binding = 2) writeonly buffer Out         { float o[]; } ob;
+layout(binding = 3) readonly  buffer ActDs       { uint ads[]; } ads;
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint k;
+    uint m;
+    uint wbase;   // byte offset of row 0 for this type
+    uint obase;
+    uint abase;
+} pc;
+
+const uint BLOCK  = QRT_BLOCK_Q6K;   // 210 bytes
+const uint QL_OFF = 0u;
+const uint QH_OFF = 128u;
+const uint SC_OFF = 192u;
+const uint D_OFF  = 208u;
+
+// Bytes are fetched out of the word array: a 210-byte block means arbitrary byte
+// offsets, so an unaligned four-byte read takes two words and a funnel shift.
+uint load4(uint off) {
+    const uint i = off >> 2u;
+    const uint q = (off & 3u) * 8u;
+    const uint lo = wt.w[i];
+    return q == 0u ? lo : ((lo >> q) | (wt.w[i + 1u] << (32u - q)));
+}
+
+int load_scale(uint off) {
+    const int v = int((wt.w[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu);
+    return v > 127 ? v - 256 : v;
+}
+
+void main() {
+    const uint nsb  = pc.k / Q4K_QK;
+    const uint nk32 = pc.k / 32u;
+    const uint lane = gl_LocalInvocationID.x % Q4K_SUBGROUP;
+    const uint sub  = gl_LocalInvocationID.x / Q4K_SUBGROUP;
+
+    uint row[Q4K_ROWS];
+    [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+        row[r] = gl_WorkGroupID.x * Q4K_TILE_N + r * Q4K_SUBGROUP + lane;
+    }
+    const uint tok0 = gl_WorkGroupID.y * Q4K_TILE_M + sub * Q4K_TOKENS;
+    if (row[Q4K_ROWS - 1u] >= pc.n || tok0 + Q4K_TOKENS > pc.m) {
+        return;
+    }
+
+    float acc[Q4K_ROWS][Q4K_TOKENS];
+    [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+        [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
+            acc[r][t] = 0.0;
+        }
+    }
+
+    const uint w_stride = nsb * BLOCK;
+    const uint a_tok    = pc.abase + tok0 * nk32;
+
+    for (uint sb = 0; sb < nsb; ++sb) {
+        uint base[Q4K_ROWS];
+        float d[Q4K_ROWS];
+        int sc[Q4K_ROWS][16];
+        [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+            base[r] = pc.wbase + row[r] * w_stride + sb * BLOCK;
+            d[r] = unpackHalf2x16(load4(base[r] + D_OFF) & 0xFFFFu).x;
+            [[unroll]] for (uint j = 0; j < 16u; ++j) {
+                sc[r][j] = load_scale(base[r] + SC_OFF + j);
+            }
+        }
+
+        // Two halves of 128 elements, four 32-element streams each: element l of stream
+        // s is at half*128 + s*32 + l, and elements 0..15 / 16..31 use two scales.
+        [[unroll]] for (uint hh = 0; hh < 2u; ++hh) {
+            [[unroll]] for (uint s = 0; s < 4u; ++s) {
+                uint q6[Q4K_ROWS][8];
+                [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+                    [[unroll]] for (uint i = 0; i < 8u; ++i) {
+                        const uint ql = load4(base[r] + QL_OFF + hh * 64u +
+                                             (((s & 1u) != 0u) ? 32u : 0u) + 4u * i);
+                        const uint qh = load4(base[r] + QH_OFF + hh * 32u + 4u * i);
+                        const uint q4 = (s < 2u) ? (ql & 0x0F0F0F0Fu)
+                                                 : ((ql >> 4) & 0x0F0F0F0Fu);
+                        const uint h2 = (qh >> (2u * s)) & 0x03030303u;
+                        q6[r][i] = (q4 | (h2 << 4u)) ^ 0x20202020u;
+                    }
+                }
+                const uint bi = a_tok + sb * 8u + hh * 4u + s;
+                [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
+                    const uint b = bi + t * nk32;
+                    const uvec4 alo = aq.aq[b * 2u];
+                    const uvec4 ahi = aq.aq[b * 2u + 1u];
+                    uint a[8];
+                    a[0] = alo.x; a[1] = alo.y; a[2] = alo.z; a[3] = alo.w;
+                    a[4] = ahi.x; a[5] = ahi.y; a[6] = ahi.z; a[7] = ahi.w;
+                    const float aq_scale = unpackHalf2x16(ads.ads[b]).x;
+                    int s0[Q4K_ROWS];
+                    int s1[Q4K_ROWS];
+                    [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+                        s0[r] = 0;
+                        s1[r] = 0;
+                    }
+                    [[unroll]] for (uint i = 0; i < 4u; ++i) {
+                        [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+                            s0[r] += qrt_dot4(q6[r][i], a[i]);
+                        }
+                    }
+                    [[unroll]] for (uint i = 4u; i < 8u; ++i) {
+                        [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+                            s1[r] += qrt_dot4(q6[r][i], a[i]);
+                        }
+                    }
+                    [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+                        const float fa = d[r] * aq_scale * float(sc[r][hh * 8u + 2u * s]);
+                        const float fb = d[r] * aq_scale * float(sc[r][hh * 8u + 2u * s + 1u]);
+                        acc[r][t] += fa * float(s0[r]) + fb * float(s1[r]);
+                    }
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
+        [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
+            ob.o[pc.obase + row[r] * pc.m + tok0 + t] = acc[r][t];
+        }
+    }
+}

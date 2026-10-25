@@ -1,11 +1,10 @@
-// Tile geometry shared by the host and the shader. Copied from the M2-4 probe
-// (kernels/bench/q4k-tiles.h) so the runtime build does not depend on bench/.
+// Tile geometry shared by the host and the three quant kernels. Copied from the M2-4
+// probe (kernels/bench/) so the runtime build does not depend on bench/.
 // Q4K_ROWS and Q4K_TOKENS are the sweep knobs that closed the 6.0 TFLOPS gate.
-#ifndef QRT_Q4K_TILES_H
-#define QRT_Q4K_TILES_H
+#ifndef QRT_TILES_H
+#define QRT_TILES_H
 
-#define Q4K_QK 256              // superblock length of Q4_K
-#define Q4K_W_WORDS 36          // 144 B superblock: d, dmin, 12 scale bytes, 128 qs bytes
+#define Q4K_QK 256              // superblock length of every K-quant
 #define Q4K_SUBGROUP 32         // lanes per row block; lane covers Q4K_ROWS rows 32 apart
 #ifndef Q4K_WG_INVOCATIONS
 #define Q4K_WG_INVOCATIONS 128  // subgroups x 32; each subgroup owns Q4K_TOKENS tokens
@@ -22,5 +21,10 @@
 
 #define Q4K_TILE_N (Q4K_ROWS * Q4K_SUBGROUP)
 #define Q4K_TILE_M (Q4K_TOKENS * Q4K_SUBGROUPS)
+
+// Superblock bytes of the quant types the store mixes (ggml-common.h).
+#define QRT_BLOCK_Q4K 144
+#define QRT_BLOCK_Q5K 176
+#define QRT_BLOCK_Q6K 210
 
 #endif

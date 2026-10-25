@@ -1,15 +1,17 @@
 #version 450
-// Q4_K (weights) x Q8_1 (activations) int8 dot GEMM, same algebra and tile map as the
-// M2-4 probe (kernels/bench/q4k-gemm.comp, README.md there derives the folding). Added
-// here: word/float/block base offsets in the push constants, so one descriptor set can
-// serve the gate, up and down matrices of an expert block that already sits in VRAM.
+// Q5_K (weights) x Q8_1 (activations) int8 dot GEMM. Same tile map and folding as the
+// Q4_K kernel; Q5_K adds a 32-byte qh plane carrying the fifth bit of every weight
+// (ggml-common.h block_q5_K, dequantize_row_q5_K at ggml-quants.c:1732). The 5-bit value
+// is rebuilt as a byte (0..31) so one dot per word covers it: a byte value below 32 is
+// a valid signed int8.
 
 #extension GL_EXT_control_flow_attributes : enable
 #ifdef Q4K_DOT4
 #extension GL_EXT_integer_dot_product : require
 #endif
 
-#include "q4k_tiles.h"
+#include "tiles.h"
+#include "common.glsl"
 
 layout(local_size_x = Q4K_WG_INVOCATIONS) in;
 
@@ -19,48 +21,17 @@ layout(binding = 2) writeonly buffer Out         { float o[]; } ob;
 layout(binding = 3) readonly  buffer ActDs       { uint ads[]; } ads;
 
 layout(push_constant) uniform PC {
-    uint n;      // rows of this matrix
-    uint k;      // reduction length
-    uint m;      // tokens, also the row stride of the output
-    uint wbase;  // first weight word of row 0 (expert block + matrix offset)
-    uint obase;  // first output float of row 0
-    uint abase;  // first activation block (token 0, reduction block 0)
+    uint n;
+    uint k;
+    uint m;
+    uint wbase;
+    uint obase;
+    uint abase;
 } pc;
 
-int q4k_dot4(uint q, uint a) {
-#ifdef Q4K_DOT4
-    return dotPacked4x8EXT(int(q), int(a));
-#else
-    const int p0 = int(q << 24u) >> 24;
-    const int p1 = int(q << 16u) >> 24;
-    const int p2 = int(q <<  8u) >> 24;
-    const int p3 = int(q) >> 24;
-    const int a0 = int(a << 24u) >> 24;
-    const int a1 = int(a << 16u) >> 24;
-    const int a2 = int(a <<  8u) >> 24;
-    const int a3 = int(a) >> 24;
-    return p0 * a0 + p1 * a1 + p2 * a2 + p3 * a3;
-#endif
-}
-
-uint q4k_byte(uvec3 s, uint i) {
-    const uint v = (i < 4u) ? s.x : ((i < 8u) ? s.y : s.z);
-    return (v >> ((i & 3u) * 8u)) & 0xFFu;
-}
-
-uint q4k_sc(uvec3 s, uint j) {
-    if (j < 4u) {
-        return q4k_byte(s, j) & 63u;
-    }
-    return (q4k_byte(s, j + 4u) & 15u) | ((q4k_byte(s, j - 4u) >> 6u) << 4);
-}
-
-uint q4k_mn(uvec3 s, uint j) {
-    if (j < 4u) {
-        return q4k_byte(s, j + 4u) & 63u;
-    }
-    return (q4k_byte(s, j + 4u) >> 4u) | ((q4k_byte(s, j) >> 6u) << 4);
-}
+const uint W_WORDS = QRT_BLOCK_Q5K / 4u;   // d, dmin, 12 scales, 32 qh bytes, 128 qs bytes
+const uint QH_WORD = 4u;                   // qh starts after the scale words
+const uint QS_WORD = 12u;                  // qs start after the 8 qh words
 
 void main() {
     const uint nsb  = pc.k / Q4K_QK;
@@ -84,14 +55,14 @@ void main() {
         }
     }
 
-    const uint w_stride = nsb * Q4K_W_WORDS;
+    const uint w_stride = nsb * W_WORDS;
     const uint a_tok    = pc.abase + tok0 * nk32;
 
     for (uint sb = 0; sb < nsb; ++sb) {
         vec2 dm[Q4K_ROWS];
         uvec3 sc[Q4K_ROWS];
         [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
-            const uint b = pc.wbase + row[r] * w_stride + sb * Q4K_W_WORDS;
+            const uint b = pc.wbase + row[r] * w_stride + sb * W_WORDS;
             dm[r] = unpackHalf2x16(wt.w[b]);
             sc[r] = uvec3(wt.w[b + 1u], wt.w[b + 2u], wt.w[b + 3u]);
         }
@@ -104,15 +75,20 @@ void main() {
             uint lo[Q4K_ROWS][8];
             uint hi[Q4K_ROWS][8];
             [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
-                f[r][0] = dm[r].x * float(q4k_sc(sc[r], jl));
-                f[r][1] = dm[r].x * float(q4k_sc(sc[r], jh));
-                k[r][0] = dm[r].y * float(q4k_mn(sc[r], jl));
-                k[r][1] = dm[r].y * float(q4k_mn(sc[r], jh));
-                const uint b = pc.wbase + row[r] * w_stride + sb * Q4K_W_WORDS + 4u + 8u * g;
+                f[r][0] = dm[r].x * float(qrt_sm_scale(sc[r], jl));
+                f[r][1] = dm[r].x * float(qrt_sm_scale(sc[r], jh));
+                k[r][0] = dm[r].y * float(qrt_sm_min(sc[r], jl));
+                k[r][1] = dm[r].y * float(qrt_sm_min(sc[r], jh));
+                const uint base = pc.wbase + row[r] * w_stride + sb * W_WORDS;
                 [[unroll]] for (uint i = 0; i < 8u; ++i) {
-                    const uint u = wt.w[b + i];
-                    lo[r][i] = u & 0x0F0F0F0Fu;
-                    hi[r][i] = (u >> 4) & 0x0F0F0F0Fu;
+                    const uint u = wt.w[base + QS_WORD + 8u * g + i];
+                    // The fifth bit lives in qh[4i..4i+3], one bit per element, bit 2g
+                    // for the low nibble and 2g+1 for the high nibble.
+                    const uint qh = wt.w[base + QH_WORD + i];
+                    const uint bl = ((qh >> jl) & 0x01010101u) << 4u;
+                    const uint bh = ((qh >> jh) & 0x01010101u) << 4u;
+                    lo[r][i] = (u & 0x0F0F0F0Fu) | bl;
+                    hi[r][i] = ((u >> 4) & 0x0F0F0F0Fu) | bh;
                 }
             }
 
@@ -143,8 +119,8 @@ void main() {
                 }
                 [[unroll]] for (uint i = 0; i < 8u; ++i) {
                     [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
-                        il[r] += q4k_dot4(lo[r][i], al[i]);
-                        ih[r] += q4k_dot4(hi[r][i], ah[i]);
+                        il[r] += qrt_dot4(lo[r][i], al[i]);
+                        ih[r] += qrt_dot4(hi[r][i], ah[i]);
                     }
                 }
                 [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {

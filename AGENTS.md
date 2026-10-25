@@ -120,6 +120,9 @@ blockers: none
   compute 腿，gate 对 CPU 双精度参考 **rel_L1 1.6e-7**；但只有 **1.51-1.55 TFLOPS**
   （每专家一次提交、16 个 workgroup），且 down 是 Q5_K/Q6_K 被跳过（`RESULTS.md` 第 39 节、
   `DECISIONS.md` 第 36 节）。下一步：整层单次提交，再补 Q5_K/Q6_K 内核。
+- **M2-5 三型 GEMM（2026-10-25）**：Q5_K 与 Q6_K 也进运行时，gate/up/down **全跑**
+  （三型 rel_L1 <= 2.5e-7），算力 **1.90-2.16 TFLOPS**，每块 0.35 ms（`RESULTS.md` 第 40 节、
+  `DECISIONS.md` 第 37 节）。瓶颈仍是每专家一次提交；下一步做**整层单次提交**。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、

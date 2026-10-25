@@ -1,11 +1,33 @@
-#include "kernels/q4k_gemm.h"
+#include "kernels/gemm.h"
 
-#include "kernels/q4k_tiles.h"
+#include "kernels/tiles.h"
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+size_t qrt_gemm_block_bytes(qrt_quant type) {
+    switch (type) {
+        case QRT_QUANT_Q4K: return QRT_BLOCK_Q4K;
+        case QRT_QUANT_Q5K: return QRT_BLOCK_Q5K;
+        case QRT_QUANT_Q6K: return QRT_BLOCK_Q6K;
+    }
+    return 0;
+}
+
+uint64_t qrt_gemm_matrix_bytes(qrt_quant type, uint32_t n, uint32_t k) {
+    return (uint64_t) n * (k / Q4K_QK) * qrt_gemm_block_bytes(type);
+}
+
+int qrt_gemm_type_of(uint32_t n, uint32_t k, uint64_t bytes) {
+    for (int t = 0; t < 3; ++t) {
+        if (qrt_gemm_matrix_bytes((qrt_quant) t, n, k) == bytes) {
+            return t;
+        }
+    }
+    return -1;
+}
 
 #ifdef QRT_HAVE_VULKAN
 
@@ -84,9 +106,9 @@ VkShaderModule load_module(VkDevice dev, const char * dir, const char * name, ch
 
 } // namespace
 
-struct qrt_q4k {
+struct qrt_gemm {
     qrt_vk_dev *    dev;
-    VkPipeline      gemm_pipe;
+    VkPipeline      gemm_pipe[3];   // Q4_K, Q5_K, Q6_K
     VkPipeline      swiglu_pipe;
     VkPipelineLayout gemm_layout;
     VkPipelineLayout swiglu_layout;
@@ -151,13 +173,13 @@ VkPipeline make_pipeline(VkDevice dev, VkShaderModule mod, VkPipelineLayout layo
 
 } // namespace
 
-int qrt_q4k_open(qrt_vk_dev * dev, const char * spv_dir, qrt_q4k ** out,
+int qrt_gemm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_gemm ** out,
                  char * err, size_t err_size) {
     *out = NULL;
     if (dev == NULL || spv_dir == NULL) {
         return fail(err, err_size, "the int8 GEMM needs a device and a SPIR-V directory");
     }
-    qrt_q4k * g = (qrt_q4k *) calloc(1, sizeof(qrt_q4k));
+    qrt_gemm * g = (qrt_gemm *) calloc(1, sizeof(qrt_gemm));
     if (g == NULL) {
         return fail(err, err_size, "out of memory for the GEMM pipelines");
     }
@@ -178,7 +200,7 @@ int qrt_q4k_open(qrt_vk_dev * dev, const char * spv_dir, qrt_q4k ** out,
     dlci.pBindings    = binds;
     VkResult r = vkCreateDescriptorSetLayout(dev->device, &dlci, nullptr, &g->dsl);
     if (r != VK_SUCCESS) {
-        qrt_q4k_close(dev, g);
+        qrt_gemm_close(dev, g);
         return vk_fail(err, err_size, "vkCreateDescriptorSetLayout", r);
     }
 
@@ -197,36 +219,40 @@ int qrt_q4k_open(qrt_vk_dev * dev, const char * spv_dir, qrt_q4k ** out,
     plci.pPushConstantRanges    = &pc[0];
     r = vkCreatePipelineLayout(dev->device, &plci, nullptr, &g->gemm_layout);
     if (r != VK_SUCCESS) {
-        qrt_q4k_close(dev, g);
+        qrt_gemm_close(dev, g);
         return vk_fail(err, err_size, "vkCreatePipelineLayout (gemm)", r);
     }
     plci.pPushConstantRanges = &pc[1];
     r = vkCreatePipelineLayout(dev->device, &plci, nullptr, &g->swiglu_layout);
     if (r != VK_SUCCESS) {
-        qrt_q4k_close(dev, g);
+        qrt_gemm_close(dev, g);
         return vk_fail(err, err_size, "vkCreatePipelineLayout (swiglu)", r);
     }
 
-    VkShaderModule gemm_mod = load_module(dev->device, spv_dir, "q4k_gemm.spv", err, err_size);
-    if (gemm_mod == VK_NULL_HANDLE) {
-        qrt_q4k_close(dev, g);
-        return -1;
-    }
-    g->gemm_pipe = make_pipeline(dev->device, gemm_mod, g->gemm_layout, pc[0].size, err, err_size);
-    vkDestroyShaderModule(dev->device, gemm_mod, nullptr);
-    if (g->gemm_pipe == VK_NULL_HANDLE) {
-        qrt_q4k_close(dev, g);
-        return -1;
+    const char * names[3] = { "gemm_q4k.spv", "gemm_q5k.spv", "gemm_q6k.spv" };
+    for (int i = 0; i < 3; ++i) {
+        VkShaderModule mod = load_module(dev->device, spv_dir, names[i], err, err_size);
+        if (mod == VK_NULL_HANDLE) {
+            qrt_gemm_close(dev, g);
+            return -1;
+        }
+        g->gemm_pipe[i] = make_pipeline(dev->device, mod, g->gemm_layout, pc[0].size,
+                                        err, err_size);
+        vkDestroyShaderModule(dev->device, mod, nullptr);
+        if (g->gemm_pipe[i] == VK_NULL_HANDLE) {
+            qrt_gemm_close(dev, g);
+            return -1;
+        }
     }
     VkShaderModule sw_mod = load_module(dev->device, spv_dir, "swiglu_q8.spv", err, err_size);
     if (sw_mod == VK_NULL_HANDLE) {
-        qrt_q4k_close(dev, g);
+        qrt_gemm_close(dev, g);
         return -1;
     }
     g->swiglu_pipe = make_pipeline(dev->device, sw_mod, g->swiglu_layout, pc[1].size, err, err_size);
     vkDestroyShaderModule(dev->device, sw_mod, nullptr);
     if (g->swiglu_pipe == VK_NULL_HANDLE) {
-        qrt_q4k_close(dev, g);
+        qrt_gemm_close(dev, g);
         return -1;
     }
 
@@ -242,7 +268,7 @@ int qrt_q4k_open(qrt_vk_dev * dev, const char * spv_dir, qrt_q4k ** out,
     dpci.pPoolSizes    = &size;
     r = vkCreateDescriptorPool(dev->device, &dpci, nullptr, &g->pool);
     if (r != VK_SUCCESS) {
-        qrt_q4k_close(dev, g);
+        qrt_gemm_close(dev, g);
         return vk_fail(err, err_size, "vkCreateDescriptorPool (gemm)", r);
     }
     VkDescriptorSet sets[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
@@ -257,7 +283,7 @@ int qrt_q4k_open(qrt_vk_dev * dev, const char * spv_dir, qrt_q4k ** out,
     dsai.pSetLayouts        = layouts;
     r = vkAllocateDescriptorSets(dev->device, &dsai, sets);
     if (r != VK_SUCCESS) {
-        qrt_q4k_close(dev, g);
+        qrt_gemm_close(dev, g);
         return vk_fail(err, err_size, "vkAllocateDescriptorSets (gemm)", r);
     }
     g->gemm_sets[GEMM_SET_INPUT]  = sets[0];
@@ -271,7 +297,7 @@ int qrt_q4k_open(qrt_vk_dev * dev, const char * spv_dir, qrt_q4k ** out,
     pci.queueFamilyIndex = dev->compute_family;
     r = vkCreateCommandPool(dev->device, &pci, nullptr, &g->cmd_pool);
     if (r != VK_SUCCESS) {
-        qrt_q4k_close(dev, g);
+        qrt_gemm_close(dev, g);
         return vk_fail(err, err_size, "vkCreateCommandPool (gemm)", r);
     }
     VkCommandBufferAllocateInfo cai;
@@ -282,7 +308,7 @@ int qrt_q4k_open(qrt_vk_dev * dev, const char * spv_dir, qrt_q4k ** out,
     cai.commandBufferCount = 1;
     r = vkAllocateCommandBuffers(dev->device, &cai, &g->cmd);
     if (r != VK_SUCCESS) {
-        qrt_q4k_close(dev, g);
+        qrt_gemm_close(dev, g);
         return vk_fail(err, err_size, "vkAllocateCommandBuffers (gemm)", r);
     }
     VkFenceCreateInfo fci;
@@ -290,14 +316,14 @@ int qrt_q4k_open(qrt_vk_dev * dev, const char * spv_dir, qrt_q4k ** out,
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     r = vkCreateFence(dev->device, &fci, nullptr, &g->fence);
     if (r != VK_SUCCESS) {
-        qrt_q4k_close(dev, g);
+        qrt_gemm_close(dev, g);
         return vk_fail(err, err_size, "vkCreateFence (gemm)", r);
     }
     *out = g;
     return 0;
 }
 
-void qrt_q4k_close(qrt_vk_dev * dev, qrt_q4k * g) {
+void qrt_gemm_close(qrt_vk_dev * dev, qrt_gemm * g) {
     if (g == NULL) {
         return;
     }
@@ -314,8 +340,10 @@ void qrt_q4k_close(qrt_vk_dev * dev, qrt_q4k * g) {
         if (g->swiglu_pipe != VK_NULL_HANDLE) {
             vkDestroyPipeline(dev->device, g->swiglu_pipe, nullptr);
         }
-        if (g->gemm_pipe != VK_NULL_HANDLE) {
-            vkDestroyPipeline(dev->device, g->gemm_pipe, nullptr);
+        for (int i = 0; i < 3; ++i) {
+            if (g->gemm_pipe[i] != VK_NULL_HANDLE) {
+                vkDestroyPipeline(dev->device, g->gemm_pipe[i], nullptr);
+            }
         }
         if (g->swiglu_layout != VK_NULL_HANDLE) {
             vkDestroyPipelineLayout(dev->device, g->swiglu_layout, nullptr);
@@ -334,12 +362,12 @@ namespace {
 
 // Chooses the descriptor set for the activation planes and refreshes it when a buffer
 // changed. Returns 0 on success.
-int pick_set(qrt_q4k * g, const qrt_q4k_gemm_args * a, VkDescriptorSet * out) {
+int pick_set(qrt_gemm * g, const qrt_gemm_args * a, VkDescriptorSet * out) {
     // The activation planes are fixed per slot: the pair the hidden set already holds
     // means the swiglu output, anything else is the layer input set.
     const int idx = (a->a_qs == g->st[GEMM_SET_HIDDEN].qs &&
                      a->a_ds == g->st[GEMM_SET_HIDDEN].ds) ? GEMM_SET_HIDDEN : GEMM_SET_INPUT;
-    qrt_q4k::set_state * st = &g->st[idx];
+    qrt_gemm::set_state * st = &g->st[idx];
     if (a->w != st->w || a->out != st->out || a->a_qs != st->qs || a->a_ds != st->ds) {
         const VkBuffer bufs[4] = { a->w, a->a_qs, a->out, a->a_ds };
         write_set(g->dev->device, g->gemm_sets[idx], bufs);
@@ -354,7 +382,7 @@ int pick_set(qrt_q4k * g, const qrt_q4k_gemm_args * a, VkDescriptorSet * out) {
 
 } // namespace
 
-int qrt_q4k_begin(qrt_q4k * g, char * err, size_t err_size) {
+int qrt_gemm_begin(qrt_gemm * g, char * err, size_t err_size) {
     if (g == NULL) {
         return fail(err, err_size, "no GEMM context");
     }
@@ -373,7 +401,7 @@ int qrt_q4k_begin(qrt_q4k * g, char * err, size_t err_size) {
     return 0;
 }
 
-int qrt_q4k_record_gemm(qrt_q4k * g, const qrt_q4k_gemm_args * a, char * err, size_t err_size) {
+int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t err_size) {
     if (g == NULL || a == NULL || a->w == VK_NULL_HANDLE || a->out == VK_NULL_HANDLE) {
         return fail(err, err_size, "the GEMM needs a weight buffer and an output buffer");
     }
@@ -381,19 +409,22 @@ int qrt_q4k_record_gemm(qrt_q4k * g, const qrt_q4k_gemm_args * a, char * err, si
         return fail(err, err_size, "n=%u must be a multiple of %d, m=%u of %d, k=%u of %d",
                     a->n, Q4K_TILE_N, a->m, Q4K_TILE_M, a->k, Q4K_QK);
     }
+    if (a->type != QRT_QUANT_Q4K && a->type != QRT_QUANT_Q5K && a->type != QRT_QUANT_Q6K) {
+        return fail(err, err_size, "unknown quant type %d", (int) a->type);
+    }
     VkDescriptorSet set = VK_NULL_HANDLE;
     pick_set(g, a, &set);
-    vkCmdBindPipeline(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_pipe);
+    vkCmdBindPipeline(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_pipe[a->type]);
     vkCmdBindDescriptorSets(g->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_layout, 0, 1,
                             &set, 0, nullptr);
-    const uint32_t pc[6] = { a->n, a->k, a->m, a->wbase_words, a->obase, a->abase };
+    const uint32_t pc[6] = { a->n, a->k, a->m, a->wbase, a->obase, a->abase };
     vkCmdPushConstants(g->cmd, g->gemm_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
     vkCmdDispatch(g->cmd, a->n / Q4K_TILE_N, a->m / Q4K_TILE_M, 1);
     ++g->dispatches;
     return 0;
 }
 
-int qrt_q4k_record_swiglu(qrt_q4k * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs,
+int qrt_gemm_record_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs,
                           VkBuffer out_ds, uint32_t m, uint32_t hid, char * err, size_t err_size) {
     if (g == NULL || gate == VK_NULL_HANDLE || up == VK_NULL_HANDLE ||
         out_qs == VK_NULL_HANDLE || out_ds == VK_NULL_HANDLE) {
@@ -423,7 +454,7 @@ int qrt_q4k_record_swiglu(qrt_q4k * g, VkBuffer gate, VkBuffer up, VkBuffer out_
     return 0;
 }
 
-int qrt_q4k_submit(qrt_q4k * g, char * err, size_t err_size) {
+int qrt_gemm_submit(qrt_gemm * g, char * err, size_t err_size) {
     if (g == NULL) {
         return fail(err, err_size, "no GEMM context");
     }
@@ -447,29 +478,29 @@ int qrt_q4k_submit(qrt_q4k * g, char * err, size_t err_size) {
     return 0;
 }
 
-uint32_t qrt_q4k_dispatches(const qrt_q4k * g) { return g != NULL ? g->dispatches : 0; }
+uint32_t qrt_gemm_dispatches(const qrt_gemm * g) { return g != NULL ? g->dispatches : 0; }
 
-int qrt_q4k_gemm(qrt_q4k * g, const qrt_q4k_gemm_args * a, char * err, size_t err_size) {
-    if (qrt_q4k_begin(g, err, err_size) != 0 || qrt_q4k_record_gemm(g, a, err, err_size) != 0) {
+int qrt_gemm_dispatch(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t err_size) {
+    if (qrt_gemm_begin(g, err, err_size) != 0 || qrt_gemm_record(g, a, err, err_size) != 0) {
         return -1;
     }
-    return qrt_q4k_submit(g, err, err_size);
+    return qrt_gemm_submit(g, err, err_size);
 }
 
-int qrt_q4k_swiglu(qrt_q4k * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs, VkBuffer out_ds,
+int qrt_gemm_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs, VkBuffer out_ds,
                    uint32_t m, uint32_t hid, char * err, size_t err_size) {
-    if (qrt_q4k_begin(g, err, err_size) != 0 ||
-        qrt_q4k_record_swiglu(g, gate, up, out_qs, out_ds, m, hid, err, err_size) != 0) {
+    if (qrt_gemm_begin(g, err, err_size) != 0 ||
+        qrt_gemm_record_swiglu(g, gate, up, out_qs, out_ds, m, hid, err, err_size) != 0) {
         return -1;
     }
-    return qrt_q4k_submit(g, err, err_size);
+    return qrt_gemm_submit(g, err, err_size);
 }
 
 #else // QRT_HAVE_VULKAN
 
-struct qrt_q4k { int unused; };
+struct qrt_gemm { int unused; };
 
-int qrt_q4k_open(qrt_vk_dev * dev, const char * spv_dir, qrt_q4k ** out,
+int qrt_gemm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_gemm ** out,
                  char * err, size_t err_size) {
     (void) dev;
     (void) spv_dir;
@@ -478,19 +509,19 @@ int qrt_q4k_open(qrt_vk_dev * dev, const char * spv_dir, qrt_q4k ** out,
     return -1;
 }
 
-void qrt_q4k_close(qrt_vk_dev * dev, qrt_q4k * g) {
+void qrt_gemm_close(qrt_vk_dev * dev, qrt_gemm * g) {
     (void) dev;
     (void) g;
 }
 
-int qrt_q4k_gemm(qrt_q4k * g, const qrt_q4k_gemm_args * a, char * err, size_t err_size) {
+int qrt_gemm_dispatch(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t err_size) {
     (void) g;
     (void) a;
     snprintf(err, err_size, "this build has no Vulkan");
     return -1;
 }
 
-int qrt_q4k_swiglu(qrt_q4k * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs, VkBuffer out_ds,
+int qrt_gemm_swiglu(qrt_gemm * g, VkBuffer gate, VkBuffer up, VkBuffer out_qs, VkBuffer out_ds,
                    uint32_t m, uint32_t hid, char * err, size_t err_size) {
     (void) g; (void) gate; (void) up; (void) out_qs; (void) out_ds; (void) m; (void) hid;
     snprintf(err, err_size, "this build has no Vulkan");

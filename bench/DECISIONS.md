@@ -724,3 +724,26 @@ design 里的数字都带 RESULTS 回链，符合"design 的估计必须能被�
 | `--moe-check <prefix>` | gate GEMM 对 CPU 参考的逐元素校验 | 不跑 |
 | `--moe-layer/--moe-expert/--moe-rows` | 校验的取样点与行数 | 0/0/64 |
 | `qrt_q4k_*` / `qrt_moe_*` | GEMM 管线与专家合成（`kernels` 模块，design 5.1 已登记） | - |
+
+## 37. M2-5 第三步判决：三型 GEMM 全部落地，下一步是整层单次提交（2026-10-25）
+
+| 项 | 结果 |
+|---|---|
+| Q4_K / Q5_K / Q6_K | 三个内核都在运行时里，按矩阵字节数自动判定类型 |
+| 正确性 | 三型全部 rel_L1 <= 2.5e-7（阈值 1e-4），见 RESULTS 40 |
+| 算力 | 1.90-2.16 TFLOPS（三个矩阵全跑）；仍是内核上限（6.1）的 1/3 |
+| 覆盖 | gate+up+down 全跑，`down_skipped=0` |
+
+**判决**：adopt。`runtime/kernels/q4k_gemm.*` 更名 `gemm.*`（不再是单一 Q4_K），
+新增 `qrt_gemm_block_bytes/matrix_bytes/type_of` 三个纯函数与 `qrt_quant` 枚举。
+
+**为什么 Q6_K 按字节寻址**：210 字节的块让行起点不是 4 的倍数，用 `uint w[]` 逐字读需要
+两个 word 加 funnel shift；这是 Q6_K 只占少数层（34/38/39）却仍值得单独一个内核的原因。
+
+**未结项**
+
+1. **整层单次提交**（下一轮）：256 个专家的 dispatch 录进一个命令缓冲，目标每块 <=0.15 ms、
+   TFLOPS >= 3。这是 design 4.6 的模型，也是 prefill 里唯一还没做的大项。
+2. **MoE 输出累加**：现在每个专家把结果写进同一块 `o_out`（值不使用），真实路径要按路由权重
+   累加到 token 上；这是收尾项，等整层提交做完再定实现。
+3. 输入激活的 Q8_1 量化仍在宿主侧生成固定图案（第 39 节未结项 3）。

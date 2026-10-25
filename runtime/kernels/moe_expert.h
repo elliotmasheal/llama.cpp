@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "kernels/q4k_gemm.h"
+#include "kernels/gemm.h"
 #include "vk_dev.h"
 
 // One MoE expert's forward pass on the GPU, composed from the int8 GEMM and the
@@ -36,8 +36,17 @@ uint32_t qrt_moe_experts_run(const qrt_moe * m);
 int qrt_moe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
                     uint64_t slot_offset, uint64_t bytes, char * err, size_t err_size);
 
-// Compares the gate output of one expert against a double-precision dequant reference
-// (the canonical Q4_K order of ggml dequantize_row_q4_K). Returns the relative L1 error
-// over the sampled rows, or -1 with a message.
+// Per-matrix result of the cross-check below.
+struct qrt_moe_check_result {
+    double   gate_rel_l1;
+    double   down_rel_l1;
+    uint32_t gate_type;   // qrt_quant of the gate matrix of this expert
+    uint32_t down_type;
+};
+
+// Compares the gate and down outputs of one expert against double-precision dequant
+// references (the canonical ggml dequant orders for all three K-quants) over the first
+// `rows` output rows. Returns -1 with a message on a structural failure.
 int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer,
-                  uint32_t expert, uint32_t rows, double * rel_l1, char * err, size_t err_size);
+                  uint32_t expert, uint32_t rows, qrt_moe_check_result * out, char * err,
+                  size_t err_size);

@@ -538,7 +538,7 @@
       ],
       "done_when": "chunk 可配；上传与计算重叠；compute 腿是 int8 GEMM（PP 有实测值）；失败可退化",
       "claimed_at": "2026-10-25T13:10:00",
-      "note": "step 1 scheduler + mmap read path (RESULTS 37/38). step 2: the int8 GEMM runs as the compute leg, gate matches the CPU reference at rel_L1 1.6e-7, but it reaches only 1.5 TFLOPS because each expert is its own submit of 16 workgroups (RESULTS 39, DECISIONS 36). down is skipped: Q5_K/Q6_K. Next: one submit per layer, then the Q5_K/Q6_K kernels"
+      "note": "step 1 scheduler + mmap read path (RESULTS 37/38). step 2 the int8 GEMM runs as the compute leg, and step 3 added the Q5_K and Q6_K variants so gate, up and down all run (correctness 1.6e-7..2.5e-7 against the CPU reference, 1.9-2.2 TFLOPS at 64 tokens per expert; RESULTS 39/40, DECISIONS 36/37). Next: one submit per layer (design 4.6), then the MoE output accumulation"
     },
     {
       "id": "M2-6",

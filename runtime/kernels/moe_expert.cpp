@@ -1,6 +1,6 @@
 #include "kernels/moe_expert.h"
 
-#include "kernels/q4k_gemm.h"
+#include "kernels/gemm.h"
 #include "weights.h"
 
 #include <math.h>
@@ -83,7 +83,7 @@ struct qrt_moe {
     qrt_vk_dev *  dev;
     qrt_weights * w;
     qrt_moe_cfg   cfg;
-    qrt_q4k *     gemm;
+    qrt_gemm *     gemm;
     uint32_t      down_skipped;   // experts whose down matrix is not Q4_K yet
     uint32_t      experts_run;
     VkBuffer      a_qs;
@@ -124,7 +124,7 @@ int qrt_moe_open(qrt_vk_dev * dev, qrt_weights * w, const char * spv_dir,
     m->dev = dev;
     m->w   = w;
     m->cfg = *cfg;
-    if (qrt_q4k_open(dev, spv_dir, &m->gemm, err, err_size) != 0) {
+    if (qrt_gemm_open(dev, spv_dir, &m->gemm, err, err_size) != 0) {
         qrt_moe_close(dev, m);
         return -1;
     }
@@ -191,7 +191,7 @@ void qrt_moe_close(qrt_vk_dev * dev, qrt_moe * m) {
     if (m == NULL) {
         return;
     }
-    qrt_q4k_close(dev, m->gemm);
+    qrt_gemm_close(dev, m->gemm);
     if (dev != NULL) {
         const struct {
             VkBuffer * buf;
@@ -223,9 +223,9 @@ uint64_t qrt_moe_flops(const qrt_moe * m) {
     if (m == NULL) {
         return 0;
     }
-    // gate and up only: the down matrix is Q5_K/Q6_K in this store.
+    // gate, up and down, each 2 x n x k multiply-adds per token.
     const uint64_t n = m->cfg.tokens;
-    return 2ull * 2ull * n * m->cfg.ffn * m->cfg.hidden;
+    return 3ull * 2ull * n * m->cfg.ffn * m->cfg.hidden;
 }
 
 int qrt_moe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
@@ -245,10 +245,9 @@ int qrt_moe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
     const uint32_t hidden = m->cfg.hidden;
     const uint32_t ffn = m->cfg.ffn;
 
-    qrt_q4k_gemm_args gate;
+    qrt_gemm_args gate;
     memset(&gate, 0, sizeof(gate));
     gate.w = buf;
-    gate.wbase_words = (uint32_t) (slot_offset / 4);
     gate.a_qs = m->a_qs;
     gate.a_ds = m->a_ds;
     gate.out = m->g_out;
@@ -256,102 +255,194 @@ int qrt_moe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
     gate.k = hidden;
     gate.m = t;
 
-    qrt_q4k_gemm_args up = gate;
-    up.wbase_words = (uint32_t) ((slot_offset + loc.gate) / 4);
+    qrt_gemm_args up = gate;
     up.out = m->u_out;
 
-    qrt_q4k_gemm_args down = gate;
-    down.wbase_words = (uint32_t) ((slot_offset + loc.gate + loc.up) / 4);
+    qrt_gemm_args down = gate;
     down.a_qs = m->h_qs;
     down.a_ds = m->h_ds;
     down.out = m->o_out;
     down.n = hidden;
     down.k = ffn;
 
-    // The store mixes quant types: gate/up are Q4_K on most layers, down is Q5_K (or
-    // Q6_K on layers 34/38/39, FORMAT.md). The GEMM here is Q4_K only, so a matrix of
-    // another type is skipped and counted instead of read as garbage.
-    const uint64_t q4k_gate = (uint64_t) ffn * (hidden / 256) * 144;
-    const uint64_t q4k_down = (uint64_t) hidden * (ffn / 256) * 144;
-    if (loc.gate != q4k_gate || loc.up != q4k_gate) {
-        return fail(err, err_size, "expert %u,%u has gate/up of %llu/%llu bytes, expected %llu",
-                    layer, expert, (unsigned long long) loc.gate,
-                    (unsigned long long) loc.up, (unsigned long long) q4k_gate);
+    // The store mixes quant types per matrix (FORMAT.md): gate/up Q4_K on most layers,
+    // down Q5_K, layers 34/38 Q6_K down, layer 39 Q5_K gate/up. The type is derived from
+    // the slice size, and an unknown size is a counted error rather than a misread.
+    const int t_gate = qrt_gemm_type_of(ffn, hidden, loc.gate);
+    const int t_up = qrt_gemm_type_of(ffn, hidden, loc.up);
+    const int t_down = qrt_gemm_type_of(hidden, ffn, loc.down);
+    if (t_gate < 0 || t_up < 0) {
+        return fail(err, err_size,
+                    "expert %u,%u gate/up of %llu/%llu bytes matches no known type", layer,
+                    expert, (unsigned long long) loc.gate, (unsigned long long) loc.up);
     }
-    const int run_down = loc.down == q4k_down;
-    if (!run_down) {
-        ++m->down_skipped;
+    if (t_down < 0) {
+        return fail(err, err_size, "expert %u,%u down of %llu bytes matches no known type",
+                    layer, expert, (unsigned long long) loc.down);
     }
+    gate.type = (qrt_quant) t_gate;
+    up.type   = (qrt_quant) t_up;
+    down.type = (qrt_quant) t_down;
+    // Q4_K and Q5_K address the weight buffer in words, Q6_K in bytes (210-byte blocks).
+    const uint32_t off_gate = (uint32_t) slot_offset;
+    const uint32_t off_up   = (uint32_t) (slot_offset + loc.gate);
+    const uint32_t off_down = (uint32_t) (slot_offset + loc.gate + loc.up);
+    gate.wbase = gate.type == QRT_QUANT_Q6K ? off_gate : off_gate / 4;
+    up.wbase   = up.type == QRT_QUANT_Q6K ? off_up : off_up / 4;
+    down.wbase = down.type == QRT_QUANT_Q6K ? off_down : off_down / 4;
 
     // One command buffer for all dispatches: at 64 tokens each GEMM is ~0.03 ms of math,
     // so four submit+fence rounds would cost more than the work (RESULTS 39).
-    if (qrt_q4k_begin(m->gemm, err, err_size) != 0 ||
-        qrt_q4k_record_gemm(m->gemm, &gate, err, err_size) != 0 ||
-        qrt_q4k_record_gemm(m->gemm, &up, err, err_size) != 0 ||
-        qrt_q4k_record_swiglu(m->gemm, m->g_out, m->u_out, m->h_qs, m->h_ds, t, ffn,
+    if (qrt_gemm_begin(m->gemm, err, err_size) != 0 ||
+        qrt_gemm_record(m->gemm, &gate, err, err_size) != 0 ||
+        qrt_gemm_record(m->gemm, &up, err, err_size) != 0 ||
+        qrt_gemm_record_swiglu(m->gemm, m->g_out, m->u_out, m->h_qs, m->h_ds, t, ffn,
                               err, err_size) != 0 ||
-        (run_down && qrt_q4k_record_gemm(m->gemm, &down, err, err_size) != 0)) {
+        qrt_gemm_record(m->gemm, &down, err, err_size) != 0) {
         return -1;
     }
-    if (qrt_q4k_submit(m->gemm, err, err_size) != 0) {
+    if (qrt_gemm_submit(m->gemm, err, err_size) != 0) {
         return -1;
     }
     ++m->experts_run;
     return 0;
 }
 
-// Canonical Q4_K dequant (ggml dequantize_row_q4_K order) times the Q8_1 activation,
-// in double, folded exactly like the kernel claims to fold it.
-static void ref_gemm_row(const unsigned char * w, const unsigned char * a_qs,
+// Canonical dequant of the three K-quants (ggml dequantize_row_q*_K order) times the
+// Q8_1 activation, in double, folded exactly like the kernels claim to fold it.
+static void ref_gemm_row(const unsigned char * w, qrt_quant type, const unsigned char * a_qs,
                          const uint32_t * a_ds, uint32_t n_row, uint32_t k, uint32_t m_tok,
                          float * out) {
+    const size_t block = qrt_gemm_block_bytes(type);
     const uint32_t nsb = k / 256;
     const uint32_t nk32 = k / 32;
+    const unsigned char * wrow = w + (size_t) n_row * nsb * block;
     for (uint32_t tok = 0; tok < m_tok; ++tok) {
         double acc = 0.0;
         for (uint32_t sb = 0; sb < nsb; ++sb) {
-            const unsigned char * blk = w + (size_t) n_row * nsb * 144 + sb * 144;
-            const uint32_t dm = (uint32_t) blk[0] | ((uint32_t) blk[1] << 8);
-            const uint32_t dmm = (uint32_t) blk[2] | ((uint32_t) blk[3] << 8);
-            const float d = f16_to_f32(dm);
-            const float dmin = f16_to_f32(dmm);
+            const unsigned char * blk = wrow + (size_t) sb * block;
+            if (type == QRT_QUANT_Q6K) {
+                const float d = f16_to_f32((uint32_t) blk[208] | ((uint32_t) blk[209] << 8));
+                for (uint32_t hh = 0; hh < 2; ++hh) {
+                    for (uint32_t s = 0; s < 4; ++s) {
+                        const uint32_t abi = tok * nk32 + sb * 8 + hh * 4 + s;
+                        const float aq = f16_to_f32(a_ds[abi] & 0xFFFFu);
+                        for (uint32_t i = 0; i < 8; ++i) {
+                            const uint32_t l = 4 * i;
+                            uint32_t ql = 0;
+                            uint32_t qh = 0;
+                            for (uint32_t b = 0; b < 4; ++b) {
+                                ql |= (uint32_t) blk[hh * 64 + ((s & 1u) ? 32 : 0) + l + b] << (8 * b);
+                                qh |= (uint32_t) blk[128 + hh * 32 + l + b] << (8 * b);
+                            }
+                            const uint32_t q4 = (s < 2) ? (ql & 0x0F0F0F0Fu)
+                                                        : ((ql >> 4) & 0x0F0F0F0Fu);
+                            const uint32_t h2 = (qh >> (2 * s)) & 0x03030303u;
+                            const uint32_t q6 = (q4 | (h2 << 4)) ^ 0x20202020u;
+                            const int sc_idx = (int) (hh * 8 + 2 * s + (i >= 4 ? 1 : 0));
+                            int8_t sv = (int8_t) blk[192 + sc_idx];
+                            for (uint32_t e = 0; e < 4; ++e) {
+                                const int8_t qv = (int8_t) (uint8_t) ((q6 >> (8 * e)) & 0xFFu);
+                                const int8_t qa = (int8_t) a_qs[(size_t) abi * 32 + l + e];
+                                acc += (double) d * (double) sv * (double) qv *
+                                       ((double) aq * (double) qa);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            const float d = f16_to_f32((uint32_t) blk[0] | ((uint32_t) blk[1] << 8));
+            const float dmin = f16_to_f32((uint32_t) blk[2] | ((uint32_t) blk[3] << 8));
             const unsigned char * scales = blk + 4;
-            const unsigned char * qs = blk + 16;
-            for (uint32_t j = 0; j < 8; ++j) {
-                uint32_t sc;
-                uint32_t mn;
-                if (j < 4) {
-                    sc = scales[j] & 63u;
-                    mn = scales[j + 4] & 63u;
-                } else {
-                    sc = (scales[j + 4] & 15u) | ((scales[j - 4] >> 6u) << 4);
-                    mn = (scales[j + 4] >> 4u) | ((scales[j] >> 6u) << 4);
+            const unsigned char * qh = type == QRT_QUANT_Q5K ? blk + 16 : NULL;
+            const unsigned char * qs = blk + (type == QRT_QUANT_Q5K ? 48 : 16);
+            for (uint32_t g = 0; g < 4; ++g) {
+                for (uint32_t half = 0; half < 2; ++half) {
+                    const uint32_t j = 2 * g + half;
+                    uint32_t scv;
+                    uint32_t mnv;
+                    if (j < 4) {
+                        scv = scales[j] & 63u;
+                        mnv = scales[j + 4] & 63u;
+                    } else {
+                        scv = (scales[j + 4] & 15u) | ((scales[j - 4] >> 6u) << 4);
+                        mnv = (scales[j + 4] >> 4u) | ((scales[j] >> 6u) << 4);
+                    }
+                    const uint32_t abi = tok * nk32 + sb * 8 + j;
+                    const float aq = f16_to_f32(a_ds[abi] & 0xFFFFu);
+                    double sub = 0.0;
+                    for (uint32_t e = 0; e < 32; ++e) {
+                        const uint8_t byte = qs[32 * g + e];
+                        uint32_t q = half == 0 ? (byte & 15u) : (byte >> 4u);
+                        if (qh != NULL) {
+                            q |= ((qh[e] >> j) & 1u) << 4;
+                        }
+                        const int8_t qa = (int8_t) a_qs[(size_t) abi * 32 + e];
+                        sub += ((double) d * (double) scv * (double) q -
+                                (double) dmin * (double) mnv) * ((double) aq * (double) qa);
+                    }
+                    acc += sub;
                 }
-                const uint32_t g = j / 2;
-                const uint32_t half = j & 1u;
-                const uint32_t abi = tok * nk32 + sb * 8 + j;
-                const float aq = f16_to_f32(a_ds[abi] & 0xFFFFu);
-                double sub = 0.0;
-                for (uint32_t e = 0; e < 32; ++e) {
-                    const uint8_t byte = qs[32 * g + e];
-                    const uint32_t q = half == 0 ? (byte & 15u) : (byte >> 4u);
-                    const int8_t qa = (int8_t) a_qs[(size_t) abi * 32 + e];
-                    sub += ((double) d * (double) sc * (double) q - (double) dmin * (double) mn) *
-                           ((double) aq * (double) qa);
-                }
-                acc += sub;
             }
         }
         out[tok] = (float) acc;
     }
 }
 
+struct check_arm {
+    qrt_gemm_args args;
+    const unsigned char * host;     // host copy of the matrix block
+    uint64_t bytes;
+    uint32_t rows;
+    qrt_quant type;
+    float * gpu;
+    float * want;
+};
+
+// Runs one matrix of the expert and compares it against the reference. Rotation of the
+// output buffer and the scratch planes is shared with qrt_moe_compute.
+static int check_one(qrt_vk_dev * dev, qrt_moe * m, check_arm * arm, const unsigned char * a_qs,
+                     const uint32_t * a_ds, double * rel_l1, char * err, size_t err_size) {
+    const uint32_t t = m->cfg.tokens;
+    if (qrt_gemm_dispatch(m->gemm, &arm->args, err, err_size) != 0) {
+        return -1;
+    }
+    qrt_vk_staging * stg = NULL;
+    if (qrt_vk_staging_create(dev, (uint64_t) t * arm->args.n * 4, &stg, err, err_size) != 0) {
+        return -1;
+    }
+    int rc = -1;
+    if (qrt_vk_download(dev, stg, arm->args.out, (uint64_t) arm->args.obase * 4, arm->gpu,
+                        (uint64_t) t * arm->args.n * 4, err, err_size) == 0) {
+        for (uint32_t row = 0; row < arm->rows; ++row) {
+            ref_gemm_row(arm->host, arm->type, a_qs, a_ds, row, arm->args.k, t,
+                         arm->want + (size_t) row * t);
+        }
+        double num = 0.0;
+        double den = 0.0;
+        for (uint32_t row = 0; row < arm->rows; ++row) {
+            for (uint32_t tok = 0; tok < t; ++tok) {
+                const double a = arm->gpu[(size_t) row * t + tok];
+                const double b = arm->want[(size_t) row * t + tok];
+                num += fabs(a - b);
+                den += fabs(b);
+            }
+        }
+        *rel_l1 = den > 0.0 ? num / den : num;
+        rc = 0;
+    }
+    qrt_vk_staging_destroy(dev, stg);
+    return rc;
+}
+
 int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer,
-                  uint32_t expert, uint32_t rows, double * rel_l1, char * err,
+                  uint32_t expert, uint32_t rows, qrt_moe_check_result * out, char * err,
                   size_t err_size) {
-    if (m == NULL || w == NULL || rel_l1 == NULL) {
+    if (m == NULL || w == NULL || out == NULL) {
         return fail(err, err_size, "the check needs the MoE leg and the store");
     }
+    memset(out, 0, sizeof(*out));
     qrt_expert_loc loc;
     if (qrt_weights_locate(w, layer, expert, &loc, err, err_size) != 0) {
         return -1;
@@ -362,13 +453,24 @@ int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer
     if (rows == 0 || rows > ffn) {
         rows = ffn;
     }
+    const int t_gate = qrt_gemm_type_of(ffn, hidden, loc.gate);
+    const int t_down = qrt_gemm_type_of(hidden, ffn, loc.down);
+    if (t_gate < 0 || t_down < 0) {
+        return fail(err, err_size, "layer %u expert %u has an unknown quant type", layer, expert);
+    }
+    out->gate_type = (uint32_t) t_gate;
+    out->down_type = (uint32_t) t_down;
+
     unsigned char * blk = (unsigned char *) malloc((size_t) loc.bytes);
     unsigned char * a_qs = (unsigned char *) malloc((size_t) t * hidden);
     uint32_t * a_ds = (uint32_t *) malloc((size_t) t * (hidden / 32) * 4);
-    float * got = (float *) malloc((size_t) t * ffn * 4);
-    float * want = (float *) malloc((size_t) t * rows * 4);
-    if (blk == NULL || a_qs == NULL || a_ds == NULL || got == NULL || want == NULL) {
-        free(blk); free(a_qs); free(a_ds); free(got); free(want);
+    unsigned char * h_qs = (unsigned char *) malloc((size_t) t * ffn);
+    uint32_t * h_ds = (uint32_t *) malloc((size_t) t * (ffn / 32) * 4);
+    float * gpu = (float *) malloc((size_t) t * hidden * 4);
+    float * want = (float *) malloc((size_t) t * hidden * 4);
+    if (blk == NULL || a_qs == NULL || a_ds == NULL || h_qs == NULL || h_ds == NULL ||
+        gpu == NULL || want == NULL) {
+        free(blk); free(a_qs); free(a_ds); free(h_qs); free(h_ds); free(gpu); free(want);
         return fail(err, err_size, "out of memory for the check buffers");
     }
     int rc = -1;
@@ -384,57 +486,79 @@ int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer
                          &tmp, &tmp_mem, err, err_size) != 0) {
             break;
         }
-        const uint64_t upload_bytes = loc.bytes > m->cfg.tokens * hidden + 4096
-                                      ? loc.bytes : m->cfg.tokens * hidden + 4096;
-        if (qrt_vk_staging_create(dev, upload_bytes, &stg, err, err_size) != 0) {
+        const uint64_t stg_bytes = (uint64_t) t * hidden * 4 > loc.bytes
+                                   ? (uint64_t) t * hidden * 4 : loc.bytes;
+        if (qrt_vk_staging_create(dev, stg_bytes, &stg, err, err_size) != 0) {
             break;
         }
         if (qrt_vk_upload(dev, stg, tmp, 0, blk, loc.bytes, err, err_size) != 0) {
             break;
         }
-        qrt_q4k_gemm_args gate;
+        fill_acts(t, hidden, a_qs, a_ds);
+
+        // Gate: the matrix type varies by layer, the reference follows it.
+        check_arm gate;
         memset(&gate, 0, sizeof(gate));
-        gate.w = tmp;
-        gate.wbase_words = 0;
-        gate.a_qs = m->a_qs;
-        gate.a_ds = m->a_ds;
-        gate.out = m->g_out;
-        gate.n = ffn;
-        gate.k = hidden;
-        gate.m = t;
-        if (qrt_q4k_gemm(m->gemm, &gate, err, err_size) != 0) {
+        gate.args.w = tmp;
+        gate.args.wbase = (t_gate == QRT_QUANT_Q6K) ? 0u : 0u;
+        gate.args.a_qs = m->a_qs;
+        gate.args.a_ds = m->a_ds;
+        gate.args.out = m->g_out;
+        gate.args.n = ffn;
+        gate.args.k = hidden;
+        gate.args.m = t;
+        gate.args.type = (qrt_quant) t_gate;
+        gate.host = blk;
+        gate.rows = rows > ffn ? ffn : rows;
+        gate.type = (qrt_quant) t_gate;
+        gate.gpu = gpu;
+        gate.want = want;
+        if (check_one(dev, m, &gate, a_qs, a_ds, &out->gate_rel_l1, err, err_size) != 0) {
             break;
         }
-        if (qrt_vk_download(dev, stg, m->g_out, 0, got, (uint64_t) t * ffn * 4,
+
+        // Down needs the swiglu output planes, so run gate, up and swiglu first and read
+        // the hidden planes back, then check down against those exact planes.
+        qrt_gemm_args up = gate.args;
+        up.out = m->u_out;
+        if (qrt_gemm_dispatch(m->gemm, &up, err, err_size) != 0 ||
+            qrt_gemm_swiglu(m->gemm, m->g_out, m->u_out, m->h_qs, m->h_ds, t, ffn,
+                            err, err_size) != 0 ||
+            qrt_vk_download(dev, stg, m->h_qs, 0, h_qs, (uint64_t) t * ffn, err, err_size) != 0 ||
+            qrt_vk_download(dev, stg, m->h_ds, 0, h_ds, (uint64_t) t * (ffn / 32) * 4,
                             err, err_size) != 0) {
             break;
         }
-        // Same deterministic activations the open uploaded, regenerated on the host.
-        fill_acts(t, hidden, a_qs, a_ds);
-        for (uint32_t row = 0; row < rows; ++row) {
-            float * row_out = want + (size_t) row * t;
-            ref_gemm_row(blk, a_qs, a_ds, row, hidden, t, row_out);
+        check_arm down;
+        memset(&down, 0, sizeof(down));
+        down.args.w = tmp;
+        down.args.wbase = (t_down == QRT_QUANT_Q6K) ? (uint32_t) loc.gate + (uint32_t) loc.up
+                                                    : (uint32_t) (loc.gate + loc.up) / 4;
+        down.args.a_qs = m->h_qs;
+        down.args.a_ds = m->h_ds;
+        down.args.out = m->o_out;
+        down.args.n = hidden;
+        down.args.k = ffn;
+        down.args.m = t;
+        down.args.type = (qrt_quant) t_down;
+        down.host = blk + loc.gate + loc.up;
+        down.rows = rows > hidden ? hidden : rows;
+        down.type = (qrt_quant) t_down;
+        down.gpu = gpu;
+        down.want = want;
+        if (check_one(dev, m, &down, h_qs, h_ds, &out->down_rel_l1, err, err_size) != 0) {
+            break;
         }
-        double num = 0.0;
-        double den = 0.0;
-        for (uint32_t row = 0; row < rows; ++row) {
-            for (uint32_t tok = 0; tok < t; ++tok) {
-                const double a = got[(size_t) row * t + tok];
-                const double b = want[(size_t) row * t + tok];
-                num += fabs(a - b);
-                den += fabs(b);
-            }
-        }
-        *rel_l1 = den > 0.0 ? num / den : num;
         rc = 0;
     } while (0);
     qrt_vk_staging_destroy(dev, stg);
     if (tmp_mem != VK_NULL_HANDLE) {
         qrt_vk_free(dev, tmp, tmp_mem);
     }
-    free(blk); free(a_qs); free(a_ds); free(got); free(want);
+    free(blk); free(a_qs); free(a_ds); free(h_qs); free(h_ds); free(gpu); free(want);
     return rc;
 }
+
 
 #else // QRT_HAVE_VULKAN
 
@@ -462,9 +586,9 @@ int qrt_moe_compute(void * user, uint32_t layer, uint32_t expert, VkBuffer buf,
 }
 
 int qrt_moe_check(qrt_vk_dev * dev, qrt_moe * m, qrt_weights * w, uint32_t layer,
-                  uint32_t expert, uint32_t rows, double * rel_l1, char * err,
+                  uint32_t expert, uint32_t rows, qrt_moe_check_result * out, char * err,
                   size_t err_size) {
-    (void) dev; (void) m; (void) w; (void) layer; (void) expert; (void) rows; (void) rel_l1;
+    (void) dev; (void) m; (void) w; (void) layer; (void) expert; (void) rows; (void) out;
     snprintf(err, err_size, "this build has no Vulkan");
     return -1;
 }

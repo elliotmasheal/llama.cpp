@@ -107,17 +107,21 @@ static int qrt_moe_check(const qrt_config * cfg, const char * prefix, const char
         fprintf(stderr, "qrt: %s\n", err);
         rc = 2;
     } else {
-        double rel_l1 = 0.0;
+        static const char * type_name[] = { "q4k", "q5k", "q6k" };
+        qrt_moe_check_result res;
         const double t0 = now_ms();
-        if (qrt_moe_check(dev, moe, w, layer, expert, rows, &rel_l1, err, sizeof(err)) != 0) {
+        if (qrt_moe_check(dev, moe, w, layer, expert, rows, &res, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             rc = 2;
         } else {
             const double dt = now_ms() - t0;
-            printf("moe_gate_check layer=%u expert=%u rows=%u tokens=%u rel_l1=%.3e "
-                   "ms=%.1f verdict=%s\n", layer, expert, rows, mcfg.tokens, rel_l1, dt,
-                   rel_l1 <= 1e-4 ? "PASS" : "FAIL");
-            if (rel_l1 > 1e-4) {
+            const int pass = res.gate_rel_l1 <= 1e-4 && res.down_rel_l1 <= 1e-4;
+            printf("moe_matrix_check layer=%u expert=%u rows=%u tokens=%u "
+                   "gate=%s gate_rel_l1=%.3e down=%s down_rel_l1=%.3e ms=%.1f verdict=%s\n",
+                   layer, expert, rows, mcfg.tokens, type_name[res.gate_type],
+                   res.gate_rel_l1, type_name[res.down_type], res.down_rel_l1, dt,
+                   pass ? "PASS" : "FAIL");
+            if (!pass) {
                 rc = 1;
             }
         }
