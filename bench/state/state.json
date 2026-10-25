@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6b is the head again: step 6 showed the dense GEMM is instruction bound, so D-1 (inner-loop shape from the expert kernel) is the next single-variable change. M2-6c step 2 and M2-6d/6a follow; X-2 waits for M3-4"
+      "note": "M2-6b stays the head: D-3 (block-major weight repack) is the next single-variable change; it is a pure layout change. M2-6c step 2 and M2-6d/6a follow, X-2 waits for M3-4"
     },
     {
       "lane": "data",
@@ -1185,7 +1185,7 @@
         "runtime/qrt_main.cpp"
       ],
       "done_when": "q8_0 权重 x q8_1 激活的 GEMM 对 CPU 参考 rel_L1 <= 1e-5；在 N=8192/K=2048/M=10240 的形状上 >= 5 TFLOPS；与 K-quant GEMM 共用记录/提交接口",
-      "note": "step 6 done 2026-10-25: the wall is not weight bandwidth. Measured 3.10-3.40 TFLOPS across M=512..10240 on attn_q (k=2048,n=8192), 2.23-2.31 on attn_output (k=4096), 4.34 with weights resident in L2; implied weight rate only 39-59 GB/s of the 156.5 available, and halving the weight traffic (TOKENS 8 -> 16) left the rate unchanged at 3.37. So it is instruction-issue bound: 2.5 MACs per instruction against a ~17 TFLOPS ceiling is 19%, and the same dot4 reaches 6.08-6.20 in the Q4_K expert kernel. Next step D-1: copy the expert inner shape (uvec4 weight reads, 2 rows per lane, deeper K panel) and target 5 TFLOPS; D-2 measures the dot4 issue rate if that is not enough. Numerics unchanged (still q8_0 x Q8_1). RESULTS 53, DECISIONS 49"
+      "note": "step 7 (D-1) done 2026-10-25: the expert kernel inner shape (2 rows x 8 tokens per lane, uvec4 weight reads, K panel 256) does not move the dense rate either (3.35-3.43 -> 3.38, rel_l1 1.297e-07). Five data-flow changes have now landed on the same 3.4 TFLOPS, while weights resident in L2 give 4.34 and the Q4_K expert kernel gives 6.08-6.20, so the wall is scattered-read latency, not bandwidth or issue rate. Next and last pure-layout attempt is D-3: repack weights block-major (128 rows x 128 k contiguous) so a wave reads 4 KiB contiguous. If that misses 5 TFLOPS, measure the dot4 issue rate (D-2) and then ask the user about numerics. RESULTS 54, DECISIONS 50"
     },
     {
       "id": "M2-6c",

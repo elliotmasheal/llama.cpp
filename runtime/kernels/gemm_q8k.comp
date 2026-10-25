@@ -1,17 +1,13 @@
 #version 450
-// Q8_0 x Q8_1 dense GEMM, LDS staged. The activation panel of the workgroup is copied
-// into shared memory once per K-panel, so the 32 lanes stop re-reading the same token
-// bytes from L2 (the previous kernel read them once per lane), and each lane holds a
-// 4 row x TOKENS register tile so one weight word feeds TOKENS tokens and one activation
-// word feeds 4 rows. Weights stay in registers: every row belongs to one lane, so
-// staging them would buy nothing.
+// Q8_0 x Q8_1 dense GEMM, D-1 shape (M2-6b step 7). One lane owns ROWS output rows and
+// TOKENS tokens; weights arrive four-to-a-word via uvec4 so a 32-element block costs two
+// loads instead of eight, and the K panel is 256 elements so the barrier and the
+// activation staging are amortized. This is the geometry the Q4_K expert kernel runs at
+// 6.08-6.20 TFLOPS (RESULTS 28); the dense kernel was 3.35 with 4 rows and 8 single-word
+// weight loads (RESULTS 53).
 //
-// TOKENS controls how many tokens one weight read serves, so it is the knob that sets
-// the weight traffic (weight bytes x m / TILE_M). It was 8 (32 tokens per workgroup) in
-// RESULTS 46-50; the sweep here is the same kernel with 16 (64 tokens).
-//
-// Weights are the prepared layout [k int8][k/8 bytes of f16 deltas] per row (see
-// qrt_gemm_q8k_prepare), which keeps every load 4-byte aligned.
+// Weights are the prepared layout [k int8][k/8 bytes of f16 deltas] per row, so every
+// 16-byte group is aligned as long as k % 16 == 0 (2048 and 4096 are).
 
 #extension GL_EXT_control_flow_attributes : enable
 #ifdef Q4K_DOT4
@@ -21,20 +17,20 @@
 #include "tiles.h"
 #include "common.glsl"
 
-#define ROWS   4u
+#define ROWS   2u
 #define TOKENS 8u
 #define LANES  32u
 #define SUBS   4u
-#define TILE_N (ROWS * LANES)     // 128 rows per workgroup
+#define TILE_N (ROWS * LANES)     // 64 rows per workgroup
 #define TILE_M (TOKENS * SUBS)    // 32 tokens per workgroup
-#define KSTEP  128u               // elements per panel
-#define QWORDS (TILE_M * KSTEP / 4u)    // 1024 words of quants
-#define DSWORDS (TILE_M * KSTEP / 32u)  // 128 words of deltas
-#define THREADS (LANES * SUBS)          // 128
+#define KSTEP  256u               // elements per panel
+#define BLOCKS (KSTEP / 32u)      // 8 quant blocks of 32 elements
+#define QWORDS (TILE_M * KSTEP / 4u)
+#define THREADS (LANES * SUBS)
 
 layout(local_size_x = THREADS) in;
 
-layout(binding = 0) readonly  buffer WeightWords { uint w[]; } wt;
+layout(binding = 0) readonly  buffer WeightWords { uvec4 w4[]; } wt;
 layout(binding = 1) readonly  buffer ActQs       { uvec4 aq[]; } aq;
 layout(binding = 2) writeonly buffer Out         { float o[]; } ob;
 layout(binding = 3) readonly  buffer ActDs       { uint ads[]; } ads;
@@ -49,7 +45,7 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared uint s_q[QWORDS];
-shared uint s_d[DSWORDS];
+shared uint s_d[TILE_M * BLOCKS];
 
 void main() {
     const uint lane = gl_LocalInvocationID.x % LANES;
@@ -75,16 +71,13 @@ void main() {
 
     const uint nk32 = pc.k / 32u;
     const uint stride = pc.k + pc.k / 8u;
-    const uint panel_blocks = KSTEP / 32u;          // 4
-    const uint my_token = sub * TOKENS;             // first token this lane reads
+    const uint my_token = sub * TOKENS;
 
     for (uint k0 = 0; k0 < pc.k; k0 += KSTEP) {
-        // One thread per (token, 32-element block): load the quants and the delta.
-        // The trip count follows TILE_M * panel_blocks, so a bigger token tile loops
-        // instead of needing more threads.
-        for (uint tt = tid; tt < TILE_M * panel_blocks; tt += THREADS) {
-            const uint t = tt / panel_blocks;
-            const uint b = tt % panel_blocks;
+        // One thread per (token, block): quants and the f16 delta of that subblock.
+        for (uint tt = tid; tt < TILE_M * BLOCKS; tt += THREADS) {
+            const uint t = tt / BLOCKS;
+            const uint b = tt % BLOCKS;
             const uint ab = pc.abase + (tok0 + t) * nk32 + k0 / 32u + b;
             const uvec4 lo = aq.aq[ab * 2u];
             const uvec4 hi = aq.aq[ab * 2u + 1u];
@@ -97,20 +90,34 @@ void main() {
             s_q[base + 5u] = hi.y;
             s_q[base + 6u] = hi.z;
             s_q[base + 7u] = hi.w;
-            s_d[t * panel_blocks + b] = ads.ads[ab];
+            s_d[t * BLOCKS + b] = ads.ads[ab];
         }
         barrier();
 
-        [[unroll]] for (uint b = 0; b < panel_blocks; ++b) {
+        // The panel's deltas: 8 f16 values are 16 bytes, one aligned uvec4 per row.
+        float dd[ROWS][BLOCKS];
+        [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+            const uint dbyte = pc.wbase + row[r] * stride + pc.k + (k0 / 32u) * 4u;
+            const uvec4 dv = wt.w4[dbyte >> 4u];
+            dd[r][0] = unpackHalf2x16(dv.x).x;
+            dd[r][1] = unpackHalf2x16(dv.x).y;
+            dd[r][2] = unpackHalf2x16(dv.y).x;
+            dd[r][3] = unpackHalf2x16(dv.y).y;
+            dd[r][4] = unpackHalf2x16(dv.z).x;
+            dd[r][5] = unpackHalf2x16(dv.z).y;
+            dd[r][6] = unpackHalf2x16(dv.w).x;
+            dd[r][7] = unpackHalf2x16(dv.w).y;
+        }
+
+        [[unroll]] for (uint b = 0; b < BLOCKS; ++b) {
+            // One weight block of 32 elements is two aligned uvec4 words per row.
             uint q[ROWS][8];
-            float dd[ROWS];
             [[unroll]] for (uint r = 0; r < ROWS; ++r) {
-                const uint wq = (pc.wbase + row[r] * stride + (k0 + b * 32u)) >> 2u;
-                [[unroll]] for (uint i = 0; i < 8u; ++i) {
-                    q[r][i] = wt.w[wq + i];
-                }
-                const uint wd = (pc.wbase + row[r] * stride + pc.k + (k0 / 32u + b) * 4u) >> 2u;
-                dd[r] = unpackHalf2x16(wt.w[wd] & 0xFFFFu).x;
+                const uint wb = (pc.wbase + row[r] * stride + k0 + b * 32u) >> 4u;
+                const uvec4 lo = wt.w4[wb];
+                const uvec4 hi = wt.w4[wb + 1u];
+                q[r][0] = lo.x; q[r][1] = lo.y; q[r][2] = lo.z; q[r][3] = lo.w;
+                q[r][4] = hi.x; q[r][5] = hi.y; q[r][6] = hi.z; q[r][7] = hi.w;
             }
             [[unroll]] for (uint t = 0; t < TOKENS; ++t) {
                 const uint sbase = (my_token + t) * (KSTEP / 4u) + b * 8u;
@@ -118,14 +125,13 @@ void main() {
                 [[unroll]] for (uint i = 0; i < 8u; ++i) {
                     aw[i] = s_q[sbase + i];
                 }
-                const float aq_scale =
-                        unpackHalf2x16(s_d[(my_token + t) * panel_blocks + b]).x;
+                const float aq_scale = unpackHalf2x16(s_d[(my_token + t) * BLOCKS + b]).x;
                 [[unroll]] for (uint r = 0; r < ROWS; ++r) {
                     int sum = 0;
                     [[unroll]] for (uint i = 0; i < 8u; ++i) {
                         sum += qrt_dot4(q[r][i], aw[i]);
                     }
-                    acc[r][t] += dd[r] * aq_scale * float(sum);
+                    acc[r][t] += dd[r][b] * aq_scale * float(sum);
                 }
             }
         }
