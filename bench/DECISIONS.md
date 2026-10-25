@@ -504,3 +504,18 @@ M1-GATE 的依赖里去掉 M3-1a（它是门后条件，不是门的阻塞项）
 - 再接 2079 MiB 稠密常驻（预算规划已在 M2-2 验证 7176 MiB 可容纳）；
 - 两项完成后 M2-3 记 done，M2-5 才能按层优先分块开工，M2-6 的注意力与它并行。
 
+## 29. 未结项：H2D staging 传输崩溃（2026-10-25）
+
+第一次实现 `qrt_vk_upload/download`（staging buffer + 一次 copy + fence）时，用真实 1.9 MB 专家块
+测试在 `qrt_vk_upload` 内发生访问违例（0xC0000005），进程无输出退出。
+
+- 复现：`g++ -DQRT_HAVE_VULKAN -Iruntime h2d_check.cpp runtime/vk_dev.cpp runtime/weights.cpp -lvulkan-1`
+  然后 `h2d-check.exe F:\LLM\llm\Qwen3.6-35B-A3B-UD-Q4_K_XL`；stderr 逐步打印定位到 `step upload`。
+- 已排除：`vk_open` / `weights_open` / 单专家读（都在崩溃点之前成功）；缺 TRANSFER usage 位
+  （已补 `usage | TRANSFER_SRC | TRANSFER_DST`，仍崩）；command pool 在创建前被填进
+  `VkCommandBufferAllocateInfo`（已修，仍崩）。
+- 处理：**代码已回退**，`build-vulkan` 重新构建通过，`state_check` 0，工作树干净；不留半成品。
+- 下一步判据：先开 `VK_LAYER_KHRONOS_validation` 拿到精确的 VUID/对象错误，或用一个 4 KB 的
+  最小 copy 用例逐行二分；确认后再接稠密常驻（2079 MiB）与 M2-3 的 done。
+- 注意：`qrt_vk_alloc` 返回的 buffer 必须带 TRANSFER 位才能被 upload/download 使用，这条已确定要保留。
+
