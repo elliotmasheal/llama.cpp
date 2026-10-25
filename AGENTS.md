@@ -153,6 +153,10 @@ blockers: none
   全部落在 **2.60-2.66 TFLOPS**，tile 不是瓶颈；反推有效读 74 GB/s，工作集 20-30 MB 装不进 2 MB L2
   （专家内核工作集 1.2 MB 时是 7.1 TFLOPS）。**LDS 分块是唯一出路**，失败假设与达标线已写进
   `RESULTS.md` 第 48 节、`DECISIONS.md` 第 45 节。
+- **M2-6b 更正（2026-10-25）**：稠密 GEMM 停在 **3.50 TFLOPS**（工作集落 L2 时），tile 形状无效、
+  L2 只值 33%。真因是 **q8_0 每位宽的 MAC 数只有 Q4_K 的一半**（3.5 vs 7.1），已接近上限 4.3。
+  **LDS 分块撤销为未验证假设**；按实测 PP = **706 tok/s**，缺口要动稠密 FLOPs 或位宽（需用户）。
+  见 `RESULTS.md` 第 48 节、`DECISIONS.md` 第 45 节。
 - **M5-2 done（2026-10-24）**：全量 10496 专家、payload 18.78 GiB，重组 377.7 s、校验 147.9 s、
   逐专家哈希 10496/10496 一致，续跑与整段 SHA-256 已实现；见 `RESULTS.md` 第 33 节、`DECISIONS.md` 第 26 节。
 - **M5-1 done（2026-10-24）**：重组格式规范 `runtime/repack/FORMAT.md`（64 KiB 块对齐、变长部件尺寸、
