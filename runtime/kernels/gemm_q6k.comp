@@ -100,8 +100,9 @@ void main() {
                         const uint q4 = (s < 2u) ? (ql & 0x0F0F0F0Fu)
                                                  : ((ql >> 4) & 0x0F0F0F0Fu);
                         const uint h2 = (qh >> (2u * s)) & 0x03030303u;
-                        q6[r][i] = ((q4 | (h2 << 4u)) ^ 0x20202020u) |
-                           ((~(q4 | (h2 << 4u)) & 0x20202020u) << 2u);
+                        const uint v6 = q4 | (h2 << 4u);
+                        const uint sgn = (~v6) & 0x20202020u;
+                        q6[r][i] = (v6 ^ 0x20202020u) | (sgn << 1u) | (sgn << 2u);
                     }
                 }
                 const uint bi = a_tok + sb * 8u + hh * 4u + s;

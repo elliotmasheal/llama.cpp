@@ -103,7 +103,8 @@ int qrt_model_read_ids(const char * path, uint32_t ** ids, uint32_t * count,
 
 int qrt_model_logits(const char * gguf_path, const char * store_prefix, const char * spv_dir,
                      const uint32_t * ids, uint32_t n_tokens, uint32_t n_layers,
-                     uint32_t n_rows, const char * out_path, char * err, size_t err_size) {
+                     uint32_t n_rows, const char * out_path, int32_t kv_k, int32_t kv_v,
+                     char * err, size_t err_size) {
     if (gguf_path == NULL || spv_dir == NULL || ids == NULL || n_tokens == 0 || out_path == NULL) {
         return fail(err, err_size, "the model run needs a GGUF, SPIR-V, tokens and an output path");
     }
@@ -178,8 +179,8 @@ int qrt_model_logits(const char * gguf_path, const char * store_prefix, const ch
         cfg.ffn = store_prefix != NULL ? 1 : 0;
         cfg.single_submit = 1;
         cfg.dn_recur = 1;
-        cfg.kv_k = QRT_KV_Q8_0;
-        cfg.kv_v = QRT_KV_Q4_0;
+        cfg.kv_k = kv_k;
+        cfg.kv_v = kv_v;
         cfg.kv_page_tokens = 16384;
         for (uint32_t l = 0; l < layer_count; ++l) {
             qrt_layer * layer = NULL;

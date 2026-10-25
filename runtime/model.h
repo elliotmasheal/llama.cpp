@@ -16,7 +16,8 @@
 // token_embd out of the dense bucket (weights.h) and the head is 248320 x 2048 per row.
 int qrt_model_logits(const char * gguf_path, const char * store_prefix, const char * spv_dir,
                      const uint32_t * ids, uint32_t n_tokens, uint32_t n_layers,
-                     uint32_t n_rows, const char * out_path, char * err, size_t err_size);
+                     uint32_t n_rows, const char * out_path, int32_t kv_k, int32_t kv_v,
+                     char * err, size_t err_size);
 
 // Reads a whitespace-separated token id file. Returns 0 on success.
 int qrt_model_read_ids(const char * path, uint32_t ** ids, uint32_t * count,

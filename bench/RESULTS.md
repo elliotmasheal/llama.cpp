@@ -2988,3 +2988,23 @@ CPU 双精度，K/V 平面取设备缓存按行格式反量化），`qrt --layer
    （fork 没有逐层读数，所以用"层数递增时的 KLD 曲线拐点"定位）。
 3. 重点复查仍未被独立参考覆盖的路径：full-attn 的 KV/rope 与 fork 的 fused 路径、router 的
    top-k 选择、以及 DeltaNet 状态在**跨 chunk**时的保存/恢复（本轮只跑单 chunk）。
+
+## 79. M2-7a 收口：Q6_K 符号扩展补齐后，同引擎 f16 臂到达 8.4e-3（2026-10-26）
+<!-- slug: m2-7a-closed -->
+
+口径：256 token（`bench/raw/m2-7a/tokens256.txt`），40 层，`--logits-rows 16`（offset 239..254），
+`--layer-store <前缀>`；KV 精度由 `--kv-k/--kv-v` 传入（此前 model.cpp 写死 q8_0/q4_0，已修）。
+产物 `l40.bin`（默认档）、`l40-f16.bin`（f16/f16）。
+
+| 对照 | PPL | mean KLD | same top-1 | 判决 |
+|---|---:|---:|---:|---|
+| fork f16 vs **runtime f16**（跨引擎） | 1.441 vs **1.485** | **8.38e-03** | **87.5%** | 低于 fork 自身 -fa on/off 的 1.47e-2 地板（Q-KV1） |
+| runtime f16 vs **runtime 默认档**（同引擎） | 1.485 vs 1.487 | 报读数（U-12 不判） | - | 默认档读数 |
+
+- Q6_K 的第一次修复只补了 bit 7（64 个原码里仍错 32 个）；按 `q-32` 的完整符号扩展重写后，
+  GPU 与 CPU 参考分别用打包表达式与逐字节减法（不再互相复制），穷举 64 码 0 错。
+- 修前同口径：PPL 5.94 / KLD 1.29 / top-1 56%；修后 **1.485 / 8.4e-3 / 87.5%**。
+- 剩余 KLD 是**跨引擎地板**（runtime 自研注意力 vs fork fused 路径），按 gates 4.1 不得据此判
+  1e-4；同引擎 A/B 才是质量门口径，而 runtime 现在已经能产出两侧。
+- 未做：`--logits-rows 512` 的 10K 档、128K/256K（Q-KV3）、跨 chunk KV/DeltaNet 状态、softplus
+  大值保护（P2，未观察到触发）。

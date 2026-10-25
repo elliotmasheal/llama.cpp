@@ -2071,7 +2071,7 @@ int main(int argc, char ** argv) {
         }
         const int rc = qrt_model_logits(logits_gguf, layer_store, g_spv_dir, ids, n_ids,
                                         (uint32_t) logits_layers, (uint32_t) logits_rows,
-                                        logits_out, err, sizeof(err));
+                                        logits_out, cfg.kv_k, cfg.kv_v, err, sizeof(err));
         if (rc != 0) {
             fprintf(stderr, "qrt: %s\n", err);
         }
