@@ -1,9 +1,13 @@
 #version 450
-// Q8_0 x Q8_1 GEMM for the dense projections, on **prepared** weights: at load time every
-// row is repacked as [K bytes of int8 q][K/8 bytes of f16 delta], so the kernel reads
-// aligned uints instead of the 34-byte blocks (which are not word aligned and cost two
-// loads plus a funnel shift per four bytes). This is the plane split M2-4 used on Q4_K,
-// where it moved the expert GEMM from 3.66 to 6.08 TFLOPS.
+// Q8_0 x Q8_1 dense GEMM, LDS staged. The activation panel of the workgroup is copied
+// into shared memory once per K-panel, so the 32 lanes stop re-reading the same token
+// bytes from L2 (the previous kernel read them once per lane), and each lane holds a
+// 4 row x 8 token register tile so one weight word feeds 8 tokens and one activation
+// word feeds 4 rows. Weights stay in registers: every row belongs to one lane, so
+// staging them would buy nothing.
+//
+// Weights are the prepared layout [k int8][k/8 bytes of f16 deltas] per row (see
+// qrt_gemm_q8k_prepare), which keeps every load 4-byte aligned.
 
 #extension GL_EXT_control_flow_attributes : enable
 #ifdef Q4K_DOT4
@@ -13,7 +17,18 @@
 #include "tiles.h"
 #include "common.glsl"
 
-layout(local_size_x = Q4K_WG_INVOCATIONS) in;
+#define ROWS   4u
+#define TOKENS 8u
+#define LANES  32u
+#define SUBS   4u
+#define TILE_N (ROWS * LANES)     // 128 rows per workgroup
+#define TILE_M (TOKENS * SUBS)    // 32 tokens per workgroup
+#define KSTEP  128u               // elements per panel
+#define QWORDS (TILE_M * KSTEP / 4u)    // 1024 words of quants
+#define DSWORDS (TILE_M * KSTEP / 32u)  // 128 words of deltas
+#define THREADS (LANES * SUBS)          // 128
+
+layout(local_size_x = THREADS) in;
 
 layout(binding = 0) readonly  buffer WeightWords { uint w[]; } wt;
 layout(binding = 1) readonly  buffer ActQs       { uvec4 aq[]; } aq;
@@ -29,64 +44,91 @@ layout(push_constant) uniform PC {
     uint abase;
 } pc;
 
-void main() {
-    const uint nk32 = pc.k / 32u;
-    const uint stride = pc.k + pc.k / 8u;   // qs row then ds row, same buffer
-    const uint lane = gl_LocalInvocationID.x % Q4K_SUBGROUP;
-    const uint sub  = gl_LocalInvocationID.x / Q4K_SUBGROUP;
+shared uint s_q[QWORDS];
+shared uint s_d[DSWORDS];
 
-    uint row[Q4K_ROWS];
-    [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
-        row[r] = gl_WorkGroupID.x * Q4K_TILE_N + r * Q4K_SUBGROUP + lane;
+void main() {
+    const uint lane = gl_LocalInvocationID.x % LANES;
+    const uint sub  = gl_LocalInvocationID.x / LANES;
+    const uint tid  = gl_LocalInvocationID.x;
+
+    uint row[ROWS];
+    [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+        row[r] = gl_WorkGroupID.x * TILE_N + r * LANES + lane;
     }
-    const uint tok0 = gl_WorkGroupID.y * Q4K_TILE_M + sub * Q4K_TOKENS;
-    if (row[Q4K_ROWS - 1u] >= pc.n || tok0 + Q4K_TOKENS > pc.m) {
+    const uint tok0 = gl_WorkGroupID.y * TILE_M;
+    // Workgroup uniform, so the barriers below are still reached by every thread.
+    if (row[ROWS - 1u] >= pc.n || tok0 + TILE_M > pc.m) {
         return;
     }
 
-    float acc[Q4K_ROWS][Q4K_TOKENS];
-    [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
-        [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
+    float acc[ROWS][TOKENS];
+    [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+        [[unroll]] for (uint t = 0; t < TOKENS; ++t) {
             acc[r][t] = 0.0;
         }
     }
 
-    const uint a_tok = pc.abase + tok0 * nk32;
+    const uint nk32 = pc.k / 32u;
+    const uint stride = pc.k + pc.k / 8u;
+    const uint panel_blocks = KSTEP / 32u;          // 4
+    const uint my_token = sub * TOKENS;             // first token this lane reads
 
-    for (uint j = 0; j < nk32; ++j) {
-        uint q[Q4K_ROWS][8];
-        float d[Q4K_ROWS];
-        [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
-            const uint base = pc.wbase + row[r] * stride;
-            const uint ds_word = (base + pc.k + j * 4u) >> 2u;
-            d[r] = unpackHalf2x16(wt.w[ds_word] & 0xFFFFu).x;
-            const uint qw = (base + j * 32u) >> 2u;
-            [[unroll]] for (uint i = 0; i < 8u; ++i) {
-                q[r][i] = wt.w[qw + i];
-            }
+    for (uint k0 = 0; k0 < pc.k; k0 += KSTEP) {
+        // One thread per (token, 32-element block): load the quants and the delta.
+        {
+            const uint t = tid / panel_blocks;
+            const uint b = tid % panel_blocks;
+            const uint ab = pc.abase + (tok0 + t) * nk32 + k0 / 32u + b;
+            const uvec4 lo = aq.aq[ab * 2u];
+            const uvec4 hi = aq.aq[ab * 2u + 1u];
+            const uint base = t * (KSTEP / 4u) + b * 8u;
+            s_q[base + 0u] = lo.x;
+            s_q[base + 1u] = lo.y;
+            s_q[base + 2u] = lo.z;
+            s_q[base + 3u] = lo.w;
+            s_q[base + 4u] = hi.x;
+            s_q[base + 5u] = hi.y;
+            s_q[base + 6u] = hi.z;
+            s_q[base + 7u] = hi.w;
+            s_d[t * panel_blocks + b] = ads.ads[ab];
         }
-        const uint bi = a_tok + j;
-        [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
-            const uint ab = bi + t * nk32;
-            const uvec4 alo = aq.aq[ab * 2u];
-            const uvec4 ahi = aq.aq[ab * 2u + 1u];
-            const float aq_scale = unpackHalf2x16(ads.ads[ab]).x;
-            uint aw[8];
-            aw[0] = alo.x; aw[1] = alo.y; aw[2] = alo.z; aw[3] = alo.w;
-            aw[4] = ahi.x; aw[5] = ahi.y; aw[6] = ahi.z; aw[7] = ahi.w;
-            [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
-                int sum = 0;
+        barrier();
+
+        [[unroll]] for (uint b = 0; b < panel_blocks; ++b) {
+            uint q[ROWS][8];
+            float dd[ROWS];
+            [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+                const uint wq = (pc.wbase + row[r] * stride + (k0 + b * 32u)) >> 2u;
                 [[unroll]] for (uint i = 0; i < 8u; ++i) {
-                    sum += qrt_dot4(q[r][i], aw[i]);
+                    q[r][i] = wt.w[wq + i];
                 }
-                acc[r][t] += d[r] * aq_scale * float(sum);
+                const uint wd = (pc.wbase + row[r] * stride + pc.k + (k0 / 32u + b) * 4u) >> 2u;
+                dd[r] = unpackHalf2x16(wt.w[wd] & 0xFFFFu).x;
+            }
+            [[unroll]] for (uint t = 0; t < TOKENS; ++t) {
+                const uint sbase = (my_token + t) * (KSTEP / 4u) + b * 8u;
+                uint aw[8];
+                [[unroll]] for (uint i = 0; i < 8u; ++i) {
+                    aw[i] = s_q[sbase + i];
+                }
+                const float aq_scale =
+                        unpackHalf2x16(s_d[(my_token + t) * panel_blocks + b]).x;
+                [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+                    int sum = 0;
+                    [[unroll]] for (uint i = 0; i < 8u; ++i) {
+                        sum += qrt_dot4(q[r][i], aw[i]);
+                    }
+                    acc[r][t] += dd[r] * aq_scale * float(sum);
+                }
             }
         }
+        barrier();
     }
 
-    [[unroll]] for (uint r = 0; r < Q4K_ROWS; ++r) {
-        [[unroll]] for (uint t = 0; t < Q4K_TOKENS; ++t) {
-            ob.o[pc.obase + row[r] * pc.m + tok0 + t] = acc[r][t];
+    [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+        [[unroll]] for (uint t = 0; t < TOKENS; ++t) {
+            ob.o[pc.obase + row[r] * pc.m + tok0 + my_token + t] = acc[r][t];
         }
     }
 }

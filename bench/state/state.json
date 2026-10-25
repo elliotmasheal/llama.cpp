@@ -1177,7 +1177,7 @@
       ],
       "done_when": "q8_0 权重 x q8_1 激活的 GEMM 对 CPU 参考 rel_L1 <= 1e-5；在 N=8192/K=2048/M=10240 的形状上 >= 5 TFLOPS；与 K-quant GEMM 共用记录/提交接口",
       "claimed_at": "2026-10-25T18:00:00",
-      "note": "Q8_0 dense GEMM in the runtime, correct at 1.297e-7, 2.64 TFLOPS on the dense working set and 3.2-3.5 when it fits L2. Tile shape was swept with the build plumbing fixed (RESULTS 49): no effect. User decision 2026-10-25: dense weights must NOT be requantised to 4 bit, so the only path to the 5.2-5.4 TFLOPS that PP 1000 needs is a dedicated kernel that raises operand reuse (4x16 register tile + LDS activation panel + K-panel double buffering)"
+      "note": "Q8_0 dense GEMM: correct at 1.297e-7 and 2.64 TFLOPS on the dense working set (3.50 when it fits L2). Four optimisations tried: aligned plane repacking +23%, group_m swizzle worse, tile shapes no effect, LDS staging with a 4x8 register tile no effect (RESULTS 46-50, DECISIONS 43-46). The cap is the q8_0 bit width; PP with this kernel is about 706-780 tok/s, so PP 1000 needs a numerics decision (dense requantisation, which the user rejected) and the user call"
     },
     {
       "id": "M2-6c",
