@@ -1,13 +1,9 @@
 #version 450
-// Q8_0 x Q8_1 dense GEMM, D-1 shape (M2-6b step 7). One lane owns ROWS output rows and
-// TOKENS tokens; weights arrive four-to-a-word via uvec4 so a 32-element block costs two
-// loads instead of eight, and the K panel is 256 elements so the barrier and the
-// activation staging are amortized. This is the geometry the Q4_K expert kernel runs at
-// 6.08-6.20 TFLOPS (RESULTS 28); the dense kernel was 3.35 with 4 rows and 8 single-word
-// weight loads (RESULTS 53).
-//
-// Weights are the prepared layout [k int8][k/8 bytes of f16 deltas] per row, so every
-// 16-byte group is aligned as long as k % 16 == 0 (2048 and 4096 are).
+// Q8_0 x Q8_1 dense GEMM, block-major weights (M2-6b step 8, D-3). The host repacks each
+// 64-row tile so that, for one 32-element k block, the 32 quant bytes of the 64 rows are
+// contiguous (gemm.cpp). A wave of 32 lanes then covers 32 consecutive slots, i.e. 1 KiB
+// of one run, instead of 32 runs 2-4 KiB apart, which is what pinned the dense kernel at
+// ~3.4 TFLOPS (RESULTS 53/54). Nothing else changes: same tiles, same dot4, same math.
 
 #extension GL_EXT_control_flow_attributes : enable
 #ifdef Q4K_DOT4
@@ -21,6 +17,7 @@
 #define TOKENS 8u
 #define LANES  32u
 #define SUBS   4u
+#define QTILE  64u                // rows per weight tile, must match QK_TILE_ROWS
 #define TILE_N (ROWS * LANES)     // 64 rows per workgroup
 #define TILE_M (TOKENS * SUBS)    // 32 tokens per workgroup
 #define KSTEP  256u               // elements per panel
@@ -30,7 +27,7 @@
 
 layout(local_size_x = THREADS) in;
 
-layout(binding = 0) readonly  buffer WeightWords { uvec4 w4[]; } wt;
+layout(binding = 0) readonly  buffer WeightWords { uint w[]; } wt;
 layout(binding = 1) readonly  buffer ActQs       { uvec4 aq[]; } aq;
 layout(binding = 2) writeonly buffer Out         { float o[]; } ob;
 layout(binding = 3) readonly  buffer ActDs       { uint ads[]; } ads;
@@ -39,7 +36,7 @@ layout(push_constant) uniform PC {
     uint n;
     uint k;
     uint m;
-    uint wbase;   // byte offset of row 0 in the prepared buffer
+    uint wbase;   // byte offset of this matrix inside the prepared buffer
     uint obase;
     uint abase;
 } pc;
@@ -70,7 +67,8 @@ void main() {
     }
 
     const uint nk32 = pc.k / 32u;
-    const uint stride = pc.k + pc.k / 8u;
+    const uint npad = (pc.n + QTILE - 1u) / QTILE * QTILE;
+    const uint dbase = pc.wbase + npad * pc.k;   // delta plane follows the quant plane
     const uint my_token = sub * TOKENS;
 
     for (uint k0 = 0; k0 < pc.k; k0 += KSTEP) {
@@ -94,30 +92,21 @@ void main() {
         }
         barrier();
 
-        // The panel's deltas: 8 f16 values are 16 bytes, one aligned uvec4 per row.
-        float dd[ROWS][BLOCKS];
-        [[unroll]] for (uint r = 0; r < ROWS; ++r) {
-            const uint dbyte = pc.wbase + row[r] * stride + pc.k + (k0 / 32u) * 4u;
-            const uvec4 dv = wt.w4[dbyte >> 4u];
-            dd[r][0] = unpackHalf2x16(dv.x).x;
-            dd[r][1] = unpackHalf2x16(dv.x).y;
-            dd[r][2] = unpackHalf2x16(dv.y).x;
-            dd[r][3] = unpackHalf2x16(dv.y).y;
-            dd[r][4] = unpackHalf2x16(dv.z).x;
-            dd[r][5] = unpackHalf2x16(dv.z).y;
-            dd[r][6] = unpackHalf2x16(dv.w).x;
-            dd[r][7] = unpackHalf2x16(dv.w).y;
-        }
-
         [[unroll]] for (uint b = 0; b < BLOCKS; ++b) {
-            // One weight block of 32 elements is two aligned uvec4 words per row.
+            // One 32-element weight block per row: 8 words at a block-major slot, so the
+            // wave reads 32 consecutive slots.
             uint q[ROWS][8];
+            float dd[ROWS];
             [[unroll]] for (uint r = 0; r < ROWS; ++r) {
-                const uint wb = (pc.wbase + row[r] * stride + k0 + b * 32u) >> 4u;
-                const uvec4 lo = wt.w4[wb];
-                const uvec4 hi = wt.w4[wb + 1u];
-                q[r][0] = lo.x; q[r][1] = lo.y; q[r][2] = lo.z; q[r][3] = lo.w;
-                q[r][4] = hi.x; q[r][5] = hi.y; q[r][6] = hi.z; q[r][7] = hi.w;
+                const uint slot = (gl_WorkGroupID.x * nk32 + k0 / 32u + b) * QTILE +
+                                  r * LANES + lane;
+                const uint wq = (pc.wbase + slot * 32u) >> 2u;
+                [[unroll]] for (uint i = 0; i < 8u; ++i) {
+                    q[r][i] = wt.w[wq + i];
+                }
+                const uint dbyte = dbase + slot * 2u;
+                const uint word = wt.w[dbyte >> 2u];
+                dd[r] = (dbyte & 2u) == 0u ? unpackHalf2x16(word).x : unpackHalf2x16(word).y;
             }
             [[unroll]] for (uint t = 0; t < TOKENS; ++t) {
                 const uint sbase = (my_token + t) * (KSTEP / 4u) + b * 8u;
@@ -131,7 +120,7 @@ void main() {
                     [[unroll]] for (uint i = 0; i < 8u; ++i) {
                         sum += qrt_dot4(q[r][i], aw[i]);
                     }
-                    acc[r][t] += dd[r][b] * aq_scale * float(sum);
+                    acc[r][t] += dd[r] * aq_scale * float(sum);
                 }
             }
         }

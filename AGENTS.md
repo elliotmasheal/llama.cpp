@@ -76,7 +76,7 @@ design 与本文件冲突时停下，按第 8 节升级。跨口径的数字不�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M2-6b data=- io=- user=-
+queues: bench=- impl=M2-6c data=- io=- user=-
 last_gate: G-REG unknown (backend-ops 2026-10-23; ctest 33/33 at M1-3c)
 blockers: none
 <!-- STATE:END -->
@@ -182,6 +182,12 @@ blockers: none
   专家核 6.08-6.20，所以墙是**散列读延迟**（一个 wave 32 条 lane 各自读相距 2-4 KiB 的 32 B），
   不是带宽也不是发射率。最后一招纯布局改动 **D-3：块主序重排**（128 行 x 128 元素连续 16 KiB）；
   再不过 5 就测 dot4 上限（D-2）然后请你定数值方案。见 `RESULTS.md` 第 54 节、`DECISIONS.md` 第 50 节。
+- **M2-6b 完成（2026-10-25）**：权重块主序重排（64 行块 x 32 字节 k 块 + 独立 delta 平面）把稠密
+  q8_0 GEMM 从 **3.38 提到 12.89 TFLOPS**（k=4096 时 14.81），正确性 rel_L1 1.3e-07/1.8e-07，
+  数值方案未变。稠密腿 30.9 TFLOP -> **约 2.4 s**（原 11.5 s），**PP 1000 重新变为可达**。
+  `RESULTS 46-50` 的"q8_0 位宽是上限"结论作废；12.9 TFLOPS 高于 design 的 fp32 roofline 7.06
+  （int8 dot4 每条指令 4 次乘加），**要不要改 roofline 口径请你定**。见 `RESULTS.md` 第 55 节、
+  `DECISIONS.md` 第 51 节。
 - **M2-6c 第一步（2026-10-25，partial）**：DeltaNet 递推核对 CPU 双精度参考 `rel_L1 2.3e-07`，
   状态保存/恢复与串行解码对批量**逐位相同**（token 循环在 shader 内、状态常驻寄存器）；
   4.75-4.83 us/token -> 30 层 10K **1.46-1.48 s**，是第 45 节整条 attention 预算 1.35 s 的 **1.09x**，

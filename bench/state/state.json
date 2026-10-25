@@ -121,7 +121,7 @@
     },
     {
       "lane": "impl",
-      "head": "M2-6b",
+      "head": "M2-6c",
       "order": [
         "M2-0",
         "M2-1",
@@ -137,7 +137,7 @@
         "X-2",
         "X-4"
       ],
-      "note": "M2-6b stays the head: D-3 (block-major weight repack) is the next single-variable change; it is a pure layout change. M2-6c step 2 and M2-6d/6a follow, X-2 waits for M3-4"
+      "note": "the dense line is closed (12.89 TFLOPS, RESULTS 55). Head is M2-6c step 2 (DeltaNet prep chain + gated RMS norm), then M2-6d and M2-6a"
     },
     {
       "lane": "data",
@@ -1170,7 +1170,7 @@
       "id": "M2-6b",
       "milestone": "M2",
       "lane": "impl",
-      "status": "partial",
+      "status": "done",
       "title": "Q8_0 x Q8_1 GEMM：稠密投影（30.9 TFLOP，PP 的最大一条腿）",
       "deps": [],
       "resources": [
@@ -1185,7 +1185,7 @@
         "runtime/qrt_main.cpp"
       ],
       "done_when": "q8_0 权重 x q8_1 激活的 GEMM 对 CPU 参考 rel_L1 <= 1e-5；在 N=8192/K=2048/M=10240 的形状上 >= 5 TFLOPS；与 K-quant GEMM 共用记录/提交接口",
-      "note": "step 7 (D-1) done 2026-10-25: the expert kernel inner shape (2 rows x 8 tokens per lane, uvec4 weight reads, K panel 256) does not move the dense rate either (3.35-3.43 -> 3.38, rel_l1 1.297e-07). Five data-flow changes have now landed on the same 3.4 TFLOPS, while weights resident in L2 give 4.34 and the Q4_K expert kernel gives 6.08-6.20, so the wall is scattered-read latency, not bandwidth or issue rate. Next and last pure-layout attempt is D-3: repack weights block-major (128 rows x 128 k contiguous) so a wave reads 4 KiB contiguous. If that misses 5 TFLOPS, measure the dot4 issue rate (D-2) and then ask the user about numerics. RESULTS 54, DECISIONS 50"
+      "note": "done 2026-10-25: block-major weight repack (64-row tiles, 32-byte k blocks, separate delta plane) took the dense q8_0 GEMM from 3.38 to 12.89 TFLOPS at N=8192/K=2048/M=10240, 14.81 at k=4096, 11.68 with L2-resident weights; rel_l1 1.297e-07/1.807e-07, numerics unchanged (q8_0 x Q8_1 int8 dot4). The dense leg is 30.9 TFLOP / 12.9 = about 2.4 s instead of 11.5 s, so PP 1000 is reachable without touching the numerics. RESULTS 55, DECISIONS 51. Note: 12.9 TFLOPS exceeds the fp32 roofline of design section 8 because int8 dot4 does four MACs per instruction; whether the reported roofline fraction changes is the user call"
     },
     {
       "id": "M2-6c",

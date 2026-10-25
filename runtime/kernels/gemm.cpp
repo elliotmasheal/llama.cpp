@@ -17,32 +17,39 @@ size_t qrt_gemm_block_bytes(qrt_quant type) {
     return 0;
 }
 
-uint64_t qrt_gemm_matrix_bytes(qrt_quant type, uint32_t n, uint32_t k) {
-    // Q8_0 is stored prepared: k bytes of quants plus k/8 bytes of deltas per row.
-    if (type == QRT_QUANT_Q8_0) {
-        return (uint64_t) n * (k + k / 8);
-    }
-    return (uint64_t) n * (k / Q4K_QK) * qrt_gemm_block_bytes(type);
-}
+// Q8_0 weights are repacked once at load time into a block-major layout: for every
+// 32-element k block of every 64-row tile, the 32 quant bytes of the 64 rows sit
+// contiguously, and the f16 deltas of that tile form their own plane. A wave of 32
+// lanes then reads 32 consecutive 32-byte slots (1 KiB of one run) instead of 32
+// scattered runs 2-4 KiB apart, which is what kept the dense kernel at 3.4 TFLOPS
+// (RESULTS 54). QK_TILE_ROWS must match the shader.
+#define QK_TILE_ROWS 64u
 
 void qrt_gemm_q8k_prepare(const void * raw, uint32_t n, uint32_t k, void * out) {
     const uint32_t blocks = k / 32;
-    const uint32_t stride = k + k / 8;
+    unsigned char * qp = (unsigned char *) out;
+    unsigned char * dp = qp + (size_t) n * k;
     const unsigned char * src = (const unsigned char *) raw;
-    unsigned char * dst = (unsigned char *) out;
     for (uint32_t row = 0; row < n; ++row) {
-        unsigned char * qrow = dst + (size_t) row * stride;
-        unsigned char * drow = qrow + k;
+        const uint32_t rt = row / QK_TILE_ROWS;
+        const uint32_t rr = row % QK_TILE_ROWS;
         for (uint32_t b = 0; b < blocks; ++b) {
             const unsigned char * blk = src + ((size_t) row * blocks + b) * 34;
-            memcpy(qrow + (size_t) b * 32, blk + 2, 32);
-            // The delta stays a f16 in the low half; the upper half must read as zero.
-            drow[b * 4 + 0] = blk[0];
-            drow[b * 4 + 1] = blk[1];
-            drow[b * 4 + 2] = 0;
-            drow[b * 4 + 3] = 0;
+            const size_t slot = ((size_t) rt * blocks + b) * QK_TILE_ROWS + rr;
+            memcpy(qp + slot * 32, blk + 2, 32);
+            memcpy(dp + slot * 2, blk, 2);
         }
     }
+}
+
+uint64_t qrt_gemm_matrix_bytes(qrt_quant type, uint32_t n, uint32_t k) {
+    // Q8_0 is stored prepared and block major: a row tile of 64 rows is padded, so the
+    // size is the padded row count times the bytes per row.
+    if (type == QRT_QUANT_Q8_0) {
+        const uint64_t rows = (n + QK_TILE_ROWS - 1u) / QK_TILE_ROWS * QK_TILE_ROWS;
+        return rows * (k + k / 8);
+    }
+    return (uint64_t) n * (k / Q4K_QK) * qrt_gemm_block_bytes(type);
 }
 
 int qrt_gemm_type_of(uint32_t n, uint32_t k, uint64_t bytes) {
