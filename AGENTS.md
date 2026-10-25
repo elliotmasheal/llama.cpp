@@ -43,14 +43,14 @@ RX 6700S 8 GiB（`-dev Vulkan1`）+ Ryzen 7 6800HS + 40172 MiB RAM，平衡电�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=X-4 data=Q-KV2 io=- user=-
+queues: bench=- impl=M2-7a data=Q-KV2 io=- user=-
 last_gate: G-REG unknown (2026-10-23)
 blockers: none
 <!-- STATE:END -->
 
 `queues` 只写任务 id；"为什么是它、做到什么算完"在 `state.json`。
 本节摘要最多 3 行：历史与读数只在 `RESULTS.md` / `DECISIONS.md`，`--lint` 会拦 dated bullet 与任务表。
-焦点：M2-6a 已 closed（KV 精度 K/V 双开关、窗口按显存预算推导、主机分页），见 `RESULTS` `m2-6a-kv-precision` / `m2-6a-kv-paging`；下一步是 bench 的 M2-7 整模型 KLD（先答 E-KV2）与 impl 的 X-4 内核回归。
+焦点：M2-6a 已 closed（KV 精度、窗口按预算推导、主机分页；design v0.7 / U-12）；下一步 impl 队首 **M2-7a 整模型前向 + QRTLOG1 logits 出口**，它是 bench M2-7 的唯一前置。
 
 ## 4. 铁律
 

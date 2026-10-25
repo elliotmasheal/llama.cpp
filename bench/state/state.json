@@ -150,7 +150,7 @@
     },
     {
       "lane": "impl",
-      "head": "X-4",
+      "head": "M2-7a",
       "order": [
         "M2-0",
         "M2-1",
@@ -160,13 +160,14 @@
         "M2-5",
         "M2-6",
         "M2-6a",
+        "M2-7a",
         "M3-1a",
         "M1-3d",
         "X-1",
         "X-2",
         "X-4"
       ],
-      "note": "M2-6a is doing (KV precision round 1); X-4 is the next unblocked impl task"
+      "note": "M2-6a is done; M2-7a (the whole-model forward and the QRTLOG1 logits exit) is the critical path to M2-7, then M3-1/M3-2"
     },
     {
       "lane": "data",
@@ -603,6 +604,7 @@
         "M2-5",
         "M2-6",
         "M2-6a",
+        "M2-7a",
         "X-1"
       ],
       "resources": [
@@ -613,7 +615,7 @@
       "paths": [
         "bench/raw/m2/**"
       ],
-      "done_when": "同一 prompt、k=1 路径的 KLD <= 1e-4，same top p 100%；读数进 RESULTS"
+      "done_when": "同一 prompt、k=1 路径；默认 KV 档只报 tail mean KLD / same top-1 / greedy 逐 token（U-11/U-12 不判），非默认档（含 f16/f16 A 侧）KLD <= 1e-4 且 same top-p 100%；读数进 RESULTS"
     },
     {
       "id": "M2-8",
@@ -1113,6 +1115,29 @@
       "done_when": "用户 2026-10-24 定：code 纳入 130。由 code 66% 命中推出 CPU 0.059（目标 0.055）；design 1.1/6.5/R2 已改"
     },
     {
+      "id": "M2-7a",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "整模型前向 + logits 出口（QRTLOG1 v1）",
+      "deps": [
+        "M2-5",
+        "M2-6",
+        "M2-6a"
+      ],
+      "resources": [
+        "gpu",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/model.*",
+        "runtime/qrt_main.cpp",
+        "runtime/CMakeLists.txt",
+        "runtime/README.md"
+      ],
+      "done_when": "embedding -> 40 层（11 full-attn + 29 DeltaNet）-> final norm -> output head 跑通一个 chunk；--logits-dump 写 QRTLOG1 v1（24 B 头 + tokens[n_pos+1] + f32 rows，格式见 bench/tools/quality/README.md 第 3 节）；相邻层 hidden 与单层链一致，logits 对 CPU 双精度参考 rel_L1 <= 1e-4；10K prompt 一档 exit 0，读数进 RESULTS"
+    },
+    {
       "id": "M2-6a",
       "milestone": "M2",
       "lane": "impl",
@@ -1339,11 +1364,12 @@
   "escalations": [
     {
       "id": "E-KV2",
-      "state": "open",
-      "decision": "DECISIONS.md#m2-6a-page-decision",
+      "state": "closed",
+      "resolved": "2026-10-25",
+      "decision": "DECISIONS.md#kv-kld-criterion",
       "question": "M2-7 的 done_when 仍是 'KLD <= 1e-4 / same top-p 100%'，而默认 KV 档（q8_0 K + q4_0 V）按 U-11 已豁免 L-MODEL、预期 2e-2。M2-7 的判据要改成：(a) 默认档只报读数、1e-4 判据对 f16/f16 A 侧或非默认档判；还是 (b) 保留 1e-4 但默认档记为已知不达标？另：design 7 的 QRT_KV_PAGE_TOKENS 仍写'常驻窗口'，需要用户改成'换页粒度 + 窗口按预算推导'",
       "needs_by": "M2-7 开跑前",
-      "outcome": null
+      "outcome": "用户 2026-10-25 选 (a)：默认档只报读数，1e-4 判 f16/f16 A 侧与非默认档；design 升 v0.7（1.3/5.5/6.5/7 节 + 决定第 8 条）、gates 4.1、bench README 第 12 条同步；QRT_KV_PAGE_TOKENS 改为换页粒度"
     },
     {
       "id": "E-KV1",

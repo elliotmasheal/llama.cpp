@@ -2038,3 +2038,33 @@ M2-6a 负责迁移成 K/V 两开关并把 q8_0 K + q4_0 V 的 832 B/token/层 �
   3. 分页目前的换入是逐页同步提交（每页一次 submit+wait）；真要跑 256K 可以合并成一次提交
      里的多个 dispatch + 一次换入大 copy，属于 M4 的优化。
   4. `heapBudget` 随桌面占用波动（今天 7378），窗口读数必须带 `budget_mib` 与日期。
+
+## 77. U-12 判决：KLD 判据只落在非默认档，KV 窗口按余量推导（2026-10-25）
+<!-- slug: kv-kld-criterion -->
+
+### 77.1 用户决定（2026-10-25，U-12）
+
+- **KLD 1e-4 判据对默认 KV 档（q8_0 K + q4_0 V）不适用**：该档的 tail mean KLD / top-1 /
+  greedy 逐 token **只报读数、不判 pass/fail**；判据落在 **f16/f16 A 侧**与任何**非默认档**上。
+  M2-7 的 10K KLD 与 G-QUAL-LONG 的 10K/128K/256K 同一口径。
+- 与 U-11 的关系：U-11 解除了"默认档必须过 L-MODEL 才能生效"，U-12 明确了"这条判据现在落在哪里"。
+  两者都不改 1e-4 这个数，也不改 `L-KERN`。
+- 同步：design v0.7（版本行、v0.7 摘要、1.3、5.5、6.5、7 节开关表、6.5 决定第 8 条）、
+  `docs/agent/gates.md` 4.1、`bench/README.md` 第 12 条、`state.json` 的 M2-7 done_when。
+- **KV 常驻窗口**改为 `min(ctx 262144, 显存余量整页数)`，`QRT_KV_PAGE_TOKENS` = 换页粒度（U-12 指示，
+  实现见 DECISIONS `m2-6a-page-decision`）。专家缓存保持优先，窗口只吃余量。
+
+### 77.2 后果
+
+1. 质量读数不再有"默认档过/不过"的歧义：每个质量报告同时给 A 侧（f16/f16）与 B 侧（默认档）
+   两组数，只有 A 侧参与判据；B 侧是可观测性（U-11 的"达标证据缺席"记录）。
+2. M2-7 的 done_when 从"KLD <= 1e-4 + same top-p 100%"改成"默认档只报；非默认档判 1e-4"。
+   这样 M2-7 不会被一个设计上已豁免的档卡住。
+3. 长上下文（128K/256K）在 8 GiB 上必然走分页：窗口 32768-114688 token（budget 7378-8176），
+   256K 要 8-3 次换页轮转；读数必须带 `budget_mib`。
+
+### 77.3 未结项
+
+- `qrt` 的 logits 出口（整模型前向 + QRTLOG1 v1 转储）仍未实现，是 M2-7 的唯一阻塞：格式已在
+  `bench/tools/quality/README.md` 第 3 节定死（24 B 头 + tokens[n_pos+1] + f32 rows），工具侧不用改。
+- M2-7a（impl）承接这条出口：embedding -> 40 层 -> final norm -> head，`--logits-dump` 写盘。
