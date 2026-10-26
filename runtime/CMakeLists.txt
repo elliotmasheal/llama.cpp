@@ -4,6 +4,7 @@
 
 add_library(qrt_core STATIC
     qrt_config.cpp
+    cpu_moe.cpp
     qrt_telemetry.cpp
     gguf_index.cpp
     weights.cpp
@@ -22,6 +23,15 @@ add_library(qrt_core STATIC
 
 target_include_directories(qrt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(qrt_core PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+find_package(Threads REQUIRED)
+target_link_libraries(qrt_core PRIVATE Threads::Threads)
+
+# The CPU expert core is AVX2 + FMA with an OpenMP row loop (M3-1a/M3-2a); the flags
+# stay on that one source so the rest of the runtime keeps the default target.
+if (NOT MSVC)
+    set_source_files_properties(cpu_moe.cpp PROPERTIES
+        COMPILE_OPTIONS "-O3;-mavx2;-mfma;-fopenmp")
+endif()
 
 # vk_dev.cpp compiles to a stub when the SDK is absent, so qrt still builds and
 # --vk-info reports why it cannot open a device.
@@ -231,4 +241,13 @@ endif()
 
 if (BUILD_TESTING)
     add_test(NAME qrt_selftest COMMAND qrt --selftest)
+    set_tests_properties(qrt_selftest PROPERTIES LABELS "qrt;cpu")
+    add_executable(qrt_cpu_moe_test cpu_moe_test.cpp cpu_moe.cpp)
+    set_target_properties(qrt_cpu_moe_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    if (NOT MSVC)
+        target_compile_options(qrt_cpu_moe_test PRIVATE -O3 -mavx2 -mfma -fopenmp)
+        target_link_options(qrt_cpu_moe_test PRIVATE -fopenmp)
+    endif()
+    add_test(NAME qrt_cpu_moe_contract COMMAND qrt_cpu_moe_test)
+    set_tests_properties(qrt_cpu_moe_contract PROPERTIES LABELS "qrt;cpu")
 endif()
