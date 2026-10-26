@@ -10,7 +10,7 @@ layout in agreement, so "按需读取" cannot silently degrade into "读了旧�
   python bench/tools/state_check.py --lane impl    one lane
   python bench/tools/state_check.py --brief M2-6   one task: reads, deps, done_when
   python bench/tools/state_check.py --lint         docs only
-  python bench/tools/state_check.py --selftest     pure unit tests, no repo reads
+  python bench/tools/state_check.py --selftest     isolated unit and CLI tests
 
 Locking has exactly one source now: a task that is `doing` and lists a
 resource holds it. The old bench/state/quiet-* files are deprecated; finding
@@ -513,6 +513,11 @@ def print_brief(st, tid):
 
 
 def run_selftest():
+    from contextlib import redirect_stdout
+    from io import StringIO
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
     bad = 0
     for (a, b), want in PATH_CASES:
         got = paths_overlap(a, b)
@@ -550,7 +555,50 @@ def run_selftest():
     if TASK_ROW.match("| **G-CONS** | every round |"):
         bad += 1
         print("FAIL TASK_ROW should not match a gate row")
-    total = len(PATH_CASES) + 9
+
+    cli_cases = [
+        ([], 8192, "M2", 0, ""),
+        (["--lint"], 8192, "M2", 0, ""),
+        ([], 1, "M2", 1, "budget is 1 B"),
+        (["--lint"], 1, "M2", 1, "budget is 1 B"),
+        ([], 8192, "invalid", 1, "unknown phase"),
+        (["--lint"], 8192, "invalid", 0, ""),
+    ]
+    with TemporaryDirectory(prefix="qrt-state-check-") as tmp:
+        root = Path(tmp)
+        docs = root / "docs" / "agent"
+        docs.mkdir(parents=True)
+        agents = root / "AGENTS.md"
+        agents.write_text(
+            "<!-- STATE:BEGIN -->\nphase: M2\nphase_status: in_progress\n"
+            "decision_gate: M1 closed\nqueues:\nlast_gate: none\nblockers: none\n"
+            "<!-- STATE:END -->\n", encoding="utf-8")
+        index = docs / "INDEX.md"
+        index.write_text("# Document index\n", encoding="utf-8")
+        state = root / "state.json"
+        fixture = {
+            "schema": SCHEMA, "track": "selftest", "updated": "2026-10-26",
+            "phase": "M2", "phase_status": "in_progress",
+            "decision_gate": {"id": "M1", "open": False, "result": "pass"},
+            "resources": {}, "lanes": {}, "queues": [], "tasks": [],
+            "last_gate": {"result": "unknown"}, "blockers": [], "escalations": [],
+            "doc_budget": {"agents_md_bytes": 8192},
+        }
+        with patch.dict(main.__globals__, ROOT=root, STATE=state, AGENTS=agents,
+                        DOCS=docs, INDEX=index):
+            for argv, cap, phase, want, message in cli_cases:
+                fixture["phase"] = phase
+                fixture["doc_budget"]["agents_md_bytes"] = cap
+                state.write_text(json.dumps(fixture), encoding="utf-8")
+                output = StringIO()
+                with redirect_stdout(output):
+                    got = main(argv)
+                if got != want or message not in output.getvalue():
+                    bad += 1
+                    print("FAIL CLI %r cap=%d phase=%s: exit %d, want %d; %s"
+                          % (argv, cap, phase, got, want, output.getvalue().strip()))
+
+    total = len(PATH_CASES) + 9 + len(cli_cases)
     print("%d/%d selftest cases passed" % (total - bad, total))
     return 0 if bad == 0 else 1
 
@@ -580,16 +628,15 @@ def main(argv):
         if j + 1 < len(argv):
             only_lane = argv[j + 1]
 
-    errors, warnings = validate(st)
+    errors, warnings = lint_docs(st)
     if "--lint" not in argv:
-        lerr, lwarn = lint_docs(st)
-        errors.extend(lerr)
-        warnings.extend(lwarn)
-
-    if "--board" in argv or only_lane:
-        print_board(st, only_lane)
-    else:
-        print_briefing(st)
+        verr, vwarn = validate(st)
+        errors.extend(verr)
+        warnings.extend(vwarn)
+        if "--board" in argv or only_lane:
+            print_board(st, only_lane)
+        else:
+            print_briefing(st)
 
     if warnings:
         print("")
@@ -601,7 +648,10 @@ def main(argv):
             print("ERROR  : " + e)
         return 1
     print("")
-    print("OK: graph, resources, queues, AGENTS.md and the doc layout agree")
+    if "--lint" in argv:
+        print("OK: document lint passed")
+    else:
+        print("OK: graph, resources, queues, AGENTS.md and the doc layout agree")
     return 0
 
 
