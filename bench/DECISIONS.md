@@ -2546,3 +2546,34 @@ done_when（重跑同一测量）。
   以后任何多行 decode 的验收必须走 `--spec-check`，不能只看 batch 计时。
 - **常驻回归**：`--spec-check --miss-split 0` 在 k=2/4/5/8 全档必过（比原先只看 100 更强，
   把 CPU 腿的多行路径纳入判据）。
+
+## 90. M3-3b 判决：MTP 草稿成立，E 低于 design 验收线拆成 M3-3c（2026-10-26）
+<!-- slug: m3-3b-mtp-draft-verdict -->
+
+- **采纳**：草稿源换成模型自带的 MTP 块（blk.40），前缀按 fork `graph_mtp` 的算子顺序在 host
+  用 double 做（`enorm/hnorm` + concat 以 embedding 在前 + `nextn.eh_proj`），头共享
+  `output.weight` 但**只 gather 候选行**。生产 decode 默认仍是 k=1 串行：推测循环要显式
+  `--spec-mtp`，因为它还没过 L-MODEL 成为默认所需的整模型门（本轮过的是接受/回滚与块自身
+  的 L-KERN，不是默认开关资格）。
+- **判决**：done_when 成立（`RESULTS.md#m3-3b-mtp-draft`）。硬门是"换成无人可控的草稿源后
+  两臂仍与串行 greedy 逐 token 一致"：4 层与 40 层、缓存开关两档都 `ids_equal=1`，无缓存档
+  逐行 float gap = 0（`legs=exact`），反例臂照旧在第 3 个 token 分叉；`--layer-check --layer 40`
+  15 段全 PASS 给块自身。bf16 的 MTP router 用新的 `qrt_gguf_read_f32_any` 装载，f32 门禁项
+  不放宽。M3-3b 记 done。
+- **E 不达标是实测结论，不改阈值**：k=4、16K 候选、10.4K prompt、q8_0 K + q4_0 V、
+  4198 MiB 缓存 + auto 下 runtime **E=2.327**，design 6.3 要 2.72/2.90，fork 同 prompt 实测
+  2.850。已排除：hnorm 漏用（修前 1.154 / 修后 2.000 同档）、KV 精度（512 档 f16 与 q8/q4 的
+  E 都是 1.939）、词表限制（完整词表 E 与 16K 完全相同，但每步 523.8 MiB/1478 ms vs
+  42.5 MiB/约 160 ms）。剩 ~18% 未归因，登记 `M3-3c`，**M3-6 依赖它**：TG = E/周期，
+  在 E 短 18% 的情况下测 130 只会把同一件事再量一遍。
+- **判据归因（收紧，不是放宽）**：`--spec-check` 的行 float gap 只在两臂对每个专家走同一算法
+  时是硬判据（缓存关闭 = `legs=exact`）。缓存开着时哪怕 `--miss-split 100`，槽位不够的 miss
+  也会被强制送 CPU 腿（512 MiB / 41 层 = 6 槽/层 < 一次 k=4 pass 的 ~20 个唯一专家），
+  两臂不同腿，此时只判逐行 top-1 并报 gap。这不是为过门改判据：ids 与 top-1 判据在所有档
+  都是相等，被移出硬判的只有"缓存开着时的跨腿 float 相等"这一条本就不成立的假设。
+- **顺带修**：`gen_decode_cache` 改为先分配缓存 slot 数组、后释放 prefill 共享 slot——原顺序在
+  分配失败时留下各层握着已释放句柄的回落路径（本轮 `failures=0` 未触发，但那是真悬垂）；
+  同时把缓存内层号与 GGUF 块号分开（`qrt_ffn_cache.layer`），否则只开部分主层时 blk.40 会
+  占错槽区。
+- **不要做**：不要把 32/512 短档的 E 当验收数（prompt 长度直接改接受率）；不要在 M3-3c 之前
+  用 `--spec-mtp` 报 TG；不要把 MTP 块的 504 MiB 重新按 design 的 8 MiB 记账。

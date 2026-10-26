@@ -49,6 +49,19 @@ class RuntimeCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("perexpert", result.stderr)
 
+    def test_boolean_cli_flag_sets_its_member_not_a_command(self):
+        # --spec-mtp is the one flag entry that turns a member on instead of selecting a
+        # command; the two failure modes to keep are a value on a flag and two commands
+        result = self.run_qrt("--spec-check", "missing", "--spec-mtp=1")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("takes no value", result.stderr)
+        result = self.run_qrt("--spec-check", "missing", "--generate", "missing")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("conflicting commands", result.stderr)
+        result = self.run_qrt("--print-config", "--spec-mtp")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("--spec-mtp needs", result.stderr)
+
     def test_invalid_numbers(self):
         for flag, value in [("--layer", "3junk"), ("--prefill-pipeline", "maybe"),
                             ("--prefill-pipeline", "2"), ("--prefill-group-kib", "abc"),

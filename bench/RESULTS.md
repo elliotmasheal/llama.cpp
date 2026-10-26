@@ -3862,3 +3862,89 @@ ggml commit 4b84522e7）；模型与 store 同上；40 层档 `--prefill-chunk 3
   留证；`last_gate` 因此不改动。
 - 未覆盖：10K prompt / 256K 上下文的 PP 与 TG、40 层的推测循环、Q-KV3 的长上下文质量门
   （都属 bench lane 的 M2-7/M2-8/M3-5/M3-6 口径）。
+
+## 92. M3-3b：MTP 草稿（blk.40 + 受限词表头）接进推测循环（2026-10-26）
+<!-- slug: m3-3b-mtp-draft -->
+
+口径：工作区 `5057dd969` + 未提交 diff；`build-vulkan`（Release/MinGW/Ninja，Vulkan）；
+模型与 store 同上；`--prefill-chunk 32`（40 层常驻会话的上限，见 86.4）；主档
+`--kv-k q8_0 --kv-v q4_0` = AGENTS 第 2 节 TG 口径；候选表 `bench/vocab/draft-16k.bin`
+（M1-3a，16384 个升序 int32）。日志在 `bench/raw/m3-3b/`。E/p 是**接受率读数**，不是 TG。
+
+### 92.1 实现与 blk.40 自身的 L-KERN
+
+- `--spec-mtp` 把草稿源从"教师强制的真实后续"换成模型自带的 MTP 块
+  （`block_count - nextn` = 40）。一步草稿 = `concat[rms_norm(emb,enorm), rms_norm(h,hnorm)]`
+  -> `nextn.eh_proj` -> `qrt_layer(40)` -> `rms_norm(out, shared_head_norm)`，后者同时是
+  受限头的输入和下一步的 h。逐条对齐 fork 的 `graph_mtp`（`src/models/qwen35moe.cpp:599-731`），
+  h 的取法对齐它的草稿循环（`common/speculative.cpp:1923` 从 `ctx_dft` 取上一行，
+  `:1831` 从最后一条被验证行起步）。
+- blk.40 的 `ffn_gate_inp` / `ffn_gate_inp_shexp` 是 **bf16**（主层是 f32），新增
+  `qrt_gguf_read_f32_any`（只接受 f32/f16/bf16，其余照旧报错）+ `bf16_to_f32`（左移 16 位，
+  精确）。f32 门禁项仍走原来的 `qrt_gguf_read_f32`，不放宽。
+- 块的独立验证：`--layer-check --layer 40 --layer-tokens 64`（f16/f16，带 store 与 merged
+  pass）15 段全 PASS：`layer_router logits_rel_l1=6.346e-07 ids_match=512/512`、
+  `layer_moe rel_l1=1.997e-05`、`layer_state chunks=60,1,2,1 mismatches=0`、`fails=0`。
+  即 bf16 装载后的路由与专家腿对 CPU 双精度参考成立。
+- 受限头是**按候选行 gather** 读 `output.weight`（新原语 `qrt_model_gemv_q8_0`，行索引
+  越界直接报错）；host 侧 rms/GEMV 用 double，与 `--logits-dump` 那条 head 同一套算法。
+- 缓存归属：MTP 块加入同一个计划（`generate_cache layers=41 slots=2298 mib=4197
+  degraded=0`，`failures=0`），为此把"缓存内的层号"与"GGUF 块号"分开
+  （`qrt_ffn_cache.layer`），否则只开部分主层时两者不等。顺带修掉一个悬垂句柄：
+  slot 数组现在**先分配再**释放 prefill 共享 slot（原来先释放再分配，分配失败时各层仍
+  握着已释放的句柄）。
+
+### 92.2 正确性门：换成无人可控的草稿源之后
+
+| 档 | ids_equal | rows_bad | worst_rel_l1 | legs | 判决 |
+|---|---:|---:|---:|---|---|
+| 4 层 32+12，k=4，无缓存，MTP+16K | 1 | 0 | 0.000e+00 | exact | PASS |
+| 40 层 32+12，k=4，无缓存，MTP+16K | 1 | 0 | 0.000e+00 | exact | PASS |
+| 40 层 32+12，k=4，512 MiB 缓存 + `--miss-split 100`，MTP | 1 | 0 | 1.080e-01（11 行只报） | cached | PASS |
+| 40 层 32+12，k=4，512 MiB 缓存 + auto，MTP | 1 | 0 | 1.022e-01（只报） | cached | PASS |
+| 40 层 32+8，k=4，无缓存，MTP+16K 的 `--generate` | ids 与 86.2 金标准 8/8 相同 | - | - | - | PASS |
+| 4 层 k=4 + `--spec-rollback off`（MTP 草稿的反例臂） | **0**（first_diff=2） | - | - | - | PASS（反例如期分叉） |
+
+`legs` 是本轮把判据归因清楚后加的字段：**只有两臂对每个专家走同一算法时**（缓存关闭）
+行的 float gap 才是 1e-4 硬判据。512 MiB 摊到 41 层只有 6 槽/层，而一次 k=4 pass 每层路由
+约 20 个唯一专家，装不下槽的 miss 即使 `--miss-split 100` 也会被强制送去 CPU 腿（`ffn_store.cpp`
+`r.failed || slot < 0` 分支），两臂的槽历史不同 -> 哪些专家在 CPU 上算就不同。此时逐行
+top-1 仍全部相同（`id=5039 want=5039` 等），gap 与 87.2 量的 CPU/GPU 腿差同量级。
+
+M3-3 的常驻回归（教师强制、`--miss-split 0`，k=2/4/8）在同一二进制上仍是
+`ids_equal=1`、`worst_rel_l1=0.000e+00`；`ctest -L qrt` 9/9（含新增的布尔 CLI 契约）。
+
+### 92.3 E 与接受率 p（design 6.3 要求报的数）
+
+| prompt | KV | 缓存 | 候选 | cycles | E | p1 / p2 / p3 / p4 | 每草稿步 |
+|---|---|---|---|---:|---:|---|---|
+| 32 | f16 | 0 | 16K | 5 | 1.400 | 0.200 / 0.000 / 0.000 / 0.000 | 160 ms / 42.5 MiB |
+| 512 | f16 | 0 | 16K | 66 | **1.939** | 0.530 / 0.258 / 0.152 / 0.000 | 183 ms / 42.5 MiB |
+| 512 | f16 | 0 | 完整词表 | 66 | **1.939** | 0.545 / 0.273 / 0.136 / 0.000 | **1478 ms / 523.8 MiB** |
+| 512 | q8_0/q4_0 | 0 | 16K | 66 | **1.939** | 0.515 / 0.273 / 0.152 / 0.000 | 142 ms / 42.5 MiB |
+| 10428 | q8_0/q4_0 | 4198 MiB + auto | 16K | 55 | **2.327** | 0.764 / 0.382 / 0.200 / 0.182 | 156 ms / 42.5 MiB（块内 GPU 13.2 ms） |
+
+- design 6.3 对 k=4 的验收线是 **E >= 2.90（CPU 0.118）/ 2.72（CPU 0.090）**，fork 在同一
+  10.4K prompt + 16K 候选下实测 **2.850**（`RESULTS.md` 第 19 节）。runtime 现在
+  **2.327，比两条线低 14% / 20%**，比 fork 低 18%。
+- 排除掉两个候选解释：把 h 从"上一步 MTP 的输出"链下去之前，E 只有 **1.154**——补上
+  `hnorm`（fork 是 `concat(enorm(emb), hnorm(h))`，我一开始只做了前半）后同一档升到
+  **2.000**（40 层 32+16）；KV 精度不是原因，512 档 f16/f16 与 q8_0/q4_0 的 E 同为 1.939。
+  剩下 18% 的差距未归因，拆成 `M3-3c`（M3-6 依赖它：TG = E/周期，E 短 18% 直接吃掉 130 的余量）。
+- 受限词表的必要性被独立证实：同一 prompt 同一模型下，完整词表草稿**每步读 523.8 MiB /
+  1478 ms**，16K 候选只读 **42.5 MiB / 142-183 ms**（8-10 倍），而 E 完全相同（1.939）。
+  design 4.1 的字节比（0.5 GiB vs 33 MB）与实测一致，只是它没算草稿步还要过一整块 MTP。
+- 32-token 档只有 5 个循环（16 个 token 也才 8 个），p1=0.200、E 在 1.4-2.0 之间跳：样本太短，
+  不能与 10.4K 档混读，该档只用作 ids 金标准的对照。
+
+### 92.4 未验证与边界
+
+- 10.4K prompt 的 prefill 在 40 层常驻会话里被 chunk 上限（64）拖成 18 分钟量级，正式
+  E/TG 口径要等共享 scratch arena 与 2048 chunk（M2-8/M3-2b 的前置）；本轮 E 的 prefill
+  是 chunk 32，与 fork M1-3b 的 2048 不是同一算术形状。
+- MTP 块的草稿仍是**串行 k-1 步**，每步一次 1 行 pass；批量草稿（一次 EH 投影 + 1 次多行
+  块前向）没有做，`draft_gpu_ms=13.2 ms/步` 说明它还有余量。
+- `--spec-check` 的 E 是注入破坏位置下的接受数，只有 `src=mtp` 的行才是真实接受率；表中
+  E/p 全部来自 `--generate --spec-mtp`。
+- 未在 40 层 + 缓存档上做过 float 级硬判据（该档两臂天然不同腿，见 92.2）；未跑 256K 上下文。
+- 未提交（无提交授权）。

@@ -1,7 +1,7 @@
 {
   "schema": 3,
   "track": "qwen36-runtime",
-  "updated": "2026-10-26 19:58",
+  "updated": "2026-10-26 21:56",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -152,8 +152,9 @@
     },
     {
       "lane": "impl",
-      "head": "M3-3b",
+      "head": "M3-3c",
       "order": [
+        "M3-3c",
         "M3-2c",
         "X-5",
         "X-6",
@@ -179,7 +180,7 @@
         "X-1",
         "X-2"
       ],
-      "note": "M3-2c done: the CPU expert leg now matches serial decode bit for bit for rows 2/4/5/8 (--spec-check --miss-split 0 is the standing regression). Next: M3-3b MTP draft (blk.40 = 504 MiB, not the 8 MiB design counted). M3-2b and M3-6 are unblocked. X-8 after."
+      "note": "M3-3b done: the MTP draft runs (blk.40 + gathered 16K head) and the accept/rollback gate holds against serial greedy at 40 layers. M3-3c next: runtime E is 2.327 against the fork 2.850 on the same 10.4K prompt, which blocks M3-6. M3-2b holds the three-leg 10%; X-8 after."
     },
     {
       "lane": "data",
@@ -795,26 +796,78 @@
       "id": "M3-3b",
       "milestone": "M3",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
       "title": "MTP 草稿（blk.40）+ 受限词表头，接进 --generate 的推测循环",
       "deps": [
         "M3-3"
       ],
-      "resources": [],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
       "paths": [
-        "runtime/spec.*",
-        "runtime/layer.*",
-        "runtime/model_generate.cpp",
-        "runtime/model.h",
-        "runtime/kernels/**",
-        "runtime/qrt_cli.*",
-        "runtime/qrt_main.cpp",
+        "bench/tools/quality/**",
+        "bench/vocab/**",
         "runtime/CMakeLists.txt",
         "runtime/README.md",
-        "bench/vocab/**"
+        "runtime/attn_deltanet.*",
+        "runtime/ffn.cpp",
+        "runtime/ffn.h",
+        "runtime/ffn_internal.h",
+        "runtime/ffn_store.cpp",
+        "runtime/gguf_index.*",
+        "runtime/kernels/**",
+        "runtime/layer.*",
+        "runtime/layer_internal.h",
+        "runtime/model.h",
+        "runtime/model_generate.cpp",
+        "runtime/model_host.cpp",
+        "runtime/model_internal.h",
+        "runtime/qrt_cli.*",
+        "runtime/qrt_half.h",
+        "runtime/qrt_main.cpp",
+        "runtime/spec.*",
+        "runtime/spec_test.cpp"
       ],
       "done_when": "草稿步由 blk.40 产生而不是教师强制的真实后续：enorm/hnorm + concat + nextn.eh_proj 接进 qrt_layer(40)（该层 router 是 bf16，需按类型装载），共享 token_embd 与 output 头；受限词表头从 bench/vocab/draft-16k.bin 取候选行。验收：--spec-check 的草稿源换成 MTP 后 两臂 ids 仍与串行 greedy 逐 token 一致，报 runtime 的 E 与接受率 p（k=4、16K 候选，门槛 design 6.3）、每草稿步字节与 ms、以及 blk.40 专家的缓存归属",
-      "note": "M3-3 只交付了接受/回滚引擎。实测 blk.40 = 504.357 MiB（gate/up q4_K 144 MiB each、down q5_K 176 MiB、attn_q/output/eh_proj q8_0、router bf16），无 nextn.embed_tokens/shared_head_head，即共享 token_embd 与 output。design 4.1 的\"8 MiB 成本可忽略\"是把 nextn.* 单独成桶的分类结果，每步真实字节约稠密 42 MiB + top-8 专家 15 MiB + 受限头 33 MiB。证据 RESULTS.md#m3-3-accept-rollback 89.6"
+      "note": "done 2026-10-26：草稿源换成 blk.40。前缀 concat[rms(emb,enorm), rms(h,hnorm)] -> nextn.eh_proj -> qrt_layer(40) -> rms(out, shared_head_norm)，h 的取法与链法对齐 fork (graph_mtp 599-731、speculative.cpp 1831/1923)。blk.40 的 router 是 bf16，新增 qrt_gguf_read_f32_any(f32/f16/bf16) + bf16_to_f32，f32 门禁项不放宽。头只 gather 候选行（qrt_model_gemv_q8_0，行越界报错）。MTP 块进同一个缓存计划（layers=41），缓存内层号与块号分开（qrt_ffn_cache.layer）；gen_decode_cache 改成先分配 slot 数组再释放 prefill 共享 slot，消掉分配失败时的悬垂句柄。门：--layer-check 层 40 十五段全 PASS（router 512/512、moe 1.997e-05、state mismatches=0）；--spec-check --spec-mtp 在 4 层与 40 层、缓存开关两档 ids_equal=1，无缓存档 worst rel 0.000e+00 (legs=exact)，反例臂 first_diff=2；--generate 40 层 32+8 的 8 个 ids 与 86.2 金标准相同；常驻教师强制回归 k=2/4/8 仍逐位相等；ctest -L qrt 9/9。E 实测（design 6.3 要求报）：10.4K prompt + k=4 + 16K + q8_0/q4_0 + 4198 MiB auto = 2.327，门槛 2.72/2.90、fork 同 prompt 2.850 -> 短 18%，拆 M3-3c 且 M3-6 依赖它。已排除 hnorm（修前 1.154 修后 2.000 同档）与 KV 精度（512 档 f16 与 q8/q4 都 1.939）。受限词表必要性独立证实：完整词表每步 523.8 MiB/1478 ms vs 42.5 MiB/约 160 ms，E 相同。未提交。",
+      "owner": "qoder-agent@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-26T20:28:33+08:00",
+      "evidence": {
+        "results": [
+          "RESULTS.md#m3-3b-mtp-draft"
+        ],
+        "decisions": [
+          "DECISIONS.md#m3-3b-mtp-draft-verdict"
+        ]
+      }
+    },
+    {
+      "id": "M3-3c",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "todo",
+      "title": "runtime MTP 的 E 比 fork 短 18%：归因（chunk 形状 / h 链 / 候选头 / 草稿块 KV）",
+      "deps": [
+        "M3-3b"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/model_generate.cpp",
+        "runtime/spec.*",
+        "runtime/layer.*",
+        "runtime/kernels/**",
+        "bench/raw/m3-3c/**",
+        "bench/tools/**"
+      ],
+      "done_when": "在 10.4K prompt、k=4、16K 候选、q8_0 K + q4_0 V、4198 MiB + auto 下给出 E 的归因与修复后的读数：先复现 fork 在同一 prompt 的 E（bench/tools/mtp_accept.py 口径），再逐项排除候选（prefill chunk 32 与 2048 的算术形状、MTP 块 KV 里 prompt 行是否应为空、草稿头 gather 与 fork 候选集语义、链式 h 的精度），目标是 design 6.3 的 2.72/2.90 或有证据说明差距来自哪一项",
+      "note": "实测 E=2.327 vs fork 2.850（同 10.4K prompt、同 k=4、同 16K 候选），比 design 6.3 两条验收线低 14-20%。已排除：hnorm 漏用（修前 1.154/修后 2.000）、KV 精度（512 档 f16 与 q8_0/q4_0 同为 1.939）、词表限制（完整词表 E 与 16K 相同）。TG = E/周期，这条差距直接压 M3-6 的 130，故 M3-6 依赖它。证据 RESULTS.md#m3-3b-mtp-draft 92.3"
     },
     {
       "id": "M3-4",
@@ -878,7 +931,8 @@
       "title": "TG >= 130 tok/s（单流，greedy，128 token）",
       "deps": [
         "M3-5",
-        "M3-2c"
+        "M3-2c",
+        "M3-3c"
       ],
       "resources": [
         "gpu",
