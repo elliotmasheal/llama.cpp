@@ -74,6 +74,10 @@ struct qrt_cpu_moe;
 
 struct qrt_ffn_cache {
     qrt_cache *       cache;
+    // This layer's index inside the cache plan. It is the block index for a session that
+    // opens the main layers in order, and differs for the MTP block, which follows the
+    // session's own layers in the plan (M3-3b).
+    uint32_t          layer;
     VkBuffer          buffer;      // this layer's slots; VK_NULL_HANDLE = every miss on CPU
     uint64_t          slot_bytes;  // bytes per slot
     qrt_cpu_moe *     cpu;

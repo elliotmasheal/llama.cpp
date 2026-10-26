@@ -84,7 +84,9 @@ struct qrt_ffn {
     int      transient;             // 1 = pack only this call's experts into the slot
 
     // Decode expert cache (M3-2a). Off unless qrt_ffn_set_cache arms it.
+    uint32_t          cache_layer;      // index in the cache plan, not always the block
     int               cache_active;
+
     qrt_cache *       cache;
     VkBuffer          cache_buf;
     uint64_t          cache_slot_bytes;

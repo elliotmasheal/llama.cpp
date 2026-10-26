@@ -29,6 +29,10 @@ struct option_desc {
     {flag, NUMBER, offsetof(qrt_cli_options, field), lo, hi, {nullptr, nullptr}, cmd, help}
 #define ENUM(flag, field, zero, one, help) \
     {flag, CHOICE, offsetof(qrt_cli_options, field), 0, 1, {zero, one}, QRT_CMD_NONE, help}
+// A flag that turns a member on instead of selecting a command. Offset 0 is the command
+// member itself, which is what the CMD entries keep using.
+#define ON(flag, field, help) \
+    {flag, FLAG, offsetof(qrt_cli_options, field), 0, 0, {nullptr, nullptr}, QRT_CMD_NONE, help}
 
 const option_desc options[] = {
     CMD("--help", QRT_CMD_HELP, "show all commands and configuration switches"),
@@ -90,6 +94,8 @@ const option_desc options[] = {
     PATH("--generate-out", generate_out, QRT_CMD_NONE, "write generated token IDs"),
     PATH("--spec-check", spec_check_gguf, QRT_CMD_SPEC_CHECK, "compare speculative cycles with a serial decode"),
     ENUM("--spec-rollback", spec_rollback, "off", "on", "off keeps every draft row: the counterexample arm"),
+    ON("--spec-mtp", spec_mtp, "draft the next tokens with the model's MTP block (blk.N nextn)"),
+    PATH("--draft-vocab-path", draft_vocab_path, QRT_CMD_NONE, "candidate token ids for a restricted draft vocabulary"),
     PATH("--cache-check", cache_prefix, QRT_CMD_CACHE, "plan and simulate the decode expert cache (host only)"),
     PATH("--cache-trace", cache_trace, QRT_CMD_NONE, "routing trace for per-layer miss weights"),
     INT("--cache-decode", cache_decode, 1, 1000000, QRT_CMD_NONE, "decode tail rows replayed"),
@@ -191,6 +197,9 @@ int qrt_cli_parse(qrt_cli_options * out, qrt_config * cfg, int argc, char ** arg
                 snprintf(err, err_size, "%s takes no value", option->flag);
                 return -1;
             }
+            if (option->offset != 0) {
+                *reinterpret_cast<int *>(reinterpret_cast<char *>(&parsed) + option->offset) = 1;
+            }
             continue;
         }
         const char * value = eq ? eq + 1 : nullptr;
@@ -268,6 +277,11 @@ int qrt_cli_parse(qrt_cli_options * out, qrt_config * cfg, int argc, char ** arg
     }
     if (parsed.command == QRT_CMD_SPEC_CHECK && !parsed.layer_store) {
         snprintf(err, err_size, "--spec-check requires --layer-store");
+        return -1;
+    }
+    if (parsed.spec_mtp && parsed.command != QRT_CMD_GENERATE &&
+        parsed.command != QRT_CMD_SPEC_CHECK) {
+        snprintf(err, err_size, "--spec-mtp needs the --generate or --spec-check command");
         return -1;
     }
     if (parsed.generate_out && parsed.command != QRT_CMD_GENERATE) {

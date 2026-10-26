@@ -111,9 +111,10 @@ const qrt_ffn_bufs * qrt_layer_ffn_bufs(const qrt_layer * l) {
 }
 qrt_ffn * qrt_layer_ffn(qrt_layer * l) { return l != NULL ? l->ffn : NULL; }
 
-int qrt_layer_set_cache(qrt_layer * l, qrt_cache * cache, VkBuffer buf, uint64_t slot_bytes,
-                        qrt_cpu_moe * cpu, int miss_split, const qrt_split_rates * rates,
-                        qrt_split_carry * carry, char * err, size_t err_size) {
+int qrt_layer_set_cache(qrt_layer * l, qrt_cache * cache, uint32_t cache_layer, VkBuffer buf,
+                        uint64_t slot_bytes, qrt_cpu_moe * cpu, int miss_split,
+                        const qrt_split_rates * rates, qrt_split_carry * carry, char * err,
+                        size_t err_size) {
     if (l == NULL || l->ffn == NULL) {
         snprintf(err, err_size, "the layer has no FFN to attach a cache to");
         return -1;
@@ -124,6 +125,7 @@ int qrt_layer_set_cache(qrt_layer * l, qrt_cache * cache, VkBuffer buf, uint64_t
     }
     qrt_ffn_cache fc{};
     fc.cache = cache;
+    fc.layer = cache_layer;
     fc.buffer = buf;
     fc.slot_bytes = slot_bytes;
     fc.cpu = cpu;

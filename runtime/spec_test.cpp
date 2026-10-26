@@ -107,6 +107,24 @@ void bad_args(void) {
     require(qrt_spec_accept(NULL, NULL, 0) == 0, "an empty comparison accepts nothing");
 }
 
+// The draft step's greedy pick: candidate rows in the order the vocabulary file gives them.
+void draft_pick(void) {
+    float lg[5] = { 1.0f, 7.0f, 3.0f, 7.0f, -2.0f };
+    uint32_t ids[5] = { 100, 250, 900, 1200, 4000 };
+    float best = 0.0f, margin = 0.0f;
+    require(qrt_spec_draft(lg, ids, 5, &best, &margin) == 250u, "the argmax maps back to its id");
+    require(best == 7.0f, "the winning logit is reported");
+    require(margin == 0.0f, "a tie with the runner-up has no margin");
+    // the first of equal winners is taken, so the pick is stable across runs
+    float flat[3] = { 2.0f, 2.0f, 1.0f };
+    require(qrt_spec_draft(flat, NULL, 3, NULL, NULL) == 0u, "ties take the first row");
+    require(qrt_spec_draft(lg, NULL, 5, NULL, NULL) == 1u, "without ids the row index wins");
+    float one[1] = { -3.0f };
+    require(qrt_spec_draft(one, ids, 1, &best, &margin) == 100u && margin == 0.0f,
+            "one candidate is its own winner");
+    require(qrt_spec_draft(NULL, NULL, 3, NULL, NULL) == 0u, "no logits is refused");
+}
+
 void vocab_file(void) {
     const uint32_t n = 6;
     uint32_t ids[n] = { 3, 17, 42, 1000, 65000, 151000 };
@@ -160,6 +178,7 @@ int main(void) {
         all_wrong(n);
     }
     bad_args();
+    draft_pick();
     vocab_file();
     if (fails != 0) {
         std::fprintf(stderr, "spec contract: %d failed\n", fails);

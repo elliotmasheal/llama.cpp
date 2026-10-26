@@ -99,6 +99,13 @@ int qrt_gguf_read_range(qrt_gguf * g, uint64_t file_offset, void * dst, size_t b
 int qrt_gguf_read_f32(qrt_gguf * g, const char * name, std::vector<float> * out,
                       char * err, size_t err_size);
 
+// The same for a tensor stored in one of the three float formats: f32 as is, f16 and
+// bf16 widened without loss. Only for tensors whose format legitimately varies between
+// blocks (the MTP block's router is bf16 while every main layer's is f32); everything
+// that is gated on f32 storage keeps using qrt_gguf_read_f32.
+int qrt_gguf_read_f32_any(qrt_gguf * g, const char * name, std::vector<float> * out,
+                          char * err, size_t err_size);
+
 int qrt_gguf_account_compute(const qrt_gguf * g, qrt_gguf_account * out, char * err, size_t err_size);
 
 // Machine-readable report: '#' lines, then one CSV row per tensor.

@@ -35,6 +35,16 @@ static inline float f16_to_f32(uint32_t h) {
     return f;
 }
 
+// bfloat16 is the top 16 bits of an f32, so widening is exact: no mantissa is dropped and
+// no subnormal case exists. The MTP block's router is stored bf16 while every main layer's
+// is f32 (RESULTS.md#m3-3-accept-rollback 89.6).
+static inline float bf16_to_f32(uint32_t h) {
+    const uint32_t bits = h << 16;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
 // Round-to-nearest-even fp32 -> binary16 bits. packHalf2x16 rounds toward zero on this
 // driver (DECISIONS 64.1), so anything that has to match the device does this explicitly.
 static inline uint32_t f32_to_f16_bits(float f) {

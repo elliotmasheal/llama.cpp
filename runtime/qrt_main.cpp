@@ -119,6 +119,8 @@ int main(int argc, char ** argv) {
         mo.n_layers = (uint32_t) options.logits_layers;
         mo.n_rows = 1;
         mo.batch_k = (uint32_t) options.generate_batch;
+        mo.mtp = (uint32_t) options.spec_mtp;
+        mo.draft_vocab_path = options.draft_vocab_path;
         uint32_t * ids = NULL;
         uint32_t n_ids = 0;
         if (qrt_model_read_ids(options.logits_tokens, &ids, &n_ids, err, sizeof(err)) != 0) {
@@ -139,6 +141,8 @@ int main(int argc, char ** argv) {
         mo.n_layers = (uint32_t) options.logits_layers;
         mo.n_rows = 1;
         mo.batch_k = 1;
+        mo.mtp = (uint32_t) options.spec_mtp;
+        mo.draft_vocab_path = options.draft_vocab_path;
         uint32_t * ids = NULL;
         uint32_t n_ids = 0;
         if (qrt_model_read_ids(options.logits_tokens, &ids, &n_ids, err, sizeof(err)) != 0) {

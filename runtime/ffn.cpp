@@ -261,12 +261,14 @@ int qrt_ffn_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_pr
     int rc = -1;
     do {
         char name[128];
+        // The router is f32 in the main layers and bf16 in the MTP block (RESULTS 89.6), so
+        // it is the one tensor the loader has to widen instead of demanding f32.
         snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", layer);
-        if (qrt_gguf_read_f32(g, name, &f->h_router, err, err_size) != 0) {
+        if (qrt_gguf_read_f32_any(g, name, &f->h_router, err, err_size) != 0) {
             break;
         }
         snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp_shexp.weight", layer);
-        if (qrt_gguf_read_f32(g, name, &f->h_sgate_w, err, err_size) != 0) {
+        if (qrt_gguf_read_f32_any(g, name, &f->h_sgate_w, err, err_size) != 0) {
             break;
         }
         if (f->h_router.size() != (size_t) cfg->n_expert * cfg->n_embd ||
@@ -500,14 +502,16 @@ int qrt_ffn_set_cache(qrt_ffn * f, const qrt_ffn_cache * cfg, char * err, size_t
     if (f == NULL || cfg == NULL || cfg->cache == NULL) {
         return fail(err, err_size, "the expert cache needs a cache object");
     }
-    const uint32_t slots = qrt_cache_slots(cfg->cache, f->layer);
+    const uint32_t slots = qrt_cache_slots(cfg->cache, cfg->layer);
     if (slots != 0 && cfg->buffer == VK_NULL_HANDLE) {
-        return fail(err, err_size, "layer %u has %u cache slots but no buffer", f->layer, slots);
+        return fail(err, err_size, "cache layer %u has %u slots but no buffer", cfg->layer,
+                    slots);
     }
     if (cfg->slot_bytes == 0) {
         return fail(err, err_size, "the expert cache needs a slot size");
     }
     f->cache = cfg->cache;
+    f->cache_layer = cfg->layer;
     f->cache_buf = cfg->buffer;
     f->cache_slot_bytes = cfg->slot_bytes;
     f->cpu = cfg->cpu;

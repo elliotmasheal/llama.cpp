@@ -103,7 +103,7 @@ int qrt_ffn_plan_cache_layer(qrt_ffn * f, char * err, size_t err_size) {
         }
         const uint32_t u = (uint32_t) f->uniq.size();
         f->uniq.push_back(e);
-        if (!qrt_cache_resident(f->cache, f->layer, e)) {
+        if (!qrt_cache_resident(f->cache, f->cache_layer, e)) {
             qrt_expert_loc loc;
             if (qrt_weights_locate(f->store, f->layer, e, &loc, err, err_size) != 0) {
                 return -1;
@@ -127,7 +127,7 @@ int qrt_ffn_plan_cache_layer(qrt_ffn * f, char * err, size_t err_size) {
         f->h2d_mask[miss_uniq[i]] = mm[i];
     }
     f->lookups.assign(f->uniq.size(), qrt_cache_lookup{});
-    if (qrt_cache_acquire_mask(f->cache, f->layer, f->uniq.data(),
+    if (qrt_cache_acquire_mask(f->cache, f->cache_layer, f->uniq.data(),
                                (uint32_t) f->uniq.size(), f->h2d_mask.data(),
                                f->lookups.data(), err, err_size) != 0) {
         f->legs.misses = (uint32_t) miss.size();
@@ -279,7 +279,7 @@ int qrt_ffn_plan_cache_layer(qrt_ffn * f, char * err, size_t err_size) {
             for (size_t r = 0; r < regions.size(); ++r) {
                 bytes += regions[r].bytes;
             }
-            qrt_cache_note_upload(f->cache, f->layer, bytes);
+            qrt_cache_note_upload(f->cache, f->cache_layer, bytes);
             regions.clear();
             fill = 0;
             return 0;

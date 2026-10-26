@@ -38,3 +38,19 @@ int qrt_model_head_rows(qrt_gguf * g, const qrt_gguf_tensor * outw, const float 
                         uint32_t n_tokens, uint32_t n_rows, uint32_t start,
                         std::vector<float> * la, std::vector<float> * lb,
                         char * err, size_t err_size);
+
+// The row math the MTP draft needs, split so one normalisation feeds both the head and the
+// next draft step's h input.
+
+// dst[E] = rms_norm(src, norm_w) in double, the same arithmetic and eps the head applies.
+void qrt_model_norm_row(const float * src, const float * norm_w, uint32_t E, double * dst);
+// The same for an h that is already held in double (the running draft hidden).
+void qrt_model_norm_row_d(const double * src, const float * norm_w, uint32_t E, double * dst);
+
+// y[r] = dot(w row idx[r], x), w q8_0 with n_in columns. idx NULL reads rows 0..n_out-1 in
+// order, and then this is the same accumulation the head does, so the two agree bit for bit.
+// A row index outside the tensor is an error, not a clamp: the draft vocabulary comes from
+// a file the runtime did not write.
+int qrt_model_gemv_q8_0(qrt_gguf * g, const qrt_gguf_tensor * w, uint32_t n_in,
+                        const uint32_t * idx, uint32_t n_out, const double * x, float * y,
+                        char * err, size_t err_size);

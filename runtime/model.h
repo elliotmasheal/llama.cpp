@@ -13,6 +13,8 @@ struct qrt_model_options {
     int reseed = 0;
     int device_planes = 0;
     uint32_t batch_k = 1;   // decode rows per pass; >1 is a diagnostic, not acceptance
+    uint32_t mtp = 0;       // 1 = draft the next tokens with the MTP block (M3-3b)
+    const char * draft_vocab_path = nullptr;  // candidate ids when QRT_DRAFT_VOCAB > 0
 };
 
 // Whole-model prefill path (M2-7a): embedding row -> the 40 main layers in order ->

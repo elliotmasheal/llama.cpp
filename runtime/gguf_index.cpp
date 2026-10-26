@@ -1,5 +1,7 @@
 #include "gguf_index.h"
 
+#include "qrt_half.h"
+
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -724,6 +726,45 @@ int qrt_gguf_read_f32(qrt_gguf * g, const char * name, std::vector<float> * out,
     }
     out->assign((size_t) count, 0.0f);
     return qrt_gguf_read_tensor(g, t, out->data(), out->size() * sizeof(float), err, err_size);
+}
+
+// f32 / f16 / bf16 into floats. The two narrow formats widen exactly, so no rounding
+// decision is made here; anything else is a caller error rather than a silent conversion.
+int qrt_gguf_read_f32_any(qrt_gguf * g, const char * name, std::vector<float> * out,
+                          char * err, size_t err_size) {
+    const qrt_gguf_tensor * t = NULL;
+    if (qrt_gguf_require(g, name, &t, err, err_size) != 0) {
+        return -1;
+    }
+    uint64_t count = 1;
+    for (uint32_t i = 0; i < t->n_dims; ++i) {
+        count *= t->ne[i];
+    }
+    if (count > SIZE_MAX / sizeof(float)) {
+        snprintf(err, err_size, "%s holds %llu values, more than a buffer can carry", name,
+                 (unsigned long long) count);
+        return -1;
+    }
+    if (t->type == 0) {
+        out->assign((size_t) count, 0.0f);
+        return qrt_gguf_read_tensor(g, t, out->data(), count * sizeof(float), err, err_size);
+    }
+    if (t->type != 1 && t->type != 30) {
+        snprintf(err, err_size, "%s is %s, expected f32, f16 or bf16", name,
+                 qrt_gguf_type_name(t->type));
+        return -1;
+    }
+    std::vector<uint16_t> raw((size_t) count);
+    if (qrt_gguf_read_tensor(g, t, raw.data(), count * sizeof(uint16_t), err, err_size) != 0) {
+        return -1;
+    }
+    const int is_bf16 = t->type == 30 ? 1 : 0;
+    out->assign((size_t) count, 0.0f);
+    for (uint64_t i = 0; i < count; ++i) {
+        (*out)[(size_t) i] = is_bf16 ? bf16_to_f32(raw[(size_t) i])
+                                     : f16_to_f32(raw[(size_t) i]);
+    }
+    return 0;
 }
 
 int qrt_gguf_account_compute(const qrt_gguf * g, qrt_gguf_account * out, char * err, size_t err_size) {

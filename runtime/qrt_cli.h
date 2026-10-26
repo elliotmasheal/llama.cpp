@@ -89,6 +89,8 @@ struct qrt_cli_options {
     int generate_batch = 1;   // decode rows per pass; >1 is a teacher-forced diagnostic
     const char * spec_check_gguf = nullptr;
     int spec_rollback = 1;    // off keeps every draft row, the counterexample arm
+    int spec_mtp = 0;         // draft with blk.40 instead of the serial reference
+    const char * draft_vocab_path = nullptr;
     const char * cache_prefix = nullptr;
     const char * cache_trace = nullptr;
     int cache_decode = 128;

@@ -36,10 +36,33 @@
 
 namespace {
 
+// The MTP draft block (design 4.1). blk.40 is a full-attention MoE layer that shares
+// token_embd and output.weight with the main model, so the only extra weights are the
+// prefix: enorm/hnorm on (embedding, hidden), their concat with the embedding first, and
+// nextn.eh_proj back to n_embd - the order of the fork's graph_mtp. The block's output is
+// normalised by nextn.shared_head_norm, which is both what the draft head reads and what
+// the next draft step feeds back as h.
+struct qrt_mtp {
+    int      on = 0;
+    qrt_layer * layer = nullptr;
+    const qrt_gguf_tensor * eh_proj = nullptr;
+    std::vector<float> enorm, hnorm, shnorm;   // n_embd each
+    std::vector<double> h;                     // the normed hidden the next step consumes
+    std::vector<double> concat;                // [2*n_embd] prefix input
+    std::vector<float> x;                      // eh_proj output row, the block's input
+    std::vector<float> out;                    // the block's raw output row
+    std::vector<float> cand;                   // draft head logits
+    std::vector<float> e_row;                  // the drafted token's embedding
+    qrt_spec_vocab * vocab = nullptr;          // NULL = the whole vocabulary
+    uint32_t steps = 0;
+    uint64_t host_bytes = 0;                   // rows gathered and read on the host
+    double step_ms = 0.0, gpu_ms = 0.0;
+};
 // Everything a decode session holds open. The owner frees the device, the GGUF reader and
 // the staging buffer when the frame ends; the layers, the cache and its buffers are closed
 // explicitly because they must go before the device does.
 struct qrt_gen {
+    qrt_mtp mtp;
     qrt_model_run_owner owner;
     qrt_vk_dev * dev = nullptr;
     qrt_gguf * g = nullptr;
@@ -58,6 +81,7 @@ struct qrt_gen {
     uint32_t chunk = 0;
     uint32_t n_ctx = 0;
     uint32_t rows_max = 0;
+    uint32_t mtp_block = 0;    // block_count - nextn, the MTP block index
     qrt_cache * cache = nullptr;
     qrt_cpu_moe * cpu = nullptr;
     std::vector<VkBuffer> cache_bufs;
@@ -73,6 +97,12 @@ struct qrt_gen {
 };
 
 void gen_close(qrt_gen * s) {
+    if (s->mtp.layer != NULL) {
+        qrt_layer_close(s->dev, s->mtp.layer);
+        s->mtp.layer = NULL;
+    }
+    qrt_spec_vocab_free(s->mtp.vocab);
+    s->mtp.vocab = NULL;
     for (size_t i = s->layers.size(); i > 0; --i) {
         if (s->layers[i - 1] != NULL) {
             qrt_layer_close(s->dev, s->layers[i - 1]);
@@ -125,10 +155,22 @@ void gen_close(qrt_gen * s) {
 // speculative pass the caller may run: it sizes the DeltaNet state ring, and 0 keeps the
 // serial shape (two ring slots, no per-row snapshots). n_reserve is how many positions past
 // the prompt the caller may still address.
+struct qrt_mtp_cfg {
+    int on;                // 1 = open blk.40 and draft from it
+    int32_t draft_vocab;   // candidates per step, 0 = the whole vocabulary
+    const char * vocab_path;
+};
+
+// The MTP block is opened with the session, after the main layers: it shares the FFN slot,
+// the staging buffer, the embedding rows and the output head.
+int mtp_open(qrt_gen * s, const char * gguf_path, const char * store_prefix,
+             const char * spv_dir, const qrt_layer_cfg & lcfg, const qrt_mtp_cfg & mc,
+             char * err, size_t err_size);
+
 int gen_open(qrt_gen * s, const qrt_config * cfg, const qrt_model_options * opt,
              const char * gguf_path, const char * store_prefix, const char * spv_dir,
-             uint32_t n_tokens, uint32_t n_reserve, uint32_t snap_rows, char * err,
-             size_t err_size) {
+             uint32_t n_tokens, uint32_t n_reserve, uint32_t snap_rows,
+             const qrt_mtp_cfg & mc, char * err, size_t err_size) {
     if (qrt_vk_open((uint32_t) cfg->vram_tier_mib, &s->dev, err, err_size) != 0) {
         return -1;
     }
@@ -152,6 +194,7 @@ int gen_open(qrt_gen * s, const qrt_config * cfg, const qrt_model_options * opt,
     }
     s->E = (uint32_t) hp->n_embd;
     s->n_layers = opt->n_layers;
+    s->mtp_block = (uint32_t) (hp->block_count - nextn);
     s->emb = qrt_gguf_find(s->g, "token_embd.weight");
     s->outw = qrt_gguf_find(s->g, "output.weight");
     if (s->emb == NULL || s->emb->type != 8 || s->emb->n_dims != 2 || s->emb->ne[0] != s->E ||
@@ -229,6 +272,10 @@ int gen_open(qrt_gen * s, const qrt_config * cfg, const qrt_model_options * opt,
         }
     }
     s->x.assign((size_t) s->rows_max * s->E, 0.0f);
+    if (mc.on != 0 && mtp_open(s, gguf_path, store_prefix, spv_dir, lcfg, mc, err,
+                               err_size) != 0) {
+        return -1;
+    }
     return 0;
 }
 
@@ -264,12 +311,28 @@ int gen_prefill(qrt_gen * s, const uint32_t * ids, uint32_t n_tokens, std::vecto
 
 // The decode expert cache (M3-2a). Prefill packed every used expert into the shared slot;
 // decode switches to per-layer slot arrays sized by the cache plan, and the split sends the
-// misses to H2D or the CPU leg. A failed cache *allocation* falls back to the prefill slot
-// (slow but correct); a plan that cannot be built is an error the caller reports.
+// misses to H2D or the CPU leg. A failed cache allocation leaves the session on the prefill
+// slot (slow but correct); a plan that cannot be built is an error the caller reports.
 int gen_decode_cache(qrt_gen * s, const qrt_config * cfg, const char * store_prefix,
                      char * err, size_t err_size) {
     if (cfg->expert_cache_mib <= 0) {
         return 0;
+    }
+    // The MTP block is a full MoE layer as well, so it takes part of the cache - and must,
+    // because the shared prefill slot it was opened with is exactly what the cache replaces
+    // (M3-3b).
+    std::vector<qrt_layer *> cl = s->layers;
+    std::vector<uint32_t> cb;
+    for (uint32_t l = 0; l < s->n_layers; ++l) {
+        cb.push_back(l);
+    }
+    if (s->mtp.on != 0) {
+        cl.push_back(s->mtp.layer);
+        cb.push_back(s->mtp_block);
+    }
+    const uint32_t n_plan = (uint32_t) cl.size();
+    if (n_plan > QRT_CACHE_MAX_LAYERS) {
+        return fail(err, err_size, "%u layers do not fit the cache plan", n_plan);
     }
     uint64_t layer_slot[QRT_CACHE_MAX_LAYERS] = {0};
     qrt_weights * wstore = NULL;
@@ -277,8 +340,8 @@ int gen_decode_cache(qrt_gen * s, const qrt_config * cfg, const char * store_pre
         return -1;
     }
     int size_ok = 1;
-    for (uint32_t l = 0; l < s->n_layers; ++l) {
-        if (qrt_weights_layer_expert_bytes(wstore, l, &layer_slot[l]) != 0) {
+    for (uint32_t i = 0; i < n_plan; ++i) {
+        if (qrt_weights_layer_expert_bytes(wstore, cb[i], &layer_slot[i]) != 0) {
             size_ok = 0;
             break;
         }
@@ -287,18 +350,16 @@ int gen_decode_cache(qrt_gen * s, const qrt_config * cfg, const char * store_pre
     qrt_weights_close(wstore);
     qrt_cache_plan plan{};
     if (!size_ok ||
-        qrt_cache_plan_build(s->n_layers, store_experts, layer_slot, NULL,
-                             (uint64_t) cfg->expert_cache_mib << 20, cfg->cache_policy,
-                             QRT_CACHE_DEFAULT_PROTECTED_PCT, &plan, err, err_size) != 0) {
+        qrt_cache_plan_build(n_plan, store_experts, layer_slot, NULL,
+                            (uint64_t) cfg->expert_cache_mib << 20, cfg->cache_policy,
+                            QRT_CACHE_DEFAULT_PROTECTED_PCT, &plan, err, err_size) != 0) {
         return fail(err, err_size, "expert cache plan: %s", err[0] ? err : "no layer sizes");
     }
-    // The prefill slot has done its job; the cache takes its VRAM.
-    qrt_vk_free(s->dev, s->slot, s->slot_mem);
-    s->slot = VK_NULL_HANDLE;
-    s->slot_mem = VK_NULL_HANDLE;
+    // Allocate the slot arrays before giving the prefill slot up: a layer keeps the handle it
+    // was opened with, so there is no fallback that could leave it pointing at freed VRAM.
     int alloc_ok = 1;
-    for (uint32_t l = 0; l < s->n_layers; ++l) {
-        const uint64_t bytes = (uint64_t) plan.slots_per_layer[l] * plan.slot_bytes[l];
+    for (uint32_t i = 0; alloc_ok && i < n_plan; ++i) {
+        const uint64_t bytes = (uint64_t) plan.slots_per_layer[i] * plan.slot_bytes[i];
         VkBuffer b = VK_NULL_HANDLE;
         VkDeviceMemory m = VK_NULL_HANDLE;
         if (bytes != 0 &&
@@ -310,7 +371,7 @@ int gen_decode_cache(qrt_gen * s, const qrt_config * cfg, const char * store_pre
         }
         s->cache_bufs.push_back(b);
         s->cache_mems.push_back(m);
-        s->cache_slots.push_back(plan.slots_per_layer[l]);
+        s->cache_slots.push_back(plan.slots_per_layer[i]);
     }
     if (!alloc_ok) {
         for (size_t i = 0; i < s->cache_bufs.size(); ++i) {
@@ -321,16 +382,14 @@ int gen_decode_cache(qrt_gen * s, const qrt_config * cfg, const char * store_pre
         s->cache_bufs.clear();
         s->cache_mems.clear();
         s->cache_slots.clear();
-        if (qrt_vk_alloc(s->dev, s->slot_bytes, QRT_VK_USAGE_STORAGE |
-                         QRT_VK_USAGE_TRANSFER_DST | QRT_VK_USAGE_TRANSFER_SRC,
-                         &s->slot, &s->slot_mem, err, err_size) != 0) {
-            return fail(err, err_size, "the cache failed and the fallback slot did not fit: %s",
-                        err);
-        }
         printf("generate_cache disabled: %s\n", err[0] ? err : "allocation");
         err[0] = '\0';
         return 0;
     }
+    // The prefill slot has done its job; the cache takes its VRAM.
+    qrt_vk_free(s->dev, s->slot, s->slot_mem);
+    s->slot = VK_NULL_HANDLE;
+    s->slot_mem = VK_NULL_HANDLE;
     if (qrt_cache_open(&plan, NULL, &s->cache, err, err_size) != 0) {
         return -1;
     }
@@ -339,16 +398,17 @@ int gen_decode_cache(qrt_gen * s, const qrt_config * cfg, const char * store_pre
         return fail(err, err_size, "out of memory for the CPU expert core");
     }
     qrt_miss_split_default_rates(&s->rates);
-    for (uint32_t l = 0; l < s->n_layers; ++l) {
-        if (qrt_layer_set_cache(s->layers[l], s->cache, s->cache_bufs[l], plan.slot_bytes[l],
+    for (uint32_t i = 0; i < n_plan; ++i) {
+        if (qrt_layer_set_cache(cl[i], s->cache, i, s->cache_bufs[i], plan.slot_bytes[i],
                                 s->cpu, cfg->miss_split, &s->rates, &s->carry, err,
                                 err_size) != 0) {
-            return fail(err, err_size, "cache on layer %u: %s", l, err);
+            return fail(err, err_size, "cache on block %u: %s", cb[i], err);
         }
     }
     s->cache_on = 1;
-    printf("generate_cache slots=%llu mib=%llu degraded=%u policy=%s split=%s threads=8\n",
-           (unsigned long long) plan.slots, (unsigned long long) (plan.bytes >> 20),
+    printf("generate_cache layers=%u slots=%llu mib=%llu degraded=%u policy=%s split=%s "
+           "threads=8\n",
+           n_plan, (unsigned long long) plan.slots, (unsigned long long) (plan.bytes >> 20),
            plan.degraded_layers, qrt_cache_policy_name(cfg->cache_policy),
            cfg->miss_split == QRT_MISS_SPLIT_AUTO ? "auto" : "fixed");
     return 0;
@@ -490,6 +550,203 @@ void gen_report(const qrt_gen * s, size_t n_ids) {
     }
 }
 
+// Open the MTP block and load its four prefix tensors. The block itself is an ordinary
+// full-attention MoE layer of the same store, so it shares the session's FFN slot and, when
+// the decode cache is on, its own slot array (gen_decode_cache covers it).
+int mtp_open(qrt_gen * s, const char * gguf_path, const char * store_prefix,
+             const char * spv_dir, const qrt_layer_cfg & lcfg, const qrt_mtp_cfg & mc,
+             char * err, size_t err_size) {
+    qrt_mtp & m = s->mtp;
+    const uint32_t B = s->mtp_block;
+    const uint32_t E = s->E;
+    char name[128];
+    snprintf(name, sizeof(name), "blk.%u.nextn.eh_proj.weight", B);
+    m.eh_proj = qrt_gguf_find(s->g, name);
+    if (m.eh_proj == NULL || m.eh_proj->type != 8 || m.eh_proj->n_dims != 2 ||
+        m.eh_proj->ne[0] != (uint64_t) 2 * E || m.eh_proj->ne[1] != E) {
+        return fail(err, err_size, "%s is not a q8_0 [%u x 2*n_embd] tensor", name, E);
+    }
+    const char * which[3] = { "enorm", "hnorm", "shared_head_norm" };
+    std::vector<float> * dst[3] = { &m.enorm, &m.hnorm, &m.shnorm };
+    for (int i = 0; i < 3; ++i) {
+        snprintf(name, sizeof(name), "blk.%u.nextn.%s.weight", B, which[i]);
+        err[0] = '\0';
+        if (qrt_gguf_read_f32(s->g, name, dst[i], err, err_size) != 0 ||
+            dst[i]->size() != E) {
+            return fail(err, err_size, "%s: %s", name, err[0] ? err : "wrong width");
+        }
+    }
+    if (mc.draft_vocab > 0) {
+        if (mc.vocab_path == NULL) {
+            return fail(err, err_size, "a restricted draft vocabulary needs --draft-vocab-path");
+        }
+        if (qrt_spec_vocab_open(mc.vocab_path, (uint32_t) mc.draft_vocab, &m.vocab, err,
+                               err_size) != 0) {
+            return -1;
+        }
+    }
+    qrt_layer_cfg mcfg = lcfg;
+    mcfg.dn_snap_rows = 0;   // full attention, and the draft is one row per step
+    if (qrt_layer_open(s->dev, gguf_path, store_prefix, B, s->chunk, spv_dir, &mcfg,
+                       &m.layer, err, err_size) != 0) {
+        return fail(err, err_size, "open the MTP block %u: %s", B, err);
+    }
+    if (qrt_layer_zero_state(m.layer, err, err_size) != 0) {
+        return -1;
+    }
+    m.e_row.assign(E, 0.0f);
+    m.h.assign(E, 0.0);
+    m.concat.assign((size_t) 2 * E, 0.0);
+    m.x.assign(E, 0.0f);
+    m.out.assign(E, 0.0f);
+    m.cand.assign(m.vocab != NULL ? qrt_spec_vocab_count(m.vocab) : s->V, 0.0f);
+    m.on = 1;
+    printf("mtp_open block=%u candidates=%u rows=%s\n", B,
+           m.vocab != NULL ? qrt_spec_vocab_count(m.vocab) : s->V,
+           m.vocab != NULL ? "gathered" : "whole vocabulary");
+    return 0;
+}
+
+// The hidden a draft step starts from: the last kept row of the pass that just ran, normed
+// by output_norm. That is exactly the vector the fork hands the MTP graph (t_h_nextn).
+void mtp_seed(qrt_gen * s, const float * hidden_row) {
+    qrt_model_norm_row(hidden_row, s->onorm.data(), s->E, s->mtp.h.data());
+}
+
+// One draft step: enorm(embed) beside the running h, concat with the embedding first,
+// nextn.eh_proj, the block at `pos`, then shared_head_norm into both the draft head and the
+// next step's h.
+int mtp_step(qrt_gen * s, uint32_t tok, uint32_t pos, uint32_t * id, float * logit,
+             float * margin, char * err, size_t err_size) {
+    qrt_mtp & m = s->mtp;
+    if (m.on == 0) {
+        return fail(err, err_size, "the session has no MTP block open");
+    }
+    const uint32_t E = s->E;
+    const double t0 = now_ms();
+    if (qrt_model_embed_rows(s->g, s->emb, E, s->V, &tok, 1, m.e_row.data(), err,
+                            err_size) != 0) {
+        return fail(err, err_size, "draft embedding: %s", err);
+    }
+    m.host_bytes += (uint64_t) (E / 32u) * 34u;
+    // both halves are normed here: enorm on the embedding, hnorm on the h the previous
+    // block or the verified pass produced (the fork's graph_mtp order)
+    qrt_model_norm_row(m.e_row.data(), m.enorm.data(), E, m.concat.data());
+    qrt_model_norm_row_d(m.h.data(), m.hnorm.data(), E, m.concat.data() + E);
+    if (qrt_model_gemv_q8_0(s->g, m.eh_proj, 2u * E, NULL, E, m.concat.data(), m.x.data(),
+                           err, err_size) != 0) {
+        return fail(err, err_size, "nextn.eh_proj: %s", err);
+    }
+    m.host_bytes += (uint64_t) E * (2u * E / 32u) * 34u;
+    if (qrt_layer_set_input_rows(m.layer, m.x.data(), 1, err, err_size) != 0 ||
+        qrt_layer_run_chunk(m.layer, pos, 1, err, err_size) != 0 ||
+        qrt_vk_download(s->dev, s->stg, qrt_layer_out(m.layer), 0, m.out.data(),
+                        (uint64_t) E * 4, err, err_size) != 0) {
+        return fail(err, err_size, "MTP block at pos %u: %s", pos, err);
+    }
+    qrt_model_norm_row(m.out.data(), m.shnorm.data(), E, m.h.data());
+    const uint32_t * idx = m.vocab != NULL ? qrt_spec_vocab_ids(m.vocab) : NULL;
+    const uint32_t n = m.vocab != NULL ? qrt_spec_vocab_count(m.vocab) : s->V;
+    if (qrt_model_gemv_q8_0(s->g, s->outw, E, idx, n, m.h.data(), m.cand.data(), err,
+                           err_size) != 0) {
+        return fail(err, err_size, "draft head: %s", err);
+    }
+    m.host_bytes += (uint64_t) n * (E / 32u) * 34u;
+    *id = qrt_spec_draft(m.cand.data(), idx, n, logit, margin);
+    ++m.steps;
+    m.step_ms += now_ms() - t0;
+    m.gpu_ms += qrt_layer_gpu_ms(m.layer);
+    return 0;
+}
+
+// n drafts for the cycle that feeds `first` at `pos`. The block writes its own KV rows at
+// the positions the drafts would take; a rejected draft leaves a stale row there that the
+// next cycle overwrites before anything reads it, as in the main layers.
+int mtp_draft(qrt_gen * s, uint32_t first, uint32_t pos, uint32_t n,
+             std::vector<uint32_t> * ids, char * err, size_t err_size) {
+    ids->assign(n, 0u);
+    uint32_t tok = first;
+    for (uint32_t i = 0; i < n; ++i) {
+        float logit = 0.0f, margin = 0.0f;
+        if (mtp_step(s, tok, pos + i, &tok, &logit, &margin, err, err_size) != 0) {
+            return -1;
+        }
+        (*ids)[i] = tok;
+    }
+    return 0;
+}
+
+// What one verified pass produced, in the shape both consumers report.
+struct qrt_cycle {
+    std::vector<uint32_t> draft;     // the rows-1 tokens the cycle tested
+    std::vector<uint32_t> verified;  // one argmax per row; the last is the bonus
+    std::vector<uint32_t> emit;      // the accepted drafts plus the bonus
+    std::vector<float> logits;       // rows * V, kept only when the caller asks
+    uint32_t rows = 0;
+    uint32_t accepted = 0;
+    uint32_t kept = 0;       // tokens the cycle emits, and the rows that stay
+    uint32_t advance = 0;    // the position step: kept, or rows in the counterexample arm
+    double gpu_ms = 0.0, h2d_ms = 0.0, cpu_ms = 0.0, pass_ms = 0.0;
+    uint32_t hits = 0, miss = 0, h2d_n = 0, cpu_n = 0;
+    uint64_t h2d_bytes = 0;
+};
+
+// Verify `pass_rows` in one pass, accept the longest draft prefix, take the verified token
+// at the first mismatch, and roll every layer back to that length. kept is both the number
+// of rows that stay and the number of tokens the cycle emits.
+int gen_cycle(qrt_gen * s, uint32_t pos, const std::vector<uint32_t> & pass_rows,
+              int keep_logits, int keep_all_rows, qrt_cycle * out, char * err,
+              size_t err_size) {
+    const uint32_t rows = (uint32_t) pass_rows.size();
+    *out = qrt_cycle{};
+    out->rows = rows;
+    out->draft.assign(pass_rows.begin() + 1, pass_rows.end());
+    const double t0 = now_ms();
+    if (gen_pass(s, pos, pass_rows.data(), rows, rows > 1u ? 1 : 0, &out->gpu_ms,
+                &out->h2d_ms, &out->cpu_ms, &out->hits, &out->miss, &out->h2d_n,
+                &out->cpu_n, &out->h2d_bytes, err, err_size) != 0) {
+        return -1;
+    }
+    std::vector<float> all;
+    if (gen_head(s, s->x.data(), rows, all, err, err_size) != 0) {
+        return fail(err, err_size, "cycle head at pos %u: %s", pos, err);
+    }
+    out->verified.assign(rows, 0u);
+    float best = 0.0f, margin = 0.0f;
+    for (uint32_t i = 0; i < rows; ++i) {
+        gen_pick(all, i, s->V, &out->verified[i], &best, &margin);
+    }
+    std::vector<uint32_t> emit(rows);
+    uint32_t kept = 1;
+    if (rows > 1u) {
+        if (qrt_spec_emit(out->draft.data(), out->verified.data(), rows - 1u, emit.data(),
+                         &kept) != 0) {
+            return fail(err, err_size, "the cycle could not emit its accepted prefix");
+        }
+    } else {
+        emit[0] = out->verified[0];
+    }
+    emit.resize(kept);
+    out->emit.swap(emit);
+    out->accepted = kept - 1u;
+    out->kept = kept;
+    out->pass_ms = now_ms() - t0;
+    if (keep_logits) {
+        out->logits.swap(all);
+    }
+    // the draft continues from the last row that stayed
+    if (s->mtp.on != 0) {
+        mtp_seed(s, s->x.data() + (size_t) (kept - 1u) * s->E);
+    }
+    out->advance = keep_all_rows != 0 ? rows : kept;
+    if (keep_all_rows != 0 || rows == 1u) {
+        // the counterexample arm leaves the state past the accepted prefix, and a single-row
+        // pass has nothing to undo: it is a plain serial step whose cursor already moved
+        return 0;
+    }
+    return qrt_spec_rollback(s->layers.data(), s->n_layers, kept, err, err_size);
+}
+
 } // namespace
 
 // End-to-end vertical slice (M3-2): open every requested layer once with one shared FFN
@@ -512,8 +769,13 @@ int qrt_model_generate(const qrt_config * cfg, const qrt_model_options * opt,
     int rc = -1;
     do {
         const uint32_t BK = opt->batch_k > 1 ? opt->batch_k : 1u;
-        if (gen_open(&s, cfg, opt, gguf_path, store_prefix, spv_dir, n_tokens, n_new, BK, err,
-                     err_size) != 0) {
+        const qrt_mtp_cfg mc = { opt->mtp != 0 ? 1 : 0, cfg->draft_vocab,
+                                 opt->draft_vocab_path };
+        // a speculative cycle needs one ring slot per row it may carry
+        const uint32_t snap = opt->mtp != 0
+                                 ? std::max(BK, (uint32_t) cfg->spec_k) : BK;
+        if (gen_open(&s, cfg, opt, gguf_path, store_prefix, spv_dir, n_tokens, n_new, snap, mc,
+                     err, err_size) != 0) {
             break;
         }
         printf("generate_run tokens=%u new=%u layers=%u chunk=%u n_ctx=%u slot_mib=%.1f\n",
@@ -584,6 +846,76 @@ int qrt_model_generate(const qrt_config * cfg, const qrt_model_options * opt,
             if (err[0] != '\0') {
                 break;
             }
+        } else if (opt->mtp != 0) {
+            // The speculative loop (design 5.4): the MTP block drafts k-1 tokens, one pass
+            // verifies them beside the last accepted token, and the cycle emits the accepted
+            // prefix plus the verified bonus.
+            const uint32_t k = (uint32_t) cfg->spec_k;
+            if (k < 2u || k > 8u) {
+                fail(err, err_size, "--spec-mtp needs QRT_SPEC_K in 2..8, got %d", cfg->spec_k);
+                break;
+            }
+            mtp_seed(&s, x.data() + (size_t) (n_tokens - 1u) * s.E);
+            std::vector<uint32_t> draft;
+            uint32_t cycles = 0, kept_total = 0, rows_total = 0, hist[9] = {0};
+            while (generated.size() < n_new) {
+                const uint32_t left = n_new - (uint32_t) generated.size();
+                const uint32_t rows = std::min(k, left + 1u);
+                std::vector<uint32_t> pass_rows;
+                if (rows > 1u && mtp_draft(&s, generated.back(), pos, rows - 1u, &draft, err,
+                                           err_size) != 0) {
+                    break;
+                }
+                pass_rows.push_back(generated.back());
+                for (uint32_t i = 0; i + 1u < rows; ++i) {
+                    pass_rows.push_back(draft[i]);
+                }
+                qrt_cycle c;
+                if (gen_cycle(&s, pos, pass_rows, 0, 0, &c, err, err_size) != 0) {
+                    break;
+                }
+                for (uint32_t i = 0; i < c.emit.size() && generated.size() < n_new; ++i) {
+                    generated.push_back(c.emit[i]);
+                }
+                pos += c.kept;
+                ++cycles;
+                kept_total += c.kept;
+                rows_total += c.rows;
+                if (c.accepted < 9u) {
+                    ++hist[c.accepted];
+                }
+                printf("generate_cycle cycle=%u pos=%u rows=%u accepted=%u kept=%u gpu_ms=%.2f "
+                       "h2d_ms=%.2f cpu_ms=%.2f hits=%u misses=%u pass_ms=%.1f\n",
+                       cycles - 1u, pos - c.kept, c.rows, c.accepted, c.kept, c.gpu_ms,
+                       c.h2d_ms, c.cpu_ms, c.hits, c.miss, c.pass_ms);
+                if (s.tel != NULL) {
+                    qrt_pass_stats ps{};
+                    ps.k = c.rows;
+                    ps.pos = pos - c.kept;
+                    ps.accepted = c.kept;
+                    ps.hit_experts = c.hits;
+                    ps.miss_experts = c.miss;
+                    ps.miss_cpu = c.cpu_n;
+                    ps.miss_h2d = c.h2d_n;
+                    ps.h2d_bytes = c.h2d_bytes;
+                    ps.draft_ms = s.mtp.steps ? s.mtp.step_ms / s.mtp.steps : 0.0;
+                    ps.gpu_ms = c.gpu_ms;
+                    ps.cpu_leg_ms = c.cpu_ms;
+                    ps.pass_ms = c.pass_ms;
+                    qrt_telemetry_pass(s.tel, cycles, &ps);
+                }
+            }
+            if (err[0] != '\0') {
+                break;
+            }
+            printf("generate_spec cycles=%u rows=%u E=%.3f accepted=%u/%u/%u/%u/%u "
+                   "draft_steps=%u draft_ms=%.2f draft_mib=%.1f draft_gpu_ms=%.2f\n",
+                   cycles, rows_total, cycles ? (double) kept_total / cycles : 0.0,
+                   hist[0], hist[1], hist[2], hist[3], hist[4], s.mtp.steps,
+                   s.mtp.steps ? s.mtp.step_ms / s.mtp.steps : 0.0,
+                   s.mtp.steps ? (double) s.mtp.host_bytes / s.mtp.steps / (1024.0 * 1024.0)
+                               : 0.0,
+                   s.mtp.steps ? s.mtp.gpu_ms / s.mtp.steps : 0.0);
         } else {
             for (uint32_t step = 1; step < n_new; ++step) {
                 double gpu = 0.0, h2d = 0.0, cpu = 0.0;
@@ -671,8 +1003,11 @@ int qrt_model_spec_check(const qrt_config * cfg, const qrt_model_options * opt,
     do {
         // arm A: the serial greedy reference, one row per pass
         std::vector<float> x;
-        if (gen_open(&s, cfg, opt, gguf_path, store_prefix, spv_dir, n_tokens, n_new, 0, err,
-                     err_size) != 0) {
+        const qrt_mtp_cfg mc_off = { 0, 0, nullptr };
+        const qrt_mtp_cfg mc = { opt->mtp != 0 ? 1 : 0, cfg->draft_vocab,
+                                opt->draft_vocab_path };
+        if (gen_open(&s, cfg, opt, gguf_path, store_prefix, spv_dir, n_tokens, n_new, 0, mc_off,
+                    err, err_size) != 0) {
             break;
         }
         printf("spec_run tokens=%u new=%u layers=%u k=%u\n", n_tokens, n_new, s.n_layers, k);
@@ -719,7 +1054,7 @@ int qrt_model_spec_check(const qrt_config * cfg, const qrt_model_options * opt,
 
         // arm B: the same prompt, the same first token, then cycles of up to k rows
         if (gen_open(&s, cfg, opt, gguf_path, store_prefix, spv_dir, n_tokens,
-                     rollback_off ? n_new * k : n_new, k, err, err_size) != 0) {
+                     rollback_off ? n_new * k : n_new, k, mc, err, err_size) != 0) {
             break;
         }
         if (gen_prefill(&s, ids, n_tokens, x, err, err_size) != 0) {
@@ -742,120 +1077,117 @@ int qrt_model_spec_check(const qrt_config * cfg, const qrt_model_options * opt,
         gen_pick(logits, 0, V, &tok, &best, &margin);
         spec_ids.push_back(tok);
         pos = n_tokens;
+        // the first cycle drafts from the prefill's last hidden, like --generate does
+        if (s.mtp.on != 0) {
+            mtp_seed(&s, x.data() + (size_t) (n_tokens - 1u) * E);
+        }
         uint32_t cycles = 0, accepted_sum = 0, rows_checked = 0, rows_bad = 0, rows_loose = 0;
         double worst_row = 0.0;
-        // Under the auto split the two arms do not put the same experts on the same legs (the
-        // multiplicity per miss differs), so there only the ids gate and the row gap is a
-        // reading: the CPU leg already differs from the GPU kernel by ~1e-2 in a logit
-        // (RESULTS.md#m3-2a-miss-split 87.2).
-        // no cache means no legs at all, so the split does not make the arms differ
-        const int same_leg = !s.cache_on || cfg->miss_split != QRT_MISS_SPLIT_AUTO;
+        // The row gap can only gate exactness when both arms run the same arithmetic on every
+        // expert. With the cache off that holds by construction. With the cache on it does not:
+        // a pass that routes more unique experts than the layer has slots keeps its leftovers
+        // on the CPU leg even at --miss-split 100 (512 MiB over 41 layers is 6 slots per layer
+        // against ~20 experts per pass), and the CPU leg itself differs from the GPU kernel by
+        // ~1e-2 in a logit (RESULTS.md#m3-2a-miss-split 87.2). Cached arms therefore gate the
+        // per-row top-1 and report the float gap as a reading.
+        const int exact_legs = !s.cache_on;
+        uint32_t hist[9] = {0};
         while (spec_ids.size() < n_new) {
             const uint32_t have = (uint32_t) spec_ids.size();
             const uint32_t left = (uint32_t) serial_ids.size() - have;
-            // The drafts are the serial arm's continuation, so the accept length a correct
-            // cycle should reach is known. One position per cycle is broken, which walks the
-            // accept counts 0..k-1 that design 7 asks for.
             const uint32_t nd = left - 1u < k - 1u ? left - 1u : k - 1u;
             const uint32_t rows = nd + 1u;
-            std::vector<uint32_t> draft(nd), pass_rows(rows), verified(rows);
-            for (uint32_t i = 0; i < nd; ++i) {
-                draft[i] = serial_ids[have + i];
-            }
-            const uint32_t break_at = cycles % k;
-            if (nd != 0 && break_at < nd) {
-                draft[break_at] ^= 0x10000u;
-                if (draft[break_at] >= V) {
-                    draft[break_at] = V - 1u;
+            std::vector<uint32_t> draft(nd), pass_rows(rows);
+            uint32_t break_at = 0;
+            if (s.mtp.on != 0) {
+                // Real drafts: the MTP block proposes the continuation and nothing is
+                // injected, so the accept lengths are whatever the draft actually achieves.
+                pass_rows[0] = spec_ids.back();
+                if (nd != 0 && mtp_draft(&s, pass_rows[0], pos, nd, &draft, err, err_size) != 0) {
+                    break;
                 }
+            } else {
+                // The drafts are the serial arm's continuation, so the accept length a correct
+                // cycle should reach is known. One position per cycle is broken, which walks
+                // the accept counts 0..k-1 that design 7 asks for.
+                for (uint32_t i = 0; i < nd; ++i) {
+                    draft[i] = serial_ids[have + i];
+                }
+                break_at = cycles % k;
+                if (nd != 0 && break_at < nd) {
+                    draft[break_at] ^= 0x10000u;
+                    if (draft[break_at] >= V) {
+                        draft[break_at] = V - 1u;
+                    }
+                }
+                pass_rows[0] = spec_ids.back();
             }
-            pass_rows[0] = spec_ids.back();
             for (uint32_t i = 0; i < nd; ++i) {
                 pass_rows[i + 1u] = draft[i];
             }
-            double gpu = 0.0, h2d = 0.0, cpu = 0.0;
-            uint32_t hits = 0, miss = 0, h2d_n = 0, cpu_n = 0;
-            uint64_t h2d_bytes = 0;
-            const double t0 = now_ms();
-            std::vector<float> all;
-            if (gen_pass(&s, pos, pass_rows.data(), rows, nd != 0 ? 1 : 0, &gpu, &h2d,
-                         &cpu, &hits, &miss, &h2d_n, &cpu_n, &h2d_bytes, err, err_size) != 0 ||
-                gen_head(&s, s.x.data(), rows, all, err, err_size) != 0) {
+            qrt_cycle c;
+            if (gen_cycle(&s, pos, pass_rows, rollback_off ? 0 : 1, rollback_off, &c, err,
+                          err_size) != 0) {
                 break;
             }
-            uint32_t keep = 1;
-            std::vector<uint32_t> out(rows);
-            for (uint32_t i = 0; i < rows; ++i) {
-                gen_pick(all, i, V, &verified[i], &best, &margin);
-            }
-            if (nd == 0) {
-                out[0] = verified[0];   // no draft to accept: the row's own argmax is the token
-            } else if (qrt_spec_emit(draft.data(), verified.data(), nd, out.data(), &keep) != 0) {
-                fail(err, err_size, "spec-check: emit rejected its arguments");
-                break;
-            }
-            // Rows 0..keep-1 carry the true tokens, so their hidden state and logits must be
-            // the serial arm's for the same predicted index. The row after the break was fed
-            // a wrong draft, so it is expected to differ and is not compared.
-            if (!rollback_off) {
-                for (uint32_t i = 0; i < keep; ++i) {
-                    const uint32_t r = pos + i + 1u - n_tokens;
-                    if (r >= serial_ids.size()) {
-                        continue;
-                    }
-                    double max_abs = 0.0;
-                    const double rel = gen_row_rel_l1(all.data() + (size_t) i * V,
-                                                      serial_logits.data() + (size_t) r * V,
-                                                      V, &max_abs);
-                    ++rows_checked;
-                    if (rel > worst_row) {
-                        worst_row = rel;
-                    }
-                    // the token is the gate in every configuration; the row gap is only a
-                    // gate when both arms put the same experts on the same legs
-                    if (verified[i] != serial_ids[r] || (same_leg && !(rel <= 1e-4))) {
-                        ++rows_bad;
-                    } else if (!(rel <= 1e-4)) {
-                        ++rows_loose;
-                    }
-                    if (verified[i] != serial_ids[r] || !(rel <= 1e-4)) {
-                        printf("spec_rows cycle=%u row=%u rel_l1=%.3e max_abs=%.3e id=%u "
-                               "want=%u legs=%s\n", cycles, i, rel, max_abs, verified[i],
-                               serial_ids[r], same_leg ? "same" : "mixed");
-                    }
+            // Rows 0..kept-1 carry the true tokens, so their logits must be the serial arm's
+            // for the same predicted index. A row past the break was fed a wrong draft token,
+            // so it is expected to differ and is not compared.
+            for (uint32_t i = 0; !rollback_off && i < c.kept; ++i) {
+                const uint32_t r = pos + i + 1u - n_tokens;
+                if (r >= serial_ids.size()) {
+                    continue;
+                }
+                double max_abs = 0.0;
+                const double rel = gen_row_rel_l1(c.logits.data() + (size_t) i * V,
+                                                 serial_logits.data() + (size_t) r * V, V,
+                                                 &max_abs);
+                ++rows_checked;
+                if (rel > worst_row) {
+                    worst_row = rel;
+                }
+                // the per-row token is the gate in every configuration; the float gap only
+                // gates where both arms share the arithmetic path
+                if (c.verified[i] != serial_ids[r] || (exact_legs && !(rel <= 1e-4))) {
+                    ++rows_bad;
+                } else if (!(rel <= 1e-4)) {
+                    ++rows_loose;
+                }
+                if (c.verified[i] != serial_ids[r] || !(rel <= 1e-4)) {
+                    printf("spec_rows cycle=%u row=%u rel_l1=%.3e max_abs=%.3e id=%u want=%u "
+                           "legs=%s\n", cycles, i, rel, max_abs, c.verified[i], serial_ids[r],
+                           exact_legs ? "exact" : "cached");
                 }
             }
-            for (uint32_t i = 0; i < keep; ++i) {
-                spec_ids.push_back(out[i]);
+            for (size_t i = 0; i < c.emit.size(); ++i) {
+                spec_ids.push_back(c.emit[i]);
             }
-            // the counterexample arm keeps every row, so the state and the length both move
-            // past what was accepted and the next cycle starts from a broken sequence
-            const uint32_t kept_rows = rollback_off ? rows : keep;
-            if (nd != 0 && qrt_spec_rollback(s.layers.data(), n_layers, kept_rows, err,
-                                             err_size) != 0) {
-                break;
-            }
-            pos += kept_rows;
+            pos += c.advance;
             ++cycles;
-            accepted_sum += keep;
+            accepted_sum += c.kept;
+            if (c.accepted < 9u) {
+                ++hist[c.accepted];
+            }
             printf("spec_cycle cycle=%u pos=%u rows=%u drafts=%u accepted=%u kept=%u "
-                   "break_at=%u gpu_ms=%.2f pass_ms=%.1f\n",
-                   cycles - 1u, pos - kept_rows, rows, nd, keep, kept_rows, break_at, gpu,
-                   now_ms() - t0);
+                   "src=%s break_at=%u gpu_ms=%.2f h2d_ms=%.2f cpu_ms=%.2f hits=%u misses=%u "
+                   "pass_ms=%.1f\n",
+                   cycles - 1u, pos - c.advance, c.rows, nd, c.accepted, c.kept,
+                   s.mtp.on != 0 ? "mtp" : "forced", break_at, c.gpu_ms, c.h2d_ms, c.cpu_ms,
+                   c.hits, c.miss, c.pass_ms);
             if (s.tel != NULL) {
                 qrt_pass_stats ps{};
-                ps.k = rows;
-                ps.pos = pos - kept_rows;
-                ps.accepted = keep;
-                ps.hit_experts = hits;
-                ps.miss_experts = miss;
-                ps.miss_cpu = cpu_n;
-                ps.miss_h2d = h2d_n;
-                ps.h2d_bytes = h2d_bytes;
-                ps.draft_ms = 0.0;
-                ps.gpu_ms = gpu;
-                ps.cpu_leg_ms = cpu;
-                ps.pass_ms = now_ms() - t0;
+                ps.k = c.rows;
+                ps.pos = pos - c.advance;
+                ps.accepted = c.kept;
+                ps.hit_experts = c.hits;
+                ps.miss_experts = c.miss;
+                ps.miss_cpu = c.cpu_n;
+                ps.miss_h2d = c.h2d_n;
+                ps.h2d_bytes = c.h2d_bytes;
+                ps.draft_ms = s.mtp.steps ? s.mtp.step_ms / s.mtp.steps : 0.0;
+                ps.gpu_ms = c.gpu_ms;
+                ps.cpu_leg_ms = c.cpu_ms;
+                ps.pass_ms = c.pass_ms;
                 qrt_telemetry_pass(s.tel, cycles, &ps);
             }
         }
@@ -875,12 +1207,39 @@ int qrt_model_spec_check(const qrt_config * cfg, const qrt_model_options * opt,
         // would not be able to see a lost state at all
         const int ok = rollback_off ? !ids_match
                                     : (ids_match && rows_bad == 0 && rows_checked > 0);
+        // The draft's own account: what a step costs, and how often each prefix survived.
+        // p_j = P(accept at least j drafts), the per-position rate design 6.3 reports.
+        {
+            std::string hstr, pstr;
+            for (uint32_t j = 0; j < 8u; ++j) {
+                char b[24];
+                snprintf(b, sizeof(b), j ? "/%u" : "%u", hist[j]);
+                hstr += b;
+            }
+            for (uint32_t j = 1; j <= k && j < 9u; ++j) {
+                uint32_t reached = 0;
+                for (uint32_t q = j; q < 9u; ++q) {
+                    reached += hist[q];
+                }
+                char b[24];
+                snprintf(b, sizeof(b), j == 1u ? "%.3f" : "/%.3f",
+                         cycles ? (double) reached / (double) cycles : 0.0);
+                pstr += b;
+            }
+            printf("spec_draft source=%s steps=%u ms_per_step=%.2f mib_per_step=%.1f "
+                   "gpu_ms_per_step=%.2f accepted=%s p=%s\n",
+                   s.mtp.on != 0 ? "mtp" : "forced", s.mtp.steps,
+                   s.mtp.steps ? s.mtp.step_ms / s.mtp.steps : 0.0,
+                   s.mtp.steps ? (double) s.mtp.host_bytes / s.mtp.steps / (1024.0 * 1024.0)
+                               : 0.0,
+                   s.mtp.steps ? s.mtp.gpu_ms / s.mtp.steps : 0.0, hstr.c_str(), pstr.c_str());
+        }
         printf("spec_check tokens=%u k=%u cycles=%u E=%.3f serial=%zu spec=%zu ids_equal=%d "
                "first_diff=%u rows_checked=%u rows_bad=%u rows_loose=%u worst_rel_l1=%.3e "
                "legs=%s break_cases=%u rollback=%s verdict=%s\n",
                n_new, k, cycles, cycles ? (double) accepted_sum / cycles : 0.0,
                serial_ids.size(), spec_ids.size(), ids_match, first_diff, rows_checked,
-               rows_bad, rows_loose, worst_row, same_leg ? "same" : "mixed", k,
+               rows_bad, rows_loose, worst_row, exact_legs ? "exact" : "cached", k,
                rollback_off ? "off" : "on", ok ? "PASS" : "FAIL");
         if (!rollback_off && !ids_match) {
             printf("spec_check FAIL at %u: serial %u, spec %u\n", first_diff,

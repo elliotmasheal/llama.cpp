@@ -3,6 +3,7 @@
 #include "layer.h"
 #include "qrt_util.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +54,29 @@ int qrt_spec_rollback(qrt_layer ** layers, uint32_t n_layers, uint32_t kept, cha
     return 0;
 }
 #endif
+
+uint32_t qrt_spec_draft(const float * logits, const uint32_t * ids, uint32_t n,
+                        float * best_logit, float * margin) {
+    if (logits == NULL || n == 0) {
+        return 0;
+    }
+    uint32_t bi = 0;
+    float bv = logits[0], sv = -INFINITY;
+    for (uint32_t i = 1; i < n; ++i) {
+        if (logits[i] > bv) {
+            sv = bv; bv = logits[i]; bi = i;
+        } else if (logits[i] > sv) {
+            sv = logits[i];
+        }
+    }
+    if (best_logit != NULL) {
+        *best_logit = bv;
+    }
+    if (margin != NULL) {
+        *margin = n > 1u ? bv - sv : 0.0f;
+    }
+    return ids != NULL ? ids[bi] : bi;
+}
 
 struct qrt_spec_vocab {
     std::vector<uint32_t> ids;

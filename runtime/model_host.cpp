@@ -48,6 +48,70 @@ int qrt_model_embed_rows(qrt_gguf * g, const qrt_gguf_tensor * emb, uint32_t E, 
     return 0;
 }
 
+namespace {
+
+// rms norm with the weight applied, in double, for either input precision. eps matches what
+// the head has always used so the two arms stay comparable.
+template <typename T>
+void norm_row_typed(const T * src, const float * norm_w, uint32_t E, double * dst) {
+    double ss = 0.0;
+    for (uint32_t i = 0; i < E; ++i) {
+        ss += (double) src[i] * (double) src[i];
+    }
+    const double inv = 1.0 / sqrt(ss / (double) E + 1e-6);
+    for (uint32_t i = 0; i < E; ++i) {
+        dst[i] = (double) src[i] * inv * (double) norm_w[i];
+    }
+}
+
+} // namespace
+
+// The row math the MTP draft needs, split so one normalisation feeds both the candidate
+// head and the next draft step's h input. The fork keeps t_h_nextn as the post-head-norm
+// hidden and applies nextn.hnorm to it again, so the double form exists for that second
+// norm: rounding h back to f32 between the two would add an error the graph does not have.
+void qrt_model_norm_row(const float * src, const float * norm_w, uint32_t E, double * dst) {
+    norm_row_typed(src, norm_w, E, dst);
+}
+
+void qrt_model_norm_row_d(const double * src, const float * norm_w, uint32_t E, double * dst) {
+    norm_row_typed(src, norm_w, E, dst);
+}
+
+int qrt_model_gemv_q8_0(qrt_gguf * g, const qrt_gguf_tensor * w, uint32_t n_in,
+                        const uint32_t * idx, uint32_t n_out, const double * x, float * y,
+                        char * err, size_t err_size) {
+    if (g == NULL || w == NULL || x == NULL || y == NULL || n_out == 0 || (n_in % 32u) != 0u) {
+        return fail(err, err_size, "the q8_0 gemv needs buffers and a 32-multiple width");
+    }
+    const uint64_t rows = w->n_dims >= 2 ? w->ne[1] : 1u;
+    const uint32_t row_bytes = (n_in / 32u) * 34u;
+    if ((uint64_t) rows * row_bytes > w->nbytes) {
+        return fail(err, err_size, "%s holds %llu bytes, %llu rows of %u do not fit", w->name,
+                    (unsigned long long) w->nbytes, (unsigned long long) rows, row_bytes);
+    }
+    std::vector<uint8_t> raw((size_t) row_bytes);
+    std::vector<float> row_f((size_t) n_in);
+    for (uint32_t r = 0; r < n_out; ++r) {
+        const uint32_t v = idx != NULL ? idx[r] : r;
+        if ((uint64_t) v >= rows) {
+            return fail(err, err_size, "row %u (id %u) is outside %s, which has %llu rows", r,
+                        v, w->name, (unsigned long long) rows);
+        }
+        if (qrt_gguf_read_range(g, w->offset + (uint64_t) v * row_bytes, raw.data(), row_bytes,
+                                err, err_size) != 0) {
+            return -1;
+        }
+        q8_0_row(raw.data(), n_in, row_f.data());
+        double acc = 0.0;
+        for (uint32_t i = 0; i < n_in; ++i) {
+            acc += (double) row_f[i] * x[i];
+        }
+        y[r] = (float) acc;
+    }
+    return 0;
+}
+
 // Final rms norm of the dumped rows, then output.weight over the whole vocabulary, in one
 // pass. Both arms go through the same vocab row, so output.weight is read once per run:
 // at 512 rows the per-row version would re-read 1.7 GB for every row. `b` and `la` may be

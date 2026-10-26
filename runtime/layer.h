@@ -117,9 +117,10 @@ struct qrt_ffn * qrt_layer_ffn(qrt_layer * l);
 // pass-level leg carry.
 struct qrt_cache;
 struct qrt_cpu_moe;
-int qrt_layer_set_cache(qrt_layer * l, qrt_cache * cache, VkBuffer buf, uint64_t slot_bytes,
-                        qrt_cpu_moe * cpu, int miss_split, const qrt_split_rates * rates,
-                        qrt_split_carry * carry, char * err, size_t err_size);
+int qrt_layer_set_cache(qrt_layer * l, qrt_cache * cache, uint32_t cache_layer, VkBuffer buf,
+                        uint64_t slot_bytes, qrt_cpu_moe * cpu, int miss_split,
+                        const qrt_split_rates * rates, qrt_split_carry * carry, char * err,
+                        size_t err_size);
 qrt_ffn_legs qrt_layer_last_legs(const qrt_layer * l);
 // Overwrites out with the CPU leg's routed sum [tokens][n_embd]; 0 when there was none.
 int qrt_layer_take_cpu_out(qrt_layer * l, float * out, uint32_t tokens);
