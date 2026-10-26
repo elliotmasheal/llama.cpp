@@ -3,7 +3,7 @@
 This directory holds the runtime that replaces the fork's decode path (design section 3.3).
 It links neither ggml nor llama: the runtime parses the GGUF itself and drives Vulkan directly.
 
-## Status: M2 prefill and model diagnostics; decode is not implemented
+## Status: M2 prefill, model diagnostics, a k=1 decode slice and the speculation cycle
 
 What exists now:
 
@@ -28,12 +28,16 @@ What exists now:
 - `layer.*`, `ffn.*`, `model.*` - the layer chain, FFN half and whole-model logits chain.
 - `expert_cache.*` - per-layer slot plan, SLRU/LRU/static, trace replay and the H2D callback
   contract (M3-0); `moe.*` - routed-only k=1..8 batch over the same kernels (M3-1).
+- `spec.*` - the speculation decision (longest accepted prefix, the verified token at the
+  first mismatch) and the rollback of the layers that carry it (M3-3).
 - `qrt_main.cpp` - the `qrt` binary: checks, model logits, cache plan and MoE batch.
 - `CMakeLists.txt` - `qrt_core`, `qrt`, `qrt_checks` and the CPU contract tests.
 
-What does not exist yet: decode/MTP (M3), the per-pass builder (M3-2), GPU-side route/cache
-lookup and indirect expert dispatch. The layer chain and the prefill scheduler both run;
-they are not wired to each other yet.
+What does not exist yet: the MTP draft (the `spec` module verifies and rolls back, it does not
+draft yet), the pre-recorded per-k command buffers, GPU-side route/cache lookup and indirect
+expert dispatch, and the GPU head/argmax. The layer chain, the prefill scheduler and the
+persistent decode session all run; prefill at 2048-token chunks across 40 layers still needs
+the shared scratch arena, so `--generate` caps the resident chunk at 64.
 
 ## Routed MoE batch (M3-1)
 
@@ -495,8 +499,10 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `expert_cache.h/.cpp` | per-layer cache plan, SLRU/LRU/static, trace parser/replay, H2D upload/wait contract (M3-0); masked acquire for the CPU leg and region uploads (M3-2a) |
 | `miss_split.h/.cpp` | H2D/CPU miss split: greedy pass-level balance under the measured leg rates, fixed 0..100 control arms (M3-2a) |
 | `cpu_moe.h/.cpp` | CPU expert core: Q4_K/Q5_K/Q6_K x Q8_1 GEMV, typed expert pass, subnormal fp16 deltas (M3-1a/M3-2a) |
-| `model.h/.cpp` | whole-model 40-layer logits chain, QRTLOG1 dump, persistent decode; the per-layer expert cache replaces the prefill slot after prefill (M3-2a) |
-| `qrt_main.cpp` | CLI entry: every check plus `--logits-dump`, `--model-check`, `--chunk-check`, `--cache-check`, `--moe-batch-check` |
+| `model_generate.cpp` | the persistent decode session shared by `--generate` (k=1, teacher-forced `--generate-batch`) and `--spec-check` (M3-2/M3-3) |
+| `model.h/.cpp` | whole-model 40-layer logits chain and the QRTLOG1 dump; the per-layer expert cache replaces the prefill slot after prefill (M3-2a) |
+| `spec.h/.cpp` | the speculation decision: accepted-prefix rule, bonus token at the first mismatch, layer rollback, the restricted draft vocabulary (M3-3) |
+| `qrt_main.cpp` | CLI entry: every check plus `--logits-dump`, `--model-check`, `--chunk-check`, `--cache-check`, `--moe-batch-check`, `--generate`, `--spec-check` |
 | `CMakeLists.txt` | `qrt_core`, `qrt`, `qrt_checks` and the CPU contract tests |
 
 ## Decode expert cache and miss split (M3-2a)
@@ -506,6 +512,32 @@ from `QRT_EXPERT_CACHE_MIB` (default 4198 MiB, 21.9%) through `qrt_cache_plan`. 
 call probes the layer's unique experts, asks `qrt_miss_split_plan` which misses go to H2D and
 which to the CPU, uploads the H2D part with one region copy per staging load, and computes the
 CPU part from the same Q8_1 planes the device produced. The CPU sum is added to the layer row
-after the download, so the GPU pass records only the hit + H2D experts. `--generate-batch K`
+after the download, so the GPU pass records only the hit + H2D experts. An expert's host result
+is staged per `(expert, row)` (`cpu_res[cpu_pos][run_tokens][n_embd]`): one miss expert serves
+every row that routed to it, and a single per-expert vector would hand each row the summed
+result of all of them (M3-2c). `--generate-batch K`
 feeds K prompt rows per pass: a teacher-forced diagnostic for the k=5 legs, not an acceptance
 path. `--miss-split` takes auto or the fixed 0..100 control arms.
+
+## Speculation cycle (M3-3)
+
+`qrt --spec-check <gguf> --logits-tokens <ids> --generate-new 12 --layer-store <prefix>
+--logits-layers 4 --spec-k 4 [--spec-rollback off] [--telemetry 1 --telemetry-path f.csv]`
+
+Design 5.4 runs as two arms over the same prompt inside one command. Arm A decodes serially,
+one row per pass, and keeps every logits row. Arm B reopens the session and runs cycles of up
+to `spec_k` rows whose drafts are arm A's true continuation with one position broken per
+cycle, so the accept count walks 0..k-1; `qrt_spec_emit` decides what the cycle emits (the
+accepted drafts plus `verified[accepted]`), `qrt_spec_rollback` puts every layer back at the
+state after the first `kept` rows, and the caller moves the length pointer. The two arms must
+emit the same ids, and every verified row that was fed a true token must match arm A's logits
+for the same predicted index. `--spec-rollback off` keeps all rows instead: that arm must
+part ways with arm A, otherwise the comparison could not see a lost state.
+
+Rollback needs the state after each row, so the DeltaNet recurrence keeps a ring of
+`dn_snap_rows + 1` states per layer (two without speculation) and reads slot `cur`, writing
+`(cur + 1 + t) % slots`. That replaced the 2 MiB per layer per chunk `state_out -> state_in`
+copy with a cursor move. The conv taps need no extra memory: after accepting `kept` rows the
+same carry stages them from the rows that stay, which is why the carry has to be recorded as
+the first command of the next pass (the qkv projection of that pass overwrites exactly the
+rows the carry reads).
