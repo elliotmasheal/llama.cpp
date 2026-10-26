@@ -67,8 +67,8 @@ int qrt_ffn_experts(qrt_ffn * f, char * err, size_t err_size);
 // policy object for the whole model; this layer routes its misses through the split,
 // uploads the H2D part itself and computes the CPU part. group() then records only the
 // GPU experts, so the caller has to add the CPU part to the downloaded layer row
-// (qrt_ffn_take_cpu_out). Enabled only for decode-size calls: the prefill transient
-// packing stays the default until the shared scratch arena exists.
+// (qrt_ffn_take_cpu_out). Enabled only for decode-size calls (at most 8 rows, checked): the
+// prefill transient packing stays the default until the shared scratch arena exists.
 struct qrt_cache;
 struct qrt_cpu_moe;
 

@@ -81,6 +81,13 @@ int qrt_ffn_plan_cache_layer(qrt_ffn * f, char * err, size_t err_size) {
     const uint32_t T = f->run_tokens;
     const uint32_t E = f->cfg.n_embd;
     const uint32_t K = f->cfg.top_k;
+    // The CPU leg stages one E-vector per (expert, row) (M3-2c), so it only pays off at the
+    // verified pass widths of design 4.2. ffn.h keeps the cache off the prefill path; this is
+    // where that promise is enforced rather than only documented.
+    if (T > 8u) {
+        return fail(err, err_size, "layer %u: the decode cache leg cannot carry %u rows",
+                    f->layer, T);
+    }
     f->legs = {};
     f->uniq.clear();
     f->use_gpu.assign(NE, 1);
@@ -155,7 +162,7 @@ int qrt_ffn_plan_cache_layer(qrt_ffn * f, char * err, size_t err_size) {
     f->cpu_res.clear();
     if (!f->cpu_pos.empty()) {
         f->cpu_out.assign((size_t) T * E, 0.0f);
-        f->cpu_res.assign((size_t) f->cpu_pos.size() * E, 0.0f);
+        f->cpu_res.assign((size_t) f->cpu_pos.size() * T * E, 0.0f);
     }
     std::vector<std::thread> workers;
     std::vector<double> cpu_worker_ms;
@@ -212,7 +219,6 @@ int qrt_ffn_plan_cache_layer(qrt_ffn * f, char * err, size_t err_size) {
                         cpu_failed = 1;
                         break;
                     }
-                    float * out = f->cpu_res.data() + (size_t) j * E;
                     for (uint32_t t = 0; t < T; ++t) {
                         for (uint32_t k = 0; k < K; ++k) {
                             if (f->h_ids[(size_t) t * K + k] != e) {
@@ -226,6 +232,10 @@ int qrt_ffn_plan_cache_layer(qrt_ffn * f, char * err, size_t err_size) {
                                 f->h_x_d.data() + (size_t) t * nb,
                                 f->h_x_s.data() + (size_t) t * nb, (int) E,
                                 (int) f->cfg.ffn, row.data());
+                            // One slot per (expert, row): the same expert can serve several
+                            // rows of the pass, and each row must only see its own
+                            // contribution (M3-2c).
+                            float * out = f->cpu_res.data() + ((size_t) j * T + t) * E;
                             for (uint32_t i = 0; i < E; ++i) {
                                 out[i] += wgt * row[i];
                             }
@@ -332,12 +342,12 @@ int qrt_ffn_plan_cache_layer(qrt_ffn * f, char * err, size_t err_size) {
     // Merge the per-expert CPU rows into the per-token routed sum.
     for (uint32_t j = 0; j < f->cpu_pos.size(); ++j) {
         const uint32_t e = f->uniq[f->cpu_pos[j]];
-        const float * res = f->cpu_res.data() + (size_t) j * E;
         for (uint32_t t = 0; t < T; ++t) {
             for (uint32_t k = 0; k < K; ++k) {
                 if (f->h_ids[(size_t) t * K + k] != e) {
                     continue;
                 }
+                const float * res = f->cpu_res.data() + ((size_t) j * T + t) * E;
                 float * dst = f->cpu_out.data() + (size_t) t * E;
                 for (uint32_t i = 0; i < E; ++i) {
                     dst[i] += res[i];  // the worker already applied the router weight

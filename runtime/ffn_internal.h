@@ -103,7 +103,9 @@ struct qrt_ffn {
     std::vector<float>           h_x_d;      // unpacked delta and delta*sum
     std::vector<float>           h_x_s;
     std::vector<float>           cpu_out;    // [run_tokens][n_embd], routed CPU sum
-    std::vector<float>           cpu_res;    // [cpu experts][n_embd], per-expert down
+    // [cpu experts][run_tokens][n_embd]: one expert serves every row that routed to it, so
+    // its down-projection result has to stay per row (M3-2c).
+    std::vector<float>           cpu_res;
 
     uint32_t dispatches;
     qrt_ffn_in in;      // what the layer handed over this chunk
