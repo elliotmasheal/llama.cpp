@@ -451,7 +451,16 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_
             qrt_gguf_close(g);
             return -1;
         }
-        if (qrt_dn_open(dev, spv_dir, &dsh, T, &l->dn, err, err_size) != 0 ||
+        // Two slots is the no-speculation ring (the carry becomes a cursor move); a
+        // speculative session opens one more slot per row a verified pass may carry.
+        const uint32_t dn_slots = l->cfg.dn_snap_rows >= 1u ? l->cfg.dn_snap_rows + 1u : 2u;
+        if (l->cfg.dn_snap_rows > T) {
+            qrt_layer_close(dev, l);
+            qrt_gguf_close(g);
+            return fail(err, err_size, "the snapshot ring wants %u rows but the layer holds %u",
+                        l->cfg.dn_snap_rows, T);
+        }
+        if (qrt_dn_open(dev, spv_dir, &dsh, T, dn_slots, &l->dn, err, err_size) != 0 ||
             qrt_dn_weights_load(dev, gguf_path, layer, &dsh, &l->dnw, err, err_size) != 0) {
             qrt_layer_close(dev, l);
             qrt_gguf_close(g);
@@ -738,15 +747,13 @@ static void stage_barrier(qrt_layer * l) {
     }
 }
 
-// The DeltaNet legs leave the next chunk's state in two places that are not where the next
-// chunk reads it: the recurrence writes state_out (state_in stays the chunk's start, the
-// kernel binds them apart), and the conv taps of the next chunk are the last conv_taps-1
-// projected rows of this one, which only exist in the qkv plane. Two buffer copies move
-// them; the shader writes have to reach the transfer stage first.
-static void record_dn_carry(qrt_layer * l, VkCommandBuffer cmd) {
+// The DeltaNet conv taps of the next chunk are the last conv_taps-1 projected rows of the
+// rows that stayed in the sequence. They only exist in the qkv plane, so one buffer copy
+// stages them; the recurrence state needs no copy at all because the ring cursor already
+// points at the slot the next chunk reads (M3-3).
+static void record_dn_carry(qrt_layer * l, VkCommandBuffer cmd, uint32_t rows) {
     const qrt_dn_bufs * b = qrt_dn_buffers(l->dn);
     const uint32_t taps = l->dsh.conv_taps - 1u;
-    const uint64_t st_bytes = (uint64_t) l->dsh.n_v_heads * l->dsh.head_dim * l->dsh.head_dim * 4;
     const uint64_t row_bytes = (uint64_t) l->dsh.conv_ch * 4;
     VkMemoryBarrier mb;
     memset(&mb, 0, sizeof(mb));
@@ -755,18 +762,14 @@ static void record_dn_carry(qrt_layer * l, VkCommandBuffer cmd) {
     mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 1, &mb, 0, nullptr, 0, nullptr);
-    VkBufferCopy state_copy;
-    memset(&state_copy, 0, sizeof(state_copy));
-    state_copy.size = st_bytes;
-    vkCmdCopyBuffer(cmd, b->state_out, b->state_in, 1, &state_copy);
-    if (l->run_tokens >= taps) {
+    if (rows >= taps) {
         VkBufferCopy conv_copy{};
-        conv_copy.srcOffset = (uint64_t) (l->run_tokens - taps) * row_bytes;
+        conv_copy.srcOffset = (uint64_t) (rows - taps) * row_bytes;
         conv_copy.size = (uint64_t) taps * row_bytes;
         vkCmdCopyBuffer(cmd, b->qkv, b->conv_state, 1, &conv_copy);
     } else {
-        const uint64_t added = (uint64_t) l->run_tokens * row_bytes;
-        const uint64_t kept = (uint64_t) (taps - l->run_tokens) * row_bytes;
+        const uint64_t added = (uint64_t) rows * row_bytes;
+        const uint64_t kept = (uint64_t) (taps - rows) * row_bytes;
         // Unused QKV rows stage the surviving taps without an overlapping buffer copy.
         const VkBufferCopy retain{added, added, kept};
         vkCmdCopyBuffer(cmd, b->conv_state, b->qkv, 1, &retain);
@@ -782,7 +785,7 @@ static void record_dn_carry(qrt_layer * l, VkCommandBuffer cmd) {
 
 // The module-by-module path has no pass buffer, so the carry gets its own submit on the
 // layer add's command buffer, which is idle between its own runs.
-static int dn_carry_submit(qrt_layer * l, char * err, size_t err_size) {
+static int dn_carry_submit(qrt_layer * l, uint32_t rows, char * err, size_t err_size) {
     VkCommandBufferBeginInfo bi;
     memset(&bi, 0, sizeof(bi));
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -791,7 +794,7 @@ static int dn_carry_submit(qrt_layer * l, char * err, size_t err_size) {
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkBeginCommandBuffer (deltanet carry)", r);
     }
-    record_dn_carry(l, l->add_cmd);
+    record_dn_carry(l, l->add_cmd, rows);
     r = vkEndCommandBuffer(l->add_cmd);
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkEndCommandBuffer (deltanet carry)", r);
@@ -868,6 +871,18 @@ static int layer_attention_half(qrt_layer * l, char * err, size_t err_size) {
     const uint32_t T = l->run_tokens;
     const uint32_t E = l->info.n_embd;
     const uint32_t last = l->n_proj - 1;
+    // 0. the conv taps this chunk needs come from the rows the last chunk left in the qkv
+    // plane, and the qkv projection of this chunk overwrites exactly those rows, so the
+    // carry has to be the first thing in the pass. The recurrence state needs no move: the
+    // ring cursor already points at the slot this chunk reads (M3-3).
+    if (l->info.linear && l->dn_carry_rows != 0) {
+        if (l->pass != NULL) {
+            record_dn_carry(l, qrt_vk_cmd_buffer(l->pass, 0), l->dn_carry_rows);
+        } else if (dn_carry_submit(l, l->dn_carry_rows, err, err_size) != 0) {
+            return -1;
+        }
+        l->dn_carry_rows = 0;
+    }
     // 1. input norm; DeltaNet's gate reads the f32 row, so norm_out points at its buffer
     if (layer_norm(l, l->x, l->norm_w, l->norm_out, l->qs, l->ds, E, 0, err, err_size) != 0) {
         return -1;
@@ -887,14 +902,12 @@ static int layer_attention_half(qrt_layer * l, char * err, size_t err_size) {
     const uint32_t pos0 = l->run_pos0;
     const uint32_t rows = l->run_tokens;
     if (l->info.linear) {
-        if (qrt_dn_layer_run(l->dn, l->dnw, rows, l->l2_eps, err, err_size) != 0) {
+        if (qrt_dn_layer_run(l->dn, l->dnw, rows, l->l2_eps, (int) l->dn_snap, err,
+                             err_size) != 0) {
             return -1;
         }
-        if (l->pass != NULL) {
-            record_dn_carry(l, qrt_vk_cmd_buffer(l->pass, 0));
-        } else if (dn_carry_submit(l, err, err_size) != 0) {
-            return -1;
-        }
+        // the rows just computed are what the next chunk stages its conv taps from
+        l->dn_carry_rows = rows;
     } else {
         if (qrt_full_qk(l->full, pos0, rows, err, err_size) != 0 ||
             qrt_full_attn(l->full, pos0, rows, err, err_size) != 0) {
@@ -1021,8 +1034,8 @@ int qrt_layer_run(qrt_layer * l, char * err, size_t err_size) {
     return qrt_layer_run_chunk(l, 0, l->info.tokens, err, err_size);
 }
 
-int qrt_layer_run_chunk(qrt_layer * l, uint32_t pos0, uint32_t tokens, char * err,
-                        size_t err_size) {
+static int layer_run_rows(qrt_layer * l, uint32_t pos0, uint32_t tokens, int snap, char * err,
+                          size_t err_size) {
     if (l == NULL) {
         return fail(err, err_size, "no layer");
     }
@@ -1037,6 +1050,7 @@ int qrt_layer_run_chunk(qrt_layer * l, uint32_t pos0, uint32_t tokens, char * er
     }
     l->run_pos0 = pos0;
     l->run_tokens = tokens;
+    l->dn_snap = snap ? 1u : 0u;
     l->pass1_ms = l->pass2_ms = 0.0;
     l->group_ms = 0.0;
     l->gpu_wait_ms = 0.0;
@@ -1062,6 +1076,53 @@ int qrt_layer_run_chunk(qrt_layer * l, uint32_t pos0, uint32_t tokens, char * er
     return 0;
 }
 
+int qrt_layer_run_chunk(qrt_layer * l, uint32_t pos0, uint32_t tokens, char * err,
+                        size_t err_size) {
+    return layer_run_rows(l, pos0, tokens, 0, err, err_size);
+}
+
+int qrt_layer_run_spec(qrt_layer * l, uint32_t pos0, uint32_t tokens, char * err,
+                       size_t err_size) {
+    if (l == NULL) {
+        return fail(err, err_size, "no layer");
+    }
+    if (l->cfg.dn_snap_rows == 0) {
+        return fail(err, err_size, "layer %u has no DeltaNet snapshot ring", l->layer);
+    }
+    if (tokens > l->cfg.dn_snap_rows) {
+        return fail(err, err_size, "%u snapshot rows pass the %u layer %u can keep",
+                    tokens, l->cfg.dn_snap_rows, l->layer);
+    }
+    return layer_run_rows(l, pos0, tokens, 1, err, err_size);
+}
+
+// Roll the sequence back to the state after the first `kept` rows of the last speculative
+// pass. The DeltaNet layers read that row's snapshot and re-stage its conv taps; a
+// full-attention layer has nothing to undo, because its KV rows are addressed by position
+// and the rows past `kept` are overwritten before anything could read them.
+int qrt_layer_rollback(qrt_layer * l, uint32_t kept, char * err, size_t err_size) {
+    if (l == NULL) {
+        return fail(err, err_size, "no layer");
+    }
+    if (!l->info.linear) {
+        return 0;
+    }
+    if (l->dn_snap == 0) {
+        return fail(err, err_size, "layer %u: the last pass kept no snapshots", l->layer);
+    }
+    if (kept == 0 || kept > l->run_tokens) {
+        return fail(err, err_size, "layer %u: keeping %u of %u snapshot rows is not a prefix",
+                    l->layer, kept, l->run_tokens);
+    }
+    // The pass read slot cur and wrote row t into (cur + 1 + t) % slots, and cur is still
+    // where it was because a snapshot pass does not move it.
+    const uint32_t slots = qrt_dn_state_slots(l->dn);
+    qrt_dn_state_use(l->dn, (qrt_dn_state_cur(l->dn) + kept) % slots);
+    l->dn_carry_rows = kept;
+    l->dn_snap = 0;
+    return 0;
+}
+
 // The recurrence state and the conv state of a DeltaNet layer start at zero for every chunk;
 // full attention rewrites the positions it reads, so it needs no reset.
 int qrt_layer_zero_state(qrt_layer * l, char * err, size_t err_size) {
@@ -1072,10 +1133,13 @@ int qrt_layer_zero_state(qrt_layer * l, char * err, size_t err_size) {
         return 0;
     }
     const qrt_dn_bufs * b = qrt_dn_buffers(l->dn);
-    const uint64_t st = (uint64_t) l->dsh.n_v_heads * l->dsh.head_dim * l->dsh.head_dim * 4;
+    const uint64_t st = qrt_dn_state_bytes(l->dn);
     const uint64_t cv = (uint64_t) (l->dsh.conv_taps - 1) * l->dsh.conv_ch * 4;
     std::vector<unsigned char> zero((size_t) (st > cv ? st : cv), 0);
-    if (qrt_vk_upload(l->dev, l->stg, b->state_in, 0, zero.data(), st, err, err_size) != 0) {
+    qrt_dn_state_use(l->dn, 0);
+    l->dn_carry_rows = 0;
+    if (qrt_vk_upload(l->dev, l->stg, b->state, qrt_dn_state_offset(l->dn), zero.data(), st,
+                      err, err_size) != 0) {
         return -1;
     }
     return qrt_vk_upload(l->dev, l->stg, b->conv_state, 0, zero.data(), cv, err, err_size);

@@ -117,6 +117,8 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
 
     const uint32_t max_tokens = tokens > 1024 ? tokens : 1024;
     const uint32_t serial_tokens = tokens < 64 ? tokens : 64;
+    // the widest verified pass the design allows is k=8; the snapshot ring is sized for it
+    const uint32_t snap_k = tokens < 8 ? tokens : 8;
     const uint64_t st_floats = (uint64_t) sh.n_v_heads * sh.head_dim * sh.head_dim;
     const uint64_t st_bytes = st_floats * 4;
 
@@ -178,7 +180,8 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
     std::vector<double> st_cpu((size_t) st_floats);
     std::vector<float> st_cpu_f((size_t) st_floats);
     do {
-        if (qrt_dn_open(dev, spv_dir, &sh, max_tokens, &dn, err, sizeof(err)) != 0) {
+        if (qrt_dn_open(dev, spv_dir, &sh, max_tokens, snap_k + 1u < 2u ? 2u : snap_k + 1u,
+                        &dn, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             break;
         }
@@ -208,10 +211,13 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
                                 err, sizeof(err)) != 0) {
                 return -1;
             }
-            return qrt_vk_download(dev, stg, b->state_out, 0, st_out, st_bytes, err, sizeof(err));
+            // the cursor already moved to the slot this chunk wrote
+            return qrt_vk_download(dev, stg, b->state, qrt_dn_state_offset(dn), st_out, st_bytes,
+                                   err, sizeof(err));
         };
         auto push_state = [&](const float * src) -> int {
-            return qrt_vk_upload(dev, stg, b->state_in, 0, src, st_bytes, err, sizeof(err));
+            return qrt_vk_upload(dev, stg, b->state, qrt_dn_state_offset(dn), src, st_bytes, err,
+                                 sizeof(err));
         };
 
         printf("dn_recur shapes n_embd=%u head_dim=%u k_heads=%u v_heads=%u d_inner=%u "
@@ -232,9 +238,9 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
         std::vector<float> y_batch_prefix((size_t) serial_tokens * sh.d_inner);
         std::vector<float> st_batch_prefix((size_t) st_floats);
         int all_ok = 1;
-        for (int v = 0; v < 2; ++v) {
-            const char * vname = v ? "cols" : "serial";
-            if (qrt_dn_set_recur(dn, v) != 0) {
+        for (int variant = 0; variant < 2; ++variant) {
+            const char * vname = variant ? "cols" : "serial";
+            if (qrt_dn_set_recur(dn, variant) != 0) {
                 printf("dn_recur variant %s unavailable on this device\n", vname);
                 all_ok = 0;
                 continue;
@@ -288,13 +294,12 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
             }
             int serial_fail = push_state(zero_state.data()) != 0;
             for (uint32_t t = 0; t < serial_tokens && !serial_fail; ++t) {
-                // in place would be cheaper, but the two state buffers make the copy explicit
+                // the ring cursor alternates, so the state stays where the next dispatch reads it
                 if (upload_range(t, 1) != 0 || qrt_dn_recur(dn, 1, err, sizeof(err)) != 0 ||
                     qrt_vk_download(dev, stg, b->y, 0, y_row.data(),
                                     (uint64_t) sh.d_inner * 4, err, sizeof(err)) != 0 ||
-                    qrt_vk_download(dev, stg, b->state_out, 0, st_serial.data(), st_bytes,
-                                    err, sizeof(err)) != 0 ||
-                    push_state(st_serial.data()) != 0) {
+                    qrt_vk_download(dev, stg, b->state, qrt_dn_state_offset(dn),
+                                    st_serial.data(), st_bytes, err, sizeof(err)) != 0) {
                     serial_fail = 1;
                 }
                 if (!serial_fail) {
@@ -317,6 +322,115 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
                    "verdict=%s\n", vname, serial_tokens, rel_serial, max_serial, rel_serial_state,
                    ok_serial ? "PASS" : "FAIL");
             all_ok &= ok_serial;
+
+            // 4) the snapshot ring (M3-3): one pass of snap_k rows must leave the state of
+            //    every row, bit for bit the states the serial path writes, and reading back
+            //    the snapshot of row j has to put the sequence exactly at row j.
+            const uint32_t slots = qrt_dn_state_slots(dn);
+            std::vector<float> st_snap((size_t) snap_k * st_floats);
+            std::vector<float> st_ser((size_t) snap_k * st_floats);
+            std::vector<float> y_snap((size_t) snap_k * sh.d_inner);
+            std::vector<float> y_plain((size_t) snap_k * sh.d_inner);
+            std::vector<float> st_plain((size_t) st_floats);
+            std::vector<float> st_row((size_t) st_floats);
+            std::vector<float> y_row1((size_t) sh.d_inner);
+            std::vector<double> st_ref(st_floats, 0.0);
+            std::vector<float> y_ref((size_t) snap_k * sh.d_inner);
+            int snap_fail = 0;
+            qrt_dn_state_use(dn, 0);
+            if (snap_k + 1u > slots) {
+                printf("dn_snap variant=%s skipped: the ring holds %u slots\n", vname, slots);
+                all_ok = 0;
+                continue;
+            }
+            if (push_state(zero_state.data()) != 0 || upload_range(0, snap_k) != 0 ||
+                qrt_dn_recur_snap(dn, snap_k, err, sizeof(err)) != 0 ||
+                qrt_vk_download(dev, stg, b->y, 0, y_snap.data(),
+                                (uint64_t) snap_k * sh.d_inner * 4, err, sizeof(err)) != 0) {
+                snap_fail = 1;
+            }
+            for (uint32_t t = 0; !snap_fail && t < snap_k; ++t) {
+                snap_fail = qrt_vk_download(dev, stg, b->state,
+                                            (uint64_t) ((1u + t) % slots) * st_bytes,
+                                            st_snap.data() + (size_t) t * st_floats, st_bytes,
+                                            err, sizeof(err)) != 0;
+            }
+            // the same rows without snapshots: identical outputs, and the last snapshot is
+            // the chunk's end state
+            if (!snap_fail && (push_state(zero_state.data()) != 0 ||
+                               run_chunk(snap_k, y_plain.data(), st_plain.data()) != 0)) {
+                snap_fail = 1;
+            }
+            int ok_plain = !snap_fail &&
+                           memcmp(y_plain.data(), y_snap.data(), y_plain.size() * 4) == 0 &&
+                           memcmp(st_plain.data(), st_snap.data() + (size_t) (snap_k - 1u) * st_floats,
+                                  st_plain.size() * 4) == 0;
+            // the serial chain one token at a time, against every snapshot
+            int ok_serial_snap = 0;
+            if (!snap_fail) {
+                qrt_dn_state_use(dn, 0);
+                ok_serial_snap = push_state(zero_state.data()) == 0;
+                for (uint32_t t = 0; ok_serial_snap && t < snap_k; ++t) {
+                    ok_serial_snap = upload_range(t, 1) == 0 &&
+                                     qrt_dn_recur(dn, 1, err, sizeof(err)) == 0 &&
+                                     qrt_vk_download(dev, stg, b->state, qrt_dn_state_offset(dn),
+                                                     st_ser.data() + (size_t) t * st_floats,
+                                                     st_bytes, err, sizeof(err)) == 0 &&
+                                     memcmp(st_ser.data() + (size_t) t * st_floats,
+                                            st_snap.data() + (size_t) t * st_floats,
+                                            (size_t) st_floats * 4) == 0;
+                }
+            }
+            // and against the double precision reference, one token at a time
+            double ref_max = 0.0, ref_rel = 0.0;
+            int ok_snap_ref = 0;
+            if (!snap_fail) {
+                ok_snap_ref = 1;
+                for (uint32_t t = 0; t < snap_k; ++t) {
+                    qrt_dn_recur_cpu(&sh, 1, q.data() + (size_t) t * sh.qk_ch,
+                                     k.data() + (size_t) t * sh.qk_ch,
+                                     v.data() + (size_t) t * sh.d_inner,
+                                     decay.data() + (size_t) t * sh.n_v_heads,
+                                     beta.data() + (size_t) t * sh.n_v_heads, st_ref.data(),
+                                     y_ref.data() + (size_t) t * sh.d_inner);
+                    for (size_t i = 0; i < st_floats; ++i) {
+                        st_row[i] = (float) st_ref[i];
+                    }
+                    double m = 0.0;
+                    const double r = rel_l1(st_snap.data() + (size_t) t * st_floats,
+                                            st_row.data(), st_floats, &m);
+                    if (!(r <= 1e-4)) {
+                        ok_snap_ref = 0;
+                    }
+                    if (m > ref_max) {
+                        ref_max = m;
+                    }
+                    if (r > ref_rel) {
+                        ref_rel = r;
+                    }
+                }
+            }
+            // rollback: put the cursor on the snapshot of row snap_k-2 and decode one more
+            // token; it must reproduce that token's row of the snapshot pass bit for bit
+            int ok_back = 0;
+            if (!snap_fail && snap_k >= 2) {
+                const uint32_t keep = snap_k - 2u;
+                qrt_dn_state_use(dn, (1u + keep) % slots);
+                ok_back = upload_range(keep + 1u, 1) == 0 &&
+                          qrt_dn_recur(dn, 1, err, sizeof(err)) == 0 &&
+                          qrt_vk_download(dev, stg, b->y, 0, y_row1.data(),
+                                          (uint64_t) sh.d_inner * 4, err, sizeof(err)) == 0 &&
+                          memcmp(y_row1.data(), y_snap.data() + (size_t) (keep + 1u) * sh.d_inner,
+                                 (size_t) sh.d_inner * 4) == 0;
+            }
+            const int ok_snap = snap_fail == 0 && ok_plain && ok_serial_snap && ok_snap_ref && ok_back;
+            printf("dn_snap variant=%s rows=%u plain_eq=%d serial_eq=%d ref_rel_l1=%.3e "
+                   "ref_max=%.3e rollback_eq=%d verdict=%s\n", vname, snap_k, ok_plain,
+                   ok_serial_snap, ref_rel, ref_max, ok_back, ok_snap ? "PASS" : "FAIL");
+            if (snap_fail) {
+                fprintf(stderr, "qrt: %s\n", err);
+            }
+            all_ok &= ok_snap;
         }
         if (all_ok == 0) {
             printf("dn_recur verdict FAIL (see the lines above)\n");
@@ -541,9 +655,9 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
                 break;
             }
             std::vector<float> zero_state_g((size_t) st_floats, 0.0f);
-            if (qrt_vk_upload(dev, stg, b->state_in, 0, zero_state_g.data(), st_bytes,
-                              err, sizeof(err)) != 0 ||
-                qrt_dn_layer_run(dn, gw, tokens, l2_eps, err, sizeof(err)) != 0) {
+            if (qrt_vk_upload(dev, stg, b->state, qrt_dn_state_offset(dn), zero_state_g.data(),
+                              st_bytes, err, sizeof(err)) != 0 ||
+                qrt_dn_layer_run(dn, gw, tokens, l2_eps, 0, err, sizeof(err)) != 0) {
                 qrt_dn_weights_free(dev, gw);
                 fprintf(stderr, "qrt: %s\n", err);
                 break;
@@ -640,8 +754,8 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
                            qrt_dn_recur(dn, tokens, err, sizeof(err)) != 0 ||
                            qrt_vk_download(dev, stg, b->y, 0, y_ser.data(),
                                            (uint64_t) tokens * sh.d_inner * 4, err, sizeof(err)) != 0 ||
-                           qrt_vk_download(dev, stg, b->state_out, 0, st_ser.data(), st_bytes,
-                                           err, sizeof(err)) != 0;
+                           qrt_vk_download(dev, stg, b->state, qrt_dn_state_offset(dn),
+                                           st_ser.data(), st_bytes, err, sizeof(err)) != 0;
             }
             if (!cmp_fail) {
                 qrt_dn_set_recur(dn, 1);
@@ -649,8 +763,8 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
                            qrt_dn_recur(dn, tokens, err, sizeof(err)) != 0 ||
                            qrt_vk_download(dev, stg, b->y, 0, y_col.data(),
                                            (uint64_t) tokens * sh.d_inner * 4, err, sizeof(err)) != 0 ||
-                           qrt_vk_download(dev, stg, b->state_out, 0, st_col.data(), st_bytes,
-                                           err, sizeof(err)) != 0;
+                           qrt_vk_download(dev, stg, b->state, qrt_dn_state_offset(dn),
+                                           st_col.data(), st_bytes, err, sizeof(err)) != 0;
             }
             if (cmp_fail) {
                 fprintf(stderr, "qrt: %s\n", err);

@@ -26,6 +26,10 @@ struct qrt_layer_cfg {
     int ffn;             // 1 = include the shared expert and the routed MoE
     int single_submit;   // 1 = record the whole layer into one pass buffer
     int dn_recur;        // 1 = the 32-column DeltaNet recurrence (RESULTS 63)
+    // Speculative width (M3-3): the number of rows a verified pass may carry. The DeltaNet
+    // state ring then holds dn_snap_rows + 1 states, enough to keep one per row plus the
+    // state the pass started from. 0 = no snapshots, the ring stays two slots.
+    uint32_t dn_snap_rows;
     int32_t kv_k;        // enum qrt_kv_precision for the full-attention cache
     int32_t kv_v;
     uint32_t kv_page_tokens;  // page granularity; the window is the chunk in the layer check
@@ -72,6 +76,15 @@ int qrt_layer_run(qrt_layer * l, char * err, size_t err_size);
 // are not part of the sequence and their output is undefined.
 int qrt_layer_run_chunk(qrt_layer * l, uint32_t pos0, uint32_t tokens, char * err,
                         size_t err_size);
+// Speculative pass (M3-3): the same rows as run_chunk, but every DeltaNet layer also keeps
+// the state after each row, so qrt_layer_rollback() can put the sequence back to any prefix
+// of them. The layer must be opened with cfg.dn_snap_rows >= tokens.
+int qrt_layer_run_spec(qrt_layer * l, uint32_t pos0, uint32_t tokens, char * err,
+                       size_t err_size);
+// Roll the sequence back to the first `kept` rows of the last speculative pass. Full
+// attention needs nothing: the caller moves its own length pointer and the dropped KV rows
+// are overwritten by the next pass.
+int qrt_layer_rollback(qrt_layer * l, uint32_t kept, char * err, size_t err_size);
 double qrt_layer_last_ms(const qrt_layer * l);
 // Per-stage timings of the last run: the attention pass, the host group, the FFN pass.
 double qrt_layer_pass1_ms(const qrt_layer * l);

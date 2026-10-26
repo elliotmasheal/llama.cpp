@@ -34,27 +34,35 @@ layout(push_constant) uniform Params {
     uint  kq_ch;      // n_k_heads * S_V, the row stride of the q and k planes
     uint  k_ratio;    // v-heads per k-head (2 here)
     float qscale;     // 1/sqrt(S_V), applied to the output
+    uint  cur;        // state slot the chunk starts from
+    uint  slots;      // state ring slots (M3-3); the end state goes to (cur + 1) % slots
+    uint  snap;       // 1 = keep a snapshot after every token, for speculative rollback
 } pc;
 
+// One slot is heads * S_V * S_V floats; the ring is the same buffer for the read and the
+// write side. A pass reads slot cur and writes (cur + 1 + t) % slots per token, or just
+// cur + 1 when it keeps no snapshots, so with slots >= 2 it never writes the slot it reads.
 layout(binding = 0) readonly  buffer QBuf    { float q[];     };  // [t][k head][S_V]
 layout(binding = 1) readonly  buffer KBuf    { float kk[];    };
 layout(binding = 2) readonly  buffer VBuf    { float v[];     };  // [t][head][S_V]
 layout(binding = 3) readonly  buffer DecayBuf{ float decay[]; };  // [t][head]
 layout(binding = 4) readonly  buffer BetaBuf { float beta[];  };  // [t][head]
-layout(binding = 5) readonly  buffer StInBuf { float st_in[]; };  // [head][col][row]
+layout(binding = 5) readonly  buffer StInBuf { float st_in[]; };  // [slots][head][col][row]
 layout(binding = 6) writeonly buffer DstBuf  { float dst[];   };  // [t][head][S_V]
-layout(binding = 7) writeonly buffer StOutBuf{ float st_out[];};
+layout(binding = 7) writeonly buffer StOutBuf{ float st_out[];};  // the same ring
 
 void main() {
     const uint lane = gl_SubgroupInvocationID;
     const uint col  = gl_WorkGroupID.y * COLS_PER_WG + gl_SubgroupID;
     const uint head = gl_WorkGroupID.x;
     const uint khead = head % (pc.heads / pc.k_ratio);
+    const uint slot_floats = pc.heads * S_V * S_V;
     const uint st_base = (head * S_V + col) * S_V;
+    const uint st_read = pc.cur * slot_floats + st_base;
 
     float s[ROWS_PER_LANE];
     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
-        s[r] = st_in[st_base + r * SUBGROUP + lane];
+        s[r] = st_in[st_read + r * SUBGROUP + lane];
     }
 
     const uint qk_base = khead * S_V + lane;
@@ -87,9 +95,19 @@ void main() {
         if (lane == 0u) {
             dst[t * pc.heads * S_V + v_base] = o * pc.qscale;
         }
-    }
-
-    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
-        st_out[st_base + r * SUBGROUP + lane] = s[r];
+        // snap keeps the state after every token so a rejected draft can be rolled back to
+        // the row that was accepted; without it only the chunk's end state is kept, and it
+        // always goes to the next slot so the host cursor only ever moves by one.
+        if (pc.snap != 0u) {
+            const uint st_write = ((pc.cur + 1u + t) % pc.slots) * slot_floats + st_base;
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                st_out[st_write + r * SUBGROUP + lane] = s[r];
+            }
+        } else if (t + 1u == pc.n_tokens) {
+            const uint st_write = ((pc.cur + 1u) % pc.slots) * slot_floats + st_base;
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; ++r) {
+                st_out[st_write + r * SUBGROUP + lane] = s[r];
+            }
+        }
     }
 }

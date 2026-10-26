@@ -37,6 +37,7 @@ add_library(qrt_core STATIC
     model_host.cpp
     model_generate.cpp
     model_io.cpp
+    spec.cpp
     ffn.cpp
     ffn_ref.cpp
     ffn_store.cpp
@@ -306,6 +307,12 @@ if (BUILD_TESTING)
     set_target_properties(qrt_miss_split_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     add_test(NAME qrt_miss_split_contract COMMAND qrt_miss_split_test)
     set_tests_properties(qrt_miss_split_contract PROPERTIES LABELS "qrt;cpu")
+    # The speculation decision is device-free: the accept rule and the draft vocabulary. The
+    # rollback it drives is device state and is gated by --spec-check against a serial decode.
+    add_executable(qrt_spec_test spec_test.cpp spec.cpp)
+    set_target_properties(qrt_spec_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME qrt_spec_contract COMMAND qrt_spec_test)
+    set_tests_properties(qrt_spec_contract PROPERTIES LABELS "qrt;cpu")
     add_executable(qrt_cpu_moe_test cpu_moe_test.cpp cpu_moe.cpp)
     set_target_properties(qrt_cpu_moe_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     if (NOT MSVC)
@@ -315,7 +322,7 @@ if (BUILD_TESTING)
     add_test(NAME qrt_cpu_moe_contract COMMAND qrt_cpu_moe_test)
     set_tests_properties(qrt_cpu_moe_contract PROPERTIES LABELS "qrt;cpu")
     add_custom_target(qrt_checks DEPENDS qrt qrt_model_test qrt_prefill_test qrt_cache_test
-                      qrt_miss_split_test qrt_cpu_moe_test)
+                      qrt_miss_split_test qrt_spec_test qrt_cpu_moe_test)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if (Python3_Interpreter_FOUND)
         add_test(NAME qrt_cli_contract

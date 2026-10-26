@@ -88,6 +88,8 @@ const option_desc options[] = {
     INT("--generate-new", generate_new, 1, 128, QRT_CMD_NONE, "greedy tokens to generate"),
     INT("--generate-batch", generate_batch, 1, 8, QRT_CMD_NONE, "decode rows per pass; >1 feeds prompt ids"),
     PATH("--generate-out", generate_out, QRT_CMD_NONE, "write generated token IDs"),
+    PATH("--spec-check", spec_check_gguf, QRT_CMD_SPEC_CHECK, "compare speculative cycles with a serial decode"),
+    ENUM("--spec-rollback", spec_rollback, "off", "on", "off keeps every draft row: the counterexample arm"),
     PATH("--cache-check", cache_prefix, QRT_CMD_CACHE, "plan and simulate the decode expert cache (host only)"),
     PATH("--cache-trace", cache_trace, QRT_CMD_NONE, "routing trace for per-layer miss weights"),
     INT("--cache-decode", cache_decode, 1, 1000000, QRT_CMD_NONE, "decode tail rows replayed"),
@@ -254,13 +256,18 @@ int qrt_cli_parse(qrt_cli_options * out, qrt_config * cfg, int argc, char ** arg
     const bool model_command = parsed.command == QRT_CMD_LOGITS ||
                                parsed.command == QRT_CMD_MODEL_CHECK ||
                                parsed.command == QRT_CMD_CHUNK_CHECK ||
-                               parsed.command == QRT_CMD_GENERATE;
+                               parsed.command == QRT_CMD_GENERATE ||
+                               parsed.command == QRT_CMD_SPEC_CHECK;
     if (model_command && !parsed.logits_tokens) {
         snprintf(err, err_size, "model commands require --logits-tokens");
         return -1;
     }
     if (parsed.command == QRT_CMD_GENERATE && !parsed.layer_store) {
         snprintf(err, err_size, "--generate requires --layer-store");
+        return -1;
+    }
+    if (parsed.command == QRT_CMD_SPEC_CHECK && !parsed.layer_store) {
+        snprintf(err, err_size, "--spec-check requires --layer-store");
         return -1;
     }
     if (parsed.generate_out && parsed.command != QRT_CMD_GENERATE) {

@@ -134,6 +134,27 @@ int main(int argc, char ** argv) {
         }
         return rc < 0 ? 2 : rc;
     }
+    if (options.command == QRT_CMD_SPEC_CHECK) {
+        qrt_model_options mo{};
+        mo.n_layers = (uint32_t) options.logits_layers;
+        mo.n_rows = 1;
+        mo.batch_k = 1;
+        uint32_t * ids = NULL;
+        uint32_t n_ids = 0;
+        if (qrt_model_read_ids(options.logits_tokens, &ids, &n_ids, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            return 2;
+        }
+        const int rc = qrt_model_spec_check(&cfg, &mo, options.spec_check_gguf,
+                                            options.layer_store, spv_dir.c_str(), ids, n_ids,
+                                            (uint32_t) options.generate_new,
+                                            options.spec_rollback ? 0 : 1, err, sizeof(err));
+        free(ids);
+        if (rc != 0 && err[0] != '\0') {
+            fprintf(stderr, "qrt: %s\n", err);
+        }
+        return rc < 0 ? 2 : rc;
+    }
     if (options.command == QRT_CMD_CHUNK_CHECK || options.command == QRT_CMD_MODEL_CHECK ||
         options.command == QRT_CMD_LOGITS) {
         qrt_model_options model_options;

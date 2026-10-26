@@ -35,9 +35,8 @@ struct qrt_dn_bufs {
     VkBuffer v;         // [tokens][d_inner]
     VkBuffer decay;     // [tokens][n_v_heads], exp() already applied
     VkBuffer beta;      // [tokens][n_v_heads], sigmoid already applied
-    VkBuffer state_in;  // [n_v_heads][head_dim][head_dim]
+    VkBuffer state;     // the state ring, [slots][n_v_heads][head_dim][head_dim]
     VkBuffer y;         // [tokens][d_inner], the raw attention output
-    VkBuffer state_out; // [n_v_heads][head_dim][head_dim], may be state_in
     // step 2a: the prep chain around the recurrence
     VkBuffer qkv;       // [tokens][conv_ch]  projection output (input of the conv)
     VkBuffer conv_state; // [conv_taps-1][conv_ch], may be NULL until written
@@ -48,18 +47,33 @@ struct qrt_dn_bufs {
     VkBuffer norm;      // [tokens][n_embd] f32 rms-norm output (the gate input)
 };
 
-// max_tokens sizes the buffers; a later chunk may be shorter.
+// The state ring (M3-3): a chunk reads slot `cur` and writes slot (cur + 1) % slots, so the
+// carry between chunks is a cursor move instead of a 2 MiB copy per layer. qrt_dn_recur_snap()
+// additionally leaves one state per token in the ring, which is what speculative rollback
+// reads back after accepting j of k rows. state_slots must be at least the largest snap
+// token count plus one, and at least two.
 int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh,
-                uint32_t max_tokens, qrt_deltanet ** out, char * err, size_t err_size);
+                uint32_t max_tokens, uint32_t state_slots, qrt_deltanet ** out,
+                char * err, size_t err_size);
 void qrt_dn_close(qrt_vk_dev * dev, qrt_deltanet * dn);
 
 const qrt_dn_shapes * qrt_dn_shapes_of(const qrt_deltanet * dn);
 const qrt_dn_bufs *   qrt_dn_buffers(const qrt_deltanet * dn);
 uint64_t              qrt_dn_state_bytes(const qrt_deltanet * dn);
+uint32_t              qrt_dn_state_slots(const qrt_deltanet * dn);
+// The slot the next recurrence reads, and the byte offset of that slot inside the ring.
+uint32_t              qrt_dn_state_cur(const qrt_deltanet * dn);
+uint64_t              qrt_dn_state_offset(const qrt_deltanet * dn);
+// Point the sequence at another slot: rollback after accepting j rows uses the snapshot of
+// row j. Out-of-range slots fail the next recurrence rather than reading past the ring.
+void                  qrt_dn_state_use(qrt_deltanet * dn, uint32_t slot);
 
 // One dispatch for the whole chunk: the shader walks the tokens in order, so a
 // batch and a serial decode run the same operations in the same order.
 int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size);
+// The same dispatch with a per-token snapshot. The cursor stays where it was: the caller
+// decides which snapshot becomes live once the accepted length is known.
+int qrt_dn_recur_snap(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size);
 // Kernel variant: 0 = two state columns per workgroup with two subgroup reductions
 // per token (the original), 1 = 32 columns per workgroup with a thread-per-row-slice
 // split (shared memory sum). Both keep the token loop inside the shader, so
@@ -110,9 +124,9 @@ int qrt_dn_gnorm_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t token
 // The four legs in sequence for one linear-attention layer: prep -> gate -> recur ->
 // gnorm. The caller fills qkv, xnorm and z (the projection outputs) beforehand, which
 // is exactly what the layer chain will hand over; this exists so the pieces are also
-// checked in the order the model runs them.
+// checked in the order the model runs them. snap=1 keeps a state snapshot per token.
 int qrt_dn_layer_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
-                     float l2_eps, char * err, size_t err_size);
+                     float l2_eps, int snap, char * err, size_t err_size);
 double qrt_dn_layer_ms(const qrt_deltanet * dn);
 
 void qrt_dn_gnorm_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * y,

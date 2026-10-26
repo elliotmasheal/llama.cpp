@@ -30,6 +30,11 @@ struct qrt_deltanet {
     qrt_dn_bufs    bufs;
     VkBuffer       mem_owner[DN_BINDINGS];
     VkDeviceMemory mem[DN_BINDINGS];
+    // the state ring (M3-3): bindings 5 and 7 are the same buffer, the shader picks the
+    // slot it reads (cur) and the slots it writes ((cur + 1 + t) % slots)
+    uint32_t       state_slots;
+    uint32_t       state_cur;
+    uint64_t       state_bytes;
 
     // step 2a: conv1d + silu + L2 norm, one pipeline on its own descriptor set
     VkBuffer       prep_qkv;
@@ -64,10 +69,6 @@ struct qrt_deltanet {
 
 namespace {
 
-// Labels in binding order, so the report can name what it allocated.
-const char * DN_LABEL[DN_BINDINGS] = { "q", "k", "v", "decay", "beta", "state_in", "y",
-                                      "state_out" };
-
 int alloc_buf(qrt_deltanet * dn, uint32_t idx, uint64_t bytes, char * err, size_t err_size) {
     if (qrt_vk_alloc(dn->dev, bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
                      QRT_VK_USAGE_TRANSFER_DST, &dn->mem_owner[idx], &dn->mem[idx],
@@ -80,10 +81,14 @@ int alloc_buf(qrt_deltanet * dn, uint32_t idx, uint64_t bytes, char * err, size_
 } // namespace
 
 int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh,
-                uint32_t max_tokens, qrt_deltanet ** out, char * err, size_t err_size) {
+                uint32_t max_tokens, uint32_t state_slots, qrt_deltanet ** out,
+                char * err, size_t err_size) {
     *out = NULL;
     if (dev == NULL || spv_dir == NULL || sh == NULL || max_tokens == 0) {
         return fail(err, err_size, "the DeltaNet recurrence needs a device, SPIR-V and tokens");
+    }
+    if (state_slots < 2) {
+        return fail(err, err_size, "the state ring needs at least 2 slots, got %u", state_slots);
     }
     if (sh->head_dim % 32 != 0 || sh->n_v_heads == 0 || sh->qk_ch % sh->n_k_heads != 0) {
         return fail(err, err_size, "shapes head_dim=%u heads=%u do not fit the 32-lane block",
@@ -108,15 +113,19 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     dn->max_tokens = max_tokens;
     dn->subgroup = subgroup;
     dn->eps = 1e-6f;
+    dn->state_slots = state_slots;
+    dn->state_cur = 0;
 
     const uint64_t qk_bytes = (uint64_t) max_tokens * sh->qk_ch * 4;
     const uint64_t v_bytes = (uint64_t) max_tokens * sh->d_inner * 4;
     const uint64_t gb_bytes = (uint64_t) max_tokens * sh->n_v_heads * 4;
-    const uint64_t st_bytes = (uint64_t) sh->n_v_heads * sh->head_dim * sh->head_dim * 4;
+    dn->state_bytes = (uint64_t) sh->n_v_heads * sh->head_dim * sh->head_dim * 4;
+    // Binding 7 (the write side) is the same allocation as binding 5, so it carries no size
+    // and no free of its own.
     const uint64_t sizes[DN_BINDINGS] = { qk_bytes, qk_bytes, v_bytes, gb_bytes, gb_bytes,
-                                          st_bytes, v_bytes, st_bytes };
+                                          dn->state_bytes * state_slots, v_bytes, 0 };
     for (uint32_t i = 0; i < DN_BINDINGS; ++i) {
-        if (alloc_buf(dn, i, sizes[i], err, err_size) != 0) {
+        if (sizes[i] != 0 && alloc_buf(dn, i, sizes[i], err, err_size) != 0) {
             qrt_dn_close(dev, dn);
             return -1;
         }
@@ -126,9 +135,9 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     dn->bufs.v = dn->mem_owner[2];
     dn->bufs.decay = dn->mem_owner[3];
     dn->bufs.beta = dn->mem_owner[4];
-    dn->bufs.state_in = dn->mem_owner[5];
+    dn->bufs.state = dn->mem_owner[5];
     dn->bufs.y = dn->mem_owner[6];
-    dn->bufs.state_out = dn->mem_owner[7];
+    dn->mem_owner[7] = dn->mem_owner[5];
 
     if (qrt_vk_make_set_layout(dev, DN_BINDINGS, &dn->dsl, err, err_size) != 0) {
         qrt_dn_close(dev, dn);
@@ -328,7 +337,23 @@ double                qrt_dn_last_ms(const qrt_deltanet * dn) { return dn->last_
 double                qrt_dn_layer_ms(const qrt_deltanet * dn) { return dn->layer_ms; }
 
 uint64_t qrt_dn_state_bytes(const qrt_deltanet * dn) {
-    return (uint64_t) dn->sh.n_v_heads * dn->sh.head_dim * dn->sh.head_dim * 4;
+    return dn->state_bytes;
+}
+
+uint32_t qrt_dn_state_slots(const qrt_deltanet * dn) {
+    return dn->state_slots;
+}
+
+uint32_t qrt_dn_state_cur(const qrt_deltanet * dn) {
+    return dn->state_cur;
+}
+
+uint64_t qrt_dn_state_offset(const qrt_deltanet * dn) {
+    return (uint64_t) dn->state_cur * dn->state_bytes;
+}
+
+void qrt_dn_state_use(qrt_deltanet * dn, uint32_t slot) {
+    dn->state_cur = slot % dn->state_slots;
 }
 
 int qrt_dn_set_recur(qrt_deltanet * dn, int cols) {
@@ -360,9 +385,14 @@ static VkCommandBuffer dn_leg_begin(qrt_deltanet * dn, const char * what, char *
 static int dn_leg_end(qrt_deltanet * dn, VkCommandBuffer cmd, const char * what, double t0,
                       char * err, size_t err_size);
 
-int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size) {
+static int dn_recur_run(qrt_deltanet * dn, uint32_t tokens, int snap, char * err,
+                        size_t err_size) {
     if (tokens == 0 || tokens > dn->max_tokens) {
         return fail(err, err_size, "chunk of %u tokens does not fit %u", tokens, dn->max_tokens);
+    }
+    if (snap && tokens + 1u > dn->state_slots) {
+        return fail(err, err_size, "%u snapshots need %u ring slots, this DeltaNet has %u",
+                    tokens, tokens + 1u, dn->state_slots);
     }
     const double t0 = now_ms();
     VkCommandBuffer cmd = dn_leg_begin(dn, "vkBeginCommandBuffer (deltanet)", err, err_size);
@@ -375,12 +405,18 @@ int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size
         uint32_t kq_ch;
         uint32_t k_ratio;
         float    qscale;
+        uint32_t cur;
+        uint32_t slots;
+        uint32_t snap;
     } pcs;
     pcs.n_tokens = tokens;
     pcs.heads    = dn->sh.n_v_heads;
     pcs.kq_ch    = dn->sh.qk_ch;
     pcs.k_ratio  = dn->sh.n_v_heads / dn->sh.n_k_heads;
     pcs.qscale   = 1.0f / sqrtf((float) dn->sh.head_dim);
+    pcs.cur      = dn->state_cur;
+    pcs.slots    = dn->state_slots;
+    pcs.snap     = snap ? 1u : 0u;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->recur_cols ? dn->pipe_cols : dn->pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dn->layout, 0, 1,
                             &dn->set, 0, nullptr);
@@ -394,7 +430,21 @@ int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size
         const uint32_t cols_per_wg = 128u / dn->subgroup;
         vkCmdDispatch(cmd, dn->sh.n_v_heads, dn->sh.head_dim / cols_per_wg, 1);
     }
-    return dn_leg_end(dn, cmd, "deltanet", t0, err, err_size);
+    // A chunk without snapshots leaves exactly one new state, so the cursor moves by one.
+    // With snapshots the caller picks the slot after the accepted row, so it stays here.
+    const int rc = dn_leg_end(dn, cmd, "deltanet", t0, err, err_size);
+    if (rc == 0 && !snap) {
+        dn->state_cur = (dn->state_cur + 1u) % dn->state_slots;
+    }
+    return rc;
+}
+
+int qrt_dn_recur(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size) {
+    return dn_recur_run(dn, tokens, 0, err, err_size);
+}
+
+int qrt_dn_recur_snap(qrt_deltanet * dn, uint32_t tokens, char * err, size_t err_size) {
+    return dn_recur_run(dn, tokens, 1, err, err_size);
 }
 
 // Every device buffer a layer weight can own lives in one table, and the same table is
@@ -783,7 +833,7 @@ int qrt_dn_gate_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens
 }
 
 int qrt_dn_layer_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t tokens,
-                     float l2_eps, char * err, size_t err_size) {
+                     float l2_eps, int snap, char * err, size_t err_size) {
     const double t0 = now_ms();
     if (qrt_dn_prep_run(dn, w, tokens, l2_eps, err, err_size) != 0) {
         return -1;
@@ -791,7 +841,8 @@ int qrt_dn_layer_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t token
     if (qrt_dn_gate_run(dn, w, tokens, err, err_size) != 0) {
         return -1;
     }
-    if (qrt_dn_recur(dn, tokens, err, err_size) != 0) {
+    if (snap ? qrt_dn_recur_snap(dn, tokens, err, err_size)
+             : qrt_dn_recur(dn, tokens, err, err_size)) {
         return -1;
     }
     if (qrt_dn_gnorm_run(dn, w, tokens, err, err_size) != 0) {

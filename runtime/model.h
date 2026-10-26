@@ -63,6 +63,16 @@ int qrt_model_chunk_check(const qrt_config * cfg, const qrt_model_options * opt,
                           const char * gguf_path, const char * store_prefix, const char * spv_dir,
                           const uint32_t * ids, uint32_t n_tokens, char * err, size_t err_size);
 
+// The M3-3 acceptance run (design 7): decode the prompt twice from the same state, once
+// serially and once as speculative cycles of up to spec_k rows whose drafts are broken one
+// position at a time. The two arms must emit the same tokens, and every verified row that was
+// fed a true token must match the serial arm's logits for the same index. rollback_off keeps
+// every row instead, which is the counterexample that shows the comparison can see the loss.
+int qrt_model_spec_check(const qrt_config * cfg, const qrt_model_options * opt,
+                         const char * gguf_path, const char * store_prefix, const char * spv_dir,
+                         const uint32_t * ids, uint32_t n_tokens, uint32_t n_new,
+                         int rollback_off, char * err, size_t err_size);
+
 // Reads a whitespace-separated token id file. Returns 0 on success.
 int qrt_model_read_ids(const char * path, uint32_t ** ids, uint32_t * count,
                        char * err, size_t err_size);

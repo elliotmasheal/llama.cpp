@@ -66,6 +66,8 @@ struct qrt_layer {
     std::vector<float> h_x, h_norm, h_post, h_qnw, h_knw;
     uint32_t           run_pos0;    // position of the chunk's first row, this run
     uint32_t           run_tokens;  // rows of the opened chunk that belong to the sequence
+    uint32_t           dn_snap;     // 1 while the last pass kept a snapshot per row
+    uint32_t           dn_carry_rows;  // rows whose last taps stage the next chunk's conv
     double             last_ms;
     double             pass1_ms;
     double             group_ms;

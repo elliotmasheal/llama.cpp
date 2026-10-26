@@ -28,6 +28,7 @@ enum qrt_command {
     QRT_CMD_CACHE,
     QRT_CMD_MOE_BATCH,
     QRT_CMD_GENERATE,
+    QRT_CMD_SPEC_CHECK,
 };
 
 struct qrt_cli_options {
@@ -86,6 +87,8 @@ struct qrt_cli_options {
     const char * generate_out = nullptr;
     int generate_new = 8;
     int generate_batch = 1;   // decode rows per pass; >1 is a teacher-forced diagnostic
+    const char * spec_check_gguf = nullptr;
+    int spec_rollback = 1;    // off keeps every draft row, the counterexample arm
     const char * cache_prefix = nullptr;
     const char * cache_trace = nullptr;
     int cache_decode = 128;
