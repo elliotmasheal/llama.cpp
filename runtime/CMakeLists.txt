@@ -5,6 +5,7 @@
 add_library(qrt_core STATIC
     qrt_config.cpp
     expert_cache.cpp
+    miss_split.cpp
     cpu_moe.cpp
     qrt_telemetry.cpp
     gguf_index.cpp
@@ -247,6 +248,10 @@ if (BUILD_TESTING)
     set_target_properties(qrt_cache_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     add_test(NAME qrt_cache_contract COMMAND qrt_cache_test)
     set_tests_properties(qrt_cache_contract PROPERTIES LABELS "qrt;cpu")
+    add_executable(qrt_miss_split_test miss_split_test.cpp miss_split.cpp)
+    set_target_properties(qrt_miss_split_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME qrt_miss_split_contract COMMAND qrt_miss_split_test)
+    set_tests_properties(qrt_miss_split_contract PROPERTIES LABELS "qrt;cpu")
     add_executable(qrt_cpu_moe_test cpu_moe_test.cpp cpu_moe.cpp)
     set_target_properties(qrt_cpu_moe_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     if (NOT MSVC)
