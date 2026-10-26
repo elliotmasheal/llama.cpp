@@ -5,8 +5,8 @@
 | 优先级 | 文件 | 只放什么 | 谁能改 |
 |---:|---|---|---|
 | 1 | `design/qwen36-moe-runtime-design.md` | 目标、非目标、硬约束、性能模型、里程碑与验收阈值 | 用户；agent 只读 |
-| 2 | `AGENTS.md` | 契约卡：目标阈值、铁律、门禁 id、路由表、STATE 块 | agent 每轮更新 STATE 块 |
-| 3 | `bench/state/state.json` | 任务图、依赖、资源、队列头、必读清单、当前状态 | agent 领任务/交接时改 |
+| 2 | `AGENTS.md` | 执行契约、目标、铁律、路由、STATE | 平时同步 STATE；用户授权时维护规则 |
+| 3 | `bench/state/state.json` | 任务图、依赖、资源、队列、必读与验收 | 主 agent 在领用/检查点/验收时串行改 |
 | 4 | `bench/RESULTS.md` | 实测数字的唯一来源（含口径头与 slug） | 有新读数时追加 |
 | 5 | `bench/DECISIONS.md` | 判决、已证伪、开关表、未结项 | 有判决时追加 |
 | 6 | `bench/README.md` | 口径常量、必报列、测量陷阱 | 口径变化时才改 |
@@ -14,8 +14,8 @@
 规则：
 
 - `RESULTS.md` 的实测优先于 design 的估计；design 里的数字必须在 `RESULTS.md` 有回链。
-- design 与本套文档冲突时停下，走 `docs/agent/failures.md` 的升级流程。
-- 跨口径的数字不可比。
+- design 硬约束冲突暂停受影响分支并升级；普通实现空白由 agent 查证、补契约与测试，不把所有未知交给用户。估计/草案不是正确性证据。
+- 跨口径数字不可比；上游贡献文档只作参考，不覆盖专用运行时契约。
 
 ## 2. 全量索引
 
@@ -25,12 +25,14 @@
 |---|---|---:|---|
 | `docs/agent/INDEX.md` | 找文档、查权威表、判"该读哪篇" | 4608 B | L2 |
 | `runtime/AGENTS.md` | 写或改 `runtime/` 下任何代码之前（进入该子树后自动上链，仍要确认） | 4096 B | L1 |
-| `docs/agent/cycle.md` | 走一轮、写每轮报告、加节锚点 | 4096 B | L3 |
-| `docs/agent/gates.md` | 判 pass/fail、动门禁、查 G-REG 固化数字、定质量门 | 4096 B | L3 |
-| `docs/agent/resources.md` | 多 agent 编排、抢资源、开 worktree、领用任务 | 5120 B | L3 |
-| `docs/agent/failures.md` | 重试、要停问用户、写 escalations | 2560 B | L3 |
+| `docs/agent/cycle.md` | 实施前：研究、连续实验、验收与检查点 | 4096 B | L3 |
+| `docs/agent/gates.md` | 判门、核对覆盖/阈值、查历史基线 | 5376 B | L3 |
+| `docs/agent/resources.md` | 分工、领用/续做/释放、资源冲突 | 5120 B | L3 |
+| `docs/agent/failures.md` | 实施前：排错、继续/停止、越权升级 | 2560 B | L3 |
 | `docs/agent/build.md` | 构建、ctest、找不到 DLL | 2048 B | L3 |
 | `docs/agent/repo-facts.md` | 查仓库还剩什么、能复用哪些内核或格式 | 2048 B | L3 |
+| `docs/agent/ARCH-REVIEW-2026-10-26.md` | 查架构审计结论、修复顺序与任务映射 | 16384 B | L3 |
+| `docs/agent/PERF-GAP-2026-10-26.md` | 查设计 vs 实现的性能差距归因、口径审计与区分性实验 | 16384 B | L3 |
 | `docs/agent/LAYOUT.md` | 维护这套文档体系本身（分层理由与迁移记录） | 不限 | L3 |
 | `bench/README.md` | 每次跑数之前 | 6144 B | 事件 |
 | `skills/*/SKILL.md` | 命中各自触发条件（见第 4 节） | 不限 | L3 |

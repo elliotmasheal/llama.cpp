@@ -27,33 +27,30 @@
 | `io` | machine-quiet + disk-io | 1 | `runtime/AGENTS.md` | 重组与逐字节校验，和 bench、构建互斥 |
 | `user` | 无 | 1 | - | 只有用户能做的决定；agent 准备一页选项后停 |
 
-## 3. 工作树与构建隔离
+## 3. 工作树与分工
 
-- 每个 impl agent 一个 worktree：`git worktree add ../fastLlama-<id> -b <id>/<task>`。
-- 每个 worktree 一个构建目录 `build-<id>`；不许共用 `build-vulkan`，不许两个 agent 同时构建。
-- 共享只读：模型文件、`bench/prompts/`、已有 `bench/raw/` 证据、`design/`。
+- 并行写代码的 impl agent 各用独立 worktree 与 `build-<id>`；不共用构建目录，不同时构建。单 agent 不为形式额外建 worktree。
+- 只读研究无需工作树；共享只读模型、prompt、已有原始证据和 design。
+- 按问题/路径分工，给子 agent 契约、边界和输出证据要求；避免重复搜索。主 agent 负责串联与最终复核，不能把摘要当验收。
 
-## 4. 领用协议（每个任务照做）
+## 4. 领取、续做、释放
 
-1. `state_check.py` 退出 0；该任务 `status` 是 `todo` / `partial`。
-2. 读 `--brief <id>` 打印的必读清单。
-3. 把 `status` 改成 `doing`，写 `owner`（`<agent-id>@<host>`）、`worktree`、带时区的 `claimed_at`（如 `2026-10-25T17:40:00+08:00`）。
-4. 同一 `resources` 或重叠 `paths` 的另一个 `doing` 必须已经结束。
-5. 把本 lane 队列头前移到下一个可跑任务（没有就写 `null`）。
-6. 再跑一次 `state_check.py`，退出 0 才开始。
-7. 完成时 `status = done`，补 `evidence`（RESULTS slug + 复现命令），读数进 `RESULTS.md`，判决进 `DECISIONS.md`，队列头前移，再校验、再提交。
+1. 先找本人 `doing` 并读其 `--brief`；队首已前移，不代表本人任务完成。新领任务须 `todo/partial`、依赖全部验收完成。
+2. 读必读清单；核对其他 `doing` 的资源与路径。冲突先登记 blocker，转做无冲突工作，不篡改声明规避锁。
+3. 新领写 `status=doing`、`owner=<agent-id>@<host>`、`worktree`、带时区 `claimed_at`；队首前移到下个可跑任务，无则 `null`。同步根 STATE。
+4. `state_check.py` 回 0 才执行；所需资源由本人本任务持有即可，不要求全局 `lock=free`。同一任务也不能同时启动两个重执行。
+5. 续做/阶段检查点核实本人任务仍活跃，更新 `claimed_at`，在 4 小时校验窗口内续期；续期不是重新领任务，不动别人归属。
+6. 全部验收后 `done`，补命令、产物、判决引用等 `evidence`；部分完成不标 done。暂停写 `partial/blocked`、下一命令/判据，确认进程退出再释放资源；重执行仍在跑就不能释放锁。
+7. 更新队列与 STATE，再校验；有授权才提交。可连续完成多个相关闭环，不在每次领取后请求下一步。
 
-**接管**：`doing` 且 `claimed_at` 超过 4 小时、或 `owner` 与自己的 agent id 不一致且已超时，才可以接管；接管时同时改写 `owner` 与 `claimed_at`，并在提交信息里写明接管原因。
+**超时不是接管授权**：先核对 owner、工作树与进程。原任务仍在运行则等待；确认已停止且收到移交/接管授权后才改 owner/时间并记原因。无法确认就阻塞，不杀进程、不强夺锁。
 
-**编辑方式**：`state.json` 直接编辑（保持 2 空格缩进），由 `state_check.py` 校验。不提供写 JSON 的工具，避免重排整份文件产生巨大 diff。
+**状态编辑**：由主 agent 串行编辑 `state.json`，保留 2 空格与小 diff，写前重读，写后校验。脚本没有 CAS/自动心跳；多个工作树的状态副本不是全局互斥，重执行前必须与协调者的最新持锁状态对账。
 
-## 5. 路径所有权
+## 5. 路径与任务边界
 
-- `task.paths` 是该任务的写权限；段级 glob 重叠即冲突（`state_check.py` 用 `fnmatch` 逐段比较，通配符吃掉剩余段才算重叠）。
-- 改别人的路径前先改 `state.json` 的归属并记录原因。
-- 合入顺序按 `deps`；一个任务一个提交；冲突由后合入者解决，不许 force push，不许改别人的提交。
-- 发现任务拆分不对：先改 `state.json`（拆任务、改 deps/paths/reads），跑通 `state_check.py`，再动手。
-
-## 6. 排班建议
-
-1 个 bench agent + 2-3 个 impl agent + 1 个 data agent。data 先产出 bench 需要的输入（非技术语料、受限词表、KV 预算），bench 才不会空转；impl 在决策门未过时只做工具与原型。
+- `task.paths` 限定任务写范围；重叠路径不并行。协作变更先获原 owner 移交并记录，不靠改归属抢占。
+- 用户明确指定的文档/流程维护可直接开展，先核对在途路径，不冒领 GPU 任务；进入重执行仍须声明资源。
+- 范围内缺少必要测试或依赖任务时，主 agent 可补 paths/reads、拆分任务并记录理由，校验后继续；不得降低 done_when、删验收依赖或越过 design。
+- 按依赖合入，有授权时一个可验收增量一个提交；保留他人工作，不 force push，不改别人提交。
+- bench 保持唯一重执行队；实现和研究可并行，未过决策门不擅自进入被门禁阻断的阶段。
