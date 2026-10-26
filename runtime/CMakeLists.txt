@@ -4,6 +4,7 @@
 
 add_library(qrt_core STATIC
     qrt_config.cpp
+    qrt_cli.cpp
     expert_cache.cpp
     miss_split.cpp
     cpu_moe.cpp
@@ -21,6 +22,7 @@ add_library(qrt_core STATIC
     layer.cpp
     model.cpp
     ffn.cpp
+    moe.cpp
     vk_dev.cpp)
 
 target_include_directories(qrt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -234,6 +236,9 @@ add_executable(qrt qrt_main.cpp)
 target_link_libraries(qrt PRIVATE qrt_core)
 target_include_directories(qrt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(qrt PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+if (NOT MSVC)
+    target_link_options(qrt PRIVATE -fopenmp)
+endif()
 
 # The shaders land next to qrt.exe, which is where the checks look by default. The copy
 # must be its own target: a POST_BUILD step on qrt only fires when qrt relinks, so a
@@ -258,6 +263,16 @@ endif()
 if (BUILD_TESTING)
     add_test(NAME qrt_selftest COMMAND qrt --selftest)
     set_tests_properties(qrt_selftest PROPERTIES LABELS "qrt;cpu")
+    add_executable(qrt_model_test model_test.cpp qrt_config.cpp)
+    set_target_properties(qrt_model_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME qrt_model_contract COMMAND qrt_model_test)
+    set_tests_properties(qrt_model_contract PROPERTIES LABELS "qrt;cpu")
+    find_package(Threads REQUIRED)
+    add_executable(qrt_prefill_test prefill_test.cpp prefill.cpp)
+    target_link_libraries(qrt_prefill_test PRIVATE Threads::Threads)
+    set_target_properties(qrt_prefill_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME qrt_prefill_contract COMMAND qrt_prefill_test)
+    set_tests_properties(qrt_prefill_contract PROPERTIES LABELS "qrt;cpu")
     add_executable(qrt_cache_test expert_cache_test.cpp expert_cache.cpp)
     set_target_properties(qrt_cache_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     add_test(NAME qrt_cache_contract COMMAND qrt_cache_test)
@@ -274,4 +289,18 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME qrt_cpu_moe_contract COMMAND qrt_cpu_moe_test)
     set_tests_properties(qrt_cpu_moe_contract PROPERTIES LABELS "qrt;cpu")
+    add_custom_target(qrt_checks DEPENDS qrt qrt_model_test qrt_prefill_test qrt_cache_test
+                      qrt_miss_split_test qrt_cpu_moe_test)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME qrt_cli_contract
+            COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/../bench/tools/quality/runtime_selftest.py
+                --qrt $<TARGET_FILE:qrt>)
+        set_tests_properties(qrt_cli_contract PROPERTIES LABELS "qrt;cpu")
+        add_test(NAME qrt_workflow_contract
+            COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/../bench/tools/quality/workflow_test.py)
+        set_tests_properties(qrt_workflow_contract PROPERTIES LABELS "qrt;cpu")
+    endif()
 endif()

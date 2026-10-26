@@ -31,7 +31,7 @@ struct qrt_config {
     int32_t      prefill_chunk;
     int32_t      kv_k;            // enum qrt_kv_precision, K cache (U-10: independent)
     int32_t      kv_v;            // enum qrt_kv_precision, V cache
-    int32_t      kv_page_tokens;  // resident KV window
+    int32_t      kv_page_tokens;  // host paging granularity
     int32_t      telemetry;       // 0 = off, 1 = one CSV row per pass
     const char * telemetry_path;  // not copied: argv and env live for the process
     int32_t      vram_tier_mib;   // runtime extension: cap the VRAM budget, 0 = auto
@@ -39,8 +39,7 @@ struct qrt_config {
 
 void qrt_config_defaults(qrt_config * cfg);
 
-// Applies the environment, then argv. Returns 0 on success, -1 with a message in
-// err on the first bad value; calling qrt_config_defaults again recovers.
+// CLI overrides environment; a failed parse leaves cfg unchanged.
 int qrt_config_parse(qrt_config * cfg, int argc, char ** argv, char * err, size_t err_size);
 
 // Rejects values that would silently change the meaning of a switch.

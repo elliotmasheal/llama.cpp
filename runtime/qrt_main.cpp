@@ -1,7 +1,5 @@
-// qrt - the qwen36 MoE runtime. M2-0 scaffold: the design section 7 switches, the
-// telemetry sink and a selftest. No model, no Vulkan device, no engine yet.
-
 #include "qrt_config.h"
+#include "qrt_cli.h"
 #include "qrt_telemetry.h"
 #include "gguf_index.h"
 #include "vk_dev.h"
@@ -11,6 +9,8 @@
 #include "attn_full.h"
 #include "layer.h"
 #include "model.h"
+#include "expert_cache.h"
+#include "moe.h"
 #include "kernels/norm.h"
 #include "kernels/moe_expert.h"
 
@@ -20,10 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
-
-static const char QRT_VERSION[] = "0.1-m2-0";
 
 static int g_failures = 0;
 
@@ -448,10 +447,9 @@ static int qrt_norm_check(const qrt_config * cfg, const char * gguf_path, const 
         qrt_vk_close(dev);
         return 2;
     }
-    if (tokens < 64) {
-        tokens = 64;
+    if (tokens == 0) {
+        tokens = 1;
     }
-    tokens = (tokens + 31u) / 32u * 32u;
 
     std::vector<float> w((size_t) k);
     if (qrt_gguf_read_tensor(g, tw, w.data(), (size_t) k * sizeof(float), err, sizeof(err)) != 0) {
@@ -500,22 +498,26 @@ static int qrt_norm_check(const qrt_config * cfg, const char * gguf_path, const 
     VkDeviceMemory gm = VK_NULL_HANDLE;
     qrt_vk_staging * stg = NULL;
     do {
+        const uint32_t alloc_tokens = tokens < 2u ? 2u : tokens;
         const uint64_t x_bytes  = (uint64_t) tokens * k * 4;
         const uint64_t qs_bytes = (uint64_t) tokens * k;
         const uint64_t ds_bytes = (uint64_t) tokens * blocks * 4;
         const uint64_t out_bytes = x_bytes;
+        const uint64_t x_alloc  = (uint64_t) alloc_tokens * k * 4;
+        const uint64_t qs_alloc = (uint64_t) alloc_tokens * k;
+        const uint64_t ds_alloc = (uint64_t) alloc_tokens * blocks * 4;
         const uint64_t gout_bytes = (uint64_t) n * tokens * 4;
-        const uint64_t stg_bytes = x_bytes > gout_bytes ? (x_bytes > wbytes_n ? x_bytes : wbytes_n)
+        const uint64_t stg_bytes = x_alloc > gout_bytes ? (x_alloc > wbytes_n ? x_alloc : wbytes_n)
                                                         : (gout_bytes > wbytes_n ? gout_bytes : wbytes_n);
         const VkBufferUsageFlags usage = QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
                                          QRT_VK_USAGE_TRANSFER_DST;
         if (qrt_gemm_open(dev, spv_dir, &gemm, err, sizeof(err)) != 0 ||
             qrt_norm_open(dev, spv_dir, &nrm, err, sizeof(err)) != 0 ||
-            qrt_vk_alloc(dev, x_bytes, usage, &xb, &xm, err, sizeof(err)) != 0 ||
+            qrt_vk_alloc(dev, x_alloc, usage, &xb, &xm, err, sizeof(err)) != 0 ||
             qrt_vk_alloc(dev, (uint64_t) k * 4, usage, &wb, &wm, err, sizeof(err)) != 0 ||
-            qrt_vk_alloc(dev, out_bytes, usage, &ob, &om, err, sizeof(err)) != 0 ||
-            qrt_vk_alloc(dev, qs_bytes, usage, &qsb, &qsm, err, sizeof(err)) != 0 ||
-            qrt_vk_alloc(dev, ds_bytes, usage, &dsb, &dsm, err, sizeof(err)) != 0 ||
+            qrt_vk_alloc(dev, x_alloc, usage, &ob, &om, err, sizeof(err)) != 0 ||
+            qrt_vk_alloc(dev, qs_alloc, usage, &qsb, &qsm, err, sizeof(err)) != 0 ||
+            qrt_vk_alloc(dev, ds_alloc, usage, &dsb, &dsm, err, sizeof(err)) != 0 ||
             qrt_vk_alloc(dev, wbytes_n, usage, &wbuf, &wbm, err, sizeof(err)) != 0 ||
             qrt_vk_alloc(dev, gout_bytes, usage, &gout, &gm, err, sizeof(err)) != 0 ||
             qrt_vk_staging_create(dev, stg_bytes, &stg, err, sizeof(err)) != 0) {
@@ -607,7 +609,7 @@ static int qrt_norm_check(const qrt_config * cfg, const char * gguf_path, const 
             fprintf(stderr, "qrt: %s\n", err);
             break;
         }
-        const uint32_t rows = 32, cols = 64;
+        const uint32_t rows = 32, cols = tokens < 64u ? tokens : 64u;
         std::vector<float> got((size_t) n * cols);
         // The dense output is [n][m], so one compared row is a 64-float slice at row * m.
         for (uint32_t row = 0; row < rows; ++row) {
@@ -646,6 +648,39 @@ static int qrt_norm_check(const qrt_config * cfg, const char * gguf_path, const 
         printf("norm_gemm n=%u k=%u m=%u rows=%u cols=%u rel_l1=%.3e verdict=%s\n", n, k, tokens,
                rows, cols, grel, chain_ok ? "PASS" : "FAIL");
 
+        // C high-precision slice: the same device projection against a float-activation
+        // reference. The weights are still the model's q8_0 values (dequantised in double);
+        // only the activation side skips Q8_1. This isolates the activation quantiser error
+        // on the largest dense leg without a second device path.
+        double fnum = 0.0, fden = 0.0, fmax = 0.0;
+        for (uint32_t row = 0; row < rows; ++row) {
+            const unsigned char * wrow = wraw.data() + (size_t) row * blocks * 34u;
+            for (uint32_t tok = 0; tok < cols; ++tok) {
+                double acc = 0.0;
+                for (uint32_t b = 0; b < blocks; ++b) {
+                    const unsigned char * blk = wrow + (size_t) b * 34u;
+                    const uint32_t dh = (uint32_t) blk[0] | ((uint32_t) blk[1] << 8);
+                    const float d = f16_to_f32_local(dh);
+                    double sub = 0.0;
+                    for (uint32_t e = 0; e < 32u; ++e) {
+                        sub += (double) (int8_t) blk[2 + e] *
+                               (double) got_out[(size_t) tok * k + b * 32u + e];
+                    }
+                    acc += sub * (double) d;
+                }
+                const double a = (double) got[(size_t) row * cols + tok];
+                const double diff = fabs(a - acc);
+                fnum += diff;
+                fden += fabs(acc);
+                fmax = fmax > diff ? fmax : diff;
+            }
+        }
+        const double frel = fden > 0.0 ? fnum / fden : fnum;
+        const int f32_ok = frel <= 1e-2;
+        printf("norm_gemm_f32 n=%u k=%u m=%u rows=%u cols=%u rel_l1=%.3e max_abs=%.3e "
+               "verdict=%s\n", n, k, tokens, rows, cols, frel, fmax,
+               f32_ok ? "PASS" : "FAIL");
+
         // Timing: the norm leg alone, then the pair as the layer would run it.
         double tn[5], tg[5];
         int timed = 1;
@@ -674,7 +709,63 @@ static int qrt_norm_check(const qrt_config * cfg, const char * gguf_path, const 
                    norm_ms * 1000.0 / (double) tokens, moved / norm_ms / 1e6, gemm_ms,
                    norm_ms + gemm_ms, (norm_ms + gemm_ms) * 1000.0 / (double) tokens);
         }
-        rc = (norm_ok && plane_ok && chain_ok) ? 0 : 1;
+
+        // A: the quantiser itself, on identical f32 inputs. This bypasses the RMS
+        // reduction: the normalised row above can differ by one ulp between the shader and
+        // the double CPU norm, which is an arithmetic difference, not a quantiser rule.
+        std::vector<float> bx((size_t) 2 * k, 0.0f);
+        const float ties[16] = { 127.0f, 0.5f, -0.5f, 1.5f, -1.5f, 126.5f, -126.5f, 64.5f,
+                                 -64.5f, 2.5f, -2.5f, 63.5f, -63.5f, 0.0f, -0.0f, 1.0f };
+        for (uint32_t i = 0; i < 16u; ++i) {
+            bx[i] = ties[i];
+        }
+        bx[k + 0u] = 1.0e-30f;
+        bx[k + 1u] = -1.0e-30f;
+        bx[k + 2u] = 1.0e-38f;
+        bx[k + 3u] = -1.0e-38f;
+        bx[k + 4u] = 3.0e-39f;
+        bx[k + 5u] = 7.0e-39f;
+        std::vector<unsigned char> bq((size_t) 2 * k);
+        std::vector<uint32_t> bd((size_t) 2 * blocks);
+        std::vector<signed char> bqr((size_t) 2 * k);
+        std::vector<uint32_t> bdr((size_t) 2 * blocks);
+        if (qrt_vk_upload(dev, stg, xb, 0, bx.data(), (uint64_t) 2 * k * 4, err,
+                          sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            break;
+        }
+        qrt_norm_args qa = na;
+        qa.tokens = 2;
+        qa.no_norm = 1;
+        qa.no_out = 1;
+        if (qrt_norm_run(nrm, &qa, err, sizeof(err)) != 0 ||
+            qrt_vk_download(dev, stg, qsb, 0, bq.data(), (uint64_t) 2 * k, err,
+                            sizeof(err)) != 0 ||
+            qrt_vk_download(dev, stg, dsb, 0, bd.data(), (uint64_t) 2 * blocks * 4, err,
+                            sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            break;
+        }
+        qrt_norm_quant_cpu(2, k, bx.data(), NULL, bqr.data(), bdr.data());
+        uint32_t bq_bad = 0, bd_bad = 0, bs_bad = 0, bq_max = 0;
+        for (uint32_t b = 0; b < 2u * blocks; ++b) {
+            int bad = 0;
+            for (uint32_t i = 0; i < 32u; ++i) {
+                const int a = (int) (signed char) bq[(size_t) b * 32u + i];
+                const int r = (int) bqr[(size_t) b * 32u + i];
+                const int diff = abs(a - r);
+                bad |= diff != 0;
+                bq_max = (uint32_t) (diff > (int) bq_max ? diff : (int) bq_max);
+            }
+            bq_bad += (uint32_t) bad;
+            bd_bad += (bd[b] & 0xFFFFu) != (bdr[b] & 0xFFFFu) ? 1u : 0u;
+            bs_bad += (bd[b] >> 16) != (bdr[b] >> 16) ? 1u : 0u;
+        }
+        const int quant_ok = bq_bad == 0 && bd_bad == 0 && bs_bad == 0;
+        printf("norm_quant tokens=2 blocks=%u qs_bad=%u ds_bad=%u sum_bad=%u maxdiff=%u "
+               "verdict=%s\n", 2u * blocks, bq_bad, bd_bad, bs_bad, bq_max,
+               quant_ok ? "PASS" : "FAIL");
+        rc = (norm_ok && plane_ok && chain_ok && quant_ok && f32_ok) ? 0 : 1;
     } while (0);
 
     qrt_vk_staging_destroy(dev, stg);
@@ -743,7 +834,10 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
         qrt_prefill * warm = NULL;
         if (qrt_prefill_open(dev, w, &wcfg, &warm, err, sizeof(err)) == 0) {
             qrt_prefill_stats wst;
-            if (qrt_prefill_run(warm, ids.data(), experts, counts.data(), NULL, NULL,
+            qrt_prefill_backend upload_only{};
+            upload_only.compute = [](void *, uint32_t, uint32_t, VkBuffer, uint64_t,
+                                      uint64_t, char *, size_t) { return 0; };
+            if (qrt_prefill_run(warm, ids.data(), experts, counts.data(), &upload_only,
                                 &wst, err, sizeof(err)) == 0) {
                 printf("prefill_warmup slots=%u blocks=%u bytes=%llu ms=%.1f per_block_ms=%.3f\n",
                        wcfg.slots, wst.blocks_done, (unsigned long long) wst.bytes,
@@ -805,16 +899,16 @@ static int qrt_prefill_check(const qrt_config * cfg, const char * prefix, const 
             rc = 2;
             break;
         }
-        qrt_prefill_compute_fn compute = use_moe ? qrt_moe_compute : qrt_prefill_probe_compute;
-        void * user = use_moe ? (void *) moe : (void *) probe;
+        const qrt_prefill_backend backend = use_moe
+            ? qrt_prefill_backend{qrt_moe_compute, qrt_moe_compute_batch, qrt_moe_wait, moe}
+            : qrt_prefill_backend{qrt_prefill_probe_compute, nullptr, nullptr, probe};
         const uint32_t skipped_before = use_moe && moe != NULL ? qrt_moe_down_skipped(moe) : 0;
         qrt_prefill_stats st;
         const int rc_run = layer_batch
-                           ? qrt_prefill_run_layers(p, ids.data(), experts, counts.data(),
-                                                    qrt_moe_compute_batch, qrt_moe_wait, moe,
+                           ? qrt_prefill_run_layers(p, ids.data(), experts, counts.data(), &backend,
                                                     &st, err, sizeof(err))
-                           : qrt_prefill_run(p, ids.data(), experts, counts.data(), compute,
-                                             user, &st, err, sizeof(err));
+                           : qrt_prefill_run(p, ids.data(), experts, counts.data(), &backend,
+                                             &st, err, sizeof(err));
         if (rc_run != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             rc = 2;
@@ -961,6 +1055,23 @@ static int qrt_selftest(void) {
         c.kv_k = 9;
         expect(qrt_config_validate(&c, err, sizeof(err)) != 0,
                "validate rejects a KV precision outside f16/q8_0/q4_0");
+        qrt_config_defaults(&c);
+        c.draft_vocab = 262145;
+        expect(qrt_config_validate(&c, err, sizeof(err)) != 0,
+               "validate and CLI share the draft vocabulary upper bound");
+    }
+
+    {
+        qrt_config c;
+        qrt_config_defaults(&c);
+        const char * bad[] = { "--spec-k", "2", "--kv-v", "bad" };
+        expect(parse_argv(&c, 4, bad, err, sizeof(err)) != 0 && c.spec_k == 4 &&
+               c.kv_v == QRT_KV_Q4_0, "a rejected configuration is not partially applied");
+        set_env("QRT_SPEC_K", "bad");
+        const char * good[] = { "--spec-k", "4" };
+        expect(parse_argv(&c, 2, good, err, sizeof(err)) == 0 && c.spec_k == 4,
+               "an explicit CLI value overrides an invalid environment value");
+        set_env("QRT_SPEC_K", NULL);
     }
 
     {
@@ -969,11 +1080,7 @@ static int qrt_selftest(void) {
         qrt_config_defaults(&c);
         const int ok = parse_argv(&c, 2, low, err, sizeof(err)) == 0 &&
                        qrt_config_validate(&c, err, sizeof(err)) == 0;
-        FILE * sink = tmpfile();
-        const int notes = sink != NULL ? qrt_config_notes(&c, sink) : 0;
-        if (sink != NULL) {
-            fclose(sink);
-        }
+        const int notes = qrt_config_notes(&c, stdout);
         expect(ok && notes >= 1, "a legal but costly value is a note, not an error");
     }
 
@@ -1406,593 +1513,289 @@ static int qrt_vk_io_check(const qrt_config * cfg, const char * prefix) {
     return bad == 0 ? 0 : 1;
 }
 
-int main(int argc, char ** argv) {
-    // Unbuffered stdout: a device loss or an access violation kills the process before
-    // the CRT flushes, and every line already printed was being lost. That turned three
-    // debugging rounds on M2-6c into guesses (DECISIONS 56.1/56.2).
-    setvbuf(stdout, NULL, _IONBF, 0);
-    int print_config = 0;
-    int vk_info = 0;
-    int vk_probe_mib = 0;
-    int vk_io_check = 0;
-    const char * dense_gguf = NULL;
-    const char * prefill_prefix = NULL;
-    const char * prefill_shader = NULL;
-    int prefill_slots = 8;
-    int prefill_layers = 4;
-    int prefill_compute_moe = 1;
-    int prefill_layer_batch = 1;
-    int prefill_pipeline = 1;
-    int prefill_group_kib = 16384;
-    int prefill_readers = 1;
-    int prefill_chunks = 1;
-    const char * dense_gguf_check = NULL;
-    const char * dense_tensor = "blk.3.attn_q.weight";
-    int dense_tokens = 10240;
-    int dense_rows = 64;
-    const char * norm_gguf_check = NULL;
-    const char * norm_tensor = "blk.3.attn_norm.weight";
-    const char * layer_gguf_check = NULL;
-    const char * layer_store = NULL;
-    int layer_index = 3;
-    int layer_tokens = 256;
-    int layer_ffn = 1;
-    int layer_pass = 1;
-    int dn_recur = 1;
-    const char * moe_prefix = NULL;
-    int moe_layer = 0;
-    int moe_expert = 0;
-    int moe_rows = 64;
-    const char * repack_prefix = NULL;
-    const char * gguf_path = NULL;
-    const char * require_tensor = NULL;
-    const char * deltanet_gguf = NULL;
-    int deltanet_layer = 0;
-    int deltanet_tokens = 256;
-    const char * fullattn_gguf = NULL;
-    int fullattn_layer = 3;          // the first full-attention layer of this model
-    int fullattn_tokens = 1024;
-    int fullattn_resident = 0;       // 0 = the whole context in VRAM
-    int fullattn_page = 0;           // 0 = the configured page granularity
-    const char * logits_gguf = NULL;
-    const char * logits_out = NULL;
-    const char * logits_tokens = NULL;
-    int logits_layers = 40;
-    int logits_rows = 8;
+static double moe_rel_l1(const float * a, const float * b, size_t n) {
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        num += fabs((double) a[i] - (double) b[i]);
+        den += fabs((double) b[i]);
+    }
+    return den > 0.0 ? num / den : num;
+}
 
-    {
-        const char * exe = argc > 0 ? argv[0] : "qrt";
-        const char * cut = strrchr(exe, '/');
-        const char * cutb = strrchr(exe, '\\');
-        const char * slash = cut > cutb ? cut : cutb;
-        if (slash != NULL) {
-            snprintf(g_spv_dir, sizeof(g_spv_dir), "%.*s", (int) (slash - exe), exe);
-        }
-    }
-    std::vector<char *> args;
-    args.push_back(argc > 0 ? argv[0] : lit("qrt"));
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            qrt_config_print_switches(stdout);
-            return 0;
-        }
-        if (strcmp(argv[i], "--selftest") == 0) {
-            return qrt_selftest();
-        }
-        if (strcmp(argv[i], "--print-config") == 0) {
-            print_config = 1;
-            continue;
-        }
-        if (strcmp(argv[i], "--vk-info") == 0) {
-            vk_info = 1;
-            continue;
-        }
-        if (strcmp(argv[i], "--vk-io-check") == 0) {
-            vk_io_check = 1;
-            continue;
-        }
-        if (strcmp(argv[i], "--dense-check") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --dense-check needs the GGUF path\n");
-                return 2;
-            }
-            dense_gguf = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--prefill-check") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --prefill-check needs the repack prefix\n");
-                return 2;
-            }
-            prefill_prefix = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--prefill-shader") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --prefill-shader needs the SPIR-V path\n");
-                return 2;
-            }
-            prefill_shader = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--prefill-compute") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --prefill-compute wants probe or moe\n");
-                return 2;
-            }
-            const char * v = argv[++i];
-            if (strcmp(v, "moe") == 0) {
-                prefill_compute_moe = 1;
-            } else if (strcmp(v, "probe") == 0) {
-                prefill_compute_moe = 0;
-            } else {
-                fprintf(stderr, "qrt: --prefill-compute wants probe or moe, not '%s'\n", v);
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--prefill-chunks") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --prefill-chunks wants a count\n");
-                return 2;
-            }
-            prefill_chunks = atoi(argv[++i]);
-            if (prefill_chunks < 1 || prefill_chunks > 16) {
-                fprintf(stderr, "qrt: --prefill-chunks wants 1..16\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--prefill-readers") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --prefill-readers wants a count\n");
-                return 2;
-            }
-            prefill_readers = atoi(argv[++i]);
-            if (prefill_readers < 1 || prefill_readers > 16) {
-                fprintf(stderr, "qrt: --prefill-readers wants 1..16\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--prefill-group-kib") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --prefill-group-kib wants a size in KiB (0 = one per expert)\n");
-                return 2;
-            }
-            prefill_group_kib = atoi(argv[++i]);
-            if (prefill_group_kib < 0) {
-                fprintf(stderr, "qrt: --prefill-group-kib wants a non-negative size\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--prefill-pipeline") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --prefill-pipeline wants 0 or 1\n");
-                return 2;
-            }
-            prefill_pipeline = atoi(argv[++i]) ? 1 : 0;
-            continue;
-        }
-        if (strcmp(argv[i], "--prefill-mode") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --prefill-mode wants perexpert or layer\n");
-                return 2;
-            }
-            const char * v = argv[++i];
-            if (strcmp(v, "layer") == 0) {
-                prefill_layer_batch = 1;
-            } else if (strcmp(v, "perexpert") == 0) {
-                prefill_layer_batch = 0;
-            } else {
-                fprintf(stderr, "qrt: --prefill-mode wants perexpert or layer, not '%s'\n", v);
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--layer-check") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --layer-check needs the GGUF path\n");
-                return 2;
-            }
-            layer_gguf_check = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--layer") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --layer needs an index\n");
-                return 2;
-            }
-            layer_index = atoi(argv[++i]);
-            if (layer_index < 0) {
-                fprintf(stderr, "qrt: --layer wants a non-negative index\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--layer-tokens") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --layer-tokens needs a count\n");
-                return 2;
-            }
-            layer_tokens = atoi(argv[++i]);
-            if (layer_tokens < 64) {
-                fprintf(stderr, "qrt: --layer-tokens wants at least 64\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--layer-store") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --layer-store needs the repack prefix\n");
-                return 2;
-            }
-            layer_store = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--layer-ffn") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --layer-ffn wants on or off\n");
-                return 2;
-            }
-            const char * v = argv[++i];
-            if (strcmp(v, "on") == 0) {
-                layer_ffn = 1;
-            } else if (strcmp(v, "off") == 0) {
-                layer_ffn = 0;
-            } else {
-                fprintf(stderr, "qrt: --layer-ffn wants on or off, not '%s'\n", v);
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--layer-pass") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --layer-pass wants on or off\n");
-                return 2;
-            }
-            const char * v = argv[++i];
-            if (strcmp(v, "on") == 0) {
-                layer_pass = 1;
-            } else if (strcmp(v, "off") == 0) {
-                layer_pass = 0;
-            } else {
-                fprintf(stderr, "qrt: --layer-pass wants on or off, not '%s'\n", v);
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--dn-recur") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --dn-recur wants serial or cols\n");
-                return 2;
-            }
-            const char * v = argv[++i];
-            if (strcmp(v, "serial") == 0) {
-                dn_recur = 0;
-            } else if (strcmp(v, "cols") == 0) {
-                dn_recur = 1;
-            } else {
-                fprintf(stderr, "qrt: --dn-recur wants serial or cols, not '%s'\n", v);
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--norm-check") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --norm-check needs the GGUF path\n");
-                return 2;
-            }
-            norm_gguf_check = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--norm-tensor") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --norm-tensor needs a tensor name\n");
-                return 2;
-            }
-            norm_tensor = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--dense-gemm-check") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --dense-gemm-check needs the GGUF path\n");
-                return 2;
-            }
-            dense_gguf_check = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--dense-tensor") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --dense-tensor needs a tensor name\n");
-                return 2;
-            }
-            dense_tensor = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--deltanet-check") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --deltanet-check needs the GGUF path\n");
-                return 2;
-            }
-            deltanet_gguf = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--deltanet-layer") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --deltanet-layer needs an index\n");
-                return 2;
-            }
-            deltanet_layer = atoi(argv[++i]);
-            if (deltanet_layer < 0) {
-                fprintf(stderr, "qrt: --deltanet-layer wants a layer index\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--deltanet-tokens") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --deltanet-tokens needs a count\n");
-                return 2;
-            }
-            deltanet_tokens = atoi(argv[++i]);
-            if (deltanet_tokens < 16) {
-                fprintf(stderr, "qrt: --deltanet-tokens wants at least 16\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--fullattn-check") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --fullattn-check needs the GGUF path\n");
-                return 2;
-            }
-            fullattn_gguf = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--fullattn-layer") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --fullattn-layer needs an index\n");
-                return 2;
-            }
-            fullattn_layer = atoi(argv[++i]);
-            if (fullattn_layer < 0) {
-                fprintf(stderr, "qrt: --fullattn-layer wants a layer index\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--fullattn-tokens") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --fullattn-tokens needs a count\n");
-                return 2;
-            }
-            fullattn_tokens = atoi(argv[++i]);
-            if (fullattn_tokens < 16) {
-                fprintf(stderr, "qrt: --fullattn-tokens wants at least 16\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--fullattn-resident") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --fullattn-resident needs a token count\n");
-                return 2;
-            }
-            fullattn_resident = atoi(argv[++i]);
-            if (fullattn_resident < 0) {
-                fprintf(stderr, "qrt: --fullattn-resident wants 0 or more\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--fullattn-page") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --fullattn-page needs a token count\n");
-                return 2;
-            }
-            fullattn_page = atoi(argv[++i]);
-            if (fullattn_page < 0) {
-                fprintf(stderr, "qrt: --fullattn-page wants 0 or more\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--logits-dump") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --logits-dump needs the GGUF path\n");
-                return 2;
-            }
-            logits_gguf = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--logits-out") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --logits-out needs a path\n");
-                return 2;
-            }
-            logits_out = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--logits-tokens") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --logits-tokens needs a token id file\n");
-                return 2;
-            }
-            logits_tokens = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--logits-layers") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --logits-layers needs a count\n");
-                return 2;
-            }
-            logits_layers = atoi(argv[++i]);
-            if (logits_layers < 0) {
-                fprintf(stderr, "qrt: --logits-layers wants 0 or more\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--logits-rows") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --logits-rows needs a count\n");
-                return 2;
-            }
-            logits_rows = atoi(argv[++i]);
-            if (logits_rows < 1) {
-                fprintf(stderr, "qrt: --logits-rows wants at least 1\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--dense-rows") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --dense-rows needs a count\n");
-                return 2;
-            }
-            dense_rows = atoi(argv[++i]);
-            if (dense_rows < 1) {
-                fprintf(stderr, "qrt: --dense-rows wants at least 1\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--dense-tokens") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --dense-tokens needs a count\n");
-                return 2;
-            }
-            dense_tokens = atoi(argv[++i]);
-            if (dense_tokens < 64) {
-                fprintf(stderr, "qrt: --dense-tokens wants at least 64\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--moe-check") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --moe-check needs the repack prefix\n");
-                return 2;
-            }
-            moe_prefix = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--moe-layer") == 0 || strcmp(argv[i], "--moe-expert") == 0 ||
-            strcmp(argv[i], "--moe-rows") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: %s needs a value\n", argv[i]);
-                return 2;
-            }
-            const int v = atoi(argv[++i]);
-            if (v < 0) {
-                fprintf(stderr, "qrt: %s wants a non-negative value\n", argv[i - 1]);
-                return 2;
-            }
-            if (strcmp(argv[i - 1], "--moe-layer") == 0) {
-                moe_layer = v;
-            } else if (strcmp(argv[i - 1], "--moe-expert") == 0) {
-                moe_expert = v;
-            } else {
-                moe_rows = v;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--prefill-slots") == 0) {            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --prefill-slots needs a count\n");
-                return 2;
-            }
-            prefill_slots = atoi(argv[++i]);
-            if (prefill_slots < 1 || prefill_slots > 64) {
-                fprintf(stderr, "qrt: --prefill-slots wants 1..64\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--prefill-layers") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --prefill-layers needs a count\n");
-                return 2;
-            }
-            prefill_layers = atoi(argv[++i]);
-            if (prefill_layers < 1) {
-                fprintf(stderr, "qrt: --prefill-layers wants a positive count\n");
-                return 2;
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--repack") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --repack needs the prefix without .qwen36rt.bin/.idx\n");
-                return 2;
-            }
-            repack_prefix = argv[++i];
-            continue;
-        }
-        if (strcmp(argv[i], "--vk-alloc-probe") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: --vk-alloc-probe needs a size in MiB\n");
-                return 2;
-            }
-            vk_probe_mib = atoi(argv[++i]);
-            if (vk_probe_mib <= 0) {
-                fprintf(stderr, "qrt: --vk-alloc-probe wants a positive MiB count\n");
-                return 2;
-            }
-            continue;
-        }
-        const int is_index = strcmp(argv[i], "--gguf-index") == 0;
-        const int is_require = strcmp(argv[i], "--require-tensor") == 0;
-        if (is_index || is_require) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "qrt: %s needs a value\n", argv[i]);
-                return 2;
-            }
-            if (is_index) {
-                gguf_path = argv[++i];
-            } else {
-                require_tensor = argv[++i];
-            }
-            continue;
-        }
-        args.push_back(argv[i]);
-    }
-    args.push_back(NULL);
-
-    qrt_config cfg;
-    qrt_config_defaults(&cfg);
-    char err[QRT_ERR_SIZE] = {0};
-    if (qrt_config_parse(&cfg, (int) args.size() - 1, args.data(), err, sizeof(err)) != 0) {
-        fprintf(stderr, "qrt: %s\n", err);
-        fprintf(stderr, "qrt: run 'qrt --help' for the switch table; nothing was allocated or opened\n");
-        return 2;
-    }
-    if (qrt_config_validate(&cfg, err, sizeof(err)) != 0) {
+static int qrt_moe_batch_check(const qrt_config * cfg, const char * gguf_path,
+                               const char * store_prefix, uint32_t layer, const char * spv_dir) {
+    char err[QRT_ERR_SIZE] = {};
+    qrt_gguf * g = NULL;
+    if (qrt_gguf_open(gguf_path, &g, err, sizeof(err)) != 0) {
         fprintf(stderr, "qrt: %s\n", err);
         return 2;
     }
-    qrt_config_notes(&cfg, stderr);
-
-    if (repack_prefix != NULL && !vk_io_check) {
-        fprintf(stderr, "qrt: --repack is only read by --vk-io-check\n");
+    const qrt_gguf_hparams hp = *qrt_gguf_hparams_of(g);
+    qrt_gguf_close(g);
+    const uint32_t E = (uint32_t) hp.n_embd;
+    const uint32_t NE = (uint32_t) hp.expert_count;
+    const uint32_t K = (uint32_t) hp.expert_used_count;
+    if (E == 0 || E % 32 != 0 || NE == 0 || K == 0 || K > 8) {
+        fprintf(stderr, "qrt: GGUF has n_embd=%d experts=%d top_k=%d\n", hp.n_embd,
+                hp.expert_count, hp.expert_used_count);
         return 2;
     }
-
-    if (print_config) {
-        qrt_config_print_effective(&cfg, stdout);
-        return 0;
+    qrt_vk_dev * dev = NULL;
+    if (qrt_vk_open((uint32_t) cfg->vram_tier_mib, &dev, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        return 2;
     }
+    const uint32_t max_tokens = 8;
+    std::vector<float> x((size_t) max_tokens * E), ones(E, 1.0f);
+    std::vector<float> xnorm((size_t) max_tokens * E);
+    std::vector<signed char> qs((size_t) max_tokens * E);
+    std::vector<uint32_t> ds((size_t) max_tokens * (E / 32u));
+    uint32_t seed = 0x5EED1234u;
+    for (size_t i = 0; i < x.size(); ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        x[i] = (float) ((int32_t) ((seed >> 8) % 2001u) - 1000) * 0.001f;
+    }
+    qrt_norm_cpu(max_tokens, E, x.data(), ones.data(), 1e-6f, xnorm.data(), qs.data(),
+                 ds.data());
+    qrt_batch_moe * serial = NULL;
+    if (qrt_batch_moe_open(dev, gguf_path, store_prefix, spv_dir, layer, 1, &serial, err,
+                     sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        qrt_vk_close(dev);
+        return 2;
+    }
+    const uint32_t ks[] = { 1, 2, 4, 5, 8 };
+    int failures = 0;
+    for (uint32_t k : ks) {
+        qrt_batch_moe * batch = NULL;
+        if (qrt_batch_moe_open(dev, gguf_path, store_prefix, spv_dir, layer, k, &batch, err,
+                         sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            failures = 1;
+            break;
+        }
+        std::vector<float> bm((size_t) k * E), sm((size_t) k * E), rm((size_t) k * E);
+        std::vector<uint32_t> bi((size_t) k * K), si((size_t) k * K), ri((size_t) k * K);
+        std::vector<float> bw((size_t) k * K), sw((size_t) k * K), rw((size_t) k * K);
+        const double mb_t0 = now_ms();
+        int rc = qrt_batch_moe_run(batch, xnorm.data(), qs.data(), ds.data(), bm.data(), bi.data(),
+                             bw.data(), err, sizeof(err));
+        const double mb_ms = now_ms() - mb_t0;
+        for (uint32_t t = 0; t < k && rc == 0; ++t) {
+            rc = qrt_batch_moe_run(serial, xnorm.data() + (size_t) t * E, qs.data() + (size_t) t * E,
+                             ds.data() + (size_t) t * (E / 32u), sm.data() + (size_t) t * E,
+                             si.data() + (size_t) t * K, sw.data() + (size_t) t * K, err,
+                             sizeof(err));
+        }
+        if (rc == 0) {
+            rc = qrt_batch_moe_ref_cpu(batch, xnorm.data(), qs.data(), ds.data(), rm.data(),
+                                 ri.data(), rw.data(), err, sizeof(err));
+        }
+        if (rc != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            qrt_batch_moe_close(dev, batch);
+            failures = 1;
+            break;
+        }
+        uint32_t serial_ids = 0, ref_ids = 0;
+        std::vector<uint8_t> seen(NE, 0);
+        for (uint32_t i = 0; i < k * K; ++i) {
+            serial_ids += bi[i] == si[i] ? 1u : 0u;
+            ref_ids += bi[i] == ri[i] ? 1u : 0u;
+            seen[si[i]] = 1;
+        }
+        uint32_t union_experts = 0;
+        for (uint8_t v : seen) {
+            union_experts += v != 0 ? 1u : 0u;
+        }
+        const uint32_t batch_experts = qrt_batch_moe_experts_used(batch);
+        const double weights_rel = moe_rel_l1(bw.data(), rw.data(), (size_t) k * K);
+        const double serial_rel = moe_rel_l1(bm.data(), sm.data(), (size_t) k * E);
+        const double ref_rel = moe_rel_l1(bm.data(), rm.data(), (size_t) k * E);
+        const bool ok = serial_ids == k * K && batch_experts == union_experts &&
+                        weights_rel <= 1e-5 && serial_rel <= 1e-6 && ref_ids == k * K &&
+                        ref_rel <= 1e-4;
+        printf("moe_batch k=%u layer=%u top_k=%u ids=%u/%u union=%u/%u weights_rel=%.3e "
+               "serial_rel=%.3e ref_ids=%u/%u ref_rel=%.3e pairs=%u rows=%u ms=%.3f verdict=%s\n",
+               k, layer, K, serial_ids, k * K, batch_experts, union_experts, weights_rel,
+               serial_rel, ref_ids, k * K, ref_rel, qrt_batch_moe_pairs(batch),
+               qrt_batch_moe_rows(batch), mb_ms, ok ? "PASS" : "FAIL");
+        if (!ok) {
+            ++failures;
+        }
+        qrt_batch_moe_close(dev, batch);
+    }
+    qrt_batch_moe_close(dev, serial);
+    qrt_vk_close(dev);
+    return failures == 0 ? 0 : 1;
+}
 
-    if (gguf_path != NULL) {
-        qrt_gguf * g = NULL;
-        if (qrt_gguf_open(gguf_path, &g, err, sizeof(err)) != 0) {
+static int qrt_cache_check(const qrt_config * cfg, const char * prefix, const char * trace_path,
+                           uint32_t decode_tokens, uint32_t protected_percent) {
+    char err[QRT_ERR_SIZE] = {};
+    qrt_weights * w = NULL;
+    if (qrt_weights_open(prefix, &w, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        return 2;
+    }
+    const uint32_t layers = qrt_weights_layers(w);
+    const uint32_t experts = qrt_weights_experts(w);
+    if (layers == 0 || layers > QRT_CACHE_MAX_LAYERS || experts == 0 ||
+        experts > QRT_CACHE_MAX_EXPERTS) {
+        fprintf(stderr, "qrt: store has %u layers x %u experts, the cache supports %u x %u\n",
+                layers, experts, QRT_CACHE_MAX_LAYERS, QRT_CACHE_MAX_EXPERTS);
+        qrt_weights_close(w);
+        return 2;
+    }
+    std::vector<uint64_t> slot_bytes(layers, 0), weights(layers, 1);
+    uint32_t mixed_layers = 0;
+    for (uint32_t l = 0; l < layers; ++l) {
+        uint64_t first = 0;
+        for (uint32_t e = 0; e < experts; ++e) {
+            qrt_expert_loc loc;
+            if (qrt_weights_locate(w, l, e, &loc, err, sizeof(err)) != 0) {
+                fprintf(stderr, "qrt: %s\n", err);
+                qrt_weights_close(w);
+                return 2;
+            }
+            if (loc.bytes == 0) {
+                fprintf(stderr, "qrt: layer %u expert %u has zero bytes\n", l, e);
+                qrt_weights_close(w);
+                return 2;
+            }
+            if (e == 0) {
+                first = loc.bytes;
+            } else if (loc.bytes != first) {
+                ++mixed_layers;
+            }
+            if (loc.bytes > slot_bytes[l]) {
+                slot_bytes[l] = loc.bytes;
+            }
+        }
+    }
+    qrt_weights_close(w);
+
+    qrt_cache_trace * trace = NULL;
+    uint32_t observed = 0;
+    const char * weight_source = "uniform";
+    if (trace_path != NULL) {
+        if (qrt_cache_trace_open(trace_path, experts, &trace, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             return 2;
         }
-        if (require_tensor != NULL) {
+        std::fill(weights.begin(), weights.end(), 0);
+        if (qrt_cache_trace_weights(trace, decode_tokens, layers, weights.data(), &observed, err,
+                                    sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            qrt_cache_trace_close(trace);
+            return 2;
+        }
+        weight_source = "trace";
+    }
+
+    const uint64_t budget = (uint64_t) cfg->expert_cache_mib << 20;
+    qrt_cache_plan plan{};
+    if (qrt_cache_plan_build(layers, experts, slot_bytes.data(), weights.data(), budget,
+                             cfg->cache_policy, protected_percent, &plan, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        qrt_cache_trace_close(trace);
+        return 2;
+    }
+    printf("cache_plan layers=%u experts=%u policy=%s budget_mib=%d bytes=%llu bytes_mib=%.1f "
+           "slots=%llu degraded=%u protected_pct=%u mixed_layers=%u weights=%s\n",
+           layers, experts, qrt_cache_policy_name(cfg->cache_policy), cfg->expert_cache_mib,
+           (unsigned long long) plan.bytes, (double) plan.bytes / (1024.0 * 1024.0),
+           (unsigned long long) plan.slots, plan.degraded_layers, protected_percent,
+           mixed_layers, weight_source);
+    for (uint32_t l = 0; l < layers; ++l) {
+        printf("cache_layer layer=%u slot_bytes=%llu slots=%u offset=%llu\n", l,
+               (unsigned long long) plan.slot_bytes[l], plan.slots_per_layer[l],
+               (unsigned long long) plan.layer_offset[l]);
+    }
+    if (trace != NULL) {
+        qrt_cache_stats st{};
+        uint32_t simulated_layers = 0;
+        uint32_t decode_rows = 0;
+        if (qrt_cache_simulate(&plan, trace, decode_tokens, &st, &simulated_layers, &decode_rows,
+                               err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            qrt_cache_trace_close(trace);
+            return 2;
+        }
+        const double hit_pct = st.lookups != 0 ? 100.0 * (double) st.hits / (double) st.lookups : 0.0;
+        printf("cache_trace path=%s tokens=%u layers=%u top_k=%u decode=%u observed_layers=%u "
+               "decode_rows=%u\n", trace_path, qrt_cache_trace_tokens(trace),
+               qrt_cache_trace_layers(trace), qrt_cache_trace_top_k(trace), decode_tokens,
+               simulated_layers, decode_rows);
+        printf("cache_stats policy=%s lookups=%llu hits=%llu misses=%llu hit_pct=%.3f "
+               "evictions=%llu promotions=%llu demotions=%llu miss_mib=%.1f "
+               "h2d_uploads=%llu h2d_mib=%.1f upload_failures=%llu wait_failures=%llu "
+               "no_slot=%llu pending=%u mode=policy_only\n",
+               qrt_cache_policy_name(cfg->cache_policy), (unsigned long long) st.lookups,
+               (unsigned long long) st.hits, (unsigned long long) st.misses, hit_pct,
+               (unsigned long long) st.evictions, (unsigned long long) st.promotions,
+               (unsigned long long) st.demotions,
+               (double) st.miss_bytes / (1024.0 * 1024.0),
+               (unsigned long long) st.h2d_uploads,
+               (double) st.h2d_bytes / (1024.0 * 1024.0),
+               (unsigned long long) st.upload_failures, (unsigned long long) st.wait_failures,
+               (unsigned long long) st.no_slot_misses, st.pending);
+        for (uint32_t l = 0; l < layers; ++l) {
+            printf("cache_layer_stats layer=%u hits=%llu misses=%llu evictions=%llu\n", l,
+                   (unsigned long long) st.layer_hits[l],
+                   (unsigned long long) st.layer_misses[l],
+                   (unsigned long long) st.layer_evictions[l]);
+        }
+        qrt_cache_trace_close(trace);
+    }
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    qrt_cli_options options;
+    qrt_config cfg;
+    qrt_config_defaults(&cfg);
+    char err[QRT_ERR_SIZE] = {};
+    if (qrt_cli_parse(&options, &cfg, argc, argv, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        return 2;
+    }
+    if (options.command == QRT_CMD_HELP) {
+        qrt_cli_print_help(stdout);
+        return 0;
+    }
+    if (options.command == QRT_CMD_SELFTEST) {
+        return qrt_selftest();
+    }
+    qrt_config_notes(&cfg, stderr);
+    if (options.command == QRT_CMD_CONFIG) {
+        qrt_config_print_effective(&cfg, stdout);
+        return 0;
+    }
+    const std::string exe = argc > 0 ? argv[0] : "qrt";
+    const size_t cut = exe.find_last_of("/\\");
+    const std::string spv_dir = cut == std::string::npos ? "." : exe.substr(0, cut);
+    snprintf(g_spv_dir, sizeof(g_spv_dir), "%s", spv_dir.c_str());
+    if (options.command == QRT_CMD_CACHE) {
+        return qrt_cache_check(&cfg, options.cache_prefix, options.cache_trace,
+                               (uint32_t) options.cache_decode,
+                               (uint32_t) options.cache_protected);
+    }
+    if (options.command == QRT_CMD_MOE_BATCH) {
+        return qrt_moe_batch_check(&cfg, options.moe_batch_gguf, options.layer_store,
+                                   (uint32_t) options.moe_layer, g_spv_dir);
+    }
+
+    if (options.gguf_path != NULL) {
+        qrt_gguf * g = NULL;
+        if (qrt_gguf_open(options.gguf_path, &g, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            return 2;
+        }
+        if (options.require_tensor != NULL) {
             const qrt_gguf_tensor * t = NULL;
-            if (qrt_gguf_require(g, require_tensor, &t, err, sizeof(err)) != 0) {
+            if (qrt_gguf_require(g, options.require_tensor, &t, err, sizeof(err)) != 0) {
                 fprintf(stderr, "qrt: %s\n", err);
                 qrt_gguf_close(g);
                 return 2;
@@ -2005,92 +1808,108 @@ int main(int argc, char ** argv) {
         qrt_gguf_close(g);
         return 0;
     }
-    if (require_tensor != NULL) {
+    if (options.require_tensor != NULL) {
         fprintf(stderr, "qrt: --require-tensor needs --gguf-index <path>\n");
         return 2;
     }
 
-    if (vk_io_check) {
-        return qrt_vk_io_check(&cfg, repack_prefix);
+    if (options.command == QRT_CMD_VK_IO) {
+        return qrt_vk_io_check(&cfg, options.repack_prefix);
     }
-    if (dense_gguf != NULL) {
-        return qrt_dense_check(&cfg, dense_gguf);
+    if (options.dense_gguf != NULL) {
+        return qrt_dense_check(&cfg, options.dense_gguf);
     }
-    if (prefill_prefix != NULL) {
-        // Default shader dir: next to the executable, as CMake copies the .spv files.
-        std::string shader_path;
-        if (prefill_shader != NULL) {
-            shader_path = prefill_shader;
-        } else {
-            std::string exe = argc > 0 ? argv[0] : "qrt";
-            const size_t cut = exe.find_last_of("/\\");
-            shader_path = (cut == std::string::npos ? std::string(".") : exe.substr(0, cut)) +
-                          "/qrt-read.spv";
-            // The directory is what the kernels want; keep the probe's file name too.
-            shader_path = (cut == std::string::npos ? std::string(".") : exe.substr(0, cut));
-        }
-        return qrt_prefill_check(&cfg, prefill_prefix, shader_path.c_str(),
-                                 (uint32_t) prefill_slots, (uint32_t) prefill_layers,
-                                 prefill_compute_moe, prefill_layer_batch, prefill_pipeline,
-                                 prefill_group_kib, prefill_readers, prefill_chunks);
+    if (options.prefill_prefix != NULL) {
+        const char * shader_path = options.prefill_shader ? options.prefill_shader : g_spv_dir;
+        return qrt_prefill_check(&cfg, options.prefill_prefix, shader_path,
+                                 (uint32_t) options.prefill_slots, (uint32_t) options.prefill_layers,
+                                 options.prefill_compute_moe, options.prefill_layer_batch, options.prefill_pipeline,
+                                 options.prefill_group_kib, options.prefill_readers, options.prefill_chunks);
     }
-    if (layer_gguf_check != NULL) {
+    if (options.layer_gguf_check != NULL) {
         qrt_layer_cfg lcfg;
         memset(&lcfg, 0, sizeof(lcfg));
-        lcfg.ffn = layer_ffn && layer_store != NULL ? 1 : 0;
-        lcfg.single_submit = layer_pass;
-        lcfg.dn_recur = dn_recur;
+        lcfg.ffn = options.layer_ffn && options.layer_store != NULL ? 1 : 0;
+        lcfg.single_submit = options.layer_pass;
+        lcfg.dn_recur = options.dn_recur;
         lcfg.kv_k = cfg.kv_k;
         lcfg.kv_v = cfg.kv_v;
         lcfg.kv_page_tokens = (uint32_t) cfg.kv_page_tokens;
-        return qrt_layer_check(layer_gguf_check, layer_store, (uint32_t) layer_index,
-                               (uint32_t) layer_tokens, &lcfg, g_spv_dir);
+        return qrt_layer_check(options.layer_gguf_check, options.layer_store, (uint32_t) options.layer_index,
+                               (uint32_t) options.layer_tokens, &lcfg, g_spv_dir);
     }
-    if (norm_gguf_check != NULL) {
-        return qrt_norm_check(&cfg, norm_gguf_check, norm_tensor, dense_tensor,
-                              (uint32_t) dense_tokens, g_spv_dir);
+    if (options.norm_gguf_check != NULL) {
+        return qrt_norm_check(&cfg, options.norm_gguf_check, options.norm_tensor, options.dense_tensor,
+                              (uint32_t) options.dense_tokens, g_spv_dir);
     }
-    if (dense_gguf_check != NULL) {
-        return qrt_dense_gemm_check(&cfg, dense_gguf_check, dense_tensor, (uint32_t) dense_tokens,
-                                    (uint32_t) dense_rows);
+    if (options.dense_gguf_check != NULL) {
+        return qrt_dense_gemm_check(&cfg, options.dense_gguf_check, options.dense_tensor, (uint32_t) options.dense_tokens,
+                                    (uint32_t) options.dense_rows);
     }
-    if (deltanet_gguf != NULL) {
-        return qrt_dn_check(deltanet_gguf, (uint32_t) deltanet_layer, (uint32_t) deltanet_tokens,
+    if (options.deltanet_gguf != NULL) {
+        return qrt_dn_check(options.deltanet_gguf, (uint32_t) options.deltanet_layer, (uint32_t) options.deltanet_tokens,
                             g_spv_dir);
     }
-    if (logits_gguf != NULL) {
-        if (logits_out == NULL || logits_tokens == NULL) {
-            fprintf(stderr, "qrt: --logits-dump also needs --logits-out and --logits-tokens\n");
-            return 2;
-        }
+    if (options.command == QRT_CMD_GENERATE) {
+        qrt_model_options mo{};
+        mo.n_layers = (uint32_t) options.logits_layers;
+        mo.n_rows = 1;
+        mo.batch_k = (uint32_t) options.generate_batch;
         uint32_t * ids = NULL;
         uint32_t n_ids = 0;
-        if (qrt_model_read_ids(logits_tokens, &ids, &n_ids, err, sizeof(err)) != 0) {
+        if (qrt_model_read_ids(options.logits_tokens, &ids, &n_ids, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
             return 2;
         }
-        const int rc = qrt_model_logits(logits_gguf, layer_store, g_spv_dir, ids, n_ids,
-                                        (uint32_t) logits_layers, (uint32_t) logits_rows,
-                                        logits_out, cfg.kv_k, cfg.kv_v, err, sizeof(err));
-        if (rc != 0) {
+        const int rc = qrt_model_generate(&cfg, &mo, options.generate_gguf, options.layer_store,
+                                          g_spv_dir, ids, n_ids, (uint32_t) options.generate_new,
+                                          options.generate_out, err, sizeof(err));
+        free(ids);
+        if (rc != 0 && err[0] != '\0') {
             fprintf(stderr, "qrt: %s\n", err);
         }
+        return rc < 0 ? 2 : rc;
+    }
+    if (options.command == QRT_CMD_CHUNK_CHECK || options.command == QRT_CMD_MODEL_CHECK ||
+        options.command == QRT_CMD_LOGITS) {
+        qrt_model_options model_options;
+        model_options.n_layers = (uint32_t) options.logits_layers;
+        model_options.n_rows = (uint32_t) options.logits_rows;
+        model_options.out_path = options.logits_out;
+        model_options.ref_out_path = options.model_check_ref;
+        model_options.reseed = options.model_check_reseed;
+        model_options.device_planes = options.model_check_planes;
+        uint32_t * ids = NULL;
+        uint32_t n_ids = 0;
+        if (qrt_model_read_ids(options.logits_tokens, &ids, &n_ids, err, sizeof(err)) != 0) {
+            fprintf(stderr, "qrt: %s\n", err);
+            return 2;
+        }
+        const auto run = options.command == QRT_CMD_CHUNK_CHECK ? qrt_model_chunk_check :
+                         options.command == QRT_CMD_MODEL_CHECK ? qrt_model_check : qrt_model_logits;
+        const char * path = options.command == QRT_CMD_CHUNK_CHECK ? options.chunk_check_gguf :
+                            options.command == QRT_CMD_MODEL_CHECK ? options.model_check_gguf : options.logits_gguf;
+        const int rc = run(&cfg, &model_options, path, options.layer_store, g_spv_dir, ids,
+                           n_ids, err, sizeof(err));
         free(ids);
-        return rc;
+        if (rc != 0 && err[0] != '\0') {
+            fprintf(stderr, "qrt: %s\n", err);
+        }
+        return rc < 0 ? 2 : rc;
     }
-    if (fullattn_gguf != NULL) {
-        return qrt_full_check(fullattn_gguf, (uint32_t) fullattn_layer, (uint32_t) fullattn_tokens,
-                              g_spv_dir, cfg.kv_k, cfg.kv_v, (uint32_t) fullattn_resident,
-                              (uint32_t) fullattn_page);
+    if (options.fullattn_gguf != NULL) {
+        return qrt_full_check(options.fullattn_gguf, (uint32_t) options.fullattn_layer, (uint32_t) options.fullattn_tokens,
+                              g_spv_dir, cfg.kv_k, cfg.kv_v, (uint32_t) options.fullattn_resident,
+                              (uint32_t) options.fullattn_page);
     }
-    if (moe_prefix != NULL) {
+    if (options.moe_prefix != NULL) {
         std::string dir = argc > 0 ? argv[0] : "qrt";
         const size_t cut = dir.find_last_of("/\\");
         dir = (cut == std::string::npos ? std::string(".") : dir.substr(0, cut));
-        return qrt_moe_check(&cfg, moe_prefix, (prefill_shader != NULL ? prefill_shader : dir.c_str()),
-                             (uint32_t) moe_layer, (uint32_t) moe_expert, (uint32_t) moe_rows);
+        return qrt_moe_check(&cfg, options.moe_prefix, (options.prefill_shader != NULL ? options.prefill_shader : dir.c_str()),
+                             (uint32_t) options.moe_layer, (uint32_t) options.moe_expert, (uint32_t) options.moe_rows);
     }
-    if (vk_info || vk_probe_mib > 0) {
+    if (options.command == QRT_CMD_VK_INFO) {
         qrt_vk_dev * dev = NULL;
         if (qrt_vk_open((uint32_t) cfg.vram_tier_mib, &dev, err, sizeof(err)) != 0) {
             fprintf(stderr, "qrt: %s\n", err);
@@ -2117,18 +1936,18 @@ int main(int argc, char ** argv) {
                    plan.kv_tokens, (unsigned) QRT_KV_CTX_TOKENS,
                    (double) plan.cache_coverage_x100 / 100.0, plan.cache_reductions);
         }
-        if (vk_probe_mib > 0) {
+        if (options.vk_probe_mib > 0) {
             const uint64_t before = dev->budget_bytes;
             VkBuffer buf = 0;
             VkDeviceMemory mem = 0;
-            if (qrt_vk_alloc(dev, (uint64_t) vk_probe_mib << 20, QRT_VK_USAGE_STORAGE,
+            if (qrt_vk_alloc(dev, (uint64_t) options.vk_probe_mib << 20, QRT_VK_USAGE_STORAGE,
                              &buf, &mem, err, sizeof(err)) != 0) {
                 fprintf(stderr, "qrt: %s\n", err);
                 rc = 2;
             } else {
                 qrt_vk_query_budget(dev, err, sizeof(err));
                 printf("probe alloc_mib=%d budget_before_mib=%llu budget_after_mib=%llu\n",
-                       vk_probe_mib, (unsigned long long) (before >> 20),
+                       options.vk_probe_mib, (unsigned long long) (before >> 20),
                        (unsigned long long) (dev->budget_bytes >> 20));
                 qrt_vk_free(dev, buf, mem);
             }
@@ -2137,17 +1956,6 @@ int main(int argc, char ** argv) {
         return rc;
     }
 
-    if (cfg.telemetry != 0) {
-        qrt_telemetry * t = qrt_telemetry_open(cfg.telemetry_path, err, sizeof(err));
-        if (t == NULL) {
-            fprintf(stderr, "qrt: %s\n", err);
-            return 2;
-        }
-        qrt_telemetry_close(t);
-        printf("telemetry=%s (header written)\n", cfg.telemetry_path);
-    }
-
-    qrt_config_print_effective(&cfg, stdout);
-    printf("qrt %s: switches parsed, no engine yet (M2-1 gguf_index is next)\n", QRT_VERSION);
-    return 0;
+    fprintf(stderr, "qrt: unsupported command\n");
+    return 2;
 }

@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <chrono>
 #include <vector>
 
@@ -224,10 +225,13 @@ struct qrt_layer {
 
     // host copies the check's reference needs
     std::vector<float> h_x, h_norm, h_post, h_qnw, h_knw;
+    uint32_t           run_pos0;    // position of the chunk's first row, this run
+    uint32_t           run_tokens;  // rows of the opened chunk that belong to the sequence
     double             last_ms;
     double             pass1_ms;
     double             group_ms;
     double             pass2_ms;
+    double             gpu_wait_ms;  // submit->fence wait of both passes: the device leg
     uint32_t           submits;
     uint32_t           dispatches;
 };
@@ -239,6 +243,7 @@ double qrt_layer_last_ms(const qrt_layer * l) { return l != NULL ? l->last_ms : 
 double qrt_layer_pass1_ms(const qrt_layer * l) { return l != NULL ? l->pass1_ms : 0.0; }
 double qrt_layer_group_ms(const qrt_layer * l) { return l != NULL ? l->group_ms : 0.0; }
 double qrt_layer_pass2_ms(const qrt_layer * l) { return l != NULL ? l->pass2_ms : 0.0; }
+double qrt_layer_gpu_ms(const qrt_layer * l) { return l != NULL ? l->gpu_wait_ms : 0.0; }
 uint32_t qrt_layer_submits(const qrt_layer * l) { return l != NULL ? l->submits : 0; }
 uint32_t qrt_layer_dispatches(const qrt_layer * l) {
     if (l == NULL) {
@@ -255,6 +260,9 @@ uint32_t qrt_layer_rows(const qrt_layer * l) {
 uint64_t qrt_layer_store_bytes(const qrt_layer * l) {
     return l != NULL && l->ffn != NULL ? qrt_ffn_store_bytes(l->ffn) : 0;
 }
+uint64_t qrt_layer_uploaded_bytes(const qrt_layer * l) {
+    return l != NULL && l->ffn != NULL ? qrt_ffn_uploaded_bytes(l->ffn) : 0;
+}
 uint64_t qrt_layer_plane_bytes(const qrt_layer * l) {
     return l != NULL && l->ffn != NULL ? qrt_ffn_planes_bytes(l->ffn) : 0;
 }
@@ -262,6 +270,36 @@ const qrt_ffn_bufs * qrt_layer_ffn_bufs(const qrt_layer * l) {
     return l != NULL && l->ffn != NULL ? qrt_ffn_buffers(l->ffn) : NULL;
 }
 qrt_ffn * qrt_layer_ffn(qrt_layer * l) { return l != NULL ? l->ffn : NULL; }
+
+int qrt_layer_set_cache(qrt_layer * l, qrt_cache * cache, VkBuffer buf, uint64_t slot_bytes,
+                        qrt_cpu_moe * cpu, int miss_split, const qrt_split_rates * rates,
+                        qrt_split_carry * carry, char * err, size_t err_size) {
+    if (l == NULL || l->ffn == NULL) {
+        snprintf(err, err_size, "the layer has no FFN to attach a cache to");
+        return -1;
+    }
+    if (rates == NULL || carry == NULL) {
+        snprintf(err, err_size, "the layer cache needs rates and a carry row");
+        return -1;
+    }
+    qrt_ffn_cache fc{};
+    fc.cache = cache;
+    fc.buffer = buf;
+    fc.slot_bytes = slot_bytes;
+    fc.cpu = cpu;
+    fc.miss_split = miss_split;
+    fc.rates = *rates;
+    fc.carry = carry;
+    return qrt_ffn_set_cache(l->ffn, &fc, err, err_size);
+}
+
+qrt_ffn_legs qrt_layer_last_legs(const qrt_layer * l) {
+    return l != NULL && l->ffn != NULL ? qrt_ffn_last_legs(l->ffn) : qrt_ffn_legs{};
+}
+
+int qrt_layer_take_cpu_out(qrt_layer * l, float * out, uint32_t tokens) {
+    return l != NULL && l->ffn != NULL ? qrt_ffn_take_cpu_out(l->ffn, out, tokens) : -1;
+}
 VkBuffer qrt_layer_x(const qrt_layer * l) { return l != NULL ? l->x : VK_NULL_HANDLE; }
 VkBuffer qrt_layer_out(const qrt_layer * l) {
     if (l == NULL) {
@@ -522,6 +560,7 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_
     l->dev = dev;
     l->layer = layer;
     l->info.tokens = tokens;
+    l->run_tokens = tokens;
     if (cfg != NULL) {
         l->cfg = *cfg;
     } else {
@@ -608,9 +647,13 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_
         memset(&kvcfg, 0, sizeof(kvcfg));
         kvcfg.k_type = l->cfg.kv_k;
         kvcfg.v_type = l->cfg.kv_v;
-        kvcfg.resident_tokens = T;
+        // The pass records the append and the attention into one command buffer, which the
+        // paged cache cannot do (it uploads between dispatches), so the whole context stays
+        // resident here: n_ctx x two heads x one row, 10.6 MiB per plane at 10.4K f16.
+        const uint32_t n_ctx = l->cfg.n_ctx > T ? l->cfg.n_ctx : T;
+        kvcfg.resident_tokens = n_ctx;
         kvcfg.page_tokens = l->cfg.kv_page_tokens;
-        if (qrt_full_open(dev, spv_dir, &fsh, T, T, &kvcfg, &l->full, err, err_size) != 0) {
+        if (qrt_full_open(dev, spv_dir, &fsh, T, n_ctx, &kvcfg, &l->full, err, err_size) != 0) {
             qrt_layer_close(dev, l);
             qrt_gguf_close(g);
             return -1;
@@ -778,6 +821,8 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_
         fc.top_k    = (uint32_t) hp.expert_used_count;
         fc.ffn      = (uint32_t) hp.expert_ff;
         fc.scale    = 1.0f;
+        fc.slot     = l->cfg.ffn_slot;
+        fc.slot_bytes = l->cfg.ffn_slot_bytes;
         if (qrt_ffn_open(dev, gguf_path, store_prefix, spv_dir, layer, &fc, &l->ffn, err,
                          err_size) != 0) {
             qrt_layer_close(dev, l);
@@ -830,13 +875,19 @@ void qrt_layer_close(qrt_vk_dev * dev, qrt_layer * l) {
     free(l);
 }
 
-int qrt_layer_set_input(qrt_layer * l, const float * x, char * err, size_t err_size) {
-    if (l == NULL || x == NULL) {
-        return fail(err, err_size, "the layer needs an input");
+int qrt_layer_set_input_rows(qrt_layer * l, const float * x, uint32_t rows, char * err,
+                             size_t err_size) {
+    if (l == NULL || x == NULL || rows == 0 || rows > l->info.tokens) {
+        return fail(err, err_size, "the layer input of %u rows does not fit the %u opened",
+                    rows, l != NULL ? l->info.tokens : 0);
     }
-    const uint64_t bytes = (uint64_t) l->info.tokens * l->info.n_embd * 4;
+    const uint64_t bytes = (uint64_t) rows * l->info.n_embd * 4;
     l->h_x.assign(x, x + (size_t) (bytes / 4));
     return qrt_vk_upload(l->dev, l->stg, l->x, 0, x, bytes, err, err_size);
+}
+
+int qrt_layer_set_input(qrt_layer * l, const float * x, char * err, size_t err_size) {
+    return qrt_layer_set_input_rows(l, x, l != NULL ? l->info.tokens : 0, err, err_size);
 }
 
 // Every stage of the layer reads what the stage before it wrote: in pass mode those are
@@ -845,6 +896,88 @@ static void stage_barrier(qrt_layer * l) {
     if (l->pass != NULL) {
         qrt_vk_cmd_record_barrier(qrt_vk_cmd_buffer(l->pass, 0));
     }
+}
+
+// The DeltaNet legs leave the next chunk's state in two places that are not where the next
+// chunk reads it: the recurrence writes state_out (state_in stays the chunk's start, the
+// kernel binds them apart), and the conv taps of the next chunk are the last conv_taps-1
+// projected rows of this one, which only exist in the qkv plane. Two buffer copies move
+// them; the shader writes have to reach the transfer stage first.
+static void record_dn_carry(qrt_layer * l, VkCommandBuffer cmd) {
+    const qrt_dn_bufs * b = qrt_dn_buffers(l->dn);
+    const uint32_t taps = l->dsh.conv_taps - 1u;
+    const uint64_t st_bytes = (uint64_t) l->dsh.n_v_heads * l->dsh.head_dim * l->dsh.head_dim * 4;
+    const uint64_t row_bytes = (uint64_t) l->dsh.conv_ch * 4;
+    VkMemoryBarrier mb;
+    memset(&mb, 0, sizeof(mb));
+    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+    VkBufferCopy state_copy;
+    memset(&state_copy, 0, sizeof(state_copy));
+    state_copy.size = st_bytes;
+    vkCmdCopyBuffer(cmd, b->state_out, b->state_in, 1, &state_copy);
+    if (l->run_tokens >= taps) {
+        VkBufferCopy conv_copy{};
+        conv_copy.srcOffset = (uint64_t) (l->run_tokens - taps) * row_bytes;
+        conv_copy.size = (uint64_t) taps * row_bytes;
+        vkCmdCopyBuffer(cmd, b->qkv, b->conv_state, 1, &conv_copy);
+    } else {
+        const uint64_t added = (uint64_t) l->run_tokens * row_bytes;
+        const uint64_t kept = (uint64_t) (taps - l->run_tokens) * row_bytes;
+        // Unused QKV rows stage the surviving taps without an overlapping buffer copy.
+        const VkBufferCopy retain{added, added, kept};
+        vkCmdCopyBuffer(cmd, b->conv_state, b->qkv, 1, &retain);
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+        const VkBufferCopy copies[] = {{added, 0, kept}, {0, kept, added}};
+        vkCmdCopyBuffer(cmd, b->qkv, b->conv_state, 2, copies);
+    }
+    qrt_vk_cmd_record_barrier_transfer(cmd);
+}
+
+// The module-by-module path has no pass buffer, so the carry gets its own submit on the
+// layer add's command buffer, which is idle between its own runs.
+static int dn_carry_submit(qrt_layer * l, char * err, size_t err_size) {
+    VkCommandBufferBeginInfo bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkResult r = vkBeginCommandBuffer(l->add_cmd, &bi);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkBeginCommandBuffer (deltanet carry)", r);
+    }
+    record_dn_carry(l, l->add_cmd);
+    r = vkEndCommandBuffer(l->add_cmd);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkEndCommandBuffer (deltanet carry)", r);
+    }
+    VkSubmitInfo si;
+    memset(&si, 0, sizeof(si));
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &l->add_cmd;
+    r = vkQueueSubmit(l->dev->compute_queue, 1, &si, l->add_fence);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkQueueSubmit (deltanet carry)", r);
+    }
+    r = vkWaitForFences(l->dev->device, 1, &l->add_fence, VK_TRUE, UINT64_MAX);
+    if (r != VK_SUCCESS) {
+        return vk_fail(err, err_size, "vkWaitForFences (deltanet carry)", r);
+    }
+    return vkResetFences(l->dev->device, 1, &l->add_fence) == VK_SUCCESS ? 0
+             : fail(err, err_size, "vkResetFences (deltanet carry) failed");
+}
+
+// Dense row stages use the Q8K tile: 1..8 rows use the one-token variant, larger short
+// tails round up to 32. Attention/DN and the routed experts use the exact run_tokens.
+static uint32_t stage_rows(const qrt_layer * l) {
+    const uint32_t t = l->run_tokens;
+    return t <= 8u ? t : ((t + 31u) & ~31u);
 }
 
 static int layer_norm(qrt_layer * l, VkBuffer src, VkBuffer w, VkBuffer out, VkBuffer qs,
@@ -857,7 +990,7 @@ static int layer_norm(qrt_layer * l, VkBuffer src, VkBuffer w, VkBuffer out, VkB
     na.qs = qs;
     na.ds = ds;
     na.k = k;
-    na.tokens = l->info.tokens;
+    na.tokens = stage_rows(l);
     na.eps = l->eps;
     na.quant = 1;
     na.no_norm = no_norm;
@@ -880,7 +1013,7 @@ static int layer_gemm(qrt_layer * l, uint32_t which, VkBuffer planes_qs, VkBuffe
     ga.out = out;
     ga.n = l->proj[which].n;
     ga.k = k;
-    ga.m = l->info.tokens;
+    ga.m = stage_rows(l);
     ga.type = QRT_QUANT_Q8_0;
     ga.token_major = 1;
     if (l->pass != NULL) {
@@ -892,7 +1025,7 @@ static int layer_gemm(qrt_layer * l, uint32_t which, VkBuffer planes_qs, VkBuffe
 
 // The attention half in the order the model runs it, recorded into the layer's pass.
 static int layer_attention_half(qrt_layer * l, char * err, size_t err_size) {
-    const uint32_t T = l->info.tokens;
+    const uint32_t T = l->run_tokens;
     const uint32_t E = l->info.n_embd;
     const uint32_t last = l->n_proj - 1;
     // 1. input norm; DeltaNet's gate reads the f32 row, so norm_out points at its buffer
@@ -907,17 +1040,24 @@ static int layer_attention_half(qrt_layer * l, char * err, size_t err_size) {
         }
     }
     stage_barrier(l);
-    // 3. the attention path
+    // 3. the attention path, over the rows that belong to the sequence
     if (getenv("QRT_LAYER_STOP_PROJ") != NULL) {
         return 0;
     }
+    const uint32_t pos0 = l->run_pos0;
+    const uint32_t rows = l->run_tokens;
     if (l->info.linear) {
-        if (qrt_dn_layer_run(l->dn, l->dnw, T, l->l2_eps, err, err_size) != 0) {
+        if (qrt_dn_layer_run(l->dn, l->dnw, rows, l->l2_eps, err, err_size) != 0) {
+            return -1;
+        }
+        if (l->pass != NULL) {
+            record_dn_carry(l, qrt_vk_cmd_buffer(l->pass, 0));
+        } else if (dn_carry_submit(l, err, err_size) != 0) {
             return -1;
         }
     } else {
-        if (qrt_full_qk(l->full, 0, T, err, err_size) != 0 ||
-            qrt_full_attn(l->full, 0, T, err, err_size) != 0) {
+        if (qrt_full_qk(l->full, pos0, rows, err, err_size) != 0 ||
+            qrt_full_attn(l->full, pos0, rows, err, err_size) != 0) {
             return -1;
         }
     }
@@ -983,15 +1123,20 @@ static int layer_run_pass(qrt_layer * l, char * err, size_t err_size) {
         in.x_qs = l->qs;
         in.x_ds = l->ds;
         in.out = l->xout;
-        if (qrt_ffn_begin(l->ffn, ring, cmd, err, err_size) != 0 ||
+        if (qrt_ffn_set_tokens(l->ffn, l->run_tokens, err, err_size) != 0 ||
+            qrt_ffn_begin(l->ffn, ring, cmd, err, err_size) != 0 ||
             qrt_ffn_route(l->ffn, &in, err, err_size) != 0) {
             return -1;
         }
     }
-    if (qrt_vk_cmd_submit(l->pass, ring, err, err_size) != 0 ||
-        qrt_vk_cmd_wait(l->pass, ring, err, err_size) != 0) {
+    if (qrt_vk_cmd_submit(l->pass, ring, err, err_size) != 0) {
         return -1;
     }
+    const double t_sub1 = now_ms();
+    if (qrt_vk_cmd_wait(l->pass, ring, err, err_size) != 0) {
+        return -1;
+    }
+    l->gpu_wait_ms += now_ms() - t_sub1;
     ++l->submits;
     l->pass1_ms = now_ms() - t0;
 
@@ -1010,10 +1155,14 @@ static int layer_run_pass(qrt_layer * l, char * err, size_t err_size) {
             qrt_ffn_experts(l->ffn, err, err_size) != 0) {
             return -1;
         }
-        if (qrt_vk_cmd_submit(l->pass, ring, err, err_size) != 0 ||
-            qrt_vk_cmd_wait(l->pass, ring, err, err_size) != 0) {
+        if (qrt_vk_cmd_submit(l->pass, ring, err, err_size) != 0) {
             return -1;
         }
+        const double t_sub2 = now_ms();
+        if (qrt_vk_cmd_wait(l->pass, ring, err, err_size) != 0) {
+            return -1;
+        }
+        l->gpu_wait_ms += now_ms() - t_sub2;
         ++l->submits;
         l->pass2_ms = now_ms() - t2;
     }
@@ -1029,8 +1178,28 @@ int qrt_layer_run(qrt_layer * l, char * err, size_t err_size) {
     if (l == NULL) {
         return fail(err, err_size, "no layer");
     }
+    return qrt_layer_run_chunk(l, 0, l->info.tokens, err, err_size);
+}
+
+int qrt_layer_run_chunk(qrt_layer * l, uint32_t pos0, uint32_t tokens, char * err,
+                        size_t err_size) {
+    if (l == NULL) {
+        return fail(err, err_size, "no layer");
+    }
+    if (tokens == 0 || tokens > l->info.tokens) {
+        return fail(err, err_size, "chunk of %u rows does not fit the %u token layer",
+                    tokens, l->info.tokens);
+    }
+    const uint32_t n_ctx = l->cfg.n_ctx > l->info.tokens ? l->cfg.n_ctx : l->info.tokens;
+    if (!l->info.linear && (tokens > n_ctx || pos0 > n_ctx - tokens)) {
+        return fail(err, err_size, "position %u with %u rows is past the KV cache this layer opened",
+                    pos0, tokens);
+    }
+    l->run_pos0 = pos0;
+    l->run_tokens = tokens;
     l->pass1_ms = l->pass2_ms = 0.0;
     l->group_ms = 0.0;
+    l->gpu_wait_ms = 0.0;
     if (l->cfg.single_submit) {
         return layer_run_pass(l, err, err_size);
     }
@@ -1129,6 +1298,165 @@ int download(qrt_layer * l, VkBuffer src, void * dst, uint64_t bytes, char * err
 }
 
 } // namespace
+
+namespace {
+
+// The f16 KV append uses round-to-nearest-even (DECISIONS 64.1 / U-13). The reference
+// builds its own rows with the same rule instead of reading the device's back.
+float f16_rne_round(float x) {
+    return f16_to_f32(f32_to_f16_bits(x));
+}
+
+} // namespace
+
+int qrt_layer_ref_cpu(qrt_layer * l, const float * x_in, float * x_out,
+                      struct qrt_layer_ref_trace * trace, int device_planes, char * err,
+                      size_t err_size) {
+    if (l == NULL || x_in == NULL || x_out == NULL) {
+        return fail(err, err_size, "the layer reference needs an input and an output");
+    }
+    const qrt_layer_info info = l->info;
+    const uint32_t E = info.n_embd;
+    const uint32_t T = info.tokens;
+    const uint32_t last = l->n_proj - 1;
+
+    std::vector<float> ref_norm((size_t) T * E);
+    std::vector<signed char> qs((size_t) T * E);
+    std::vector<uint32_t> ds((size_t) T * (E / 32u));
+    qrt_norm_cpu(T, E, x_in, l->h_norm.data(), l->eps, ref_norm.data(), qs.data(), ds.data());
+    if (trace != NULL && trace->xnorm != NULL) {
+        memcpy(trace->xnorm, ref_norm.data(), ref_norm.size() * sizeof(float));
+    }
+
+    std::vector<std::vector<float>> ref_proj(last);
+    for (uint32_t i = 0; i < last; ++i) {
+        std::vector<double> acc;
+        dense_cpu(l->proj[i].raw, l->proj[i].n, E, qs.data(), ds.data(), T, &acc);
+        to_token_major(acc, l->proj[i].n, T, &ref_proj[i]);
+    }
+
+    std::vector<float> ref_src((size_t) T * info.inter);
+    if (info.linear) {
+        const qrt_dn_shapes & sh = l->dsh;
+        const uint64_t st_f = (uint64_t) sh.n_v_heads * sh.head_dim * sh.head_dim;
+        std::vector<float> cst((size_t) (sh.conv_taps - 1) * sh.conv_ch, 0.0f);
+        std::vector<float> csto(cst.size());
+        std::vector<float> q((size_t) T * sh.qk_ch), k((size_t) T * sh.qk_ch);
+        std::vector<float> v((size_t) T * sh.d_inner);
+        std::vector<float> dec((size_t) T * sh.n_v_heads), bet(dec.size());
+        std::vector<double> st((size_t) st_f, 0.0);
+        std::vector<float> y((size_t) T * sh.d_inner);
+        qrt_dn_prep_cpu(&sh, T, ref_proj[0].data(), qrt_dn_weights_host(l->dnw, 0), cst.data(),
+                        l->l2_eps, q.data(), k.data(), v.data(), csto.data());
+        qrt_dn_gate_cpu(&sh, T, ref_norm.data(), qrt_dn_weights_host(l->dnw, 1),
+                        qrt_dn_weights_host(l->dnw, 2), qrt_dn_weights_host(l->dnw, 3),
+                        qrt_dn_weights_host(l->dnw, 4), dec.data(), bet.data());
+        qrt_dn_recur_cpu(&sh, T, q.data(), k.data(), v.data(), dec.data(), bet.data(),
+                         st.data(), y.data());
+        qrt_dn_gnorm_cpu(&sh, T, y.data(), ref_proj[1].data(), qrt_dn_weights_host(l->dnw, 5),
+                         l->eps, ref_src.data());
+    } else {
+        if (qrt_full_kv_k(l->full) != QRT_KV_F16 || qrt_full_kv_v(l->full) != QRT_KV_F16) {
+            return fail(err, err_size,
+                        "layer %u: the model reference chain models f16 KV rows only, run it "
+                        "with --kv-k f16 --kv-v f16", l->layer);
+        }
+        const qrt_full_shapes & sh = l->fsh;
+        const uint32_t hd = sh.head_dim;
+        std::vector<float> q_out((size_t) T * sh.n_head * hd);
+        std::vector<float> k_out((size_t) sh.n_kv * T * hd);
+        std::vector<float> v_out(k_out.size());
+        qrt_full_qk_cpu(&sh, 0, T, ref_proj[0].data(), ref_proj[1].data(), ref_proj[2].data(),
+                        l->h_qnw.data(), l->h_knw.data(), q_out.data(), k_out.data(),
+                        v_out.data());
+        for (size_t i = 0; i < k_out.size(); ++i) {
+            k_out[i] = f16_rne_round(k_out[i]);
+            v_out[i] = f16_rne_round(v_out[i]);
+        }
+        std::vector<uint32_t> rows(T);
+        for (uint32_t i = 0; i < T; ++i) {
+            rows[i] = i;
+        }
+        qrt_full_attn_rows_cpu(&sh, T, rows.data(), T, q_out.data(), k_out.data(), v_out.data(),
+                               ref_proj[0].data(), ref_src.data());
+    }
+
+    // output projection over the reference's own Q8_1 planes, then the residual add
+    std::vector<float> src_copy((size_t) T * info.inter);
+    std::vector<signed char> p2qs((size_t) T * info.inter);
+    std::vector<uint32_t> p2ds((size_t) T * (info.inter / 32u));
+    if (trace != NULL && trace->attn_src != NULL) {
+        memcpy(trace->attn_src, ref_src.data(), ref_src.size() * sizeof(float));
+    }
+    qrt_norm_quant_cpu(T, info.inter, ref_src.data(), src_copy.data(), p2qs.data(), p2ds.data());
+    if (device_planes &&
+        (download(l, l->p2_qs, p2qs.data(), p2qs.size(), err, err_size) != 0 ||
+         download(l, l->p2_ds, p2ds.data(), p2ds.size() * 4, err, err_size) != 0)) {
+        return -1;
+    }
+    std::vector<double> acc_out;
+    dense_cpu(l->proj[last].raw, l->proj[last].n, info.inter, p2qs.data(), p2ds.data(), T,
+              &acc_out);
+    std::vector<float> ref_out((size_t) T * E);
+    to_token_major(acc_out, l->proj[last].n, T, &ref_out);
+    std::vector<float> ref_x((size_t) T * E);
+    for (size_t i = 0; i < ref_x.size(); ++i) {
+        ref_x[i] = x_in[i] + ref_out[i];
+    }
+    if (trace != NULL) {
+        if (trace->attn_out != NULL) {
+            memcpy(trace->attn_out, ref_out.data(), ref_out.size() * sizeof(float));
+        }
+        if (trace->x_res != NULL) {
+            memcpy(trace->x_res, ref_x.data(), ref_x.size() * sizeof(float));
+        }
+    }
+    std::vector<float> ref_post((size_t) T * E);
+    qrt_norm_cpu(T, E, ref_x.data(), l->h_post.data(), l->eps, ref_post.data(), nullptr, nullptr);
+    if (trace != NULL && trace->post_norm != NULL) {
+        memcpy(trace->post_norm, ref_post.data(), ref_post.size() * sizeof(float));
+    }
+    if (l->ffn == NULL) {
+        memcpy(x_out, ref_x.data(), ref_x.size() * sizeof(float));
+        return 0;
+    }
+    std::vector<float> ref_logits((size_t) T * info.n_expert);
+    std::vector<uint32_t> ref_ids((size_t) T * info.top_k);
+    std::vector<float> ref_wts(ref_ids.size()), sgate((size_t) T);
+    std::vector<float> shexp((size_t) T * E), moe((size_t) T * E);
+    std::vector<signed char> post_qs;
+    std::vector<uint32_t> post_ds;
+    if (device_planes && l->ffn != NULL) {
+        post_qs.assign((size_t) T * E, 0);
+        post_ds.assign((size_t) T * (E / 32u), 0);
+        if (download(l, l->qs, post_qs.data(), post_qs.size(), err, err_size) != 0 ||
+            download(l, l->ds, post_ds.data(), post_ds.size() * 4, err, err_size) != 0) {
+            return -1;
+        }
+    }
+    if (qrt_ffn_ref_cpu(l->ffn, ref_post.data(), post_qs.empty() ? nullptr : post_qs.data(),
+                        post_ds.empty() ? nullptr : post_ds.data(), T, ref_logits.data(),
+                        ref_ids.data(), ref_wts.data(), sgate.data(), shexp.data(), moe.data(),
+                        err, err_size) != 0) {
+        return -1;
+    }
+    if (trace != NULL) {
+        if (trace->moe != NULL) {
+            memcpy(trace->moe, moe.data(), moe.size() * sizeof(float));
+        }
+        if (trace->shexp != NULL) {
+            memcpy(trace->shexp, shexp.data(), shexp.size() * sizeof(float));
+        }
+    }
+    for (uint32_t t = 0; t < T; ++t) {
+        const float s = 1.0f / (1.0f + expf(-sgate[t]));
+        for (uint32_t c = 0; c < E; ++c) {
+            const size_t i = (size_t) t * E + c;
+            x_out[i] = ref_x[i] + moe[i] + shexp[i] * s;
+        }
+    }
+    return 0;
+}
 
 int qrt_layer_check(const char * gguf_path, const char * store_prefix, uint32_t layer,
                     uint32_t tokens, const qrt_layer_cfg * cfg, const char * spv_dir) {
@@ -1497,6 +1825,44 @@ int qrt_layer_check(const char * gguf_path, const char * store_prefix, uint32_t 
                r_layer <= 1e-4 ? "PASS" : "FAIL");
         fails += r_layer <= 1e-4 ? 0 : 1;
     }
+    std::vector<float> baseline((size_t) T * E), input(baseline.size()), output(baseline.size());
+    if (download(l, qrt_layer_out(l), baseline.data(), baseline.size() * 4, err, sizeof(err)) != 0) {
+        fprintf(stderr, "qrt: %s\n", err);
+        qrt_layer_close(dev, l);
+        qrt_vk_close(dev);
+        return 2;
+    }
+    const uint32_t pieces[] = {T - 4u, 1u, 2u, 1u};
+    int state_bad = 0;
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        int rc = qrt_layer_zero_state(l, err, sizeof(err));
+        uint32_t pos = 0;
+        for (uint32_t count : pieces) {
+            if (rc != 0) break;
+            std::fill(input.begin(), input.end(), 0.0f);
+            std::copy_n(x.data() + (size_t) pos * E, (size_t) count * E, input.data());
+            if (repeat == 2 && pos + count == T) {
+                for (uint32_t c = 0; c < E; ++c) input[(size_t) (count - 1) * E + c] += (float) (c % 7);
+            }
+            rc = qrt_layer_set_input(l, input.data(), err, sizeof(err)) ||
+                 qrt_layer_run_chunk(l, pos, count, err, sizeof(err)) ||
+                 download(l, qrt_layer_out(l), output.data(), output.size() * 4, err, sizeof(err));
+            if (rc != 0) break;
+            const size_t checked = (size_t) (repeat == 2 && pos + count == T ? count - 1u : count) * E;
+            state_bad += memcmp(output.data(), baseline.data() + (size_t) pos * E,
+                                checked * sizeof(float)) != 0;
+            pos += count;
+        }
+        if (rc != 0) {
+            fprintf(stderr, "qrt: chunk state check: %s\n", err);
+            qrt_layer_close(dev, l);
+            qrt_vk_close(dev);
+            return 2;
+        }
+    }
+    printf("layer_state chunks=%u,1,2,1 repeats=2 prefix_causal=1 mismatches=%d verdict=%s\n",
+           T - 4u, state_bad, state_bad == 0 ? "PASS" : "FAIL");
+    fails += state_bad != 0;
     printf("layer_check layer=%u linear=%d tokens=%u fails=%d open=%d verdict=%s\n", layer,
            info.linear, T, fails, open, fails == 0 ? (open == 0 ? "PASS" : "PASS_OPEN") : "FAIL");
 

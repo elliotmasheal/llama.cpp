@@ -13,11 +13,26 @@
 struct qrt_weights;
 struct qrt_prefill;
 
-// Called once per uploaded block, after its fence signalled. The slot memory must
-// not be touched again until this returns. Returning -1 counts as a failed block.
+// Compute must release the slot before returning, including on failure.
 typedef int (*qrt_prefill_compute_fn)(void * user, uint32_t layer, uint32_t expert,
                                       VkBuffer buf, uint64_t slot_offset, uint64_t bytes,
                                       char * err, size_t err_size);
+
+// Consume the arrays before returning; only device buffers may be borrowed until wait.
+typedef int (*qrt_prefill_batch_fn)(void * user, uint32_t layer, uint32_t ring, VkBuffer buf,
+                                    const uint32_t * experts, const uint64_t * offsets,
+                                    const uint64_t * bytes, uint32_t count,
+                                    char * err, size_t err_size);
+
+// Retire all ring work, even after a partial batch failure; an empty ring is a no-op.
+typedef int (*qrt_prefill_wait_fn)(void * user, uint32_t ring, char * err, size_t err_size);
+
+struct qrt_prefill_backend {
+    qrt_prefill_compute_fn compute;
+    qrt_prefill_batch_fn batch;
+    qrt_prefill_wait_fn wait;
+    void * user;
+};
 
 struct qrt_prefill_cfg {
     uint32_t chunk;        // tokens per chunk (QRT_PREFILL_CHUNK), reported only
@@ -34,8 +49,8 @@ struct qrt_prefill_stats {
     uint32_t layers;
     uint32_t blocks;          // blocks the router asked for
     uint32_t groups;          // copies actually submitted (coalesced blocks)
-    uint32_t blocks_done;
-    uint32_t blocks_failed;
+    uint32_t blocks_done;     // compute completed, including the batch wait
+    uint32_t blocks_failed;   // observed failures; unstarted/cancelled blocks are not counted
     uint32_t slot_reductions; // staging slots given up because allocation failed
     uint64_t bytes;
     double read_ms;           // host read of the repacked store into the mapping
@@ -52,28 +67,14 @@ void qrt_prefill_close(qrt_vk_dev * dev, qrt_prefill * p);
 // ids holds `counts[layer]` expert ids per layer, row stride `stride`. The caller
 // decides the set (a real router, or every expert for a chunk that hits them all).
 int qrt_prefill_run(qrt_prefill * p, const uint32_t * ids, uint32_t stride,
-                    const uint32_t * counts, qrt_prefill_compute_fn compute, void * user,
+                    const uint32_t * counts, const qrt_prefill_backend * backend,
                     qrt_prefill_stats * out, char * err, size_t err_size);
-
-// Layer batch (design 4.6): every expert of a layer is uploaded into one layer buffer,
-// then the whole layer runs as a single submit. The callback records all of the layer's
-// dispatches into one command buffer and submits once, so the GPU keeps 512 workgroups
-// busy instead of 16 (RESULTS 39).
-typedef int (*qrt_prefill_batch_fn)(void * user, uint32_t layer, uint32_t ring, VkBuffer buf,
-                                    const uint32_t * experts, const uint64_t * offsets,
-                                    const uint64_t * bytes, uint32_t count,
-                                    char * err, size_t err_size);
-
-// Waits for one ring of the batch callback's submissions; the scheduler calls it before
-// it reuses that ring's buffer or command buffer.
-typedef int (*qrt_prefill_wait_fn)(void * user, uint32_t ring, char * err, size_t err_size);
 
 // With pipeline = 1 the layer buffers alternate, so layer L+1 is read and uploaded while
 // layer L is still computing. pipeline = 0 is the serial shape, kept for comparison.
 int qrt_prefill_run_layers(qrt_prefill * p, const uint32_t * ids, uint32_t stride,
-                           const uint32_t * counts, qrt_prefill_batch_fn batch,
-                           qrt_prefill_wait_fn wait, void * user, qrt_prefill_stats * out,
-                           char * err, size_t err_size);
+                           const uint32_t * counts, const qrt_prefill_backend * backend,
+                           qrt_prefill_stats * out, char * err, size_t err_size);
 
 // How many layer buffers the scheduler keeps (1, or 2 with pipeline on).
 uint32_t qrt_prefill_layer_buffers(const qrt_prefill * p);

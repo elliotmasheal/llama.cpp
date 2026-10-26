@@ -3,13 +3,18 @@
 This directory holds the runtime that replaces the fork's decode path (design section 3.3).
 It links neither ggml nor llama: the runtime parses the GGUF itself and drives Vulkan directly.
 
-## Status: M2-0 scaffold, M2-1 GGUF index, M2-2 Vulkan device and budget
+## Status: M2 prefill and model diagnostics; decode is not implemented
 
 What exists now:
 
 - `qrt_config.*` - the ten switches of design section 7 plus two runtime extensions
   (`--telemetry-path`, `--vram-tier-mib`), their design defaults, strict validation, and
-  non-fatal notes for legal-but-costly values.
+  non-fatal notes for legal-but-costly values. Parsing is atomic: a rejected value leaves
+  the configuration unchanged, an explicit CLI value overrides even an invalid environment
+  value, and the command line is validated against the same bounds as the structure.
+- `qrt_cli.*` - the command table and dispatch options. Every flag is strict (`strtoll`,
+  range checked), commands are mutually exclusive, `--flag=value` works for all flags, and
+  an unknown or stray argument is rejected before any allocation.
 - `qrt_telemetry.*` - a CSV sink with one row per decode pass, holding the columns
   `bench/README.md` section 2 asks for.
 - `gguf_index.*` - read-only GGUF metadata, tensor table and absolute byte offsets, plus
@@ -20,13 +25,78 @@ What exists now:
   staging buffer with the H2D/D2H copy path, and the pass command-buffer recorder
   (`qrt_vk_cmd`) the layer chain submits once per half.
 - `weights.*` - the repacked expert store: `.idx` page table, per-expert byte ranges, reads.
-- `qrt_main.cpp` - the `qrt` binary: `--help`, `--print-config`, `--selftest`,
-  `--gguf-index`, `--require-tensor`, `--vk-info`, `--vk-alloc-probe`, `--vk-io-check`.
-- `CMakeLists.txt` - the `qrt_core` library and the `qrt` executable, plus the
-  `qrt_selftest` ctest case.
+- `layer.*`, `ffn.*`, `model.*` - the layer chain, FFN half and whole-model logits chain.
+- `expert_cache.*` - per-layer slot plan, SLRU/LRU/static, trace replay and the H2D callback
+  contract (M3-0); `moe.*` - routed-only k=1..8 batch over the same kernels (M3-1).
+- `qrt_main.cpp` - the `qrt` binary: checks, model logits, cache plan and MoE batch.
+- `CMakeLists.txt` - `qrt_core`, `qrt`, `qrt_checks` and the CPU contract tests.
 
-What does not exist yet: decode (M3), the expert cache (M3-0) and GPU-side routing. The
-layer chain and the prefill scheduler both run; they are not wired to each other yet.
+What does not exist yet: decode/MTP (M3), the per-pass builder (M3-2), GPU-side route/cache
+lookup and indirect expert dispatch. The layer chain and the prefill scheduler both run;
+they are not wired to each other yet.
+
+## Routed MoE batch (M3-1)
+
+```
+build-vulkan/bin/qrt.exe --moe-batch-check <model.gguf> --layer-store <prefix> [--moe-layer 0]
+```
+
+- Drives one layer's router -> top-8 -> gather -> per-expert gate/up/swiglu/down -> weighted
+  accumulate through the existing kernels for k=1, 2, 4, 5 and 8. `routed_only` skips the
+  shared expert and the final residual, so the token count no longer has to be a multiple
+  of 32; the full layer/prefill path keeps them and is unchanged.
+- Each k is checked against k=1 serial runs of the same tokens (ids and MoE output) and
+  against one CPU double reference (`qrt_ffn_ref_cpu`); the union expert count is compared
+  with the union of the serial top-k ids.
+- The expert row blocks are padded to 8 rows per used expert (the K-quant token tile), so a
+  k<=8 decode batch is weight-read bound instead of the old 32-row compute-bound shape. This
+  is the correctness path; M3-2 still needs grouped/indirect dispatch and a persistent model.
+  The full prefill path keeps its 32-token layer chunks and 64-row expert blocks.
+
+## Expert cache (M3-0)
+
+```
+build-vulkan/bin/qrt.exe --cache-check <store-prefix> [--cache-trace <trace.bin>] \
+    [--cache-decode 128] [--expert-cache-mib 4198] [--cache-policy slru|lru|static] \
+    [--cache-protected 20]
+```
+
+- Slot bytes follow the layer: the maximum expert block in that layer (RESULTS 35).
+  The single expert-cache budget keeps one floor slot per layer and splits the rest in
+  proportion to the trace's cold-cache miss traffic divided by slot bytes. Missing or
+  short trace layers get the floor only; `mixed_layers` counts layers whose experts are
+  not all the same size.
+- SLRU is per layer (probation/protected, default protected segment 20%; measured on
+  the two M1 traces). `lru` and `static` are comparison arms; static fills slots and then
+  reports no-slot misses instead of evicting.
+- `--cache-check` replays the last `--cache-decode` rows of each routing trace with no
+  IO callbacks, so `mode=policy_only`, `h2d_uploads=0`, `miss_mib` is the H2D volume the
+  plan would request, and `no_slot` is the CPU-leg remainder. The upload/wait scheduling
+  contract is covered by `qrt_cache_contract` (success, upload failure, wait failure,
+  per-layer pending guard, cross-layer overlap).
+- M3-2 supplies the real callbacks: read the expert into staging, `qrt_vk_upload_submit`
+  to `slot_offset`, `qrt_vk_staging_wait` before use, and allocates one device buffer of
+  `plan.bytes`. The cache never allocates VRAM and never reads the store.
+- A budget below one slot per layer degrades: zero-slot layers report every lookup as
+  `no_slot`; no path aborts. `--expert-cache-mib 0` is the zero-cache counterexample.
+
+## Diagnostic workflow
+
+```
+python -B bench/tools/quality/qgate.py run --qrt build-vulkan/bin/qrt.exe \
+    --build-dir build-vulkan --model <model.gguf> --store <repack-prefix> \
+    --tokens bench/raw/m2-7a/tokens10k.txt --output-dir bench/raw/<new-dir> \
+    --rows 16 [--baseline <earlier same-token dump> --align]
+```
+
+The workflow refuses to overwrite an existing output directory, runs build, the `qrt`
+CTest label, `--selftest`, `--print-config`, `--gguf-index`, the 40-layer logits dump and
+`qgate.py verify` in order, stops at the first non-zero exit, and records every command,
+exit code and log path in `workflow.json`. With `--baseline` it adds `qgate.py compare`;
+its result is a diagnostic comparison, not a model or performance acceptance. The same
+exit code (3) is preserved for a quality failure. `--chunk` defaults to 2048, so a prompt
+whose length is not a multiple of 32 is processed as a short final chunk instead of being
+truncated.
 
 ## Build
 
@@ -320,6 +390,11 @@ build-vulkan/bin/qrt.exe --layer-check <gguf> --layer 3 --layer-tokens 512 --lay
   `vk_dev.*`): one submit for the attention half and the router, one for the FFN. The router's
   top-k has to reach the host before the expert GEMM grids can be recorded, so the FFN costs a
   second submit (DECISIONS 68). `--layer-pass off` keeps the module-by-module path as the A/B.
+- The FFN slot holds the whole layer and persists across the chunk loop: `qrt_ffn_group` skips
+  experts already resident and uploads a contiguous run of missing experts as one H2D copy.
+  `model_upload` prints the cumulative MiB per layer; on a 10.4K prompt the first chunk of each
+  layer loads the layer once and the following chunks add 0 unless a new expert is routed. The
+  counter is the evidence for the layer-first read-once rule; it is not a performance gate.
 - `--layer-ffn on|off` (default on when `--layer-store` is given), `--dn-recur serial|cols`
   (default cols, the 32-column recurrence from RESULTS 63).
 - `--layer-check` compares each stage against one CPU double chain. The reference for a stage
@@ -345,6 +420,43 @@ build-vulkan/bin/qrt.exe --layer-check <gguf> --layer 3 --layer-tokens 512 --lay
 - Still missing for M2-6: the router tile is far from its roofline (the activation tile is
   re-read once per row block), and GPU-side grouping plus indirect dispatch is what a true
   one-submit layer needs.
+
+## Whole model run and the reference chain (M2-7a)
+
+```
+build-vulkan/bin/qrt.exe --logits-dump <gguf> --logits-tokens <ids> --logits-out <bin>
+                         --logits-layers 40 --logits-rows 16 --layer-store <prefix>
+build-vulkan/bin/qrt.exe --model-check <gguf> --logits-tokens <ids> --logits-rows 16
+                         --logits-out <bin> --model-check-ref <bin> --layer-store <prefix>
+                         --kv-k f16 --kv-v f16 [--model-check-reseed on|off]
+```
+
+- `runtime/model.*` runs the real chain: `token_embd` rows on the host (q8_0, one row per
+  token), then the 40 blocks in order - one layer open / set_input / zero_state / run / read
+  back / close at a time, so only one layer's weights are resident - then `output_norm` and
+  `output.weight` on the host in double. It writes QRTLOG1 v1
+  (`bench/tools/quality/README.md` section 3): 24 B header, `tokens[n_rows + 1]`, f32 rows.
+- `--model-check` runs the same device chain beside one CPU double chain
+  (`qrt_layer_ref_cpu` in `layer.*`), which recomputes the Q8_1 planes, the KV rows and the
+  expert legs from the host copies. Unlike `--layer-check` no stage reads a device buffer
+  back, so the two arms are independent and the residual stream can be carried across layers.
+  Only the f16 KV arm is referenceable: a q8_0/q4_0 row would need the block-max search of the
+  append kernel, which `--fullattn-check` gates (the reference fails instead of quietly
+  comparing another precision).
+- It prints per layer `model_stage` (xnorm / src / outproj / res / post / moe / shexp, device
+  against reference, for localisation) and `model_ref` (the whole hidden row), plus the first
+  layer of each type re-run against the chain hidden (`replay_rel_l1`, which is the
+  "adjacent layer hidden equals the single-layer chain" item), and ends with `model_check`
+  carrying the worst hidden, the logit rel_L1 of the two arms and the verdict against 1e-4.
+  `--model-check-reseed on` starts every reference layer from the device hidden, which
+  isolates one layer instead of accumulating the chain.
+- The activation quantiser is a step function, so it dominates any model-level distance
+  between two arms: sharing only its two packing decisions (input-norm planes excepted, they
+  are overwritten before the readback) moves the same reference chain from 1.2e-3 to 2.1e-6 on
+  the layer output - a factor 590 - while the arithmetic stages stay at 1e-7. `qgate.py
+  compare` of `--logits-out` against `--model-check-ref` is the reading that behaves like a
+  distance (RESULTS `m2-7a-model-ref-chain`).
+
 ## Telemetry## Telemetry
 
 `--telemetry 1 --telemetry-path <file>` writes a CSV with this header:
@@ -378,6 +490,22 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `kernels/q4k_gemm.*` | Q4_K x Q8_1 int8 GEMM and swiglu+Q8_1 kernels, one submit per call |
 | `kernels/moe_expert.*` | one expert's gate/up/swiglu/down as a prefill compute callback |
 | `layer.h/.cpp` | one layer chain: norm, projections, attention path, output projection, residual, post norm, FFN half, one pass submit (M2-6) |
-| `ffn.h/.cpp` | FFN half: router, top-k, gated shared expert, routed experts, weighted accumulate (M2-6) |
-| `qrt_main.cpp` | CLI entry, `--selftest`, `--gguf-index`, `--vk-info`, `--vk-io-check`, `--dense-check`, `--prefill-check`, `--moe-check`, `--dense-gemm-check`, `--norm-check`, `--layer-check` |
-| `CMakeLists.txt` | `qrt_core`, `qrt`, `qrt_selftest` |
+| `ffn.h/.cpp` | FFN half: router, top-k, gated shared expert, routed experts, weighted accumulate (M2-6); `routed_only` skips shared/residual for k=1..8 |
+| `moe.h/.cpp` | routed-only batch over the FFN kernels (M3-1) |
+| `expert_cache.h/.cpp` | per-layer cache plan, SLRU/LRU/static, trace parser/replay, H2D upload/wait contract (M3-0); masked acquire for the CPU leg and region uploads (M3-2a) |
+| `miss_split.h/.cpp` | H2D/CPU miss split: greedy pass-level balance under the measured leg rates, fixed 0..100 control arms (M3-2a) |
+| `cpu_moe.h/.cpp` | CPU expert core: Q4_K/Q5_K/Q6_K x Q8_1 GEMV, typed expert pass, subnormal fp16 deltas (M3-1a/M3-2a) |
+| `model.h/.cpp` | whole-model 40-layer logits chain, QRTLOG1 dump, persistent decode; the per-layer expert cache replaces the prefill slot after prefill (M3-2a) |
+| `qrt_main.cpp` | CLI entry: every check plus `--logits-dump`, `--model-check`, `--chunk-check`, `--cache-check`, `--moe-batch-check` |
+| `CMakeLists.txt` | `qrt_core`, `qrt`, `qrt_checks` and the CPU contract tests |
+
+## Decode expert cache and miss split (M3-2a)
+
+After prefill, `--generate` frees the shared FFN slot and builds one slot array per layer
+from `QRT_EXPERT_CACHE_MIB` (default 4198 MiB, 21.9%) through `qrt_cache_plan`. Each decode
+call probes the layer's unique experts, asks `qrt_miss_split_plan` which misses go to H2D and
+which to the CPU, uploads the H2D part with one region copy per staging load, and computes the
+CPU part from the same Q8_1 planes the device produced. The CPU sum is added to the layer row
+after the download, so the GPU pass records only the hit + H2D experts. `--generate-batch K`
+feeds K prompt rows per pass: a teacher-forced diagnostic for the k=5 legs, not an acceptance
+path. `--miss-split` takes auto or the fixed 0..100 control arms.

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -29,6 +30,7 @@ struct par_job {
     uint32_t last;
     uint64_t span_off;
     unsigned char * map;
+    bool mapped;
     std::atomic<int> failed;
     char err[256];
 };
@@ -36,17 +38,42 @@ struct par_job {
 struct thread_pool {
     std::vector<std::thread> workers;
     std::mutex mu;
+    std::mutex read_mu;
     std::condition_variable cv_start;
     std::condition_variable cv_done;
     par_job * job = nullptr;
-    int epoch = 0;
+    uint64_t epoch = 0;
     int done = 0;
     int readers = 1;
     bool stop = false;
 };
 
+void pool_read(thread_pool * pool, par_job * job, uint32_t id) {
+    for (uint64_t i = (uint64_t) job->first + id; i < job->last; i += (uint32_t) pool->readers) {
+        if (job->failed.load(std::memory_order_relaxed) != 0) {
+            break;
+        }
+        char err[256] = {};
+        // The unmapped store shares a seek/fread cursor between readers.
+        std::unique_lock<std::mutex> lk(pool->read_mu, std::defer_lock);
+        if (!job->mapped) {
+            lk.lock();
+            if (job->failed.load(std::memory_order_relaxed) != 0) {
+                break;
+            }
+        }
+        if (qrt_weights_read_expert(job->w, job->layer, job->experts[i],
+                                    job->map + (job->offsets[i] - job->span_off),
+                                    (size_t) job->sizes[i], err, sizeof(err)) != 0) {
+            if (job->failed.fetch_add(1) == 0) {
+                snprintf(job->err, sizeof(job->err), "%s", err[0] ? err : "group read failed");
+            }
+        }
+    }
+}
+
 void pool_worker(thread_pool * pool, int id) {
-    int seen = 0;
+    uint64_t seen = 0;
     for (;;) {
         par_job * job = nullptr;
         {
@@ -58,18 +85,7 @@ void pool_worker(thread_pool * pool, int id) {
             seen = pool->epoch;
             job = pool->job;
         }
-        // Strided by the worker count, so every worker copies whole experts.
-        for (uint32_t i = job->first + (uint32_t) id; i < job->last; i += (uint32_t) pool->readers) {
-            if (job->failed.load(std::memory_order_relaxed) != 0) {
-                break;
-            }
-            if (qrt_weights_read_expert(job->w, job->layer, job->experts[i],
-                                        job->map + (job->offsets[i] - job->span_off),
-                                        (size_t) job->sizes[i], job->err,
-                                        sizeof(job->err)) != 0) {
-                job->failed.store(1);
-            }
-        }
+        pool_read(pool, job, (uint32_t) id);
         {
             std::lock_guard<std::mutex> lk(pool->mu);
             ++pool->done;
@@ -109,9 +125,44 @@ double now_ms() {
 int fail(char * err, size_t err_size, const char * fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(err, err_size, fmt, ap);
+    if (err != NULL && err_size != 0) {
+        vsnprintf(err, err_size, fmt, ap);
+    }
     va_end(ap);
     return -1;
+}
+
+void record_failure(int & rc, char * err, size_t err_size, const char * detail) {
+    if (rc == 0) {
+        rc = fail(err, err_size, "%s", detail[0] ? detail : "prefill operation failed");
+    }
+}
+
+bool aligned_bytes(uint64_t bytes, uint64_t * aligned) {
+    if (bytes == 0 || bytes > UINT64_MAX - 63) {
+        return false;
+    }
+    *aligned = (bytes + 63) / 64 * 64;
+    return true;
+}
+
+int validate_routes(uint32_t layers, uint32_t stride, const uint32_t * counts,
+                    uint64_t * total, char * err, size_t err_size) {
+    if ((uint64_t) layers * stride > SIZE_MAX / sizeof(uint32_t) ||
+        layers > SIZE_MAX / sizeof(uint32_t)) {
+        return fail(err, err_size, "router table size overflows");
+    }
+    *total = 0;
+    for (uint32_t l = 0; l < layers; ++l) {
+        if (counts[l] > stride) {
+            return fail(err, err_size, "layer %u count %u exceeds stride %u", l, counts[l], stride);
+        }
+        *total += counts[l];
+    }
+    if (*total == 0 || *total > UINT32_MAX || *total > SIZE_MAX / sizeof(uint32_t)) {
+        return fail(err, err_size, "router block count is empty or overflows");
+    }
+    return 0;
 }
 
 } // namespace
@@ -131,34 +182,47 @@ uint32_t qrt_prefill_unique_experts(uint32_t chunk, uint32_t top_k, uint32_t exp
 
 int qrt_prefill_open(qrt_vk_dev * dev, qrt_weights * w, const qrt_prefill_cfg * cfg,
                      qrt_prefill ** out, char * err, size_t err_size) {
+    if (out == NULL) {
+        return fail(err, err_size, "prefill needs an output pointer");
+    }
     *out = NULL;
     if (dev == NULL || w == NULL || cfg == NULL) {
         return fail(err, err_size, "prefill needs a device, a store and a config");
     }
-    qrt_prefill * p = (qrt_prefill *) calloc(1, sizeof(qrt_prefill));
+    if (cfg->slots < 1 || cfg->slots > 64 || cfg->readers > 16) {
+        return fail(err, err_size, "prefill needs 1..64 slots and 0..16 readers");
+    }
+    const uint64_t max_expert = qrt_weights_max_expert_bytes(w);
+    uint64_t slot_bytes = cfg->slot_bytes != 0 ? cfg->slot_bytes : max_expert;
+    if (cfg->group_bytes > slot_bytes) {
+        const uint64_t group_bytes = ((uint64_t) cfg->group_bytes / 64 + 1) * 64;
+        if (max_expert > UINT64_MAX - group_bytes) {
+            return fail(err, err_size, "prefill group capacity overflows");
+        }
+        slot_bytes = group_bytes + max_expert;
+    }
+    const uint32_t want = cfg->slots;
+    if (slot_bytes == 0 || slot_bytes > UINT64_MAX / want || slot_bytes > SIZE_MAX / want) {
+        return fail(err, err_size, "prefill slot capacity is empty or overflows");
+    }
+    qrt_prefill * p = new (std::nothrow) qrt_prefill{};
     if (p == NULL) {
         return fail(err, err_size, "out of memory for the prefill scheduler");
     }
     p->dev = dev;
     p->w   = w;
     p->cfg = *cfg;
-    p->slot_bytes = cfg->slot_bytes != 0 ? cfg->slot_bytes : qrt_weights_max_expert_bytes(w);
-    if (cfg->group_bytes > p->slot_bytes) {
-        // A coalesced copy is a run of experts plus the one that crosses the group edge.
-        p->slot_bytes = (cfg->group_bytes / 64 + 1) * 64 + qrt_weights_max_expert_bytes(w);
-    }
-    if (p->slot_bytes == 0) {
-        free(p);
-        return fail(err, err_size, "expert store reports zero-byte experts");
-    }
-    uint32_t want = cfg->slots > 0 ? cfg->slots : 1;
+    p->cfg.readers = cfg->readers != 0 ? cfg->readers : 1;
+    p->cfg.slot_reductions = 0;
+    p->slot_bytes = slot_bytes;
+    p->pool.readers = (int) p->cfg.readers;
 
     // Slots are one allocation: two multi-GiB blocks can fail to fit where the sum
     // does (the same reason runtime/proto keeps its dense and expert slices joined).
     if (qrt_vk_alloc(dev, p->slot_bytes * want,
                      QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
                      &p->buf, &p->mem, err, err_size) != 0) {
-        free(p);
+        qrt_prefill_close(dev, p);
         return -1;
     }
     p->stg = (qrt_vk_staging **) calloc(want, sizeof(*p->stg));
@@ -178,7 +242,9 @@ int qrt_prefill_open(qrt_vk_dev * dev, qrt_weights * w, const qrt_prefill_cfg * 
             ++p->slots;
         }
         if (p->slots == attempt) {
-            err[0] = '\0';
+            if (err != NULL && err_size != 0) {
+                err[0] = '\0';
+            }
             break;
         }
         for (uint32_t i = 0; i < p->slots; ++i) {
@@ -200,6 +266,15 @@ int qrt_prefill_open(qrt_vk_dev * dev, qrt_weights * w, const qrt_prefill_cfg * 
     if (p->pend_layer == NULL || p->pend_expert == NULL || p->pend_bytes == NULL) {
         qrt_prefill_close(dev, p);
         return fail(err, err_size, "out of memory for the slot bookkeeping");
+    }
+    try {
+        p->pool.workers.reserve(p->pool.readers - 1);
+        for (int id = 1; id < p->pool.readers; ++id) {
+            p->pool.workers.emplace_back(pool_worker, &p->pool, id);
+        }
+    } catch (...) {
+        qrt_prefill_close(dev, p);
+        return fail(err, err_size, "cannot start the prefill readers");
     }
     *out = p;
     return 0;
@@ -236,28 +311,28 @@ void qrt_prefill_close(qrt_vk_dev * dev, qrt_prefill * p) {
     free(p->pend_layer);
     free(p->pend_expert);
     free(p->pend_bytes);
-    free(p);
+    delete p;
 }
 
 int qrt_prefill_run(qrt_prefill * p, const uint32_t * ids, uint32_t stride,
-                    const uint32_t * counts, qrt_prefill_compute_fn compute, void * user,
+                    const uint32_t * counts, const qrt_prefill_backend * backend,
                     qrt_prefill_stats * out, char * err, size_t err_size) {
-    if (p == NULL || ids == NULL || counts == NULL || out == NULL) {
-        return fail(err, err_size, "prefill run needs ids, counts and a stats sink");
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (p == NULL || ids == NULL || counts == NULL || out == NULL ||
+        backend == NULL || backend->compute == NULL) {
+        return fail(err, err_size, "prefill run needs ids, counts, stats and a compute backend");
     }
     qrt_vk_dev * dev = p->dev;
-    memset(out, 0, sizeof(*out));
     out->slot_reductions = p->cfg.slot_reductions;
     const uint32_t layers = qrt_weights_layers(p->w);
+    uint64_t total = 0;
+    if (validate_routes(layers, stride, counts, &total, err, err_size) != 0) {
+        return -1;
+    }
 
     // Flatten (layer, expert) once so the ring has a single index to work with.
-    uint64_t total = 0;
-    for (uint32_t l = 0; l < layers; ++l) {
-        total += counts[l];
-    }
-    if (total == 0) {
-        return fail(err, err_size, "the router asked for no experts");
-    }
     uint32_t * flat_layer = (uint32_t *) malloc((size_t) total * sizeof(uint32_t));
     uint32_t * flat_expert = (uint32_t *) malloc((size_t) total * sizeof(uint32_t));
     if (flat_layer == NULL || flat_expert == NULL) {
@@ -278,90 +353,89 @@ int qrt_prefill_run(qrt_prefill * p, const uint32_t * ids, uint32_t stride,
 
     const double t_start = now_ms();
     int rc = 0;
-    for (uint64_t i = 0; i < total && rc == 0; ++i) {
-        const uint32_t slot = (uint32_t) (i % p->slots);
-        if (i >= p->slots) {
-            // The block sitting in this slot has been in flight for `slots` steps,
-            // so its upload should be long done: wait, then compute it while the
-            // blocks submitted after it keep streaming.
-            const double w0 = now_ms();
-            if (qrt_vk_staging_wait(dev, p->stg[slot], err, err_size) != 0) {
-                rc = -1;
-                break;
-            }
-            out->wait_ms += now_ms() - w0;
-            if (p->pend_bytes[slot] != 0) {
-                const double c0 = now_ms();
-                if (compute != NULL &&
-                    compute(user, p->pend_layer[slot], p->pend_expert[slot], p->buf,
-                            (uint64_t) slot * p->slot_bytes, p->pend_bytes[slot],
-                            err, err_size) != 0) {
-                    ++out->blocks_failed;
-                }
-                out->compute_ms += now_ms() - c0;
-            }
-            p->pend_bytes[slot] = 0;
+    auto finish_slot = [&](uint32_t slot) {
+        if (p->pend_bytes[slot] == 0) {
+            return;
         }
-
-        qrt_expert_loc loc;
-        if (qrt_weights_locate(p->w, flat_layer[i], flat_expert[i], &loc,
-                               err, err_size) != 0) {
-            ++out->blocks_failed;
-            continue;
-        }
-        if (loc.bytes > p->slot_bytes) {
-            return fail(err, err_size, "expert %u,%u needs %llu bytes, the slot holds %llu",
-                        flat_layer[i], flat_expert[i], (unsigned long long) loc.bytes,
-                        (unsigned long long) p->slot_bytes);
-        }
-        unsigned char * map = (unsigned char *) qrt_vk_staging_map(p->stg[slot]);
-        const double r0 = now_ms();
-        const int read = qrt_weights_read_expert(p->w, flat_layer[i], flat_expert[i],
-                                                map, (size_t) p->slot_bytes, err, err_size);
-        out->read_ms += now_ms() - r0;
-        if (read != 0) {
-            ++out->blocks_failed;
-            continue;
-        }
-        const double u0 = now_ms();
-        if (qrt_vk_upload_submit(dev, p->stg[slot], p->buf,
-                                 (uint64_t) slot * p->slot_bytes, loc.bytes,
-                                 err, err_size) != 0) {
-            ++out->blocks_failed;
-            continue;
-        }
-        out->upload_ms += now_ms() - u0;
-        p->pend_layer[slot]  = flat_layer[i];
-        p->pend_expert[slot] = flat_expert[i];
-        p->pend_bytes[slot]  = loc.bytes;
-        out->bytes += loc.bytes;
-        ++out->blocks_done;
-    }
-
-    // Drain: the last `slots` blocks never reached the compute leg inside the loop.
-    for (uint32_t k = 0; k < p->slots && rc == 0; ++k) {
-        const uint64_t i = total - p->slots + k;
-        if (i >= total) {
-            break;
-        }
-        const uint32_t slot = (uint32_t) (i % p->slots);
+        char detail[256] = {};
         const double w0 = now_ms();
-        if (qrt_vk_staging_wait(dev, p->stg[slot], err, err_size) != 0) {
-            rc = -1;
-            break;
+        if (qrt_vk_staging_wait(dev, p->stg[slot], detail, sizeof(detail)) != 0) {
+            ++out->blocks_failed;
+            record_failure(rc, err, err_size, detail);
         }
         out->wait_ms += now_ms() - w0;
-        if (p->pend_bytes[slot] != 0) {
+        if (rc == 0) {
+            detail[0] = '\0';
             const double c0 = now_ms();
-            if (compute != NULL &&
-                compute(user, p->pend_layer[slot], p->pend_expert[slot], p->buf,
-                        (uint64_t) slot * p->slot_bytes, p->pend_bytes[slot],
-                        err, err_size) != 0) {
+            if (backend->compute(backend->user, p->pend_layer[slot], p->pend_expert[slot], p->buf,
+                                 (uint64_t) slot * p->slot_bytes, p->pend_bytes[slot],
+                                 detail, sizeof(detail)) != 0) {
                 ++out->blocks_failed;
+                record_failure(rc, err, err_size, detail);
+            } else {
+                ++out->blocks_done;
             }
             out->compute_ms += now_ms() - c0;
         }
         p->pend_bytes[slot] = 0;
+    };
+    uint64_t submitted = 0;
+    for (uint64_t i = 0; i < total && rc == 0; ++i) {
+        const uint32_t slot = (uint32_t) (i % p->slots);
+        if (i >= p->slots) {
+            finish_slot(slot);
+            if (rc != 0) {
+                break;
+            }
+        }
+        char detail[256] = {};
+        qrt_expert_loc loc;
+        if (qrt_weights_locate(p->w, flat_layer[i], flat_expert[i], &loc,
+                               detail, sizeof(detail)) != 0) {
+            ++out->blocks_failed;
+            record_failure(rc, err, err_size, detail);
+            break;
+        }
+        if (loc.bytes == 0 || loc.bytes > p->slot_bytes) {
+            ++out->blocks_failed;
+            rc = fail(err, err_size, "expert %u,%u needs %llu bytes, the slot holds %llu",
+                      flat_layer[i], flat_expert[i], (unsigned long long) loc.bytes,
+                      (unsigned long long) p->slot_bytes);
+            break;
+        }
+        unsigned char * map = (unsigned char *) qrt_vk_staging_map(p->stg[slot]);
+        detail[0] = '\0';
+        const double r0 = now_ms();
+        const int read = qrt_weights_read_expert(p->w, flat_layer[i], flat_expert[i],
+                                                map, (size_t) p->slot_bytes, detail, sizeof(detail));
+        out->read_ms += now_ms() - r0;
+        if (read != 0) {
+            ++out->blocks_failed;
+            record_failure(rc, err, err_size, detail);
+            break;
+        }
+        detail[0] = '\0';
+        const double u0 = now_ms();
+        const int upload = qrt_vk_upload_submit(dev, p->stg[slot], p->buf,
+                                                (uint64_t) slot * p->slot_bytes, loc.bytes,
+                                                detail, sizeof(detail));
+        out->upload_ms += now_ms() - u0;
+        if (upload != 0) {
+            ++out->blocks_failed;
+            record_failure(rc, err, err_size, detail);
+            break;
+        }
+        p->pend_layer[slot]  = flat_layer[i];
+        p->pend_expert[slot] = flat_expert[i];
+        p->pend_bytes[slot]  = loc.bytes;
+        out->bytes += loc.bytes;
+        ++out->groups;
+        ++submitted;
+    }
+
+    const uint64_t pending = submitted < p->slots ? submitted : p->slots;
+    for (uint64_t i = submitted - pending; i < submitted; ++i) {
+        finish_slot((uint32_t) (i % p->slots));
     }
     out->total_ms = now_ms() - t_start;
     free(flat_layer);
@@ -755,16 +829,38 @@ int upload_layer(qrt_prefill * p, uint32_t layer, uint32_t slot_index, const uin
         qrt_expert_loc loc;
         if (qrt_weights_locate(p->w, layer, ids[(size_t) layer * stride + e], &loc,
                                err, err_size) != 0) {
+            ++out->blocks_failed;
             return -1;
+        }
+        uint64_t aligned = 0;
+        if (!aligned_bytes(loc.bytes, &aligned) || off > p->layer_bytes[slot_index] ||
+            aligned > p->layer_bytes[slot_index] - off) {
+            ++out->blocks_failed;
+            return fail(err, err_size, "expert layout exceeds the layer buffer");
         }
         experts[e] = ids[(size_t) layer * stride + e];
         sizes[e] = loc.bytes;
         offsets[e] = off;
-        off += (loc.bytes + 63) / 64 * 64;
+        off += aligned;
     }
 
+    int rc = 0;
+    uint32_t pending[64] = {};
+    auto finish_slot = [&](uint32_t slot) {
+        if (pending[slot] == 0) {
+            return;
+        }
+        char detail[256] = {};
+        const double w0 = now_ms();
+        if (qrt_vk_staging_wait(dev, p->stg[slot], detail, sizeof(detail)) != 0) {
+            out->blocks_failed += pending[slot];
+            record_failure(rc, err, err_size, detail);
+        }
+        out->wait_ms += now_ms() - w0;
+        pending[slot] = 0;
+    };
     uint32_t e = 0;
-    while (e < count) {
+    while (e < count && rc == 0) {
         uint32_t last = e;
         if (group == 0) {
             ++last;
@@ -781,25 +877,27 @@ int upload_layer(qrt_prefill * p, uint32_t layer, uint32_t slot_index, const uin
         const uint64_t span_bytes = offsets[last - 1] + sizes[last - 1] - span_off;
 
         const uint32_t slot = (uint32_t) (out->groups % p->slots);
-        if (out->groups >= p->slots) {
-            const double w0 = now_ms();
-            if (qrt_vk_staging_wait(dev, p->stg[slot], err, err_size) != 0) {
-                return -1;
-            }
-            out->wait_ms += now_ms() - w0;
+        finish_slot(slot);
+        if (rc != 0) {
+            break;
         }
         unsigned char * map = (unsigned char *) qrt_vk_staging_map(p->stg[slot]);
         if (span_bytes > p->slot_bytes) {
-            return fail(err, err_size, "group of %llu bytes exceeds the %llu byte staging slot",
-                        (unsigned long long) span_bytes, (unsigned long long) p->slot_bytes);
+            out->blocks_failed += last - e;
+            rc = fail(err, err_size, "group of %llu bytes exceeds the %llu byte staging slot",
+                      (unsigned long long) span_bytes, (unsigned long long) p->slot_bytes);
+            break;
         }
         const double r0 = now_ms();
         if (p->pool.readers <= 1) {
             for (uint32_t i = e; i < last; ++i) {
+                char detail[256] = {};
                 if (qrt_weights_read_expert(p->w, layer, experts[i],
                                             map + (offsets[i] - span_off),
-                                            (size_t) sizes[i], err, err_size) != 0) {
+                                            (size_t) sizes[i], detail, sizeof(detail)) != 0) {
                     ++out->blocks_failed;
+                    record_failure(rc, err, err_size, detail);
+                    break;
                 }
             }
         } else {
@@ -813,6 +911,7 @@ int upload_layer(qrt_prefill * p, uint32_t layer, uint32_t slot_index, const uin
             job->last = last;
             job->span_off = span_off;
             job->map = map;
+            job->mapped = qrt_weights_mapped(p->w) != 0;
             job->failed.store(0);
             job->err[0] = '\0';
             {
@@ -822,61 +921,65 @@ int upload_layer(qrt_prefill * p, uint32_t layer, uint32_t slot_index, const uin
                 ++p->pool.epoch;
             }
             p->pool.cv_start.notify_all();
-            // The main thread is worker 0 and must finish its share before it submits.
-            for (uint32_t i = e; i < last; i += p->pool.readers) {
-                if (qrt_weights_read_expert(p->w, layer, experts[i],
-                                            map + (offsets[i] - span_off),
-                                            (size_t) sizes[i], err, err_size) != 0) {
-                    job->failed.store(1);
-                }
-            }
-            const int want = (int) p->pool.readers - 1;
+            pool_read(&p->pool, job, 0);
+            const int want = p->pool.readers - 1;
             {
                 std::unique_lock<std::mutex> lk(p->pool.mu);
-                p->pool.cv_done.wait(lk, [&] { return p->pool.done >= want; });
+                p->pool.cv_done.wait(lk, [&] { return p->pool.done == want; });
+                p->pool.job = nullptr;
             }
             if (job->failed.load() != 0) {
-                ++out->blocks_failed;
-                snprintf(err, err_size, "%s", job->err[0] != '\0' ? job->err : "group read failed");
+                out->blocks_failed += (uint32_t) job->failed.load();
+                record_failure(rc, err, err_size, job->err);
             }
         }
         out->read_ms += now_ms() - r0;
-        const double u0 = now_ms();
-        if (qrt_vk_upload_submit(dev, p->stg[slot], dst, span_off, span_bytes,
-                                 err, err_size) != 0) {
-            return -1;
+        if (rc != 0) {
+            break;
         }
+        char detail[256] = {};
+        const double u0 = now_ms();
+        const int upload = qrt_vk_upload_submit(dev, p->stg[slot], dst, span_off, span_bytes,
+                                                detail, sizeof(detail));
         out->upload_ms += now_ms() - u0;
+        if (upload != 0) {
+            out->blocks_failed += last - e;
+            record_failure(rc, err, err_size, detail);
+            break;
+        }
+        pending[slot] = last - e;
         for (uint32_t i = e; i < last; ++i) {
             out->bytes += sizes[i];
         }
-        out->blocks_done += last - e;
         ++out->groups;
         e = last;
     }
-    for (uint32_t k = 0; k < p->slots && k < out->groups; ++k) {
-        const double w0 = now_ms();
-        if (qrt_vk_staging_wait(dev, p->stg[k], err, err_size) != 0) {
-            return -1;
-        }
-        out->wait_ms += now_ms() - w0;
+    for (uint32_t k = 0; k < p->slots; ++k) {
+        finish_slot(k);
     }
-    return 0;
+    return rc;
 }
 
 } // namespace
 
 int qrt_prefill_run_layers(qrt_prefill * p, const uint32_t * ids, uint32_t stride,
-                           const uint32_t * counts, qrt_prefill_batch_fn batch,
-                           qrt_prefill_wait_fn wait, void * user, qrt_prefill_stats * out,
-                           char * err, size_t err_size) {
-    if (p == NULL || ids == NULL || counts == NULL || out == NULL || batch == NULL) {
-        return fail(err, err_size, "the layer batch needs ids, counts and a callback");
+                           const uint32_t * counts, const qrt_prefill_backend * backend,
+                           qrt_prefill_stats * out, char * err, size_t err_size) {
+    if (out != NULL) {
+        memset(out, 0, sizeof(*out));
     }
-    memset(out, 0, sizeof(*out));
+    if (p == NULL || ids == NULL || counts == NULL || out == NULL || backend == NULL ||
+        backend->batch == NULL || backend->wait == NULL) {
+        return fail(err, err_size, "the layer batch needs ids, counts, stats and batch/wait backend");
+    }
     out->slot_reductions = p->cfg.slot_reductions;
     out->pipeline = p->cfg.pipeline ? 1u : 0u;
     const uint32_t layers = qrt_weights_layers(p->w);
+    uint64_t total = 0;
+    if (validate_routes(layers, stride, counts, &total, err, err_size) != 0) {
+        return -1;
+    }
+    out->blocks = (uint32_t) total;
 
     // One buffer has to hold the largest layer, so size it from the table, not a guess.
     uint64_t need = 0;
@@ -895,16 +998,23 @@ int qrt_prefill_run_layers(qrt_prefill * p, const uint32_t * ids, uint32_t strid
             qrt_expert_loc loc;
             if (qrt_weights_locate(p->w, l, ids[(size_t) l * stride + e], &loc,
                                    err, err_size) != 0) {
+                ++out->blocks_failed;
                 return -1;
             }
-            layer += (loc.bytes + 63) / 64 * 64;
+            uint64_t aligned = 0;
+            if (!aligned_bytes(loc.bytes, &aligned) || aligned > SIZE_MAX ||
+                layer > SIZE_MAX - aligned) {
+                ++out->blocks_failed;
+                return fail(err, err_size, "layer %u byte layout overflows", l);
+            }
+            layer += aligned;
         }
         if (layer > need) {
             need = layer;
         }
     }
-    if (need == 0 || n_active == 0) {
-        return fail(err, err_size, "the router asked for no experts");
+    if (max_count > SIZE_MAX / sizeof(uint64_t) || n_active > SIZE_MAX / sizeof(uint32_t)) {
+        return fail(err, err_size, "layer bookkeeping size overflows");
     }
     const uint32_t buffers = qrt_prefill_layer_buffers(p);
     for (uint32_t i = 0; i < buffers; ++i) {
@@ -930,54 +1040,59 @@ int qrt_prefill_run_layers(qrt_prefill * p, const uint32_t * ids, uint32_t strid
 
     const double t_start = now_ms();
     int rc = 0;
-    uint32_t submitted = 0;
+    bool inflight[2] = {};
+    bool batch_ok[2] = {};
+    uint32_t ring_count[2] = {};
+    uint32_t last_ring = 0;
+    auto finish_ring = [&](uint32_t ring) {
+        if (!inflight[ring]) {
+            return;
+        }
+        char detail[256] = {};
+        const double w0 = now_ms();
+        if (backend->wait(backend->user, ring, detail, sizeof(detail)) != 0) {
+            if (batch_ok[ring]) {
+                out->blocks_failed += ring_count[ring];
+            }
+            record_failure(rc, err, err_size, detail);
+        } else if (batch_ok[ring]) {
+            out->blocks_done += ring_count[ring];
+        }
+        out->wait_ms += now_ms() - w0;
+        inflight[ring] = false;
+    };
     for (uint32_t a = 0; a < n_active && rc == 0; ++a) {
         const uint32_t layer = active[a];
         const uint32_t slot = buffers == 2 ? (a & 1u) : 0u;
-        if (buffers == 2) {
-            // The buffer we are about to fill was read by the compute of layer a-2.
-            if (a >= 2) {
-                const double w0 = now_ms();
-                if (wait(user, slot, err, err_size) != 0) {
-                    rc = -1;
-                    break;
-                }
-                out->wait_ms += now_ms() - w0;
-            }
-        } else if (submitted > 0) {
-            const double w0 = now_ms();
-            if (wait(user, 0, err, err_size) != 0) {
-                rc = -1;
-                break;
-            }
-            out->wait_ms += now_ms() - w0;
+        finish_ring(slot);
+        if (rc != 0) {
+            break;
         }
         if (upload_layer(p, layer, slot, ids, stride, counts[layer], experts,
                          offsets, sizes, out, err, err_size) != 0) {
             rc = -1;
             break;
         }
+        // A failed callback can still have submitted part of this ring.
+        inflight[slot] = true;
+        ring_count[slot] = counts[layer];
+        last_ring = slot;
+        char detail[256] = {};
         const double c0 = now_ms();
-        if (batch(user, layer, slot, p->layer_buf[slot], experts, offsets, sizes, counts[layer],
-                  err, err_size) != 0) {
-            rc = -1;
+        batch_ok[slot] = backend->batch(backend->user, layer, slot, p->layer_buf[slot],
+                                        experts, offsets, sizes, counts[layer],
+                                        detail, sizeof(detail)) == 0;
+        out->compute_ms += now_ms() - c0;
+        if (!batch_ok[slot]) {
+            out->blocks_failed += counts[layer];
+            record_failure(rc, err, err_size, detail);
             break;
         }
-        out->compute_ms += now_ms() - c0;
-        ++submitted;
         ++out->layers;
     }
-    if (rc == 0 && submitted > 0) {
-        const double w0 = now_ms();
-        if (wait(user, (submitted - 1) % buffers, err, err_size) != 0) {
-            rc = -1;
-        } else if (buffers == 2 && submitted >= 2 &&
-                   wait(user, (submitted - 2) % buffers, err, err_size) != 0) {
-            rc = -1;
-        }
-        out->wait_ms += now_ms() - w0;
+    for (uint32_t k = 0; k < buffers; ++k) {
+        finish_ring((last_ring + buffers - k) % buffers);
     }
-    out->blocks = out->blocks_done + out->blocks_failed;
     out->total_ms = now_ms() - t_start;
     free(active);
     free(offsets);

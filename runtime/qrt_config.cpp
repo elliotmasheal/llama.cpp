@@ -250,18 +250,12 @@ static int find_opt(const char * flag, size_t len) {
 }
 
 int qrt_config_parse(qrt_config * cfg, int argc, char ** argv, char * err, size_t err_size) {
-    for (int i = 0; i < OPT_COUNT; ++i) {
-        const char * v = getenv(OPT_DESC[i].env);
-        if (v != NULL && *v != '\0' && apply_opt(cfg, i, v, err, err_size) != 0) {
-            return -1;
-        }
-    }
-
-    // argv order matters: the last occurrence of a flag wins.
+    const char * values[OPT_COUNT] = {};
     for (int a = 1; a < argc; ++a) {
         const char * arg = argv[a];
         if (arg == NULL || strncmp(arg, "--", 2) != 0) {
-            continue;
+            snprintf(err, err_size, "unexpected argument '%s'", arg != NULL ? arg : "");
+            return -1;
         }
         const char * eq = strchr(arg, '=');
         const size_t name_len = eq != NULL ? (size_t) (eq - arg) : strlen(arg);
@@ -270,19 +264,32 @@ int qrt_config_parse(qrt_config * cfg, int argc, char ** argv, char * err, size_
             snprintf(err, err_size, "unknown option '%s' (see --help)", arg);
             return -1;
         }
-        const char * value = NULL;
         if (eq != NULL) {
-            value = eq + 1;
-        } else if (a + 1 < argc) {
-            value = argv[++a];
+            values[opt] = eq + 1;
+        } else if (a + 1 < argc && strncmp(argv[a + 1], "--", 2) != 0) {
+            values[opt] = argv[++a];
         } else {
             snprintf(err, err_size, "%s: missing value (want %s)", OPT_DESC[opt].flag, OPT_DESC[opt].want);
             return -1;
         }
-        if (apply_opt(cfg, opt, value, err, err_size) != 0) {
+    }
+    qrt_config parsed = *cfg;
+    for (int i = 0; i < OPT_COUNT; ++i) {
+        const char * value = values[i];
+        if (value == NULL) {
+            value = getenv(OPT_DESC[i].env);
+            if (value != NULL && *value == '\0') {
+                value = NULL;
+            }
+        }
+        if (value != NULL && apply_opt(&parsed, i, value, err, err_size) != 0) {
             return -1;
         }
     }
+    if (qrt_config_validate(&parsed, err, err_size) != 0) {
+        return -1;
+    }
+    *cfg = parsed;
     return 0;
 }
 
@@ -291,8 +298,9 @@ int qrt_config_validate(const qrt_config * cfg, char * err, size_t err_size) {
         snprintf(err, err_size, "QRT_SPEC_K %d is not one of 1, 2, 4, 5, 8", cfg->spec_k);
         return -1;
     }
-    if (cfg->draft_vocab < 0 || (cfg->draft_vocab > 0 && cfg->draft_vocab < 1024)) {
-        snprintf(err, err_size, "QRT_DRAFT_VOCAB %d is neither 0 nor at least 1024", cfg->draft_vocab);
+    if (cfg->draft_vocab < 0 || cfg->draft_vocab > 262144 ||
+        (cfg->draft_vocab > 0 && cfg->draft_vocab < 1024)) {
+        snprintf(err, err_size, "QRT_DRAFT_VOCAB %d is neither 0 nor 1024..262144", cfg->draft_vocab);
         return -1;
     }
     if (cfg->expert_cache_mib < 0 || cfg->expert_cache_mib > 8176) {
@@ -411,14 +419,6 @@ void qrt_config_print_switches(FILE * f) {
     for (int i = 0; i < OPT_COUNT; ++i) {
         fprintf(f, "  %-22s %-20s %-19s %s\n", OPT_DESC[i].env, OPT_DESC[i].flag, def[i], OPT_DESC[i].want);
     }
-    fprintf(f, "\n  %-22s %-20s %-19s %s\n", "-", "--print-config", "-", "print the effective values and the notes");
-    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--selftest", "-", "check the switches and the telemetry sink");
-    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--gguf-index <path>", "-", "print the GGUF tensor table and account");
-    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--require-tensor <name>", "-", "exit 2 when the tensor is missing");
-    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--vk-info", "-", "device, memory types and the VRAM plan");
-    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--vk-alloc-probe <mib>", "-", "allocate once and re-read the budget");
-    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--deltanet-check <path>", "-", "DeltaNet recurrence vs the CPU reference");
-    fprintf(f, "  %-22s %-20s %-19s %s\n", "-", "--help, -h", "-", "this table");
 }
 
 void qrt_config_print_effective(const qrt_config * cfg, FILE * f) {
