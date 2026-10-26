@@ -4,6 +4,7 @@
 
 add_library(qrt_core STATIC
     qrt_config.cpp
+    expert_cache.cpp
     cpu_moe.cpp
     qrt_telemetry.cpp
     gguf_index.cpp
@@ -242,6 +243,10 @@ endif()
 if (BUILD_TESTING)
     add_test(NAME qrt_selftest COMMAND qrt --selftest)
     set_tests_properties(qrt_selftest PROPERTIES LABELS "qrt;cpu")
+    add_executable(qrt_cache_test expert_cache_test.cpp expert_cache.cpp)
+    set_target_properties(qrt_cache_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME qrt_cache_contract COMMAND qrt_cache_test)
+    set_tests_properties(qrt_cache_contract PROPERTIES LABELS "qrt;cpu")
     add_executable(qrt_cpu_moe_test cpu_moe_test.cpp cpu_moe.cpp)
     set_target_properties(qrt_cpu_moe_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     if (NOT MSVC)
