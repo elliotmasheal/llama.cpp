@@ -2481,3 +2481,68 @@ done_when（重跑同一测量）。
 - **关闭零开销**：只多一次 `tel != NULL` 分支；未在正式批次里量化，属未验证项。
 - **未做**：telemetry 的 `draft_ms` 仍为 0（M3-3）、跨长 prompt 的连续 CSV、与 X-2 采集脚本
   的端到端对拍。
+
+## 88. M3-3 判决：接受/回滚引擎成立，MTP 草稿因实测字节账拆出（2026-10-26）
+<!-- slug: m3-3-accept-rollback-verdict -->
+
+- **采纳**：DeltaNet 用 `k+1` 槽状态环 + 主机游标做回滚，不用“重算一遍”也不用反解递推。
+  理由：反解（delta rule 可逆）会引入不在前向算术顺序内的除法/累加顺序，位相等无法保证；
+  重算需要保留每层的 qkv 历史，实际更贵。环的代价是每层 `(k+1) x 2 MiB`（k=4 时 10 MiB/层，
+  30 个线性层 300 MiB），换来的是回滚零拷贝、并且**删掉了原来每 chunk 一次 2 MiB/层的
+  状态拷贝**。design 5.4“状态很小”这句要按这个字节数重读。
+- **判决**：`done_when` 三条（保存 k 份状态 / 接受最长前缀并回滚 / 第一个不匹配处用验证结果）
+  在真实模型上成立，证据 `RESULTS.md#m3-3-accept-rollback`（k=2/4/8 两臂 ids 全同、
+  verified 行逐位相等、反例臂在第 3 个 token 分叉）。内核侧 L-KERN 由 `dn_snap` 子项给出：
+  快照与串行状态 `memcmp` 逐位相等。**M3-3 记 partial**：标题里的“MTP 草稿（受限词表）”
+  未做，拆成 `M3-3b`。
+- **拆出 M3-3b 的依据（实测，非推断）**：MTP 块 `blk.40` = 504.357 MiB，与任一主层同量级
+  （`blk.3` 496.838 MiB），含 256 个专家；它的 `ffn_gate_inp` 是 bf16 而主层是 f32。
+  design 2.1/4.1 的“nextn 8 MiB、每步只读输出头”是把 `blk.40.nextn.*` 四个张量单独成桶的
+  分类结果，不是块的真实尺寸。每草稿步的字节账因此是稠密 ~42 MiB + top-8 专家 ~15 MiB +
+  受限头 ~33 MiB ≈ 90 MiB（156.5 GB/s 下 ~0.6 ms），受限词表仍是必要条件但收益比 design
+  算的小。**design 未改**（由用户改），这里只登记实测与口径差异。
+- **排除**：不把“verified 行逐位相等”外推成“批量 pass 与串行 pass 恒定位相等”。本轮成立
+  是因为 `stage_rows` 对 1..8 行都走 1-token Q8K 路径；行宽超过它或换 tile 就得重估。
+- **不改默认**：`--generate` 的 decode 仍是 k=1 串行；推测循环目前只由 `--spec-check`
+  驱动，`QRT_SPEC_K` / `QRT_DRAFT_VOCAB` 保持既有默认值但不生效于生产路径，因此不触发
+  L-MODEL。新开关 `--spec-rollback on|off`（off 是反例臂）与 `--spec-check` 只用于验收。
+- **暴露并拆出 M3-2c（阻断 M3-6）**：`--spec-check` 只在 `--miss-split 100`（全部 H2D、GPU 算专家）
+  时两臂逐位相等；`auto` 在**还没发生回滚**的 cycle 0 row 0 就 `rel_l1=2.818e-01`，`0`（全部 CPU 腿）
+  时 rows=4 的 CPU 腿在同一位置给出 126863 而 rows=1 给出金标准 4438。三点夹逼把缺陷定在
+  **CPU 专家腿的 rows>1 路径**（嫌疑：`ffn_store.cpp:168-182` 为 CPU 腿下载的 Q8_1 平面在
+  `stage_rows` 1..8 的 1-token Q8K 布局下按 `t * E` 线性读取是否成立）。这是 M3-2a 交付路径的
+  既有缺口，不是接受/回滚的问题：`--generate-batch` 过去只做腿计时，其数值从未与串行对拍，
+  X-6 的 `--moe-batch-check` 覆盖的是 GPU routed 内核。M3-6 的口径（k=4 + 21.7% 缓存 + auto）
+  正踩在上面，故 M3-6 与 M3-2b 都依赖 M3-2c；在 M3-2c 之前，任何推测验收固定
+  `--miss-split 100`，并把该口径写进读数行。
+- **留给 M3-5 的既有事实**：默认 `--expert-cache-mib 4198 + --miss-split auto` 下，同配置
+  两次运行的 step logit 不同（19.5748 vs 19.7491），ids 全同。原因在腿切分随实测速率变化，
+  部分和相加顺序随之变化，不是本轮引入。M3-5 若要逐 token 比 logit，需先固定 `--miss-split`
+  或把判据限定在 ids/top-1、logit 只报容差。
+
+## 89. M3-2c 判决：CPU 腿多行暂存修复，推测验收按腿路径分档（2026-10-26）
+<!-- slug: m3-2c-cpu-leg-verdict -->
+
+- **采纳**：CPU 专家腿的结果暂存从 `[专家][n_embd]` 改成 `[专家][run_tokens][n_embd]`，
+  worker 写 `(专家, 行)` 槽、合并按 `(专家, 行)` 取回。不采用"每行重跑一遍专家"或"把多行
+  折成一次 multi-token GEMV"：前者浪费已经读进来的权重，后者要新内核，而缺陷本身只是索引。
+  同时把 `ffn.h` 里"只为 decode 尺度调用开启"这条只写在注释上的约束变成代码检查
+  （`qrt_ffn_plan_cache_layer` 对 `run_tokens > 8` 直接报错）：暂存现在按行数放大，
+  若将来把缓存接到 prefill 尺度就是几 GiB 的主机分配，宁可红也不要静默吃内存。
+  design 4.2 的固定形状上限正是 8，`--generate-batch` 的上限也是 8，本轮没有因此被挡住的路径。
+- **判决**：rows>1 的 CPU 腿与串行同腿路径**逐位一致**（k=2/4/5/8 下
+  `--miss-split 0` 两臂 worst rel_L1 = 0.000e+00、ids 全同），M3-2c 收口；M3-6 与 M3-2b 的
+  依赖由此满足。证据 `RESULTS.md#m3-2c-cpu-leg-rows`。
+- **判据分档（不是放宽）**：`--spec-check` 的行 gap 只在两臂同腿时是硬判据（固定
+  `--miss-split 0` 或 `100`，阈值 rel_L1 <= 1e-4，实测 0）；`auto` 下两臂的 miss 多重度不同，
+  切分点随之不同，gap 是 **CPU 腿与 GPU 内核之间的既有算术差**（87.2 已量到同一量级），
+  记为 `rows_loose` 读数并打印 `legs=mixed`，token 与 top-1 仍逐位判。这不是把阈值放宽去
+  迁就某次失败：本轮 auto 的 12 个 token 全部与串行一致，且同腿档仍是 0 差距。
+- **排除**：`--miss-split auto` 与 `0` 的差距**不是**接受/回滚问题——缺陷显形于
+  cycle 0 row 0，那还没有发生任何回滚；也不是 `qrt_cpu_moe` 句柄竞态（结构体只有一个 int）；
+  也不是 Q8_1/top-k 平面布局（`[tokens][k]` 行主序，且 GPU-only 档逐位相等）。
+- **历史读数不动**：M3-2a 的 87.2 正确性对照与 87.3 三条腿耗时都取自 rows=1 或 GPU-only，
+  不需撤回；`--generate-batch K` 的数值从未与串行对拍，这正是本缺陷逃过 X-6 的原因——
+  以后任何多行 decode 的验收必须走 `--spec-check`，不能只看 batch 计时。
+- **常驻回归**：`--spec-check --miss-split 0` 在 k=2/4/5/8 全档必过（比原先只看 100 更强，
+  把 CPU 腿的多行路径纳入判据）。

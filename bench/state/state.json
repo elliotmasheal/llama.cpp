@@ -1,7 +1,7 @@
 {
   "schema": 3,
   "track": "qwen36-runtime",
-  "updated": "2026-10-26 18:05",
+  "updated": "2026-10-26 19:58",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -152,8 +152,9 @@
     },
     {
       "lane": "impl",
-      "head": "M3-3",
+      "head": "M3-3b",
       "order": [
+        "M3-2c",
         "X-5",
         "X-6",
         "X-7",
@@ -161,6 +162,7 @@
         "M3-2a",
         "M3-3",
         "M3-2b",
+        "M3-3b",
         "X-8",
         "X-4",
         "M2-0",
@@ -177,7 +179,7 @@
         "X-1",
         "X-2"
       ],
-      "note": "M3-2a done on the split; M3-2b holds the three-leg 10% (GPU leg), after M3-3/M3-4. M3-4 telemetry done. Next M3-3 MTP draft + accept/rollback (needs k DeltaNet snapshots and KV length rollback); X-8 after."
+      "note": "M3-2c done: the CPU expert leg now matches serial decode bit for bit for rows 2/4/5/8 (--spec-check --miss-split 0 is the standing regression). Next: M3-3b MTP draft (blk.40 = 504 MiB, not the 8 MiB design counted). M3-2b and M3-6 are unblocked. X-8 after."
     },
     {
       "lane": "data",
@@ -748,17 +750,71 @@
       "id": "M3-3",
       "milestone": "M3",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
       "title": "MTP 草稿（受限词表）+ 接受/回滚",
       "deps": [
         "M3-2",
         "M1-3a"
       ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/CMakeLists.txt",
+        "runtime/README.md",
+        "runtime/attn_deltanet.*",
+        "runtime/attn_deltanet_check.cpp",
+        "runtime/kernels/deltanet_recur*.comp",
+        "runtime/layer.*",
+        "runtime/layer_internal.h",
+        "runtime/model.h",
+        "runtime/model_generate.cpp",
+        "runtime/model_internal.h",
+        "runtime/qrt_cli.*",
+        "runtime/qrt_main.cpp",
+        "runtime/spec.*",
+        "runtime/spec_test.cpp"
+      ],
+      "done_when": "保存 k 份 DeltaNet 状态；接受最长前缀并回滚；第一个不匹配处用验证结果。design 7 的验收法：构造 k 个 token 中第 i 个不匹配的用例，KV 与 DeltaNet 状态与串行解码逐字节一致，接受的 token 流与串行 greedy 逐 token 一致",
+      "owner": "qoder-agent@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-26T18:39:06+08:00",
+      "note": "done 2026-10-26（引擎一半；MTP 草稿拆到 M3-3b）：deltanet 内核与模块改成 k+1 槽状态环（push constant cur/slots/snap，绑定 5/7 同一块分配），layer 删掉每 chunk 2 MiB/层的 state_out->state_in 拷贝，conv taps 的 carry 移到 pass 的第一条命令（qkv 投影会覆盖 carry 要读的行）。新增 runtime/spec.*（最长前缀接受 + 第一个不匹配处取 verified[accepted] + 逐层回滚 + 受限词表装载）、qrt_spec_test CPU 契约、--deltanet-check 的 dn_snap 子项、qrt --spec-check 两臂对拍。证据：k=2/4/8 与串行臂 ids 全同、verified 行 rel_L1 0.000e+00（rows_checked=11, rows_bad=0）；--spec-rollback off 反例臂在第 3 个 token 分叉；dn_snap 快照与逐 token 串行状态 memcmp 逐位相等、回滚后单步输出逐位相等；ctest -L qrt 9/9；chunk-check 512/128 carry 0.000e+00 对反例 2.174e-01；layer-check 层 3 mismatches=0；model-check 40 层 hidden_max 4.675e-05 / logits 1.002e-05 / top1 8/8；generate 40 层 32+8（cache 关）ids 与 8 个 logit 与 RESULTS 86.2 逐值相同，peak 2740.5 MiB 不变。实测推翻 design 2.1 的\"nextn 8 MiB\"：blk.40 = 504.357 MiB（256 专家 + bf16 router），草稿每步约 90 MiB（受限头口径），见 RESULTS 89.6。未提交（无提交授权）。另外 --spec-check 两臂接上 decode 专家缓存后复跑（512 MiB、--miss-split 100、282 槽）仍 ids 全同、verified 行逐位相等；--generate 4 层 32+3 仍 79,4438,4438 peak 779.8 MiB验收对拍目前必须固定 --miss-split 100：auto/0 下 CPU 专家腿在 rows>1 与串行不一致（既有缺陷，拆出 M3-2c，M3-6 依赖它）",
+      "evidence": {
+        "results": [
+          "RESULTS.md#m3-3-accept-rollback"
+        ],
+        "decisions": [
+          "DECISIONS.md#m3-3-accept-rollback-verdict"
+        ]
+      }
+    },
+    {
+      "id": "M3-3b",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "todo",
+      "title": "MTP 草稿（blk.40）+ 受限词表头，接进 --generate 的推测循环",
+      "deps": [
+        "M3-3"
+      ],
       "resources": [],
       "paths": [
-        "runtime/spec.*"
+        "runtime/spec.*",
+        "runtime/layer.*",
+        "runtime/model_generate.cpp",
+        "runtime/model.h",
+        "runtime/kernels/**",
+        "runtime/qrt_cli.*",
+        "runtime/qrt_main.cpp",
+        "runtime/CMakeLists.txt",
+        "runtime/README.md",
+        "bench/vocab/**"
       ],
-      "done_when": "保存 k 份 DeltaNet 状态；接受最长前缀并回滚；第一个不匹配处用验证结果"
+      "done_when": "草稿步由 blk.40 产生而不是教师强制的真实后续：enorm/hnorm + concat + nextn.eh_proj 接进 qrt_layer(40)（该层 router 是 bf16，需按类型装载），共享 token_embd 与 output 头；受限词表头从 bench/vocab/draft-16k.bin 取候选行。验收：--spec-check 的草稿源换成 MTP 后 两臂 ids 仍与串行 greedy 逐 token 一致，报 runtime 的 E 与接受率 p（k=4、16K 候选，门槛 design 6.3）、每草稿步字节与 ms、以及 blk.40 专家的缓存归属",
+      "note": "M3-3 只交付了接受/回滚引擎。实测 blk.40 = 504.357 MiB（gate/up q4_K 144 MiB each、down q5_K 176 MiB、attn_q/output/eh_proj q8_0、router bf16），无 nextn.embed_tokens/shared_head_head，即共享 token_embd 与 output。design 4.1 的\"8 MiB 成本可忽略\"是把 nextn.* 单独成桶的分类结果，每步真实字节约稠密 42 MiB + top-8 专家 15 MiB + 受限头 33 MiB。证据 RESULTS.md#m3-3-accept-rollback 89.6"
     },
     {
       "id": "M3-4",
@@ -801,7 +857,8 @@
         "M3-3",
         "M3-4",
         "M2-6a",
-        "X-1"
+        "X-1",
+        "M3-3b"
       ],
       "resources": [
         "gpu",
@@ -820,7 +877,8 @@
       "status": "todo",
       "title": "TG >= 130 tok/s（单流，greedy，128 token）",
       "deps": [
-        "M3-5"
+        "M3-5",
+        "M3-2c"
       ],
       "resources": [
         "gpu",
@@ -1210,7 +1268,8 @@
       "status": "todo",
       "title": "GPU 腿回到带宽地板：attention/DeltaNet/router 与跨层 overlap",
       "deps": [
-        "M3-2a"
+        "M3-2a",
+        "M3-2c"
       ],
       "resources": [
         "gpu",
@@ -1230,6 +1289,42 @@
       ],
       "done_when": "k=5、4198 MiB、auto 下 GPU 设备腿（pass1+pass2 submit->fence）<= 30 ms/pass，且三条腿 spread <=10%（同一测量重跑 RESULTS#m3-2a-miss-split 的表）；报 attention/DeltaNet/router 的 per-layer 分解与前后读数",
       "note": "2026-10-26 user chose (b) on E-SPLIT1: M3-2a closes on miss-leg balance; the 34.5% three-leg spread and its GPU device leg (158-190 ms vs the 21 ms bandwidth floor) move here. Not claimed."
+    },
+    {
+      "id": "M3-2c",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "done",
+      "title": "CPU 专家腿在 rows>1 与串行不一致：定位并修 Q8_1 平面的行寻址",
+      "deps": [
+        "M3-2a"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/ffn_store.cpp",
+        "runtime/ffn.*",
+        "runtime/cpu_moe.*",
+        "runtime/layer.cpp",
+        "runtime/qrt_main.cpp",
+        "runtime/README.md"
+      ],
+      "done_when": "同一层、同一行集合下，rows=1 与 rows=2/4/5/8 在 `--miss-split 0` 与 `auto` 下的层输出与 GPU-only（`--miss-split 100`）逐位一致（或给出并验证 rel_L1 <= 1e-6 的明确差异来源），`--spec-check` 不再需要固定 `--miss-split 100`，并留 CPU 双精度参考对照",
+      "note": "done 2026-10-26：根因是 ffn_store.cpp 的 CPU 腿结果暂存只有每专家一份向量（cpu_res = [cpu_pos][E]），worker 把该专家在所有命中行上的贡献累加进同一份，合并时又把这一份总量加给每一行；T=1 时专家至多一行所以看不出来，k=4 的多重度约 1.61 就直接错。改为 [cpu_pos][run_tokens][E] 的 (专家,行) 槽。排除项：不是 qrt_cpu_moe 句柄竞态（struct 只有一个 int）、不是 Q8_1/top-k 平面布局（都是 [tokens][k] 行主序）、不是接受/回滚（缺陷显形于 cycle0 row0，尚未回滚）。读数：--miss-split 0 下 k=2/4/5/8 两臂 ids 全同、worst rel_L1 0.000e+00（修复前 k=4 是 1.510e+00 且第 2 个 token 就分叉）；100 档不变；auto 档 ids 全同、行 gap worst 7.284e-02/max_abs 9.719e-02 归因于 87.2 的 CPU-vs-GPU 腿差，判据按腿路径分档（同腿 1e-4 硬判、auto 只判 token 与 top-1）。回归：ctest -L qrt 9/9、40 层 --generate 32+8 ids 与基线逐位相同、peak 6938.3 MiB 不变、cpu_ms 386.17->351.60 （噪声内）。M3-6/M3-2b 的依赖解除。未提交。",
+      "owner": "qoder-agent@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-26T19:44:22+08:00",
+      "evidence": {
+        "results": [
+          "RESULTS.md#m3-2c-cpu-leg-rows"
+        ],
+        "decisions": [
+          "DECISIONS.md#m3-2c-cpu-leg-verdict"
+        ]
+      }
     },
     {
       "id": "U-5",

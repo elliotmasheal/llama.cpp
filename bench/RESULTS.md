@@ -3578,3 +3578,287 @@ auto 把两条 miss 腿平衡到 0.1-0.2%（k=1 8 步累计 479.84/480.79；k=5 
   中途写失败在结束时打印失败行数。
 - 未验证：k>1 的 accepted（要 M3-3）、跨 10K/128 token 的连续行、telemetry 对 TG 的影响（关闭
   路径的常数开销未单独计时）。
+
+## 89. M3-3 前半：DeltaNet 状态环 + 接受/回滚在真实模型上对齐串行 greedy（2026-10-26）
+<!-- slug: m3-3-accept-rollback -->
+
+口径：工作区 `4b84522e7` + 未提交 diff；`build-vulkan`（Release/MinGW，Vulkan）；模型
+`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` + 同名 `.qwen36rt` store；`--prefill-chunk 32`；
+KV 档 f16/f16（对照 86.2 的金标准）与默认 q8_0/q4_0；电源平衡 + AC。
+本轮全部是**短档诊断与正确性**证据，不是 PP/TG 批次，也不构成 M3-5。
+
+### 89.1 实现：环而不是拷贝
+
+- `deltanet_recur.comp` / `deltanet_recur_cols.comp` 的 push constant 增加 `cur / slots / snap`
+  （填满 8 个 uint，正好是 layout 预留的 32 B）。状态读写都落在同一条环上：读槽 `cur`，
+  写槽 `(cur + 1 + t) % slots`；`snap=0` 只写末态且固定写到 `cur+1`，所以主机游标每次只 +1。
+- 环容量：`slots = max(2, dn_snap_rows + 1)`。绑定 5 与 7 指向**同一块**分配（第 7 个不再
+  单独持有内存），`bufs.state_in/state_out` 合并成 `bufs.state`。
+- `layer.cpp` 删掉 chunk 之间 2 MiB/层的 `state_out -> state_in` 拷贝；`record_dn_carry`
+  只剩 conv taps，且必须记在 pass 的**第一条命令**：qkv 投影的输出平面正是 conv 的输入行，
+  记晚了就会读到本 chunk 自己刚写的行（第一轮就因此在第 3 个 token 分叉，logit
+  19.5748/19.7491/19.7135 三种读数即来自这类顺序错误 + 下面 89.5 的不确定性）。
+- 新入口：`qrt --spec-check`（`runtime/spec.*` + `model_generate.cpp`
+  `qrt_model_spec_check`）、`qrt_spec_test` CPU 契约、`--deltanet-check` 的 `dn_snap` 子项。
+
+### 89.2 状态环的 L-KERN（`--deltanet-check --deltanet-layer 0 --deltanet-tokens 64`）
+
+`bench/raw/m3-3/dn-ring.log`，两个递推变体都过：
+
+| 项 | serial | cols |
+|---|---:|---:|
+| `dn_snap rows=8` plain_eq / serial_eq / rollback_eq | 1 / 1 / 1 | 1 / 1 / 1 |
+| `dn_snap ref_rel_l1` / `ref_max` | 5.697e-08 / 1.788e-07 | 6.063e-08 / 1.788e-07 |
+| `dn_recur correct` state_rel_l1 | 1.470e-07 | 1.679e-07 |
+| `dn_recur split`（半块接续） rel / state | 0.000e+00 / 0.000e+00 | 0.000e+00 / 0.000e+00 |
+| `dn_recur serial`（逐 token） rel / state | 0.000e+00 / 0.000e+00 | 0.000e+00 / 0.000e+00 |
+
+`dn_snap` 的三条判据是独立的：8 行的快照与**逐 token 串行**链的状态 `memcmp` 逐位相等；
+无快照的同行 pass 输出与快照 pass 输出逐位相等且末态等于第 8 份快照；快照对 CPU 双精度
+逐 token 参考 rel_L1 <= 1e-4；把游标放到第 `snap_k-2` 行快照后单步解码，输出行与该快照
+pass 的对应行逐位相等（= 回滚语义）。
+
+递推计时（诊断，1024 token）：cols 1.693 -> 2.104 ms/层（1.65 -> 2.05 us/token），
+serial 6.290 -> 5.987 ms；`dn_layer` 四腿 13.82 -> 12.04 us/token。环把读写并进同一块
+（检查器开 9 槽 = 18 MiB）使递推本身变贵，但省掉了每 chunk 一次 2 MiB/层拷贝，四腿合算
+的每 token 成本下降。正式 TG 口径下这两项都要重新测。
+
+### 89.3 模型级回归（与 86.2 金标准对照）
+
+| 检查 | 读数 | 判决 |
+|---|---|---|
+| `ctest -L qrt` | 9/9（含新增 `qrt_spec_contract`） | PASS |
+| `qrt --selftest` | 0 failed | PASS |
+| `--layer-check` 层 3 @512 + store | `layer_state chunks=508,1,2,1 mismatches=0`，`fails=0` | PASS |
+| `--chunk-check` 512 token / chunk 128（4 层） | carry_vs_single `0.000e+00`，no-carry 反例 `2.174e-01` | PASS |
+| `--model-check` 40 层 64 token `reseed off planes device` f16 | `hidden_max=4.675e-05`、`logits_rel_l1=1.002e-05`、top1 8/8、NLL 两臂 0.1763/0.1763 | PASS（与 2026-10-26 记录的同口径稳定读数一致） |
+| `--generate` 40 层 32+8 f16 `--expert-cache-mib 0` | ids `587,3393,8,271,58,20077,10911,9251`，8 个 step logit 21.9527/19.7135/22.9325/22.2525/17.9262/18.8983/17.4952/21.9585 | 与 `RESULTS.md#m3-2-persistent-generate` 逐值相同；peak 2740.5 MiB 不变 |
+
+### 89.4 `--spec-check`：对抗草稿的两臂对拍
+
+`--spec-check <gguf> --logits-tokens tokens32.txt --generate-new 12 --layer-store <prefix>
+--logits-layers 4 --prefill-chunk 32 --kv-k f16 --kv-v f16 --spec-k {2,4,8}`。
+臂 A 串行逐 token 参考（环 2 槽），臂 B 同一 prompt 重开会话（环 k+1 槽）跑推测循环，
+草稿取臂 A 的真实后续、每循环固定破坏第 `cycle % k` 个位置；`--spec-rollback off` 是反例臂。
+4 层（3 个 DeltaNet + 1 个 full-attn），缓存关闭以保持确定性：
+
+| k | cycles | E | ids_equal | rows_checked | rows_bad | worst_rel_l1 | 判决 |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 2 | 8 | 1.375 | 1 | 11 | 0 | 0.000e+00 | PASS |
+| 4 | 5 | 2.200 | 1 | 11 | 0 | 0.000e+00 | PASS |
+| 8 | 5 | 2.200 | 1 | 11 | 0 | 0.000e+00 | PASS |
+| 4 + rollback off | 11 | 1.000 | **0**（first_diff=2） | 不比对 | - | - | PASS（反例如期分叉） |
+
+接受数按 break_at 走到 1..k，最后一个不足 k 的尾循环自动缩行（k=8 的 cycle 3 是 rows=5、
+cycle 4 是 rows=1）。“第一个不匹配处用验证结果”在臂 B 的 ids 里直接可见：分叉位置的 token
+来自 `verified[accepted]`，其后草稿全部丢弃，而两臂最终 ids 完全相同。
+verified 行的 logits 与臂 A 同序号行**逐位相等**（worst rel_L1 = 0）：`stage_rows` 对 1..8
+行都走 1-token Q8K 路径（86.1），所以两臂的算术形状相同，位相等是预期而非偶然。
+
+单次 pass 诊断（4 层，host head 在内，不能当 TG）：rows=1 约 1.35 s、rows=2 约 1.87 s、
+rows=4 约 2.89 s、rows=8 约 4.9 s。
+
+两臂同时接上 decode 专家缓存（`--expert-cache-mib 512 --miss-split 100`，282 槽 / 511 MiB /
+SLRU，`degraded=0`）后再跑 k=4 与 k=8：`ids_equal=1`、`rows_checked=11`、`rows_bad=0`、
+`worst_rel_l1=0.000e+00`，两臂判决都 PASS。即状态环与缓存槽、H2D miss 腿在同一层对象上
+共存不互相破坏；固定 100% H2D 也让两臂的求和顺序一致（对照 89.5）。
+`--generate` 4 层 32+3 在同一二进制上仍是 `79, 4438, 4438`、peak 779.8 MiB，与 86.3 相同。
+
+### 89.5 顺带量到的既有不确定性（不是本轮引入）
+
+默认 `--expert-cache-mib 4198` + `--miss-split auto` 的 40 层 32+8 两次运行，ids 全同但
+step logit 不同（3393：19.5748 vs 19.7491；8：22.9144 vs 22.9580）。原因是 auto 按实测腿
+速率切分 miss，切分结果在不同运行间不同，CPU 腿与 GPU 腿的部分和相加顺序随之变化。
+`RESULTS.md#m3-2a-miss-split` 的三条腿读数同理。**对 M3-5“与参考 greedy 逐 token 一致”的
+含义**：要么固定 `--miss-split`，要么把逐 token 判据落在 ids 与 top-1 上、logit 只报容差；
+本轮未替 M3-5 决定，留作该任务的验收口径问题。
+
+### 89.5b `--miss-split auto|0` 下 CPU 专家腿在 rows>1 与串行不一致（既有缺陷，本轮暴露）
+
+同一条 `--spec-check`（4 层、32+12、f16、`--expert-cache-mib 512`）只换 miss 分配：
+
+| `--miss-split` | 结果 |
+|---|---|
+| 100（全部 H2D，GPU 算） | `ids_equal=1`、`worst_rel_l1=0.000e+00`（512 MiB 与 4198 MiB 两档都 PASS） |
+| auto | FAIL：`cycle=0 row=0` 就 `rel_l1=2.818e-01 max_abs=2.684`，此时**还没有任何回滚发生** |
+| 0（全部 CPU 腿） | FAIL：同一位置 spec 臂给 126863，串行臂给 4438（4438 与 86.3 的 4 层金标准一致） |
+
+三点合起来把变量夹到 **CPU 专家腿的 rows>1 计算**，而不是接受/回滚、也不是缓存或环：
+
+- rows=4 全 GPU 与 rows=1 全 GPU 逐位相等，说明路由 id/权重与 GPU 腿对行数不变。
+- rows=1 走 CPU 腿给 `4438@9.6335`，与缓存关闭的 `4438@9.6460` 同序（腿间求和顺序差）。
+- rows=4 走 CPU 腿在同一位置给出完全不同的行。
+
+`ffn_store.cpp:216-233` 的行循环本身按 `h_ids[t*K+k] == e` 累加 `wgt * row[i]`，
+`cpu_res[j]` 与 `cpu_out[t]` 的分块也按 T 行分配；下一步要查的是 CPU 腿读的那两份
+Q8_1 平面（`f->in.x_qs` / `x_ds`，`ffn_store.cpp:168-182`）在 `stage_rows` 1..8 走的
+1-token Q8K 布局下，行是否真的按 `t * E` / `t * nb` 连续排列——若不连续，t=1 恰好只读第 0
+行所以对，t>1 就会把别的行的平面当成自己的行。判据：在 `--miss-split 0` 下比较 rows=1 与
+rows=4 的 `x_qs` 下载缓冲，或直接对同一行用 CPU 双精度参考核（`--moe-check` 的参考路径）。
+`--generate-batch K` 过去只用于腿计时（87 节），其数值从未与串行对拍，所以这条不在 X-6 的
+`--moe-batch-check` 覆盖里：那个检查对的是 **GPU** routed 内核的 k=1..8。
+
+**影响**：M3-6 的 TG 口径是 `k=4 + 21.7% 缓存 + auto 分担`，正踩在这条路径上；在它修好前，
+`--spec-check` 的验收对拍必须固定 `--miss-split 100`（本轮 PASS 的两档都是这么跑的）。
+承接任务 `M3-2c`，M3-6 依赖它。
+
+### 89.6 MTP 块的实测字节账（design 2.1 的“nextn 8 MiB”是分类产物）
+
+`gguf_dims.py` 口径下 `blk.40` 张量表实测（`bench/raw/m3-3/`，脚本读 GGUF 头，不加载权重）：
+
+| 项 | 字节 |
+|---|---:|
+| `ffn_gate_exps` / `ffn_up_exps`（q4_K） | 144.000 MiB each |
+| `ffn_down_exps`（q5_K） | 176.000 MiB |
+| `attn_q`（q8_0）/ `attn_output` / `nextn.eh_proj` | 17.000 / 8.500 / 8.500 MiB |
+| `attn_k`/`attn_v`/三个 `*_shexp`（q8_0） | 1.062 MiB each |
+| `ffn_gate_inp`、`ffn_gate_inp_shexp` | **bf16**（主层是 f32） |
+| `enorm`/`hnorm`/`shared_head_norm`/两个 norm | 0.008 MiB each |
+| **blk.40 合计** | **504.357 MiB**（对照 `blk.3` 496.838 MiB） |
+
+`blk.40` 与 `blk.7` 是同一个“full-attn + 256 专家 MoE”块，只多四个 `nextn.*` 张量；
+它没有 `nextn.embed_tokens` / `nextn.shared_head_head`，即共享 `token_embd` 与 `output`。
+design 2.1 的“nextn（MTP 块，Q8_0）8 MiB”只统计了 `blk.40.nextn.*` 四个张量
+（eh_proj 8.5 MiB 占大头），专家与注意力本来就被归进 routed/dense 两桶。
+据此，design 4.1 的“每步草稿只读 8 MiB，成本可忽略”不成立：草稿一步要读稠密约 42 MiB +
+top-8 专家约 15 MiB + 输出头（受限词表约 33 MiB / 完整词表 0.5 GiB），按 156.5 GB/s
+是每步约 0.6 ms（受限）量级，而不是 3.2 ms 的“只有头”账。**未改 design**（design 由用户改），
+这里只按“design 的数字必须在 RESULTS 有回链”登记实测。
+
+### 89.7 未验证与边界
+
+- 草稿来源仍是**教师强制的真实后续**，不是 MTP 块：`E` 是注入破坏位置下的接受数，
+  不是原生 MTP 的接受率；受限词表 16K 草稿头未接。M3-3 标题里的“MTP 草稿（受限词表）”
+  是未完成的一半。
+- 4 层 / 12 token 短档；10K prompt、256K 上下文、128 token 未跑（属 M3-5/M3-6）。
+- `--generate` 的 decode 仍走 k=1 串行；推测循环目前只由 `--spec-check` 驱动。
+- 专家缓存续用时的环回退路径（分配失败后重开 slot）未单独演练；该路径在
+  `qrt_layer_open` 之后重分配 slot，层内记录的 slot 句柄不会更新，属既有实现风险，
+  本轮未改（触发条件是显存分配失败，本轮 `failures=0`）。
+- 未提交（无提交授权）。
+
+## 90. M3-2c：CPU 专家腿的多行暂存错误已修，rows>1 与串行逐位一致（2026-10-26）
+<!-- slug: m3-2c-cpu-leg-rows -->
+
+口径：工作区 `4b84522e7` + 未提交 diff；`build-vulkan`（Release/MinGW，Vulkan）；
+`--spec-check` 4 层（3 个 DeltaNet + 1 个 full-attn）、`tokens32.txt`、`--generate-new 12`、
+`--prefill-chunk 32`、f16/f16、`--expert-cache-mib 512`（282 槽 / 511 MiB / SLRU / `degraded=0`）。
+原始日志 `bench/raw/m3-2c/`。本轮是正确性修复与回归，不是 TG/PP 批次。
+
+### 90.1 根因（一行分配，不是竞态、不是平面布局）
+
+先排除两个候选假设，再定位：
+
+| 假设 | 区分性证据 | 结论 |
+|---|---|---|
+| CPU 腿 worker 并发共用 `qrt_cpu_moe` 句柄有竞态 | `struct qrt_cpu_moe { int threads; }`（`cpu_moe.cpp:42`）无内部 scratch，每次调用只用调用方的 `row` 缓冲 | 否定 |
+| 为 CPU 腿下载的 Q8_1 平面在 `stage_rows` 1..8 下不是线性 `t*E` | `norm.h` 与 `ffn_topk.comp:12-13` 都是 `[tokens][k]` 行主序（ids/wts 同）；`--miss-split 100` 两臂逐位相等也说明路由与行表无误 | 否定 |
+| 每专家只有一份结果向量，却被多行共享 | `cpu_res.assign(cpu_pos.size() * E)`（`ffn_store.cpp:158`），worker 把该专家在**所有**行上的贡献累加进同一个 `out`（原 `:215`），合并时再把这一份总量加给**每一**命中行（原 `:335`） | **成立** |
+
+后果只在 `T > 1` 显形：k=4 时 miss 专家的平均多重度约 1.61（design 4.3），一个服务 2 行的专家
+会把两行的加权和同时加给两行；`T = 1` 时每专家至多一行，所以 M3-2/M3-2a 的串行 decode
+读数没受影响。修复 = 暂存改成 `[cpu 专家][run_tokens][n_embd]`，worker 写 `(j,t)` 槽，
+合并按 `(j,t)` 取回。累加次数不变，因此耗时不变（见 90.3）。
+
+### 90.2 修复前后（同一命令，只换 `--miss-split`）
+
+`--spec-check ... --spec-k 4 --expert-cache-mib 512 --miss-split X`：
+
+| `--miss-split` | 修复前 | 修复后 |
+|---|---|---|
+| 0（全部 CPU 腿） | `ids_equal=0`（第 2 个 token 起分叉：serial 4438 / spec 126863），`rows_bad=11`，worst rel_L1 **1.510e+00** | `ids_equal=1`，`rows_bad=0`，`rows_loose=0`，worst rel_L1 **0.000e+00**，PASS |
+| 100（全部 H2D，GPU 算） | `ids_equal=1`，worst 0.000e+00 | 不变（回归通过） |
+| auto | `ids_equal=1` 但 cycle0 row0 rel_L1 2.818e-01 / max_abs 2.684，`rows_bad=11` | `ids_equal=1`，`rows_bad=0`，`rows_loose=11`，worst rel_L1 7.284e-02（max_abs 9.719e-02），PASS |
+
+**全部宽度都验了**（split 0 下两臂逐位相等是判据）：
+
+| k | cycles | E | ids_equal | worst_rel_l1 | legs | 判决 |
+|---:|---:|---:|---:|---:|---|---|
+| 2 | 8 | 1.375 | 1 | 0.000e+00 | same | PASS |
+| 4 | 5 | 2.200 | 1 | 0.000e+00 | same | PASS |
+| 5 | 5 | 2.200 | 1 | 0.000e+00 | same | PASS |
+| 8 | 5 | 2.200 | 1 | 0.000e+00 | same | PASS |
+
+auto 档的残留不是这条缺陷：`--miss-split auto` 让两臂把不同专家分到不同腿（rows=1 与 rows=k
+的每个 miss 的多重度不同，代价模型随之给出不同切分），而行 gap 就是 **CPU 腿与 GPU 内核之间
+的算术差**——`RESULTS.md#m3-2a-miss-split` 87.2 早已量到同一量级（全 CPU 对 GPU 臂 top-1 相同、
+logit 差 -0.0125/-0.0099/+0.0214；auto 40 层 logit 差最大 0.208，ids 8/8 一致）。因此
+`--spec-check` 的行判据按腿路径分档：两臂同腿（固定 0 或 100）时 rel_L1 <= 1e-4 是硬判据；
+auto 时只判 token 与 top-1，行 gap 记为读数 `rows_loose` 并打印 `legs=mixed`。本轮 auto 全部
+12 个 token 的 top-1 与串行一致。
+
+### 90.3 回归与耗时
+
+- `ctest -L qrt` 9/9（含 M3-3 的 `qrt_spec_contract`）。
+- 40 层 `--generate` 32+8、默认 4198 MiB + auto：ids 与本轮修复前基线逐位相同
+  （`587,3393,8,271,58,20077,10911,9251`），`submits_per_layer=2`、`peak 6938.3 MiB`、
+  `failures=0` 不变。串行 rows=1 路径本就不触发该缺陷，这里只作下限回归。
+- CPU 腿耗时（40 层 7 个 decode step 求和）：`cpu_ms` 386.17 -> 351.60 ms、`gpu_ms`
+  521.50 -> 515.52 ms。auto 的切分点本身在运行间变化，这个差在噪声内；修复只改暂存形状、
+  不改累加次数，无新增开销。
+- 历史读数影响面：87.2 的三行正确性对照与 87.3 的三条腿耗时都建立在 rows=1 或 GPU-only 上，
+  **不需要撤回**；`--generate-batch K`（rows=5）当时只用于腿计时，其数值从未与串行对拍，
+  正是这条缺陷逃过 X-6 `--moe-batch-check` 的原因（那个检查覆盖的是 GPU routed 内核的 k=1..8）。
+
+### 90.4 现在的常驻回归判据
+
+`--spec-check --miss-split 0`（全部 miss 走 CPU 腿）在 k=2/4/5/8 下要求两臂 ids 全同且
+`worst_rel_l1 = 0`。这条比原来只看 `--miss-split 100` 更强：它把 CPU 腿的多行路径放进判据里，
+以后再有人动 `cpu_res`/合并循环，宽度一测就会红。
+`qrt_ffn_plan_cache_layer` 现在对 `run_tokens > 8` 直接报错（design 4.2 的固定形状上限），
+把"缓存腿只用于 decode 尺度"从注释变成检查；4 层 32+4 串行 `--generate`（512 MiB 缓存）仍
+`79,4438,4438,182187`，`dispatches_max=47`、`failures=0`，prefill 段不触发该路径。
+
+### 90.5 未验证与边界
+
+- 4 层 / 12 token 短档；10K prompt、256K 上下文、128 token 与 40 层的推测循环未跑（M3-5 的
+  口径），40 层 + auto 的行 gap 未单独量化（只继承了 87.2 的量级）。
+- 未测 `--miss-split` 在 rows>1 下切分点的运行间分布；auto 的 gap 归因基于"两臂同腿即逐位
+  相等 + 87.2 的 CPU/GPU 腿差"这两条证据，未再拆到单专家层。
+- Q6_K 下腿（层 34/38/39）未进入本轮 4 层窗口；`qrt_gemv_q6k_q8_1` 的多行使用即 `cpu_res`
+  的同一处，修复对它同样生效，但本轮无读数。
+- 未提交（无提交授权）。
+
+## 91. 全量回归：M3-3 + M3-2c 合流后的整套检查（2026-10-26）
+<!-- slug: regress-20261026-m33 -->
+
+口径：工作区 `4b84522e7` + 未提交 diff；`build-vulkan`（Release/MinGW/Ninja，Vulkan，
+ggml commit 4b84522e7）；模型与 store 同上；40 层档 `--prefill-chunk 32`、短档 f16/f16；
+平衡电源 + AC，单次只跑一个重执行。原始日志 `bench/raw/regress-20261026/`。
+本节是**正确性回归集**，不是 PP/TG 批次。
+
+| 步骤 | 退出码 | 读数 | 判决 |
+|---|---:|---|---|
+| 全量 `cmake --build build-vulkan -j 8` | 0 | 70/70 目标，含 llama-cli/server 与 qrt | PASS |
+| `ctest --test-dir build-vulkan`（整组） | 0 | **42/42 passed** | PASS |
+| `ctest -L qrt`（runtime CPU 契约） | 0 | 9/9（含新增 `qrt_spec_contract`） | PASS |
+| `--selftest` / `--print-config` | 0 | 0 failed | PASS |
+| `--gguf-index --require-tensor blk.40.nextn.eh_proj.weight` | 0 | MTP 张量在表内 | PASS |
+| `--vk-info` | 0 | `failures=0` | PASS |
+| `--vk-io-check --repack <prefix>` | 0 | `failures=0` | PASS |
+| `--norm-check` | 0 | `qs_bad=0`、verdict=PASS（A 层量化器逐位） | PASS |
+| `--dense-gemm-check` | 0 | verdict=PASS | PASS |
+| `--deltanet-check` 层 0 @64 | 0 | 两个变体 `dn_snap` 全 1、state 与参考 1.7e-07 | PASS |
+| `--fullattn-check` 层 3 @1024 f16 | 0 | `full_attn` 1.278e-06；`full_attn_f16` 探针 9.060e-04 标 `gate_1e-4=FAIL` | PASS（探针行是既有 f16 packed 算术示警，不是门禁项） |
+| `--moe-check` 层 0 专家 8 | 0 | verdict=PASS | PASS |
+| `--moe-batch-check` 层 0 / 3 / **34** | 0 | 三档全 PASS（34 = Q6_K down 腿） | PASS |
+| `--cache-check` 128 decode | 0 | 规划与回放正常 | PASS |
+| `--layer-check` 层 0 @64 / 层 39 @64 | 0 | `fails=0`，含 reset/前缀因果回归 | PASS |
+| `--chunk-check` 512 / chunk 128（4 层） | 0 | carry 0.000e+00，no-carry 反例非零 | PASS |
+| `--model-check` 40 层 64 token（reseed off、planes device） | 0 | `hidden_max=4.675e-05`、`logits_rel_l1=1.002e-05`、top1 8/8、NLL 0.1763/0.1763 | PASS |
+| `--generate` 40 层 32+8（`--expert-cache-mib 0`） | 0 | ids 与 8 个 step logit **与 86.2 金标准逐值相同**，peak 2740.5 MiB | PASS |
+| `--spec-check` k=2/4/5/8（512 MiB，`--miss-split 0`） | 0 | ids 全同、worst rel_L1 0.000e+00 | PASS |
+| `--spec-check` k=4（`--miss-split 100`） | 0 | ids 全同、worst 0.000e+00 | PASS |
+| `--spec-check` k=4（`--miss-split auto`） | 0 | ids 全同，`rows_loose=11`、worst 7.220e-02、`legs=mixed` | PASS（auto 档只判 token，见 90.2） |
+| `--spec-check` k=4（无缓存） | 0 | ids 全同、worst 0.000e+00、`legs=same` | PASS |
+| `--spec-check` k=4 `--spec-rollback off`（反例臂） | 0 | `ids_equal=0`、`first_diff=2` | PASS（反例如期分叉） |
+
+- 触发了本轮的两处小修：`--vk-io-check` 的 store 前缀走 `--repack`（我之前按位置传参报
+  `unexpected argument`）；`same_leg` 现在在无缓存时判 `same`（否则会把只有 GPU 一路的
+  配置误标成 `mixed`、把 1e-4 硬判据白松开）。
+- 代码 ASCII 自查：`runtime/` 改动文件逐字节扫描，`model_generate.cpp` 曾有 12 个非 ASCII
+  字节（design 7 的中文引文），已改为 ASCII；其余全部 clean。
+- G-REG 未触发（`src/`、`ggml/`、`common/`、`tools/` 本轮无改动），仍按整组 ctest 42/42
+  留证；`last_gate` 因此不改动。
+- 未覆盖：10K prompt / 256K 上下文的 PP 与 TG、40 层的推测循环、Q-KV3 的长上下文质量门
+  （都属 bench lane 的 M2-7/M2-8/M3-5/M3-6 口径）。
