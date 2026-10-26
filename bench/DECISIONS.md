@@ -2068,3 +2068,416 @@ M2-6a 负责迁移成 K/V 两开关并把 q8_0 K + q4_0 V 的 832 B/token/层 �
 - `qrt` 的 logits 出口（整模型前向 + QRTLOG1 v1 转储）仍未实现，是 M2-7 的唯一阻塞：格式已在
   `bench/tools/quality/README.md` 第 3 节定死（24 B 头 + tokens[n_pos+1] + f32 rows），工具侧不用改。
 - M2-7a（impl）承接这条出口：embedding -> 40 层 -> final norm -> head，`--logits-dump` 写盘。
+
+## 78. M2-7a 判定：整模型算术对 CPU 双精度链 5.9e-7，模型级 rel_L1 不能当 int8 流水线的门（2026-10-26）
+<!-- slug: m2-7a-ref-chain-verdict -->
+
+证据：`RESULTS.md#m2-7a-model-ref-chain`。
+
+### 78.1 采纳
+
+- **采纳**"整模型对 CPU 双精度链"这条腿：`qrt_layer_ref_cpu()` 一层纯主机双精度、层间不回读设备
+  缓冲；40 层逐层隔离口径下每层 hidden <= 5.93e-06、logits rel_L1 5.93e-07、两臂 KLD 1.79e-13、
+  top-1 16/16。这把"链上还有没有语义错"从推测变成读数：没有。
+- **采纳**"相邻层 hidden 与单层链一致"用重跑证明：同输入重跑首层（DeltaNet 与 full-attn 各一）
+  逐位相同（`replay_rel_l1=0.000e+00`），runner 的 open/set_input/zero_state/run/回读/close 序列
+  不残留状态。
+- **采纳**输出头单次流式扫词表：512 行档从"每行重读 1.7 GB"变成一遍；改前改前产物逐位相同。
+- **判决**模型级 `logits 对 CPU 双精度参考 rel_L1 <= 1e-4` 这条判据的口径必须写清"打包决策是否
+  共享"：int8 激活打包是阶跃函数，共享后 5.9e-7，两臂各自打包时同一层 1.2e-3、40 层链 1.4e-1，
+  而算术阶段一直 1e-7。所以独立打包链的 rel_L1 测的是量化轨迹分叉，不是算术错，不能当质量门；
+  `--layer-check` 早就按同一约定办（参考吃设备平面，"the quantiser is what --norm-check gates"）。
+  旁证：`--norm-check` 长期记 `qs_bad=80/655360`，CPU 与 shader 的 Q8_1 边界本来不逐位一致。
+- **判决**fork 的 8.3796e-03 不是算术错：参考臂与设备臂彼此差 1.79e-13，但对 fork 报出**同一个**
+  8.3796e-03、同一个 top-1 87.5% -> 这是两条臂共有的系统性偏差（int8 激活平面 + 与 fork fused
+  路径的约定差），量级在 Q-KV1 的 fork 自身地板 1.47e-2 内。要再往下必须换口径（同引擎 A/B），
+  不能靠"修算术"。
+
+### 78.2 证伪
+
+- **证伪**"DeltaNet 递推深度导致 logits 太扁平"：32 token 与 256 token 的 layer 0 同输入隔离差
+  分别是 2.560e-04 与 3.202e-04，不随 chunk 长度线性增长。
+- **证伪**"10K 单 chunk 失败是 expert cache 预留挤占"：`--expert-cache-mib` 4198 -> 1500 同一层
+  同一缓冲失败。真实原因是 T=10400 时每层平面（proj_out 340 MB 级）加 470 MB 专家槽超预算。
+- **证伪**"`--logits-dump` 到 10K 就能满足 M2-7a 的 10K 档"：单 chunk 路径根本不到 10.4K；
+  design 口径是 chunk 2048，2048 档 exit 0（293 s，512 tail 行），真 10.4K 需要跨 chunk 状态。
+
+### 78.3 开关表（新增）
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `--model-check <gguf>` | 关 | 设备链 + 一条纯主机双精度链同跑，逐层比 hidden，末尾比 logits |
+| `--model-check-ref <bin>` | 必填 | 参考臂的 QRTLOG1 转储，给 `qgate.py compare` 用 |
+| `--model-check-reseed on\|off` | off | on = 每层参考都吃设备 hidden（逐层隔离）；off = 参考自链（累积） |
+| `--model-check-planes cpu\|device` | cpu | device = 复用设备 Q8_1 平面，只用于定位；cpu = 真独立参考 |
+
+三条都是诊断入口，不改任何默认数值行为；`--logits-dump` 的产物在重构后逐位不变。
+
+### 78.4 未结项
+
+1. **判据口径待用户裁（E-CHAIN1）**：`M2-7a.done_when` 写的"logits 对 CPU 双精度参考
+   rel_L1 <= 1e-4"没写打包决策口径。两个口径的实测都进了 RESULTS 80。建议按 gates 的 L-MODEL
+   用 KLD/top-1 当模型级门，把 rel_L1 留给逐层隔离口径（打包共享）。agent 不自行改判据。
+2. **跨 chunk 前向**（M2-7a 的第二块，消费者是 M2-7/Q-KV3）：`qrt_layer_run` 的 pos0 写死 0；
+   DeltaNet `state_in`/`state_out` 分离且没有回写，`qrt_dn_prep_cpu` 的 `conv_state_out` 被丢弃。
+   10.4K/128K/256K 都卡这条；T=10400 单 chunk 还额外撞每层平面+专家槽的显存预算（80.6）。
+3. **q8_0/q4_0 KV 行的参考**：现在显式报错。要覆盖默认档就得给参考实现 block-max 量化，
+   或者接受默认档只做同引擎 A/B（U-11/U-12 已把默认档排除在 1e-4 判据外）。
+4. `--model-check` 一轮 256 token/40 层约 25 分钟（CPU 参考为主），只能当低频验收跑；
+   若 X-4 要天天跑，得把参考链的行数/token 数限制成开关。
+
+## Agent 自主推进与证据闭环（2026-10-26）
+<!-- slug: agent-loop-contract -->
+
+用户要求改善单会话推进深度与交付质量。采纳以下执行规则；不改变 design、任务图、性能/质量阈值、KV 豁免或资源互斥。
+
+- 区分会话、单变量实验和可验收增量；在授权范围持续研究/修复/验证，不每次实验后请示。具体请求验收完成就结束，宽泛推进才继续相关就绪任务。
+- 首次失败即列假设和区分性实验；无新增证据时换定位方式，不将重试次数当退出配额。
+- CPU 与 GPU 参考曾复制相同错误（`RESULTS.md#m2-7a-four-fixes`）；验收要求独立参考、先红后绿反例及真实消费者串联。更宽的局部阈值或检查器 PASS 不能冒充硬门通过。
+- 本人 doing 优先于已前移的队首；自持锁可续跑，超时不构成夺锁授权。仅越界动作/受阻分支暂停，保留其他安全推进空间。
+- 去掉上游投稿式准入规则和可覆盖入口的旧模板；明确校验器不证明实际阅读、产物正确或 done_when 真值。
+- 修复 `--lint` 分支并补六个隔离回归，证据见 `RESULTS.md#agent-loop-lint-regression`。此次只证明文档一致性与校验器行为；自主推进效果和模型正确性仍须在后续真实任务中验证。
+
+## 79. 审阅重构判决：单一配置/CLI 契约、prefill backend、短尾块状态、全流程入口；E-CHAIN1 采纳 (a)（2026-10-26）
+<!-- slug: review-refactor-decisions -->
+
+证据：`RESULTS.md#m2-7a-review-refactor`。
+
+### 79.1 采纳
+
+- **单一 CLI 表 + 原子配置**：未知参数、冲突命令、垃圾数值在分配前 exit 2；CLI > `QRT_*`
+  > 默认；显式 CLI 覆盖坏环境值；被拒值不部分应用。修复前的 13 条断言失败与真入口崩溃是
+  缺陷，不是风格问题。
+- **`qrt_prefill_backend` 能力组**：compute/batch/wait + user，两种调度共用；缺 wait/compute
+  或 `counts>stride` 在分配前拒绝；每轮结束等完已提交 ring，失败保留首错。复用现有调度器，
+  不新建第二套。
+- **RAII 与严格 I/O**：device/GGUF/staging/layer 统一释放；token 文件完整解析；dump 短写/
+  close 失败报错；输出路径不得等于 GGUF/store。
+- **有效 token 尾块**：分配仍 32 对齐，`run_tokens` 可非 32 倍数；DeltaNet conv taps 不足
+  一个 chunk 时用 QKV 空闲行暂存旧 taps。`layer_state` 以 60,1,2,1 两轮重复、reset 与前缀
+  因果反例固定契约，layer 0/3 逐位一致。
+- **全流程入口 `qgate.py run`**：构建、CPU 回归、自检、配置、索引、40 层前向、转储校验与可选
+  对比一条命令；失败即停；产物目录不可复用；显式声明不是性能/模型质量验收。
+- **E-CHAIN1（用户 2026-10-26）选 (a)**：`rel_L1 <= 1e-4` 只判打包决策共享口径（5.929e-07），
+  独立打包 4 层链 8.836e-03 / KLD 1.8881e-04 只报读数。阈值不改。M2-7a 据此收口；
+  10.4K（10,428 tok，6 chunk，末块 188）exit 0。
+
+### 79.2 证伪与排除
+
+- **证伪“CLI/测试问题只是风格”**：13 条断言失败、单臂真入口崩溃、FFN 释放后读取、prefill
+  尾部漏调与失败不传播，均有复现或注入反例。
+- **证伪“10.4K 必须截断成 10400”**：10,428 以 6 chunk 跑通，末块 188 token，exit 0；
+  独立打包 4 层链的 8.836e-03 不是新回归（设备 40 层 dump 重构前后逐字节相同）。
+- **保留**：独立打包的模型级距离由 int8 激活阶跃主导（RESULTS 80.4），不能当算术门。
+
+### 79.3 接口与开关
+
+- `qrt_prefill_run` / `qrt_prefill_run_layers` 改为接收 `qrt_prefill_backend`，不保留旧参数
+  列表 shim；`--prefill-compute probe` 只允许 `--prefill-mode perexpert`。
+- 新增 `qrt_checks` 构建目标；CTest 标签 `qrt`：`qrt_selftest`、`qrt_model_contract`、
+  `qrt_prefill_contract`、`qrt_cli_contract`、`qrt_workflow_contract`。
+- `--logits-layers 0` 仍可用于 embedding/head 诊断；层数按 `block_count - nextn` 校验，
+  MTP 不静默纳入。
+
+### 79.4 未结项
+
+1. M3 decode/MTP、expert cache/SLRU、miss split、per-pass telemetry 仍未实现；10.4K 读数是
+   prefill 诊断，不是 PP。
+2. q8_0/q4_0 KV 行的 CPU 参考（append 的 block-max）仍缺，`--model-check` 继续要求 f16/f16。
+3. 工作区未提交（无提交授权）。
+
+## 80. M3-0 专家缓存：按层槽位、SLRU 20%、容量退化与 H2D 回调契约（2026-10-26）
+<!-- slug: m3-0-expert-cache -->
+
+证据：`RESULTS.md#m3-0-expert-cache`。
+
+### 80.1 采纳
+
+- **槽字节按层**：每层槽取该层最大专家字节（1.812 / 1.945 / 2.195 MiB），槽不跨层；
+  41 层保留 1 个 floor 槽，其余在**同一个** 4198 MiB 预算内按 trace 冷缓存 miss / 槽字节切分。
+  真实 store 上 `mixed_layers=0`，计划 2298 槽 / 4197.8 MiB。
+- **SLRU per layer，protected 20%**：两份 M1 trace 的 128 行回放，p20 命中 79.893 / 78.989，
+  per-layer LRU 79.749 / 78.896，static 44.932 / 52.048。20% 是内部实现参数（design 未规定
+  分段比例）；默认 policy 仍是 design 的 slru，M4 可再调。
+- **容量退化不 abort**：预算不足一个 floor 时按权重降序给能放下的层开槽；零槽层返回
+  `no_slot` 交给 CPU 腿。0 / 64 / 512 MiB 三档 exit 0。
+- **H2D 调度契约**：`upload(layer,expert,dst_offset,bytes)` + `wait` 回调；miss 先占槽再提交，
+  同一层存在 pending 时拒绝再次 acquire，不同层可重叠；upload/wait 失败回收槽并计数，
+  调用者把该 expert 交给 CPU。真实 vk 缓冲由 M3-2 按 `plan.bytes` 分配并接
+  `qrt_vk_upload_submit` / `qrt_vk_staging_wait`。
+- **trace 权重**：M1-1 格式严格解析；按每个记录末尾 decode 行的冷 miss 计数加权，短记录层
+  跳过；层 39 的 21 行 warm 加 128 行 decode 仍参与回放。
+
+### 80.2 证伪与边界
+
+- **证伪**“static 足够”：static 在两个语料只有 44.9% / 52.0%，远低于 SLRU 的 79.9% / 79.0%。
+- **证伪**“容量退化会 abort/静默返回成功”：三档预算均 exit 0，`degraded` 与 `no_slot` 可计数。
+- 本轮 `--cache-check` 是 policy-only：没有真实 DMA，`miss_mib` 只是 H2D 体积估算；
+  `h2d_uploads=0`。真实 H2D 与 pass 的合并提交归 M3-2，CPU miss 腿归 M3-2a。
+- 未改 design 的缓存容量、槽按层、SLRU 选择或 21.7% 覆盖目标。
+
+### 80.3 接口与验证
+
+- 新增 `expert_cache.*` 与 `--cache-check`；CLI 的 `--cache-trace` / `--cache-decode` /
+  `--cache-protected` 只在 cache 命令下生效，坏值在分配前拒绝。
+- 新增 `qrt_cache_contract` 到 `qrt_checks` 与 CTest 标签 `qrt`；`ctest -L qrt` 6/6。
+- 未提交（无提交授权）；真实 vk 接线、M3-1 批量内核、M3-2 pass、M3-2a miss_split 仍未做。
+
+## 81. M3-1 路由专家批量：routed-only k=1..8、并集与串行一致性（2026-10-26）
+<!-- slug: m3-1-moe-batch -->
+
+证据：`RESULTS.md#m3-1-moe-batch`。
+
+### 81.1 采纳
+
+- **`ffn.routed_only`**：只在 decode 小批时跳过共享专家、残差和最终 out，路由/ top-k /
+  gather / expert GEMM / weighted accumulate 仍走生产内核；token 数可以是 1/2/4/5/8，
+  完整 prefill/layer 路径仍要求 32 对齐（`routed_only=0`）。
+- **`runtime/moe.*`**：单层的 routed-only 批量封装，固定输入/输出缓冲区、一次 route +
+  一次 experts 提交；不与 prefill 的 `kernels/moe_expert` 混用（名字分开，避免第二套调度器）。
+- **`--moe-batch-check`**：每个 k 同时检查 top-8 id、并集专家数、MoE 输出对 k=1 串行和 CPU
+  双精度参考。三层（DeltaNet / full-attn / Q6_K down）全部通过；串行 rel_L1=0，CPU 参考
+  最大 1.7e-05。
+- **不改变默认**：层链、prefill 和共享专家路径不设 `routed_only`，回归 PASS；新增命令是
+  诊断入口，不替代 M3-5/M3-6。
+
+### 81.2 证伪与边界
+
+- **证伪**“k<32 必须复制到 32 个 token”：routed-only 路径以 k 个有效 token 运行，
+  router/topk/gather/accum 均按 k 处理；只有每个专家的 row block 仍补齐到 32 行。
+- **证伪**“并集分组会改变 token 结果”：batch 与 k=1 串行的 routed sum 逐位一致（0），
+  并集专家数与串行 top-8 的并集完全相等。
+- **未验证/不做**：共享专家的小 k 路径、最终 logits/sampler、per-pass 单提交、GPU 侧
+  routing/indirect dispatch 和 32 行 tile 之外的性能优化；这些是 M3-2/M3-3/M4 的范围。
+  本轮没有改变任何量化内核，L-KERN 不重判；检查阈值与已有 `--moe-check` 同量级，
+  不冒充整模型 L-MODEL 或 TG。
+
+### 81.3 接口
+
+- `--moe-batch-check <gguf>` 需要 `--layer-store <prefix>`，复用 `--moe-layer`；缺 store 或
+  坏参数在分配前 exit 2。
+- `ctest -L qrt` 6/6；新增模块已接入 `qrt_core`，未新增测试目标（GPU 检查是验收入口）。
+- 未提交（无提交授权）；M3-2 需要 GPU 侧路由/indirect dispatch 与持久层驻留，尚未实现。
+
+## 82. U-13：三层数值门、2-submit/跨层 pipeline、repack v2、code 130（2026-10-26）
+<!-- slug: u-13-three-tier-gate-2submit-repack-v2 -->
+
+用户 2026-10-26 对架构审计（`docs/agent/ARCH-REVIEW-2026-10-26.md`）作出四项决定：
+
+### 82.1 三层数值门
+
+- **A 量化器逐位一致**：Q8_1 与 KV 行格式在边界、次正规、ties、±0、block max 上，
+  CPU 参考与 shader 逐位一致；`--norm-check` 的 `qs_bad=0`。A 层不允许共享打包决策。
+- **B 算术链可证伪**：完整 40 层链、`reseed off`，参考从原始输入独立计算；在共享同一批
+  量化字节的前提下 logits rel_L1 <= 1e-4、top-1 100%。逐层隔离读数不再作为 B 的交付值。
+- **C 模型质量外部锚**：runtime f16/f16 对 fork f16 的 KLD <= **1.5e-2**（fork 自身路径地板）、
+  top-1 >= **85%**；同时补一个无 Q8_1 激活的高精度短切片读数，量出量化本身的误差。
+  C 是外部 sanity，不把默认数值路径的 1e-4 判据放宽。
+- f16 KV 的 append 必须用 RNE，不能继续用 `packHalf2x16` 的向零取整；f16 是 C 的 A 侧。
+- 任务：X-7；门禁文本进 `docs/agent/gates.md` 4.2；读数进 RESULTS。
+
+### 82.2 短期执行模型
+
+- 允许每层 **2 次 submit + 跨层 pipeline**（用户 2026-10-26）；design 4.6 的“每 pass 一次
+  submit”继续作为长期目标，由 GPU 侧 routing/cache/indirect dispatch 实现。
+- 2-submit 不是放弃同步纪律：ring/pool 必须支持 record-ahead，transfer 与 compute 用
+  timeline semaphore，CPU/H2D miss 腿在层边界 rendezvous；不得建第二套调度器。
+- 任务：M3-2；X-6 的 compact expert tile 是其前置。
+
+### 82.3 repack v2
+
+- 批准 repack v2 内部布局：Q4_K/Q5_K/Q6_K 块主序/按内核 tile 交织、gate/up 交织、
+  scale SoA；**不改任何量化值**，逐专家 SHA-256 保留并在加载时校验；保留 v1 读取回退。
+- 理由：dense Q8_0 的同一类布局改动已从 3.38 到 12.89 TFLOPS（RESULTS 55）；专家腿
+  正确层链仍是 5.4 TFLOPS（RESULTS 73.3），是 PP 和 CPU 0.0665 的下一块布局红利。
+- 任务：M5-5；M5-4 端到端校验必须在 v2 后重跑。
+
+### 82.4 code 仍要求 130
+
+- U-5 不撤回：code 的 TG 硬指标仍是 130；本审计不打开 U-2。
+- M3-1a 的 0.0575/0.0587 是预热后首轮，20 轮中位 0.0665（RESULTS 30）；按中位 code 约 120。
+  M3-6 之前必须把持续中位压到 0.059，或按 failures 升级用户决策；不得用首轮读数过门。
+- 任务：M3-1b/M3-2 的 CPU 布置与 repack v2 共同承担；未达标前不宣称 code 130。
+
+### 82.5 边界
+
+- 本判决不修改 design；design 的 130/1000 硬地板与 U-7/U-11/U-12 保持。
+- 不因三层门降低 B 的 1e-4，也不因 C 的 1.5e-2 地板放宽默认值。
+- 审计中的 PP 194 tok/s 是 10.4K 诊断层循环，不是正式 M2-8；M2-8 仍须单次 r>=3 全阶段重测。
+
+## 83. X-5/X-6 判决：专家 slot 跨 chunk 常驻与 8 行 decode tile（2026-10-26）
+<!-- slug: x-5-x-6-prefill-slot-decode-tile -->
+
+证据：`RESULTS.md#x-5-x-6-prefill-slot-decode-tile`。
+
+### 83.1 X-5 采纳
+
+- `qrt_ffn_open` 按层实际字节固定 `dev_off[256]`，slot 仍按整层分配；新增 per-expert
+  loaded bitmap。`qrt_ffn_group` 跳过已驻留专家，只读缺失专家；连续缺失且 slot 偏移连续的
+  专家合并成一次 H2D。
+- `model_upload` 打印累计上传 MiB，作为“每专家最多一次”的可观察证据；flush 前检查
+  `uploaded_bytes + chunk_fill <= store_bytes`。
+- 10.4K 诊断：40 层 `model_layer ms` 67.56 s -> 38.9 s（约 1.74x），输出与修改前逐字节相同；
+  每层累计上传收敛到该层 store 字节，不随 6 个 chunk 线性增长。
+- 保留整层 slot 跨 chunk 是设计 4.5 的实现；不新增预算桶，不建第二套缓存。
+
+### 83.2 X-6 采纳
+
+- routed-only 专家行对齐从 32 改为 8（K-quant 的 `Q4K_TOKENS`）；`max_rows` 同步改为
+  `n_expert*7`。Q8_0 的 shared-expert kernel 仍要求 32，不受影响。
+- `qrt_gemm_record` 对 K-quant 允许 `m % 8 == 0`，dispatch y 用 `ceil(m/32)`；每个 subgroup
+  仍用 `tok0 + 8 > m` 屏蔽。prefill 的 64 行专家块行为不变。
+- M3-1 三层 k=1/2/4/5/8 全部 PASS；k=4 层 3 rows 960 -> 240，k=1 256 -> 64；ids/union/
+  serial/CPU ref 全部一致。
+- 这是 decode tile 的量级修复，不是 decode engine。M3-2 仍需 grouped/indirect dispatch、
+  persistent model、GPU head/argmax 与 miss 腿调度；`--moe-batch-check` 的 ms 不作 TG。
+
+### 83.3 证伪与边界
+
+- 证伪“专家只读一次但首 chunk 后必为 0”：2048 chunk 首轮并未路由全部 256 个专家；后续
+  chunk 会补新专家。正确判据是每专家最多一次、累计收敛到 store_bytes，不是后续全 0。
+- 证伪“32 行 padding 是 kernel 硬约束”：K-quant kernel 的 subgroup 本身按 8 token 屏蔽；
+  只有 host 的 rows_e 和 Q8_0 kernel 需要 32。改 8 后全 k 与串行/CPU 参考一致。
+- 不做/未验证：完整 prefill 端到端 PP、decode/MTP、真实 H2D miss、TG。X-5 的 wall 83/91 s
+  含 host head，不能当 M2-8；X-6 的 ms 含 open/upload，不能当周期。
+- 未提交（无提交授权）。
+
+## 84. X-7 三层数值门：A/B 通过、C 外部锚通过但留 7 个残余分叉（2026-10-26）
+<!-- slug: x-7-three-tier-gate-decisions -->
+
+证据：`RESULTS.md#x-7-three-tier-gate`。
+
+### 84.1 采纳
+
+- **A 量化器逐位**：相同 f32 输入（含 tie、±0、次正规）下 `norm_quant` 的
+  `qs_bad=0 / ds_bad=0 / sum_bad=0`；`norm_q8` 的 3 个差异来自 RMS 的 float/double 归约，
+  单列为诊断，不算 A 失败。
+- **B 完整链算术**：64 token、40 层、`reseed off`、共享设备 Q8_1 平面，logits rel_L1
+  **4.122e-05**、top-1 16/16，满足 1e-4。输入 norm 平面由 CPU 计算（层 39 xnorm 3.208e-05），
+  已在 RESULTS 标明；独立打包的 40 层链仍是 1.387e-01，只作敏感性读数。
+- **C 外部锚**：512 context、同 fork token 流、255 行；runtime 对 fork KLD **1.0867e-02**、
+  top-1 **97.255%**，优于 fork 自身 `-fa on/off` 的 1.4681e-02 / 93.701%。C 的 KLD/top-1
+  判据通过。C 的 7 个 margin>=0.05 分叉只报：U-7 是推测接受口径，fork 自身有 11 个；
+  最差分叉 0.959 仍是残余，不能宣称 greedy 全同。
+- **f16 KV RNE**：`attn_full_qk.comp` 的 f16 K/V append 改为 `qrt_f32_to_f16_rne`；
+  layer 参考同步改为 RNE。f16 `full_attn` 1.428e-06 PASS，f16 store 1.76e-04；默认 q8_0 K
+  的 `full_attn` 1.399e-06 PASS、store 5.76e-03（量化行误差，留观察）。
+- **高精度短切片**：`norm_gemm_f32` 用设备 f32 norm 行、模型 q8_0 双精度反量化，跳过 Q8_1
+  激活，dense projection rel_L1 3.989e-03，满足 1e-2 的 sanity 阈值。只覆盖 dense projection，
+  不是全模型 f32 激活锚。
+
+### 84.2 证伪与排除
+
+- 第一次 C 的 KLD 0.213 是 token 错位：`tokens512.txt` 与 fork 基线有 10 个 token 不同；
+  改用 fork token 流后作废该读数。
+- 第二次 C 的 KLD 9.1e-2 是 context 口径错位：fork `2 x 256` 独立 chunk，对 runtime 512
+  跨 chunk 链；改用 fork `-c 512 --chunks 1` 后作废该读数。
+- B 不能用“共享设备平面”替代独立打包；1e-4 是算术门，独立打包的 1.387e-01 仍记录为
+  量化敏感性，不拿来改阈值。
+- C 的 1.5e-2 是 fork 路径地板，不是放宽 B；B 仍 1e-4。
+
+### 84.3 残余与后续
+
+- C 的 7 个 margin>=0.05 分叉（最差 0.959）尚未归因到 fork 路径、Q8_1 量化或真实缺陷；
+  需要高精度全模型锚与逐层外部对照。X-8 跟踪。
+- 默认 q8_0/q4_0 的 dequantized K/V staging 仍用 `packHalf2x16` 向零取整；本轮只修
+  persistent f16 KV。它是默认档的质量残留，不阻塞 B（f16 A 侧）。
+- `norm_gemm_f32` 只覆盖 dense projection；full-model 无 Q8_1 激活锚未实现。
+- X-5/X-6 的 golden `cmp=0` 是 f16 KV 仍 truncating 的构建；X-7 的 RNE 会改变 f16 输出，
+  但 X-5/X-6 的专家读取与 tile 路径不依赖该舍入，默认 q8/q4 不走 f16 append。
+- 不因 C 的 KLD/top-1 通过而宣称模型 bit-equivalent。
+- 未提交（无提交授权）。
+
+## 85. M3-2 判决：持久层会话 32+8 贯通，2 submits/layer（2026-10-26）
+<!-- slug: m3-2-persistent-generate-decisions -->
+
+证据：`RESULTS.md#m3-2-persistent-generate`。
+
+### 85.1 采纳
+
+- **一次打开全部层**：`--generate` 打开 40 层（dense/attention/KV/DeltaNet 状态常驻），
+  每层 `zero_state` 一次；prefill 与 decode 共用同一批 `qrt_layer`，不重跑 full prompt。
+- **共享 FFN slot**：`qrt_ffn_cfg.slot/slot_bytes` 接收 caller-owned 562 MiB 缓冲；
+  `qrt_ffn_group` 在 transient 模式按当前路由打包专家，`qrt_ffn_close` 不释放外部 slot。
+- **动态 run_tokens**：`qrt_ffn_set_tokens` 让 route/group/experts 用 1..32 行；layer 的
+  dense 行阶段用 `stage_rows`（1..8 走 Q8K m1，较大短尾取整 32）；attention/DN 用 exact。
+- **Q8_0 m=1 变体**：`gemm_q8k_m1.spv` 与 `norm_gemm m=1` 对 CPU 参考 1.142e-07；共享专家
+  和 dense 投影在 k=1 不再受 32-token tile 阻塞。
+- **短档贯通**：40 层 32+8 f16，wall 42 s、peak 2740.5 MiB、2 submits/layer、1 top-k
+  回读/layer；8/8 生成 token 与 fresh chunked prefill 的 top1/logit 一致。默认 q8/q4
+  32+2 也一致（2/2）。4 层 32+4 12 s、peak 779.8 MiB。
+
+### 85.2 与 M3-2 原判据的关系
+
+- 原 `done_when` 的“每层只回 CPU 一次取 k 个 id、层间只用 barrier、单次提交”**未按字面**
+  实现。U-13 已允许短期每层 2 次 submit；当前正是 2 次。GPU 侧 route/cache/indirect dispatch
+  仍是 M3-2 的长期目标，不在本切片。
+- 本切片是 k=1 correctness/贯通，不是 M3-5 的 128-token 逐 token 验收，也不是 M3-6 的 TG。
+- generate 把 `--prefill-chunk` 上限收到 64；10K prompt 的 2048 chunk 需要共享 scratch
+  arena 和 40 层缓冲复用，未实现。host head 每 token 扫描 0.5 GiB，decode 1.9-2.0 s/token。
+
+### 85.3 下一步
+
+- **M3-2a**：expert cache/SLRU + H2D/CPU miss 分担接入持久会话；当前 shared slot 每层/token
+  重传使用到的专家。
+- **M3-3/M3-4**：MTP 草稿、接受/回滚、per-pass telemetry。
+- GPU head/argmax 与分组/间接 dispatch 是 TG 的前置；X-8 继续数值残余。
+- 未提交（无提交授权）。
+
+## 86. M3-2a 判决：miss 分担接线成立，三条腿 10% 被 GPU 腿挡住（2026-10-26）
+<!-- slug: m3-2a-split-verdict -->
+
+### 86.1 采纳
+
+- **每层一个槽数组**，槽偏移用层内偏移。单缓冲 4198 MiB 时 Q6_K 的 `wbase` 是 32 位字节
+  偏移，超 4 GiB 的槽无法寻址；每层缓冲同时让 `dev_off` 保持在 32 位内。
+- **`qrt_cache_acquire_mask`**：CPU 腿的 miss 不占槽、不驱逐、不上传；H2D 腿独占槽与上传
+  统计。缓存对象在 decode 路径以 `io = NULL` 打开，上传由 ffn 用 store + staging 完成，
+  便于把 store 读和 H2D 都算进 H2D 腿。
+- **按 pass 平衡**：`qrt_split_carry` 把每层实际两条腿耗时累加，下一层从累计差额起分。
+  单层只有 ~8 个 miss，两个粒度步就改变 20%，层内无法满足 10%；pass 内累计可以。
+  auto 的 H2D 速率用 EWMA 跟实测（R10 的争用变化），CPU 曲线保持 M3-1a 实测点。
+- **一次多段上传**：`qrt_vk_upload_regions` 把本层 H2D miss 打包进 staging 后单次提交；
+  逐专家提交实测 2.3 GB/s，打包后约 2.9 GB/s（仍受 store 读限制）。
+- **CPU 专家核覆盖 Q4_K/Q5_K/Q6_K**：store 的类型混合是逐层固定的（38/2/1 层三种组合），
+  不是全 Q4_K。**fp16 次正规数必须解码**：d=2e-5 的块在真实权重里常见，按 0 处理会让
+  gate 行偏 24%。这复现了 DECISIONS 65/67 的陷阱，补入 CPU 契约测试。
+- **CPU 部分输出在下载后相加**：worker 内乘路由权重，合并处只做加法；两处都乘会把
+  routed sum 压到真实值的 1/3（8.384 -> 2.451），40 层后改 top-1。
+
+### 86.2 未采纳 / 未判
+
+- **三条腿 10% 不判通过**：auto 把 H2D/CPU 平衡到 0.1-0.2%，但 GPU 腿 158-190 ms 对
+  miss 腿 165-249 ms，spread 34.5%。GPU 腿是设备等待时间，已排除 host 记录；它比 design
+  2.6 的带宽账高约 5 倍，属于 attention/DeltaNet/router 效率（M2 项），不是 miss 分配。
+- **固定 0/50/100 只作对照**：50 按个数分会失衡（H2D 728 ms vs CPU 361 ms），10% 不能靠
+  固定比例；auto 的必要性由此成立。
+- **不把短档 k=5 teacher-forced 当 TG 或 M3-5**；`--generate-batch` 是腿计时诊断，不产出
+  可接受序列。
+
+### 86.3 下一步
+
+- 10% 的前提是 GPU 腿回到带宽地板（21 ms/pass 量级）：先做 attention/DeltaNet/router 的
+  M2 性能项，或把 miss 腿与下一层 pass1 重叠（跨层 pipeline），使周期不再相加。
+- store 驻留与 H2D 速率（0.19 ms/专家）是另一前提；当前 2.9 GB/s 含 SSD/页缓存。
+- 判决与证据：`RESULTS.md#m3-2a-miss-split`。
+
+### 86.4 用户裁定（2026-10-26）
+
+E-SPLIT1 选 (b)：**以“两条 miss 腿平衡 + 接线正确”收口 M3-2a**，GPU 腿差距拆成独立任务
+`M3-2b`（attention/DeltaNet/router 效率或跨层 overlap，使 GPU 设备腿回到 ~21 ms/pass 量级），
+之后继续 M3-3（MTP）/M3-4（telemetry）。M3-2a 的 done_when 按此澄清：
+`k=5、4198 MiB 下 auto 使 H2D/CPU 两条 miss 腿耗时差 <=10%（实测 0.1-0.2%）；三条腿 spread
+只报读数并指向 M3-2b；固定 0/50/100 仅对照`。10% 的三条腿判据没有取消，转移到 M3-2b 的
+done_when（重跑同一测量）。
+
+## 87. M3-4 判决：telemetry 只接 decode，schema 不动（2026-10-26）
+<!-- slug: m3-4-telemetry-verdict -->
+
+- **采纳**：`qrt_telemetry` 的 CSV 头已是 bench/README 第 2 节要的列，不在 M3-4 改 schema；
+  `--generate` 每 token 一行，写入命中、两条 miss 腿、H2D 字节和三个耗时。`accepted=1` 是
+  k=1 的真实值；M3-3 接 MTP 后再填接受数，k>1 的诊断 pass 不冒充接受。
+- **降级**：sink 打不开时打印原因并继续，不被遥测拖停；写失败只在结束时报行数。
+- **关闭零开销**：只多一次 `tel != NULL` 分支；未在正式批次里量化，属未验证项。
+- **未做**：telemetry 的 `draft_ms` 仍为 0（M3-3）、跨长 prompt 的连续 CSV、与 X-2 采集脚本
+  的端到端对拍。

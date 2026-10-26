@@ -1,7 +1,7 @@
 {
   "schema": 3,
   "track": "qwen36-runtime",
-  "updated": "2026-10-25 18:54",
+  "updated": "2026-10-26 18:05",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -55,12 +55,14 @@
       "runtime/AGENTS.md": 4096,
       "docs/agent/INDEX.md": 4608,
       "docs/agent/cycle.md": 4096,
-      "docs/agent/gates.md": 4096,
+      "docs/agent/gates.md": 5376,
       "docs/agent/resources.md": 5120,
       "docs/agent/failures.md": 2560,
       "docs/agent/build.md": 2048,
       "docs/agent/repo-facts.md": 2048,
-      "bench/README.md": 6144
+      "bench/README.md": 6144,
+      "docs/agent/ARCH-REVIEW-2026-10-26.md": 16384,
+      "docs/agent/PERF-GAP-2026-10-26.md": 16384
     },
     "note": "L0 AGENTS.md is injected every session; L1 <dir>/AGENTS.md is subtree scope; L3 docs/agent is read on demand. state_check.py --lint enforces every cap here plus index coverage."
   },
@@ -146,12 +148,21 @@
         "M4-3",
         "M4-4"
       ],
-      "note": "Q-KV1 closed: the fork cannot gate KV precision (1.5e-2 path floor); M2-7 needs M2-6a (KV precision) before the 256K-context KLD run"
+      "note": "M2-7/M2-8 still need the bench runs; M3-5/M3-6 now depend on M3-4 and the cache/MTP path. Q-KV1 closed: fork cannot gate KV precision (1.5e-2 path floor)."
     },
     {
       "lane": "impl",
-      "head": "X-4",
+      "head": "M3-3",
       "order": [
+        "X-5",
+        "X-6",
+        "X-7",
+        "M3-2",
+        "M3-2a",
+        "M3-3",
+        "M3-2b",
+        "X-8",
+        "X-4",
         "M2-0",
         "M2-1",
         "M2-2",
@@ -164,10 +175,9 @@
         "M3-1a",
         "M1-3d",
         "X-1",
-        "X-2",
-        "X-4"
+        "X-2"
       ],
-      "note": "M2-7a is doing (runner harness works, logits wrong); X-4 is the next free impl task"
+      "note": "M3-2a done on the split; M3-2b holds the three-leg 10% (GPU leg), after M3-3/M3-4. M3-4 telemetry done. Next M3-3 MTP draft + accept/rollback (needs k DeltaNet snapshots and KV length rollback); X-8 after."
     },
     {
       "lane": "data",
@@ -179,16 +189,17 @@
         "M1-3a",
         "M5-1"
       ],
-      "note": "R0 turns the measured legs into the roofline model; M5-1 unblocks the io lane"
+      "note": "Q-KV2 256K prompt; R0/M1-2a/M1-3a/M5-1 done. No data task blocks X-5..X-7."
     },
     {
       "lane": "io",
       "head": null,
       "order": [
-        "M5-2",
-        "M5-4"
+        "M5-5",
+        "M5-4",
+        "M5-2"
       ],
-      "note": "waiting for M5-1 (repack format)"
+      "note": "M5-5 repack v2 approved 2026-10-26; can start now that X-7 released machine-quiet/disk-io. M5-4 must rerun after v2."
     },
     {
       "lane": "user",
@@ -196,7 +207,7 @@
       "order": [
         "U-2"
       ],
-      "note": "M1 closed by conditional pass; U-2 only if M3-1a misses 0.059"
+      "note": "U-13 done; code remains 130, U-2 stays closed unless sustained CPU median misses 0.059."
     }
   ],
   "tasks": [
@@ -605,7 +616,8 @@
         "M2-6",
         "M2-6a",
         "M2-7a",
-        "X-1"
+        "X-1",
+        "X-7"
       ],
       "resources": [
         "gpu",
@@ -624,7 +636,8 @@
       "status": "todo",
       "title": "PP >= 1000 tok/s（10K prompt + 256K ctx）",
       "deps": [
-        "M2-7"
+        "M2-7",
+        "X-5"
       ],
       "resources": [
         "gpu",
@@ -640,15 +653,26 @@
       "id": "M3-0",
       "milestone": "M3",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
       "title": "专家缓存：SLRU + H2D 调度 + 按层槽尺寸",
-      "note": "slot bytes follow the layer (1.812 / 1.945 / 2.195 MiB), user decision E-1 on 2026-10-25; the 4198 MiB cache is split per layer from the routing trace, with the existing cache budget and no second budgeter",
+      "owner": "qoder-agent@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-26T10:42:00+08:00",
+      "note": "2026-10-26 10:05 user explicitly prioritised M3 infrastructure; claimed ahead of the impl queue after M3-0 deps checked (M2-3 done, no other doing task). Scope: per-layer slots, SLRU/LRU/static policy, injectable H2D upload/wait scheduling, trace-weighted split, capacity degradation, host-only check and CPU contract tests. Real vk upload wiring is M3-2; this task proves policy/slot accounting and the callback contract. slot bytes follow the layer (1.812 / 1.945 / 2.195 MiB), user decision E-1 on 2026-10-25; the 4198 MiB cache is split per layer from the routing trace, with the existing cache budget and no second budgeter. done 2026-10-26: implemented host-side expert_cache with per-layer slot bytes from the store, one floor slot per layer and trace-miss/slot-byte split of the single budget, per-layer SLRU (protected 20%) plus LRU/static arms, injectable upload/wait scheduling with per-layer pending guard and failure recycling, strict M1-1 trace parser, capacity degradation to no-slot/CPU, and --cache-check. Evidence: RESULTS m3-0-expert-cache; 4198 MiB gives 2298 slots/4197.8 MiB, decode-128 replay on trace-10k-g128 and trace-multidoc gives SLRU p20 79.893/78.989%, per-layer LRU 79.749/78.896%, static 44.932/52.048%; 0/64/512 MiB budgets exit 0 with degraded=41/6/0; qrt_cache_contract covers plan, policy, fake H2D scheduling and trace failures; ctest -L qrt 6/6. Real vk H2D wiring stays M3-2, miss_split M3-2a; no commit (no authorization).",
       "deps": [
         "M2-3"
       ],
-      "resources": [],
+      "resources": [
+        "machine-quiet"
+      ],
       "paths": [
-        "runtime/expert_cache.*"
+        "runtime/expert_cache.*",
+        "runtime/expert_cache_test.cpp",
+        "runtime/qrt_cli.*",
+        "runtime/qrt_main.cpp",
+        "runtime/CMakeLists.txt",
+        "runtime/README.md",
+        "runtime/AGENTS.md"
       ],
       "done_when": "命中/未命中可计数；容量不足退化；不出现 abort"
     },
@@ -656,33 +680,69 @@
       "id": "M3-1",
       "milestone": "M3",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
+      "owner": "qoder-agent@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-26T11:46:00+08:00",
       "title": "批量 k 的 MoE 内核与路由",
       "deps": [
         "M2-4"
       ],
-      "resources": [],
+      "resources": [
+        "gpu",
+        "machine-quiet",
+        "host-ram"
+      ],
       "paths": [
         "runtime/kernels/**",
-        "runtime/moe.*"
+        "runtime/moe.*",
+        "runtime/ffn.*",
+        "runtime/qrt_cli.*",
+        "runtime/qrt_main.cpp",
+        "runtime/CMakeLists.txt",
+        "runtime/README.md",
+        "runtime/AGENTS.md"
       ],
+      "note": "2026-10-26 11:05 user asked to continue M3 with infrastructure first; M3-0 done, M3-1 deps M2-4 done, no other doing task. Scope: routed-only small-k (1/2/4/5/8) path over the existing router/topk/gather/expert kernels, k=1 serial and CPU double reference comparisons. Shared expert and full prefill chunk stay on the existing path; performance of 32-row expert tiles is M3-2/M4, correctness is this task. done 2026-10-26: added ffn.routed_only (skip shared expert/residual for decode batches, tokens 1..256) and runtime/moe.* plus --moe-batch-check. Layers 0 (DeltaNet), 3 (full-attn) and 34 (Q6_K down) pass k=1/2/4/5/8: top-8 ids exact versus k=1 serial and CPU double reference, union expert count equals the serial union, weights rel <= 1.259e-6, routed MoE versus serial rel_L1 = 0 for every token, CPU ref max 1.706e-5. Layer 3 regression layer_check PASS (layer_state mismatches 0, moe 1.252e-5, ffn_out 2.561e-7); ctest -L qrt 6/6. Expert row blocks still pad to 32 rows, so this is the correctness path, not the decode-tile performance; M3-2 needs GPU-side routing/indirect dispatch and persistent layer residency. No commit (no authorization).",
       "done_when": "k=1/2/4/5/8 的 top-8 路由与并集专家计算正确；与 k=1 串行结果一致"
     },
     {
       "id": "M3-2",
       "milestone": "M3",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
       "title": "pass 构建器：每 k 预录命令缓冲，单次提交/同步",
       "deps": [
         "M3-1",
-        "M2-5"
+        "M2-5",
+        "X-6"
       ],
-      "resources": [],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
       "paths": [
-        "runtime/pass.*"
+        "runtime/pass.*",
+        "runtime/model.cpp",
+        "runtime/model.h",
+        "runtime/layer.cpp",
+        "runtime/layer.h",
+        "runtime/ffn.cpp",
+        "runtime/ffn.h",
+        "runtime/moe.cpp",
+        "runtime/moe.h",
+        "runtime/expert_cache.cpp",
+        "runtime/expert_cache.h",
+        "runtime/qrt_main.cpp",
+        "runtime/qrt_cli.cpp",
+        "runtime/qrt_cli.h",
+        "runtime/CMakeLists.txt",
+        "runtime/README.md",
+        "bench/tools/quality/**"
       ],
-      "done_when": "每 pass 只回 CPU 一次取 k 个 id；层间只用 barrier；形状与 k 绑定"
+      "done_when": "一个 CLI 入口完成 prefill -> k=1 greedy decode 短档（如 32+8 token）；KV/DeltaNet 状态跨阶段保持，不重跑 full prompt；40 层常驻或给出明确显存/状态方案；每层 <=2 submit（U-13），记录 submit/top-k 回读与显存峰值；输出 ids 与参考 greedy 逐 token 一致；报诊断耗时",
+      "note": "done 2026-10-26: --generate opens all 40 layers once, shares one 562 MiB FFN slot, prefills 32-token chunks then decodes run_tokens=1 with KV/DN state carried. 40-layer 32+8 f16: wall 42 s, peak 2740.5 MiB, 2 submits/layer, 1 top-k readback/layer, 57 dispatches max; 8/8 generated ids match fresh chunked prefill top1/logit (587,3393,8,271,58,20077,10911,9251). Default q8/q4 32+2 also 2/2. Added gemm_q8k_m1 (norm_gemm m=1 rel 1.142e-07), shared external slot transient packing, ffn run_tokens, layer stage_rows. Not TG: host head 0.5 GiB/token, 1.9-2.0 s/token; no cache/miss split/MTP/GPU head. Evidence RESULTS 86 / DECISIONS 85."
     },
     {
       "id": "M3-3",
@@ -704,16 +764,32 @@
       "id": "M3-4",
       "milestone": "M3",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
       "title": "每 pass telemetry：命中、H2D、耗时、接受数",
       "deps": [
         "M3-2"
       ],
       "resources": [],
       "paths": [
-        "runtime/telemetry.*"
+        "runtime/telemetry.*",
+        "runtime/qrt_telemetry.*",
+        "runtime/model.cpp",
+        "runtime/qrt_main.cpp",
+        "runtime/README.md"
       ],
-      "done_when": "CSV schema 固定并与 X-2 对齐；关闭时零开销"
+      "done_when": "CSV schema 固定并与 X-2 对齐；关闭时零开销",
+      "owner": "qoder-agent@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-26T18:05:00+08:00",
+      "note": "done 2026-10-26: --generate opens qrt_telemetry before decode and writes one row per token with the schema already used by bench/README section 2 (k=1 accepted=1; draft_ms 0 until M3-3). A missing sink prints and continues; write failures are reported at close; --telemetry 0 keeps one NULL check per pass and creates no file. Evidence: 4-layer 32+3 run, rows with hits/misses/both legs/H2D bytes; off run has no file; bad path continues. RESULTS m3-4-telemetry, DECISIONS m3-4-telemetry-verdict. No commit.",
+      "evidence": {
+        "results": [
+          "RESULTS.md#m3-4-telemetry"
+        ],
+        "decisions": [
+          "DECISIONS.md#m3-4-telemetry-verdict"
+        ]
+      }
     },
     {
       "id": "M3-5",
@@ -909,7 +985,8 @@
       "status": "todo",
       "title": "端到端校验与回滚演练",
       "deps": [
-        "M5-3"
+        "M5-3",
+        "M5-5"
       ],
       "resources": [
         "machine-quiet",
@@ -1090,18 +1167,69 @@
       "id": "M3-2a",
       "milestone": "M3",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
       "title": "miss_split：H2D 与 CPU 自适应分配",
       "deps": [
         "M3-2"
       ],
+      "resources": [],
+      "paths": [
+        "runtime/miss_split.*",
+        "runtime/ffn.*",
+        "runtime/ffn.cpp",
+        "runtime/layer.*",
+        "runtime/model.*",
+        "runtime/cpu_moe.*",
+        "runtime/expert_cache.*",
+        "runtime/qrt_main.cpp",
+        "runtime/qrt_cli.*",
+        "runtime/qrt_config.*",
+        "runtime/CMakeLists.txt",
+        "runtime/README.md",
+        "bench/tools/quality/**"
+      ],
+      "done_when": "k=5、4198 MiB 缓存下 auto 使 H2D/CPU 两条 miss 腿耗时差 <=10%（固定 0/50/100 仅对照）；接线正确：全 H2D 与 prefill-slot 臂一致、全 CPU 同 top-1；三条腿 spread 只报读数，10% 判据转到 M3-2b",
+      "owner": "qoder-agent@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-26T17:05:00+08:00",
+      "note": "partial 2026-10-26: per-layer slot arrays replace the prefill slot after prefill; qrt_miss_split_plan balances the H2D/CPU legs over a pass (carry), the cache acquire takes a mask so CPU-leg misses neither evict nor upload, the H2D leg uploads a layer in one region submit, and the CPU leg runs 8 experts in parallel from the device Q8_1 planes. CPU core now covers Q4_K/Q5_K/Q6_K; fixed a real defect: subnormal fp16 deltas were read as 0 (gate row L1 265.657 -> 214.389 = reference). Correctness: all-H2D matches the prefill-slot arm; all-CPU matches top-1 (4 layers and 40 layers 8/8 ids); logits drift <= 0.21 after 40 layers. Gate not met: at k=5 / 4198 MiB auto balances H2D/CPU to 0.1-0.2% but the three-leg spread is 34.5% (GPU 158-190 ms, H2D 165-249, CPU 170-239); the GPU device leg is ~5x the design 2.6 bandwidth floor (attention/DeltaNet/router efficiency), and miss legs run at 0.36-1.7 ms/expert vs 0.137/0.19 design (store read ~2.9 GB/s). Evidence RESULTS m3-2a-miss-split, DECISIONS m3-2a-split-verdict. Escalation E-SPLIT1: criterion/next-step choice. No commit (no authorization). User chose (b) 2026-10-26: close M3-2a on miss-leg balance and wiring; the three-leg 10% moves to M3-2b.",
+      "evidence": {
+        "results": [
+          "RESULTS.md#m3-2a-miss-split"
+        ],
+        "decisions": [
+          "DECISIONS.md#m3-2a-split-verdict",
+          "DECISIONS.md#m3-2a-split-verdict"
+        ]
+      }
+    },
+    {
+      "id": "M3-2b",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "todo",
+      "title": "GPU 腿回到带宽地板：attention/DeltaNet/router 与跨层 overlap",
+      "deps": [
+        "M3-2a"
+      ],
       "resources": [
+        "gpu",
+        "host-ram",
         "machine-quiet"
       ],
       "paths": [
-        "runtime/miss_split.*"
+        "runtime/attn_full.*",
+        "runtime/attn_deltanet.*",
+        "runtime/kernels/**",
+        "runtime/layer.*",
+        "runtime/model.cpp",
+        "runtime/ffn.cpp",
+        "runtime/qrt_main.cpp",
+        "runtime/CMakeLists.txt",
+        "runtime/README.md"
       ],
-      "done_when": "k=5、21.9% 缓存下三条腿耗时差 <= 10%；QRT_MISS_SPLIT=auto；固定 0/50/100 仅作对照"
+      "done_when": "k=5、4198 MiB、auto 下 GPU 设备腿（pass1+pass2 submit->fence）<= 30 ms/pass，且三条腿 spread <=10%（同一测量重跑 RESULTS#m3-2a-miss-split 的表）；报 attention/DeltaNet/router 的 per-layer 分解与前后读数",
+      "note": "2026-10-26 user chose (b) on E-SPLIT1: M3-2a closes on miss-leg balance; the 34.5% three-leg spread and its GPU device leg (158-190 ms vs the 21 ms bandwidth floor) move here. Not claimed."
     },
     {
       "id": "U-5",
@@ -1118,10 +1246,10 @@
       "id": "M2-7a",
       "milestone": "M2",
       "lane": "impl",
-      "status": "doing",
-      "owner": "deepseek-v4.1-flash@ElliotMasheal",
+      "status": "done",
+      "owner": "qoder-agent@ElliotMasheal",
       "worktree": "E:/fastLlama",
-      "claimed_at": "2026-10-26T00:05:00+08:00",
+      "claimed_at": "2026-10-26T09:33:00+08:00",
       "title": "整模型前向 + logits 出口（QRTLOG1 v1）",
       "deps": [
         "M2-5",
@@ -1130,16 +1258,26 @@
       ],
       "resources": [
         "gpu",
-        "machine-quiet"
+        "machine-quiet",
+        "host-ram",
+        "disk-io"
       ],
       "paths": [
         "runtime/model.*",
         "runtime/qrt_main.cpp",
         "runtime/CMakeLists.txt",
-        "runtime/README.md"
+        "runtime/README.md",
+        "runtime/layer.*",
+        "runtime/qrt_config.*",
+        "runtime/ffn.*",
+        "runtime/prefill.*",
+        "runtime/qrt_cli.*",
+        "runtime/vk_dev.h",
+        "runtime/*test*",
+        "bench/tools/quality/**"
       ],
-      "note": "doing 2026-10-26: the harness runs end to end (embedding -> 40 layers -> final norm -> host head -> QRTLOG1 v1, qgate verify PASS on 4 and 16 rows) but the logits are wrong: PPL 2.60e+06 / mean NLL 14.77 against the fork f16 arm 3.3621 on the same 256 tokens. Format and row offsets are ruled out; next is the 1-layer hidden comparison against --layer-check and the fork row overlap (RESULTS m2-7a-runner-wip)",
-      "done_when": "embedding -> 40 层（10 full-attn + 30 DeltaNet）-> final norm -> output head 跑通一个 chunk；--logits-dump 写 QRTLOG1 v1（24 B 头 + tokens[n_pos+1] + f32 rows，格式见 bench/tools/quality/README.md 第 3 节）；相邻层 hidden 与单层链一致，logits 对 CPU 双精度参考 rel_L1 <= 1e-4；10K prompt 一档 exit 0，读数进 RESULTS"
+      "note": "2026-10-26 08:50 user explicitly authorized this session to take over M2-7a after confirming no qrt/llama/build process was running; preserve all existing uncommitted edits. User-requested review/refactor scope adds configuration/CLI, prefill callback contracts, resource and IO safety, and regression workflow without changing gates or design. Previous checkpoint: re-claimed 2026-10-26 07:28 by qoder-agent@ElliotMasheal: previous claim (deepseek-v4.1-flash, 00:05) expired at 7.3 h with no qrt/llama/build process alive; same host, same worktree E:/fastLlama, uncommitted M2-7a edits present; user asked to continue in this worktree. doing 2026-10-26: the device chain and one host-only double chain now run side by side (--model-check; qrt_layer_ref_cpu in runtime/layer.*, no device readback between layers). Met: replay of the first DeltaNet and first full-attn layer is bit-identical to the chain (adjacent-layer handoff); with the Q8_1 packing decisions shared, all 40 layers hold hidden <= 5.93e-06 and logits rel_L1 5.93e-07 (arms KLD 1.79e-13, top-1 16/16); the same reference packing for itself gives 1.2e-3 per layer and 1.39e-01 over the chain, which is int8 step-function decorrelation, not arithmetic (--norm-check already records qs_bad=80/655360 CPU-vs-shader boundary flips). Baseline unchanged: 256 tok / 40 layers / 16 rows f16-f16 = PPL 1.484673, KLD vs fork 8.3796e-03, top-1 87.5%, and the reference arm gives the identical reading, so the fork gap is systematic to both arms, not an arithmetic defect (RESULTS m2-7a-model-ref-chain, DECISIONS m2-7a-ref-chain-verdict). Open: the 10K tier needs cross-chunk state (qrt_layer_run hardcodes pos0=0; DeltaNet state_in/state_out are never swapped and prep discards conv_state_out) - one 10400-token chunk dies at layer 20 on the expert slot allocation with 4198 and 1500 MiB caches alike, while the design's 2048 chunk with 512 tail rows exits 0 in 293 s. E-CHAIN1 asks which packing convention the rel_L1 1e-4 item is judged under. Device-arm dumps are bit-identical before/after the head refactor; --selftest, --norm-check, --deltanet-check, --fullattn-check and --layer-check 0/3 PASS. done 2026-10-26 09:33: user authorized takeover and a review+refactor round. Review fixes: strict table-driven CLI (garbage numbers/unknown args/conflicting commands now exit 2 before allocation), atomic config (CLI overrides invalid env, rejected value leaves config unchanged), RAII model ownership, strict token file and dump I/O, FFN release/capacity guards, prefill backend contract with reader pool and failure drain, non-multiple-of-32 valid tail chunks with DeltaNet conv-tap carry across short chunks. Evidence: ctest -L qrt 5/5; final 40-layer f16 dump bit-identical to the pre-refactor baseline (cmp exit 0); replay 0 for layer 0 and 3; layer 0/3 64-token PASS including layer_state 60,1,2,1 mismatches 0; prefill probe 162/162 and layer-moe 512/512 readers=2; ref-only model-check no longer crashes; 10428-token prompt default q8_0/q4_0 KV in 6 chunks (last 188 tokens) exits 0, 88.0 s workflow model stage, dump verify PASS (RESULTS m2-7a-review-refactor). Independent-packing 4-layer chain reports rel_L1 8.836e-3 / KLD 1.8881e-4 as a reading only; user chose (a), so the rel_L1 gate is the shared-packing arm 5.929e-7 (RESULTS 80, device dump bit-identical). No commit made (no authorization).",
+      "done_when": "embedding -> 40 层（10 full-attn + 30 DeltaNet）-> final norm -> output head 跑通一个 chunk；--logits-dump 写 QRTLOG1 v1（24 B 头 + tokens[n_pos+1] + f32 rows，格式见 bench/tools/quality/README.md 第 3 节）；相邻层 hidden 与单层链一致，logits 对 CPU 双精度参考 rel_L1 <= 1e-4（用户 2026-10-26 裁定：只判打包决策共享口径，实测 5.929e-7；独立打包只报读数）；10K prompt 一档 exit 0，读数进 RESULTS"
     },
     {
       "id": "M2-6a",
@@ -1356,6 +1494,158 @@
         "bench/raw/q-kv3/**"
       ],
       "done_when": "A = runtime f16 KV、B = q8_0 K + q4_0 V，三档各报 tail-512 mean KLD / same top-1 / needle；按 docs/agent/gates.md 的 G-QUAL-LONG 判 pass/fail"
+    },
+    {
+      "id": "U-13",
+      "milestone": "M2",
+      "lane": "user",
+      "status": "done",
+      "title": "U-13 已决：三层数值门、2-submit/跨层 pipeline、repack v2、code 130",
+      "deps": [],
+      "resources": [],
+      "paths": [
+        "bench/DECISIONS.md",
+        "docs/agent/ARCH-REVIEW-2026-10-26.md",
+        "docs/agent/gates.md"
+      ],
+      "done_when": "四项决定写入 DECISIONS/gates；X-5/X-6/X-7/M5-5 任务建立；code 仍为 130",
+      "note": "用户 2026-10-26：A/B/C 三层门；短期每层 2 submit + 跨层 pipeline；批准 repack v2 内部布局；code 仍要求 130。证据见 docs/agent/ARCH-REVIEW-2026-10-26.md，判决 DECISIONS.md#u-13-three-tier-gate-2submit-repack-v2。"
+    },
+    {
+      "id": "X-5",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "done",
+      "title": "prefill 层内专家常驻：消除每 chunk 重读",
+      "deps": [
+        "M2-5",
+        "M2-6",
+        "M2-7a"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/ffn.cpp",
+        "runtime/ffn.h",
+        "runtime/layer.cpp",
+        "runtime/layer.h",
+        "runtime/model.cpp",
+        "runtime/README.md",
+        "runtime/CMakeLists.txt"
+      ],
+      "done_when": "10.4K 层循环每层专家 store 只读一遍（每专家最多上传一次；uploaded_bytes 收敛到该层 store_bytes，不随 chunk 数线性增长；后续 chunk 只补新路由专家）；同 KV 档 golden logits 与修改前逐字节一致；--model-check/--chunk-check 不回归；报修改前后 10.4K 层循环 ms 与 uploaded bytes",
+      "note": "done 2026-10-26: ffn slot fixed dev_off + per-expert loaded bitmap + contiguous-run H2D; model_upload counter. 10.4K diagnostic 40-layer ms 67556.3 -> 38881.9, wall 110 -> 83 s, golden cmp=0; layer 0 upload 464.0 MiB, layer 39 559.8 MiB (store 463.9/561.9); model-check 64 tok PASS logits rel_L1 6.403e-07; chunk-check 512/128 carry 0.000e+00, no-carry 5.517e-01; layer-check layer3 PASS; ctest 6/6. Evidence RESULTS 84."
+    },
+    {
+      "id": "X-6",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "done",
+      "title": "decode 专家行 padding 32 -> 8",
+      "deps": [
+        "M3-1",
+        "M2-7a"
+      ],
+      "resources": [
+        "gpu",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/ffn.cpp",
+        "runtime/ffn.h",
+        "runtime/moe.cpp",
+        "runtime/moe.h",
+        "runtime/qrt_main.cpp",
+        "runtime/README.md"
+      ],
+      "done_when": "routed-only k=1/2/4/5/8 的专家行对齐 32->8；层 3 k=4 rows 960->240、k=1 256->64；ids/union/weights/MoE 对 k=1 串行与 CPU 参考一致；prefill chunk 2048 不回归；ctest -L qrt 通过；报每 k rows 与诊断耗时",
+      "note": "done 2026-10-26: expert rows pad 32 -> 8 (K-quant Q4K_TOKENS), max_rows n*7; qrt_gemm_record allows m%8 for K-quant with ceil(m/32) dispatch, Q8_0 still 32. Layers 0/3/34 k=1/2/4/5/8 PASS; k=4 layer3 rows 960 -> 240, k=1 256 -> 64; 10.4K prefill cmp=0; layer-check layer3 PASS; ctest 6/6. Evidence RESULTS 84."
+    },
+    {
+      "id": "X-7",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "done",
+      "title": "三层数值门：量化器逐位、完整链算术、外部质量锚",
+      "deps": [
+        "X-5",
+        "X-6",
+        "M2-7a",
+        "X-1"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/ffn.cpp",
+        "runtime/ffn.h",
+        "runtime/layer.cpp",
+        "runtime/layer.h",
+        "runtime/model.cpp",
+        "runtime/model.h",
+        "runtime/kernels/common.glsl",
+        "runtime/kernels/attn_full_qk.comp",
+        "runtime/README.md",
+        "bench/tools/quality/**"
+      ],
+      "done_when": "A：--norm-check qs_bad=0（边界/次正规/ties 全码）；B：完整 40 层链 reseed off、共享同一批量化字节，logits rel_L1 <= 1e-4、top-1 100%；C：runtime f16/f16 对 fork f16 的 KLD <= 1.5e-2、top-1 >= 85%，并报无 Q8_1 激活的高精度短切片；f16 KV append 改 RNE；读数进 RESULTS/DECISIONS",
+      "note": "done 2026-10-26: A pure quantiser norm_quant qs_bad/ds_bad/sum_bad=0 on identical f32 incl ties/denormal; norm-path 3/32768 diagnostic (RMS float/double). B full 40-layer reseed off device planes logits rel_L1 4.122e-05 top1 16/16 (input norm CPU; independent chain 1.387e-01 retained as sensitivity). C 512-context fork anchor KLD 1.0867e-02 top1 97.255% vs fork own on/off 1.4681e-02/93.701%; 7 flips margin>=0.05 reported (fork 11), worst 0.959 residual. f16 KV append RNE; high-precision dense slice norm_gemm_f32 3.989e-03. selftest 0, ctest 6/6. Evidence RESULTS 85 / DECISIONS 84."
+    },
+    {
+      "id": "M5-5",
+      "milestone": "M5",
+      "lane": "io",
+      "status": "todo",
+      "title": "repack v2：块主序/交织与 scale SoA",
+      "deps": [
+        "M5-1",
+        "M5-2"
+      ],
+      "resources": [
+        "machine-quiet",
+        "disk-io"
+      ],
+      "paths": [
+        "tools/expert-repack/**",
+        "runtime/weights.cpp",
+        "runtime/weights.h",
+        "runtime/repack/FORMAT.md",
+        "runtime/kernels/**",
+        "runtime/README.md"
+      ],
+      "done_when": "Q4_K/Q5_K/Q6_K 块主序/按 tile 交织、gate/up 交织、scale SoA；逐字节值不变；逐专家 SHA 在加载时校验；保留 v1 读取回退；报 PP 专家腿与 CPU 0.0665 的前后读数",
+      "note": "用户 2026-10-26 批准 repack v2 内部布局，不改量化值。dense 同类布局已 3.38->12.89 TFLOPS；专家正确链仍 5.4 TFLOPS。"
+    },
+    {
+      "id": "X-8",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "todo",
+      "title": "C 残余分叉归因 + 全模型 f32 激活锚 + q8/q4 staging RNE",
+      "deps": [
+        "X-7"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/attn_full.cpp",
+        "runtime/attn_full.h",
+        "runtime/layer.cpp",
+        "runtime/model.cpp",
+        "runtime/qrt_main.cpp",
+        "runtime/kernels/attn_full_attn.comp",
+        "bench/tools/quality/**"
+      ],
+      "done_when": "解释 C 的 7 个 margin>=0.05 分叉（区分 fork 路径、Q8_1 量化、真实缺陷）；实现并跑通全模型无 Q8_1 激活的高精度锚；决定默认 q8/q4 dequant K/V staging 是否改 RNE 并给出数值/性能证据；读数进 RESULTS/DECISIONS",
+      "note": "X-7 残余：C 7 flips worst 0.959；默认 q8/q4 dequant staging 仍 packHalf2x16 truncation；norm_gemm_f32 只覆盖 dense projection。不阻塞 M3-2。"
     }
   ],
   "last_gate": {
@@ -1366,6 +1656,20 @@
   },
   "blockers": [],
   "escalations": [
+    {
+      "id": "E-CHAIN1",
+      "state": "closed",
+      "resolved": "2026-10-26",
+      "decision": "DECISIONS.md#review-refactor-decisions",
+      "question": "M2-7a 的 done_when 写 logits 对 CPU 双精度参考 rel_L1 <= 1e-4，但没写 int8 激活打包的口径。两个口径实测都进了 RESULTS#m2-7a-model-ref-chain：共享打包决策 5.93e-07（40 层全覆盖，两臂 KLD 1.79e-13）；两臂各自打包 1.2e-3/层、40 层链 1.387e-01 —— 后者测的是 Q8_1 阶跃导致的轨迹分叉（--norm-check 本来就记着 CPU 与 shader 有 80/655360 个块边界判定不同），不是算术错。请选择模型级判据：(a) rel_L1 只对'打包决策共享'口径判，独立打包口径只报读数；(b) 模型级改用 gates 的 L-MODEL 口径 KLD<=1e-4 + top-1，rel_L1 只留逐层隔离；(c) 保留现写法（那么 M2-7a 在 int8 流水线下结构性不过，需要放宽到 ~2e-1）。建议 (b)。",
+      "needs_by": "M2-7 收口前（10.4K 档的 logits 门）",
+      "options": [
+        "(a) rel_L1 只判打包共享口径",
+        "(b) 模型级用 KLD<=1e-4+top-1，rel_L1 留逐层（建议）",
+        "(c) 保留现写法并放宽阈值"
+      ],
+      "outcome": "用户 2026-10-26 选 (a)：rel_L1 只对打包决策共享口径判定（实测 5.929e-7），独立打包 4 层链 8.836e-3 / KLD 1.8881e-4 只报读数；不改阈值。M2-7a done_when 已按此口径澄清并收口"
+    },
     {
       "id": "E-KV2",
       "state": "closed",
@@ -1401,6 +1705,19 @@
       "question": "design 5.1/5.3 的专家槽常数 1.84 MiB 是否改成按层分尺寸（1.812 / 1.945 / 2.195 MiB）？E-1 已定按层切分，但 design 仍是单一常数",
       "needs_by": "M3 decode 开工前",
       "outcome": "design 5.1（116-118）与 5.3（314/326）已按层分尺寸；1.84 只作摊平估算口径，不用于分配"
+    },
+    {
+      "id": "E-SPLIT1",
+      "state": "closed",
+      "resolved": "2026-10-26",
+      "question": "M3-2a 的 done_when 要求 k=5、21.9% 缓存下三条腿耗时差 <=10%。实现已把 H2D/CPU 两条 miss 腿平衡到 0.1-0.2%，但 GPU 设备腿 158-190 ms 对 miss 腿 165-249 ms，spread 34.5%（RESULTS#m3-2a-miss-split）。GPU 腿是 pass1+pass2 的 submit->fence 等待，比 design 2.6 的带宽账高约 5 倍，根因是 attention/DeltaNet/router 效率（M2 项），miss 分配改不动它。请选择：(a) M3-2a 保持 partial，先做 GPU 腿的 M2 性能项或跨层 pipeline，再回来判 10%；(b) 以“两条 miss 腿平衡 + 接线正确”收口 M3-2a，把 GPU 腿差距拆成独立性能任务，继续 M3-3/M3-4（建议）；(c) 把 10% 判据改成只对两条 miss 腿判（需要改 done_when）。",
+      "needs_by": "M3-3 领取前",
+      "options": [
+        "(a) 保持 partial，先修 GPU 腿再判",
+        "(b) 以 miss 腿平衡收口，GPU 腿另立任务（建议）",
+        "(c) 改判据为两条 miss 腿"
+      ],
+      "outcome": "用户选 (b)：M3-2a 以两条 miss 腿平衡（实测 0.1-0.2%）+ 接线正确收口；三条腿 10% 判据转到新任务 M3-2b，由 attention/DeltaNet/router 效率或跨层 overlap 把 GPU 设备腿拉回 ~21 ms/pass 后重跑。"
     }
   ]
 }

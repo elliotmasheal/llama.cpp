@@ -3008,3 +3008,573 @@ CPU 双精度，K/V 平面取设备缓存按行格式反量化），`qrt --layer
   1e-4；同引擎 A/B 才是质量门口径，而 runtime 现在已经能产出两侧。
 - 未做：`--logits-rows 512` 的 10K 档、128K/256K（Q-KV3）、跨 chunk KV/DeltaNet 状态、softplus
   大值保护（P2，未观察到触发）。
+
+## 80. M2-7a 整模型 CPU 双精度链：算术差 5.9e-7，模型级距离由 Q8_1 打包决定（2026-10-26）
+<!-- slug: m2-7a-model-ref-chain -->
+
+口径：`qrt --model-check <gguf> --logits-tokens <ids> --logits-layers 40 --logits-rows 16
+--logits-out A --model-check-ref B --layer-store <prefix> --kv-k f16 --kv-v f16
+[--model-check-reseed on|off] [--model-check-planes cpu|device]`；token 串仍是 77/78/79 用的
+`bench/raw/m2-7a/tokens256.txt`（256 token，行 offset 239..254）。构建源 b8ce846fe + 本轮未提交
+diff，产物 `bench/raw/m2-7a/chain40.*`、`iso40-device.log`、`iso40d-*.bin`。这是正确性诊断批次
+（单次、确定性回归），不是正式性能批次，不占 PP/TG 口径。
+
+### 80.1 新增的两条腿
+
+- `qrt_layer_ref_cpu()`（`runtime/layer.*`）：一层 = input norm -> Q8_1 平面 -> 投影 -> DeltaNet
+  四腿或 full-attn -> 输出投影 -> 残差 -> post norm -> FFN 参考 -> 加权累加，全部在主机双精度里，
+  **层间接口不回读设备缓冲**。full-attn 的 K/V 行由参考自己做截尾 f16（驱动 `packHalf2x16` =
+  `v_cvt_pkrtz`，DECISIONS 64.1）；q8_0/q4_0 行需要复现 append kernel 的 block-max，参考不模拟，
+  直接报错而不悄悄换精度。
+- `--model-check`（`runtime/model.*`、`qrt_main.cpp`）：设备链与参考链同跑，逐层打
+  `model_stage`（定位用，读设备分段缓冲）、`model_ref`（整层 hidden）、`replay_rel_l1`；末尾
+  `model_check` 给 hidden_max / logits rel_L1 / top-1 / 两臂 NLL 与判据。`--model-check-ref` 把
+  参考臂也写成 QRTLOG1，于是 `qgate.py compare` 能比"同引擎、同语义、双精度算术"两臂。
+- 顺带修掉输出头的重复读盘：原先每个 dump 行都把 `output.weight` 整表过一遍（512 行 = 88 GB），
+  现在单次流式扫过词表、两臂共用同一行。改完 `l40-f16-final.bin` 与 HEAD 的 `l40-f16.bin`
+  **逐位相同**（`cmp` 退出 0，最后一次用收口时的二进制），整轮 256 token/40 层/16 行从 61 s 降到
+  39 s。`--logits-dump` 不跑重跑腿，逐层重跑只在 `--model-check` 里做。
+
+### 80.2 基线复现（未改数值）
+
+| 臂 | PPL | mean KLD vs fork | same top-1 | 退出码 |
+|---|---:|---:|---:|---:|
+| 本轮设备臂 f16/f16（256 tok, 40 层, 16 行） | 1.484673 | 8.3796e-03 | 87.5% | 0 |
+| 另一轮同参数设备臂 `iso40d-gpu.bin` | 逐位相同 | 同上 | 同上 | 0 |
+
+与 RESULTS 79 的 1.485 / 8.38e-3 / 87.5% 一致；两次不同参数的运行设备臂产物逐位一致。
+
+### 80.3 参考链的两条口径读数
+
+| 口径 | 每层 hidden rel_L1 | logits rel_L1 | 两臂 mean KLD | same top-1 | 判据 1e-4 |
+|---|---:|---:|---:|---:|---|
+| 40 层逐层隔离 + 打包决策共享（reseed on, planes device） | 最大 5.925e-06 | **5.929e-07** | **1.7873e-13** | 16/16 | PASS，余量 170x |
+| 40 层链 + 两臂各自打包（reseed off, planes cpu） | 1.236e-03 -> 1.521e-01 | 1.387e-01 | 3.0120e-02 | 15/16 | FAIL |
+| 4 层逐层隔离 + 各自打包 | 1.24e-03 / 9.5e-05 / 3.1e-04 / 3.4e-04 | 6.754e-04 | - | 2/2 | FAIL |
+
+- 两臂 NLL：共享打包口径下设备臂 0.3957 = 参考臂 0.3957；独立打包链下 0.3957 vs 0.3787
+  （参考臂更像理想模型，但离 fork 更远，见 80.5）。
+
+### 80.4 机制：阶跃式的 Q8_1 打包，不是算术也不是语义
+
+同一层、同一输入（layer 0，256 token，只换打包决策的来源）：
+
+| 阶段 | 平面各算 | 平面共享 |
+|---|---:|---:|
+| xnorm | 3.536e-08 | 3.536e-08 |
+| src（注意力输出） | 4.757e-05 | 4.757e-05 |
+| outproj | 4.583e-04 | 1.612e-07 |
+| res | 3.202e-04 | 1.127e-07 |
+| post | 3.592e-04 | 1.598e-07 |
+| moe | 2.514e-03 | 3.169e-06 |
+| shexp | 4.218e-03 | 5.121e-06 |
+| 层输出 hidden | 1.236e-03 | 2.077e-06 |
+
+共享两个 int8 打包决策后，同一条参考链的层输出差从 1.24e-3 掉到 2.08e-6（590x），算术阶段落到
+1e-7 量级。40 层共享打包口径的阶段最大值：xnorm 3.933e-08、src 4.757e-05、outproj 2.347e-07、
+res 1.127e-07、post 1.598e-07、moe 2.104e-05、shexp 1.036e-05。`src` 是剩下唯一没共享的打包点
+（输入 norm 的平面缓冲在第 7 步被覆盖，回读拿不到），它给每层带来 4.8e-5。
+旁证：`--norm-check` 长期记着 `qs_bad=80 / 655360`（1.22e-04）——CPU 参考与 shader 对 Q8_1
+边界本来就不是逐位一致，所以"两臂各自打包"必然分叉。
+
+### 80.5 fork 三方对照（16 行，offset 239..254）
+
+| 对照 | PPL A/B | mean KLD | same top-1 |
+|---|---|---:|---:|
+| fork f16 vs 设备臂 | 1.441039 / 1.484673 | 8.3796e-03 | 87.5% |
+| fork f16 vs 参考臂（打包共享） | 1.441039 / 1.484673 | **8.3796e-03** | 87.5% |
+| fork f16 vs 参考臂（独立打包链） | 1.441039 / 1.459672 | 2.8495e-02 | 93.75% |
+
+参考臂（打包共享）与设备臂到 fork 的距离**逐位相同的读数**，而它们彼此只差 1.79e-13：
+8.4e-3 不是某一条臂的算术错，而是两条臂共有的系统性偏差（int8 激活平面 + 与 fork fused 路径的
+约定差），量级仍在 Q-KV1 记的 fork 自身地板 1.47e-2 之内。
+
+### 80.6 done_when 三条出口的现状
+
+- 相邻层 hidden 与单层链一致：`replay_rel_l1=0.000e+00`、`replay_max=0.000e+00`（DeltaNet 与
+  full-attn 各取首层，同输入重跑逐位相同）-> PASS。
+- logits 对 CPU 双精度参考 rel_L1 <= 1e-4：打包共享口径实测 **5.929e-07**（40 层全覆盖）；
+  完全独立打包口径实测 1.387e-01，机制见 80.4。两个数都记，判据口径待裁（DECISIONS
+  `m2-7a-ref-chain-verdict`，升级项 E-CHAIN1）。
+- 10K prompt 一档：`tokens10k.txt`（由 `llama-tokenize --ids` 从 `prompt10k.txt` 取 10428 个 id，
+  截到 10400=325x32；前缀与 fork 转储的 token 流逐位相同）单 chunk 跑 40 层，在 layer 20 报
+  `allocating the layer expert slot buffer` 退出非 0（默认 expert cache 4198 MiB 与 1500 MiB 两档
+  同位置失败 -> 不是预留挤占，是 T=10400 的每层平面与专家槽合计超预算）。design 口径本来是
+  chunk 2048：`tokens2048.txt` + 512 tail 行 40 层 **exit 0，293 s**（其中输出头 512 行占大头）。
+  真 10.4K 档需要跨 chunk：`qrt_layer_run` 的 pos0 写死 0，且 DeltaNet 状态没回写
+  （`state_in`/`state_out` 分离、`qrt_dn_prep_cpu` 的 `conv_state_out` 被丢弃），归 M2-7。
+
+### 80.7 门禁
+
+- L-KERN：本轮只新增参考实现与诊断入口，未改内核数值路径。回归全绿：`--selftest` 0 failed；
+  `--norm-check` PASS；`--deltanet-check` PASS（cols_vs_ref 2.654e-07）；`--fullattn-check` 层 3
+  512 token PASS（full_attn 1.399e-06）；`--layer-check` 层 0 / 层 3 @512 token 带 store
+  `fails=0 open=0 verdict=PASS`（attn 4.752e-07 / 5.752e-07，ffn_out 1.156e-07 / 1.159e-06）。
+- G-REG：n/a（`runtime/` 不走）。
+- L-MODEL / G-QUAL-LONG：本轮不改默认值，不判；10K/128K/256K 仍归 M2-7 与 Q-KV3。
+- 未做：跨 chunk KV 与 DeltaNet 状态；q8_0/q4_0 KV 行的参考（现在显式报错）；softplus 大值保护。
+
+## Agent 执行契约与 lint 回归（2026-10-26）
+<!-- slug: agent-loop-lint-regression -->
+
+口径：用户指定的文档/流程维护，基于 b8ce846fe 的未提交工作区；仅本地 Python 确定性检查，非模型/性能批次，不占 GPU，不改变在途任务归属。以下次数为实际测试用例数，不是性能重复次数。
+
+| 检查 | 修复前反例 | 修复后 |
+|---|---|---|
+| `python -B bench/tools/state_check.py --selftest` | 新增六例后 21/23；`--lint` 放过 1 B 超预算、却检查了应忽略的任务 phase | 23/23，exit 0 |
+| 默认命令 / `--lint` | 默认包含文档检查，`--lint` 反而跳过 | 两者 exit 0；前者全检，后者只检文档 |
+| `--brief X-4` / `--board --lane impl` | - | exit 0，任务和必读清单正常 |
+| `git diff --check` | - | exit 0 |
+
+六个隔离用例使用临时目录：合法文档/状态、超预算文档、非法 phase，分别测试默认/`--lint`。超预算两入口都必须非 0；非法 phase 只影响完整校验。测试不修改真实状态或文档。
+
+G-CONS 通过；L-KERN/L-MODEL/G-REG 与模型性能验收不适用（未改运行时或 fork 实现），不据此宣称 M2-7a 或任何模型质量门完成。规则判决见 `DECISIONS.md#agent-loop-contract`。
+
+## 81. 审阅修复 + 配置/prefill 重构 + M2-7a 全流程收口（2026-10-26）
+<!-- slug: m2-7a-review-refactor -->
+
+口径：`b8ce846fe` + 本次未提交 diff；独立构建 `build-review`（Release、MinGW、Vulkan、
+`QRt_Q8K_ROWS/TOKENS/WG=2/8/128`）。产物在 `bench/raw/review-20261026/`。以下为确定性
+契约与诊断读数（重放 1-3 次，按项标注），**不是正式性能批次**，不报 PP/TG。
+
+### 81.1 审阅发现并修复的异常
+
+| 类别 | 修复前证据 | 修复后 |
+|---|---|---|
+| CLI 接受垃圾 | `--layer 3junk`、`--prefill-pipeline maybe`、`--prefill-pipeline 2`、未知位置参数、`--print-config` 夹带命令均被接受；`cli-before.log` 9 组用例 13 条断言失败 | 表驱动严格解析与命令互斥，分配前 exit 2；`qrt_cli_contract` 12/12 |
+| 内置自检环境依赖 | 无可用 `tmpfile()` 时 note 用例失败，`--selftest` exit 1 | 直接写 stdout，`--selftest` 0 failed |
+| 模型单臂崩溃 | `--model-check` 只给 `--model-check-ref` 时 exit 3221225477（读空 vector）；`ref-only-before.log` | 同一命令 exit 0，`ref-only-after.log` logits rel_L1 0 |
+| 所有权泄漏 | `model_forward` 多处早退绕过 device/GGUF/staging 释放；`memset` 覆盖含 vector 的结果；`arms` 的 want 位未初始化 | RAII 统一释放，值初始化；CPU 桩 18 类注入 × 2（含部分创建）资源配对 |
+| FFN 越界/UAF | store 维度不足时释放后再读 `f->store`；单专家超 staging 或 32 位偏移会越界 | 先取维度，拷贝前拒绝；CPU 契约覆盖 |
+| prefill 失败不传播 | `calloc` 含 thread/mutex 的对象；reader 未接线；1 专家 8 槽尾部下溢导致 0 回调仍返回 0；compute/read/upload 失败不传播、不排空 | 构造/析构 + `qrt_prefill_backend` 能力契约，失败先排空；`qrt_prefill_contract` 通过 |
+| 输入/输出 | token 文件遇垃圾后缀静默截断；dump 忽略 `fwrite/fclose` 失败；输出可覆盖输入/GGUF/store | 完整十进制解析、失败不返回部分结果；短写报错；路径冲突拒绝 |
+
+### 81.2 重构边界（design 5.1 内，无新后端/第二套调度器）
+
+- `qrt_cli.*`：单张选项表；CLI > `QRT_*` > 默认；显式 CLI 可覆盖坏环境值；被拒值不部分应用；
+  `qrt_config_parse` 与 `qrt_config_validate` 同一范围。
+- `qrt_prefill_backend{compute,batch,wait,user}`：per-expert 与 layer-batch 共用；缺能力或
+  `counts>stride` 在分配前拒绝；每轮结束等完所有已提交 ring。
+- `model.*`：`qrt_config + qrt_model_options` 单一入口；校验 `block_count/nextn`，不静默包含
+  MTP；输出路径不得等于 GGUF/store；`write_dump` 检查短写与 close。
+- `layer.*`：有效 token 尾块可非 32 倍数（分配仍按 32 对齐）；`run_tokens < conv_taps-1` 时
+  用 QKV 空闲行暂存旧 taps，避免重叠拷贝；新增 `60,1,2,1` ×2 重复/reset/前缀因果回归。
+- `qgate.py run`：构建→`ctest -L qrt`→selftest→config→index→40 层前向→verify [→compare]，
+  失败即停、不覆盖已有输出、命令/退出码/日志进 `workflow.json`；状态标 `format_verified`
+  或 `comparison_passed`，并显式写 `model_quality_acceptance=false`。
+
+### 81.3 实测
+
+| 检查 | 读数 | 次数/口径 |
+|---|---|---|
+| runtime CPU 契约 | `ctest -L qrt` 5/5（selftest、model、prefill、cli、workflow） | 1 次，exit 0 |
+| 40 层设备臂回归 | 重构前后 QRTLOG1 **逐字节相同**（15,892,572 B；top1=90448 logit=14.0954） | 各 1 次，f16 KV，256 tok，16 行 |
+| 相邻层 replay | layer 0 与 layer 3 `replay_rel_l1=0.000e+00`，`replay_max=0` | 1 次，64 tok，f16 |
+| 独立打包 4 层链 | hidden max 1.532e-02；logits rel_L1 8.836e-03；KLD 1.8881e-04；top-1 16/16 | 仅报读数（E-CHAIN1） |
+| 共享打包 40 层 | hidden 5.925e-06、logits 5.929e-07、KLD 1.79e-13、top-1 16/16 | `RESULTS#m2-7a-model-ref-chain`；设备臂逐字节未变 |
+| 层链 | layer 0/3 @64 tok f16 `fails=0 open=0`；`layer_state chunks=60,1,2,1 repeats=2 prefix_causal=1 mismatches=0` | 各 1 次 |
+| prefill 插件 | probe 162/162 done，failed 0；layer-moe 512/512 done，2 层，groups 64，readers=2 | 各 1 次；只作调度/消费者串联 |
+| 10.4K 档 | 10,428 tok，q8_0 K + q4_0 V，chunk 2048 → 6 chunk（末块 188 tok），exit 0；model 阶段 88.0 s，40 层 ms 合计 53.6 s；dump verify PASS | 1 次，16 行 |
+
+10.4K 的 88.0 s 是含 host embedding、`output.weight` 单遍扫描（1.7 GB）与落盘的诊断时长，
+不能当 PP；40 层合计只覆盖层循环。重放类检查是确定性回归，不做 r>=3 性能判定。
+
+### 81.4 E-CHAIN1 裁定与 M2-7a 收口
+
+用户 2026-10-26 选 (a)：`rel_L1 <= 1e-4` 只对**打包决策共享**口径判定（5.929e-07），
+独立打包只报读数（4 层链 8.836e-03 / KLD 1.8881e-04）。阈值未改。M2-7a 的 done_when 已按此
+口径澄清；10.4K exit 0 已补齐。判决记录 `DECISIONS.md#review-refactor-decisions`。
+
+### 81.5 未验证与边界
+
+- M3 decode、MTP、expert cache/SLRU、miss split、per-pass telemetry 仍未实现；本轮不宣称
+  任何 TG 或正式 PP 读数。
+- q8_0/q4_0 KV 行仍无 CPU 参考（`--model-check` 要求 f16/f16）；独立打包链的轨迹分叉是
+  int8 激活阶跃的固有性质，不是本轮算术回归。
+- 工作区未提交（无提交授权）；`.qoder/` 为本次子代理 worktree 目录，未纳入版本控制。
+
+## 82. M3-0 专家缓存：按层槽位、SLRU 与容量退化（2026-10-26）
+<!-- slug: m3-0-expert-cache -->
+
+口径：工作区 `b8ce846fe` + 未提交 diff，`build-review`（Release/MinGW）。检查是**主机侧策略回放**：
+store 41 层 x 256 专家，槽字节取每层最大专家块；trace 为 M1-1 的 `trace-10k-g128.bin`
+（10563 token / 40 层 / top-8）与 `trace-multidoc-g128.bin`，取每个记录末尾 128 行；预算 4198 MiB；
+权重为这些行的冷缓存 miss 计数；除注明外 SLRU protected=20%。单次确定性回放，不是性能批次。
+
+### 82.1 计划
+
+`qrt --cache-check <store> --cache-trace <trace> --cache-decode 128 --expert-cache-mib 4198`
+
+| trace | policy | slots | bytes MiB | hit % | misses | evictions | no_slot |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 10k | slru (p20) | 2298 | 4197.8 | **79.893** | 8236 | 8236 | 0 |
+| 10k | lru | 2298 | 4197.8 | 79.749 | 8295 | 8295 | 0 |
+| 10k | static | 2298 | 4197.8 | 44.932 | 22556 | 0 | 22556 |
+| multidoc | slru (p20) | 2298 | 4197.8 | **78.989** | 8606 | 8606 | 0 |
+| multidoc | lru | 2298 | 4197.8 | 78.896 | 8644 | 8644 | 0 |
+| multidoc | static | 2298 | 4197.8 | 52.048 | 19641 | 0 | 19641 |
+
+两个语料各 40 层 x 128 行 x top-8 = 40960 次查询；`slru` 在 p20 下两个语料都略高于 per-layer
+`lru`，因此把 20% 作为内部默认（design 只规定 SLRU，不规定分段比例）。槽分布：38 个 1.812 MiB
+层多为 57-58 槽，层 34/38（1.945 MiB）54 槽，层 39（2.195 MiB）48 槽，层 40 保留 1 槽；
+`mixed_layers=0`，`degraded=0`。`miss_mib` 是策略回放请求的 H2D 体积（10k 15081.3，
+multidoc 15804.3），不是实测 DMA；`h2d_uploads=0` 因为检查没有 IO 回调。
+
+### 82.2 容量退化
+
+| budget MiB | slots | degraded layers | hit % | no_slot | exit |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 41 | 0.000 | 40960 | 0 |
+| 64 | 35 | 6 | 2.595 | 36480 | 0 |
+| 512 | 280 | 0 | 26.992 | 5248 | 0 |
+
+零槽层把每次查询交给 CPU 腿（`no_slot`），没有 abort，也没有第二个预算器；退化按权重降序
+保留能放下的层，槽字节仍按层。
+
+### 82.3 契约与回归
+
+- `qrt_cache_contract`（CPU，无 Vulkan）：预算切分/上限/溢出/坏参数、逐层隔离、SLRU
+  promotion/demotion、LRU/static 差异、重复 expert、pending 同层保护与跨层重叠、upload
+  失败回收、wait 失败回收、零槽退化、trace 截断/越界/尾随数据、warm+decode 回放。
+- `ctest -L qrt` 6/6（新增 `qrt_cache_contract`）。
+- 本轮不改数值内核；L-KERN n/a。真实 H2D 的上传/等待由 M3-2 的 pass 提供回调，M3-0 只固定
+  契约并用 fake IO 验证顺序与失败路径。
+
+## 83. M3-1 批量 k 路由专家：k=1/2/4/5/8 对串行与 CPU 参考一致（2026-10-26）
+<!-- slug: m3-1-moe-batch -->
+
+口径：工作区 `b8ce846fe` + 未提交 diff，`build-review`（Release/MinGW，Vulkan）。检查在层
+0（DeltaNet、Q5_K down）、层 3（full-attn、Q5_K）、层 34（Q6_K down）各跑一遍；输入是固定
+种子的 `xnorm` 及其 Q8_1 平面（`qrt_norm_cpu`，权重全 1），不是自然语言 token；k 取 1/2/4/5/8。
+单次确定性回归，不是性能批次；每层 5 个 k 的 `moe_batch` 行全部 PASS。
+
+`--moe-batch-check <gguf> --layer-store <prefix> --moe-layer L`
+
+| k | pairs | rows (L3 / L0 / L34) | ids vs serial | union vs serial | weights max rel | MoE vs serial | CPU ref ids | CPU ref max rel |
+|---:|---:|---|---|---|---:|---:|---|---:|
+| 1 | 8 | 256 / 256 / 256 | 8/8 | 8/8 | 1.021e-06 | 0.000e+00 | 8/8 | 1.390e-06 |
+| 2 | 16 | 512 / 512 / 512 | 16/16 | 16/16 | 1.259e-06 | 0.000e+00 | 16/16 | 1.536e-06 |
+| 4 | 32 | 960 / 960 / 928 | 32/32 | 30/30, 30/30, 29/29 | 1.082e-06 | 0.000e+00 | 32/32 | 1.706e-05 |
+| 5 | 40 | 1152 / 1216 / 1184 | 40/40 | 36/36, 38/38, 37/37 | 1.036e-06 | 0.000e+00 | 40/40 | 1.326e-05 |
+| 8 | 64 | 1760 / 1856 / 1696 | 64/64 | 55/55, 58/58, 53/53 | 9.481e-07 | 0.000e+00 | 64/64 | 8.530e-06 |
+
+- `ids` 指每个 k 的 `k*8` 个 top-8 id 与 k=1 串行逐 token 完全一致；CPU 参考 id 也全部一致。
+- `union` 是 batch 实际使用的专家数对 k 个串行 top-8 的并集，三个层、五个 k 全部相等。
+- `MoE vs serial` 是每个 token 的 routed sum（不含共享专家）对 k=1 串行的 rel_L1，全部为 0；
+  CPU 双精度参考最大 1.706e-05（层 0、k=4），没有出现 token 级分叉。
+- rows 是每个被路由专家的 32 行补齐后的总行数，仍保留 M2 的 tile 形状；这是正确性路径，
+  不是最终 decode tile 性能。
+- 层 3 回归：`layer_check` PASS（`layer_moe` 1.252e-05、`layer_ffn_out` 2.561e-07、
+  `layer_state` 60,1,2,1 mismatches=0），说明 `routed_only` 没有改变共享专家/残差的全量路径。
+- `ctest -L qrt` 6/6；本轮不新增内核数值路径，L-KERN 不重判；原始日志
+  `bench/raw/m3-1-moe-batch-layer{0,3,34}.log`、`m3-1-layer3-regression.log`。
+
+## 84. X-5/X-6：prefill 专家只读一次 + decode 专家行 8 行对齐（2026-10-26）
+<!-- slug: x-5-x-6-prefill-slot-decode-tile -->
+
+口径：工作区 `b8ce846fe` + 未提交 diff；`build-vulkan`（Release/MinGW，Vulkan）；
+`tokens10k.txt`（10400 个 id，325 x 32），40 层，`--prefill-chunk 2048`，f16/f16 KV，
+`--logits-rows 16`。这是诊断/确定性回归，不是正式 M2-8，也不报 TG；原始日志与产物在
+`bench/raw/x-5/`。
+
+### 84.1 X-5：整层专家 slot 跨 chunk 常驻
+
+修复：`qrt_ffn_open` 为 256 个专家预先固定 `dev_off`，并用 per-expert loaded bitmap 让
+`qrt_ffn_group` 只读/传尚未驻留的专家；连续缺失专家合并成一次 H2D。`model_upload` 打印
+每层累计上传 MiB。
+
+| 臂 | 10.4K wall | 40 层 `model_layer ms` 合计 | 输出 |
+|---|---:|---:|---|
+| 修改前（每 chunk 重读整层） | 110 s | 67,556.3 ms | base |
+| X-5 | 83 s | 38,881.9 ms | 与 base 逐字节相同（`cmp`=0） |
+| X-5+X-6 | 91 s | 39,100.3 ms | 与 base 逐字节相同（`cmp`=0） |
+
+- 层循环折算（10400 token）：67.56 s -> 38.9 s，约 **1.74x**；wall 含 host head/落盘，不作为 PP。
+- 上传计数：层 0 累计 464.0 MiB（该层 store 约 463.9 MiB），层 39 累计 559.8 MiB
+  （store 约 561.9 MiB；未路由到的专家不传）。首 chunk 不是所有专家都被路由，后续 chunk
+  只补新出现的专家；累计不随 6 个 chunk 线性增长。每个专家最多上传一次由 loaded bitmap 保证。
+- `model-check` 64 token、f16、`reseed on + planes device`：`hidden_max=1.046e-05`、
+  `logits_rel_L1=6.403e-07`、top1=16/16、`verdict=PASS`；`chunk-check` 512 token / chunk 128：
+  carry 对单 chunk `0.000e+00`，no-carry 反例 `5.517e-01`，`verdict=PASS`。
+- `layer-check` 层 3 @512 带 store：`layer_moe` 3.552e-05、`layer_ffn_out` 1.159e-06、
+  `layer_state` mismatches=0，`fails=0 open=0 verdict=PASS`；`ctest -L qrt` 6/6。
+
+### 84.2 X-6：routed-only 专家行 32 -> 8
+
+修复：`rows_e` 从 `ceil(cnt/32)*32` 改为 `ceil(cnt/8)*8`，`max_rows` 从 `n_expert*31` 改为
+`n_expert*7`；K-quant 的 `qrt_gemm_record` 允许 `m` 为 8 的倍数并按 32 行 tile 上取整
+dispatch（Q8_0 kernel 仍要求 32），每个 subgroup 自己用 `tok0 + 8 > m` 屏蔽。
+
+| 层 | k | 旧 rows | 新 rows | ids/union | serial | CPU ref | verdict |
+|---|---:|---:|---:|---|---|---|---|
+| 0 | 1 | 256 | 64 | 8/8 | 0 | 1.390e-06 | PASS |
+| 0 | 4 | 960 | 240 | 32/30 | 0 | 1.706e-05 | PASS |
+| 0 | 8 | 1760 | 464 | 64/58 | 0 | 8.530e-06 | PASS |
+| 3 | 4 | 960 | 240 | 32/30 | 0 | 1.357e-06 | PASS |
+| 3 | 8 | 1760 | 440 | 64/55 | 0 | 1.183e-06 | PASS |
+| 34 | 4 | 928 | 232 | 32/29 | 0 | 5.348e-07 | PASS |
+| 34 | 8 | 1696 | 424 | 64/53 | 0 | 5.211e-07 | PASS |
+
+- 三层 k=1/2/4/5/8 全部 PASS；weights max rel <=1.259e-06，routed sum vs k=1 serial = 0。
+- rows 减少 4x；k<=8 的专家 GEMM 从 32 行计算受限回到权重读受限。`--moe-batch-check` 的
+  `ms=` 含 open/upload/serial，是诊断，不是 decode pass 或 TG。
+- prefill chunk 2048 的每专家约 64 行，8 与 32 对齐都得到 64，输出逐字节不变；`layer-check`
+  与 `ctest` 同上。
+
+### 84.3 边界
+
+- 本轮没有 decode engine、MTP、cache 接线、GPU head/argmax 或 grouped/indirect dispatch；
+  X-6 只去掉 32 行 padding 的量级错误，不证明 TG。
+- PP 仍不是 1000：10.4K 层循环 39 s，剩余成本在 attention/dense、每 chunk 的残差 D2H、
+  host head 和未集成的 prefill 调度；X-5 只消除重复专家读取。
+- X-5/X-6 的 golden 对比使用当时 f16 KV 仍 truncating 的构建；X-7 把 f16 KV append 改成
+  RNE，f16 输出会按设计变化。X-5/X-6 的专家读取与 tile 路径不依赖该舍入；默认 q8/q4 不走
+  f16 append。
+- 未提交（无提交授权）。
+
+## 85. X-7 三层数值门：量化器逐位、完整链算术、外部质量锚（2026-10-26）
+<!-- slug: x-7-three-tier-gate -->
+
+口径：工作区 `b8ce846fe` + 未提交 diff；`build-vulkan`（Release/MinGW，Vulkan）。
+A 是确定性量化器回归；B/C 是 64/512 token 的诊断，不是正式 M2-7 的 10K/128K/256K 批次。
+原始产物在 `bench/raw/x-7-*`、`bench/raw/x-7/`。
+
+### 85.1 A：量化器逐位一致
+
+`qrt --norm-check <gguf> --dense-tokens 512`：
+
+| 检查 | 读数 | 判决 |
+|---|---|---|
+| norm_row | rel_l1 3.970e-08 | PASS |
+| norm_q8（norm 路径，诊断） | qs_bad 3 / 32768，maxdiff 1，ds_bad 0，sum_bad 3 | PASS（阈值 maxdiff<=1、frac<=1e-3） |
+| norm_gemm（同一批 Q8_1） | rel_l1 1.251e-07 | PASS |
+| **norm_quant（A：同一 f32 输入，无 norm）** | **qs_bad 0, ds_bad 0, sum_bad 0, maxdiff 0** | **PASS** |
+| norm_gemm_f32（C 高精度 dense 切片） | rel_l1 3.989e-03，max_abs 1.791e-02 | PASS（<=1e-2） |
+
+- A 的输入包含 tie（0.5/1.5/2.5/63.5/64.5/126.5/127）、±0、1e-30/1e-38/次正规；
+  f32 输入相同，CPU 与 shader 的 Q8_1 逐位一致。`norm_q8` 的 3 个差异来自 RMS 的
+  float/double 归约差，不是量化规则，故单列为诊断，不冒充 A。
+- `norm_gemm_f32` 是 C 的无 Q8_1 激活短切片：权重仍是模型 q8_0 值（双精度反量化），
+  激活用设备 norm 输出的 f32 行；Q8_1 激活量化对 dense projection 的 rel_L1 约 0.4%。
+
+### 85.2 B：完整 40 层链、reseed off、共享设备量化平面
+
+`qrt --model-check ... --prefill-chunk 64 --kv-k f16 --kv-v f16 --model-check-reseed off
+--model-check-planes device`，64 token、40 层：
+
+| 指标 | 读数 |
+|---|---:|
+| hidden max rel_L1 | 5.148e-05 |
+| **logits rel_L1** | **4.122e-05** |
+| same top-1 | 16/16 |
+| NLL 两臂 | 0.8912 / 0.8912 |
+| 判决 | **PASS**（<=1e-4） |
+
+- 这是 B 的完整链，不是逐层隔离；参考链的 attention 输出/FFN post-norm 使用设备 Q8_1
+  平面，输入 norm 平面由 CPU 计算（层 39 `xnorm=3.208e-05`），因此 B 是“算术 + 共享主要
+  量化字节”的隔离，不是完全独立打包。独立 40 层链仍是 1.387e-01（RESULTS 80.3），只作
+  量化敏感性读数，不冒充 B。
+- 64 token 的 B 运行约 177 s；这是 CPU 双精度参考的诊断，不是性能批次。
+
+### 85.3 C：同 context 外部锚
+
+第一次 C 试跑用 `tokens512.txt`，与 fork 基线有 10 个 token 不同（198/271/317/845），
+KLD 0.213 是 token 错位，作废。第二次用 fork token 流但拿 2x256 独立 chunk 的 fork 基线
+（`ref-t5-a.bin`）对 runtime 512 跨 chunk 链，KLD 9.1e-2；fork 的 chunk 是独立 256 context，
+runtime 携带 512，口径不同，作废。
+
+最终 C：
+
+- fork：`ref-c512-f16.bin`，`-c 512 -b 512 --chunks 1 -fa on`，255 行（token 256..510）。
+- runtime：同 fork token 流，512 token，`--prefill-chunk 256`，f16/f16，`--logits-rows 385`
+  （start 126，覆盖 126..510）；`--align` 交集 255 行。
+- `qgate compare --align --kld-max 1.5e-2 --margin-max 0.05`：
+
+| 对照 | mean KLD | same top-1 | margin>=0.05 分叉 | 最差分叉 margin |
+|---|---:|---:|---:|---:|
+| runtime 对 fork 512 | **1.0867e-02** | **97.255%** | 7 | 0.9592 |
+| fork `-fa on` 对 `-fa off` | 1.4681e-02 | 93.701% | 11 | 0.8933 |
+
+- C 的 KLD/top-1 判据（<=1.5e-2、>=85%）**通过**；runtime 在这两项上优于 fork 自身
+  on/off 路径差。7 个 margin>=0.05 的 top-1 分叉**只报**：U-7 的 0.05 是推测接受口径，
+  不适用于跨引擎；fork 自己的两条路径也有 11 个。最差分叉 0.959 仍是残余风险，不能据此
+  宣称 bit-equivalent 或 greedy 全同。
+- C 的外部锚只说明 runtime 没有超出 fork 路径地板；B 仍负责 1e-4 的算术判据。
+
+### 85.4 f16 KV RNE 与回归
+
+- `attn_full_qk.comp` 的 f16 K/V append 从 `packHalf2x16`（本驱动向零）改为
+  `qrt_f32_to_f16_rne`；`layer.cpp` 的参考从 truncation 改为同一 RNE。
+- `fullattn-check` f16 512：`full_attn` rel_l1 1.428e-06 PASS，`k_f16_store_rel_l1=1.757e-04`、
+  `v_f16_store_rel_l1=1.762e-04`；`full_attn_f16` 的 1.073e-03 是已知的 f16 操作数探针，
+  不是主门。默认 q8_0 K 的 `full_attn` 1.399e-06 PASS，`k_q8_0_store_rel_l1=5.762e-03`；
+  这是量化行本身的误差，留作残余观察。
+- `layer-check` 层 3 f16 @512：`fails=0 open=0`，`layer_state` mismatches=0；`selftest`
+  0 failed；`ctest -L qrt` 6/6。
+
+### 85.5 边界
+
+- A 只证明量化规则在相同 f32 输入上逐位；norm 路径的 3 个边界翻转是 RMS 归约差。
+- B 使用共享设备平面；完全独立打包的 40 层链仍不达 1e-4，这是 int8 激活阶跃的性质，
+  不是本轮可消除的算术差。
+- C 的 7 个分叉、默认 q8/q4 的 dequant staging truncation、以及全模型无 Q8_1 激活的
+  高精度锚仍未解决；`norm_gemm_f32` 只覆盖 dense projection。
+- 未做 10K/128K/256K 的正式 M2-7 / Q-KV3；未做 PP/TG。未提交（无提交授权）。
+
+## 86. M3-2 持久会话：40 层 32+8 贪心贯通，8/8 对 fresh chunked prefill（2026-10-26）
+<!-- slug: m3-2-persistent-generate -->
+
+口径：工作区 `b8ce846fe` + 未提交 diff；`build-vulkan`（Release/MinGW，Vulkan）；
+`tokens32.txt` 取自 `tokens256.txt` 前 32 个 id；`--prefill-chunk 32`，默认/ f16 KV 两档；
+`--logits-layers 40`。这是短档诊断/贯通证据，不是 TG 或正式 M2-8。
+
+### 86.1 新增入口
+
+`qrt --generate <gguf> --logits-tokens <ids> --generate-new N --layer-store <prefix>
+--logits-layers 40 --prefill-chunk 32 [--generate-out <ids>]`
+
+- 一次打开全部 40 层（dense/attention/KV/DeltaNet 状态常驻），`zero_state` 每层一次；
+  先按 32-token chunk 做层优先 prefill，再用同一批层对象逐 token decode（`run_tokens=1`）。
+- 40 层共用一个 562 MiB FFN slot；`qrt_ffn_group` 在 shared-slot 模式下按当前路由打包专家，
+  `qrt_ffn_set_tokens` 让 route/group/experts 使用 1..32 的 run_tokens；layer 的 dense 行阶段
+  用 `stage_rows`（1..8 走 1-token Q8K，较大短尾上取整 32）。
+- 新增 `gemm_q8k_m1.spv`（同一 prepared 权重、TILE_M=1）；`norm_gemm m=1` 对 CPU 参考
+  rel_L1 1.142e-07，Q8_1 激活的 f32 dense 切片 4.321e-03。
+
+### 86.2 40 层 32+8（f16）
+
+`--generate-new 8 --kv-k f16 --kv-v f16`：
+
+| 项 | 读数 |
+|---|---:|
+| 生成 ids | 587, 3393, 8, 271, 58, 20077, 10911, 9251 |
+| wall | 42 s |
+| decode layer_ms（7 次） | 1895-2013 ms/token（含 host head） |
+| peak VRAM | 2740.5 MiB |
+| submits / 层 | 2 |
+| dispatches max / 层 | 57 |
+| top-k 回读 / 层 / token | 1 |
+
+**状态一致性**：对每个生成前缀做一次 fresh chunked prefill（`--logits-dump --logits-rows 1`，
+chunk 32），比较该前缀最后一 token 的 top1/logit。8/8 与持久会话的 step logit 完全一致：
+587@21.9527、3393@19.7135、8@22.9325、271@22.2525、58@17.9262、20077@18.8983、
+10911@17.4952、9251@21.9585。不是“自己和自己”的循环：fresh 路径重新开层、重新 prefill，
+只共享权重和相同输入前缀。
+
+### 86.3 其他档
+
+| 配置 | 输出/读数 |
+|---|---|
+| 4 层 32+4 f16 | ids 79, 4438, 4438, 182187；12 s；peak 779.8 MiB |
+| 40 层 32+2 默认 q8_0 K + q4_0 V | ids 587, 3393；28 s；peak 2740.0 MiB；fresh prefix33/34 top1 logit 22.0646/19.7247 与生成一致 |
+
+### 86.4 边界
+
+- 只支持短档：generate 把 `--prefill-chunk` 上限收到 64，T=32/64 的 40 层常驻才在
+  8 GiB 内；10K prompt 的 chunk 2048 需要共享 scratch arena 与真正的层内缓冲复用，未做。
+- host head 每次扫描 0.5 GiB `output.weight`，decode 约 1.9-2.0 s/token；这不是 TG。
+  下一步 GPU head/argmax 或 head 常驻显存。
+- 没有 expert cache/SLRU 接线、H2D/CPU miss 分担、MTP、跨层 pipeline 或预录命令缓冲；
+  当前 shared slot 每层/token 重传使用到的专家。M3-2a/M3-3/M3-4 仍未做。
+- 未做 10K/长上下文；未提交（无提交授权）。
+
+## 87. M3-2a 专家缓存接线与 miss 分担：正确链贯通，三条腿 10% 未达（2026-10-26）
+<!-- slug: m3-2a-miss-split -->
+
+口径：工作区 `b8ce846fe` + 未提交 diff；`build-vulkan`（Release/MinGW，Vulkan）；
+`tokens32.txt`，40 层，`--prefill-chunk 32`，f16 KV（除注明），`QRT_EXPERT_CACHE_MIB=4198`
+（21.9%，2298 槽，每层一个槽数组，共 6938-6940 MiB 峰值）。以下为**单次诊断读数**，不是
+r>=3 性能批次；后半段有持续负载下的热降频漂移。产物在 `bench/raw/m3-2a/`。
+
+### 87.1 实现
+
+- **按层槽位**：prefill 结束后释放 562 MiB 共享 slot，按 `qrt_cache_plan` 给每层分配
+  `slots_per_layer[l] x layer_expert_bytes[l]` 的独立缓冲；4198 MiB 时 2298 槽、degraded=0。
+  槽偏移是层内偏移，避开单缓冲超过 4 GiB 时 Q6_K 的 32 位 wbase 上限。
+- **miss 分担**：`qrt_cache_acquire_mask` 只让 H2D 腿的 miss 占槽；CPU 腿的 miss 不驱逐、
+  不上传。`qrt_miss_split_plan` 以“已花时间 + 本层成本”做 LPT 贪心；单层 8 个 miss 的粒度
+  无法在层内平衡到 10%，所以平衡按 pass 累计（`qrt_split_carry`），H2D 速率用实测 EWMA 更新。
+- **两条腿并发**：CPU 腿 8 线程按专家分片，主线程同时读 store 并把本层 H2D miss 打包进
+  staging，一次 `qrt_vk_upload_regions` 提交多段（不同槽不连续）。逐专家 submit+fence
+  的旧路径测到 2.3 GB/s；打包后按 pass 计约 2.9 GB/s，仍受 store 读限制。
+- **CPU 专家核**：补 Q5_K/Q6_K（store 实际是 Q4_K gate/up + Q5_K down 38 层、Q6_K down
+  2 层、Q5_K gate/up + Q6_K down 1 层），新增 typed expert pass 与 Q8_1 输入变体。
+  **发现并修复非显然缺陷**：`cpu_moe` 的 fp16 解码把次正规数当 0，真实权重里
+  d 为次正规数（约 2e-5）的块很常见；修复前 gate 行 L1 265.657 vs 双精度参考 214.389，
+  修复后逐行一致。CPU 测试补了次正规 d/dmin 样例。
+- **CPU 部分输出**：层输出下载后按 token 相加（worker 已乘路由权重，合并处不再乘）。
+
+### 87.2 正确性（对照臂）
+
+| 对照 | 读数 | 结论 |
+|---|---|---|
+| 全 H2D（`--miss-split 100`，1024 MiB，32+4） | ids 587/3393/8/271，logit 21.9527/19.7135/22.9325/22.2525，与 prefill-slot 臂打印一致 | 缓存接线不改 GPU 数学 |
+| 全 CPU（`--miss-split 0`，4 层，32+4） | ids 4438/4438/182187 与 GPU 臂一致；logit 差 -0.0125/-0.0099/+0.0214 | CPU 腿与 GPU 同 top-1 |
+| auto（40 层，32+8） | 8/8 ids 与基线一致（587,3393,8,271,58,20077,10911,9251）；logit 差最大 0.208（21.9585 -> 21.7502） | 40 层累积差仍不改 greedy |
+| 单专家 gate（layer 0 expert 8） | CPU L1 214.389 = `qrt_moe_ref_row` 214.389 | 真实权重逐行一致 |
+| 单专家 down（Q5_K，同一 h 平面） | Python 反量化 L1 12.716 vs 内核 12.716（逐元素 max 差 2e-6） | Q5_K 真实数据一致 |
+
+### 87.3 三条腿（k=5，4198 MiB）
+
+`--generate-batch 5` 每 pass 喂 5 个 prompt id（teacher-forced 诊断）。GPU 腿 = 每层两次
+`submit -> fence` 的等待和（设备执行），H2D/CPU 腿在 `qrt_ffn_group` 内测量；两条 miss 腿
+并发。冷缓存两 pass：
+
+| pass | GPU ms | H2D ms | CPU ms | hits | misses | H2D 专家 | CPU 专家 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 91.71 | 260.02 | 250.98 | 0 | 777 | 225 | 552 |
+| 1 | 100.23 | 203.21 | 214.64 | 119 | 719 | 168 | 551 |
+
+连续 21 pass（热状态，末 8 pass）：GPU 158-190 ms，H2D 165-249 ms，CPU 170-239 ms；
+累计 spread 34.5%，命中 9538/20880 = 45.7%（同一 32-token 前缀反复走，偏高）。
+
+| 分配 | GPU ms | H2D ms | CPU ms | spread |
+|---|---:|---:|---:|---:|
+| auto | 2960.62 | 4519.19 | 4513.80 | 34.5% |
+| 固定 0 | 127.48 | 0.00 | 612.78 | 100% |
+| 固定 50 | 247.03 | 728.33 | 360.78 | 66.1% |
+| 固定 100 | 429.27 | 892.42 | 0.00 | 100% |
+
+auto 把两条 miss 腿平衡到 0.1-0.2%（k=1 8 步累计 479.84/480.79；k=5 4519.19/4513.80），
+固定 50 按个数分配则 H2D 耗时约为 CPU 的 2 倍，这是 auto 存在的理由。**但三条腿 10% 未达**。
+
+### 87.4 未达的原因（分解）
+
+- GPU 腿每层 3.2-4.4 ms（k=5，pass1+pass2 等待），design 2.6 的 21 ms/pass 是**带宽账**
+  （2.17 GB 稠密 /156 GB/s），要求 attention/DeltaNet/router 全部藏在读带宽下；当前
+  RESULTS 73.3/67 的注意力与 DN 效率（40% roofline）使 GPU 腿比带宽账高约 5 倍。
+- miss 腿每专家：H2D 0.65-1.7 ms、CPU 0.36-0.57 ms，design 是 0.19 / 0.137。store 读
+  （1.9 MiB/专家）约 2.9 GB/s，SSD/页缓存而非 RAM 速率。
+- 即使两条 miss 腿都到 design 速率，按 816 miss/pass 平衡后约 65 ms < GPU 100 ms，
+  三条腿仍差 35%；要过 10% 需先让 GPU 腿回到带宽地板（M2 的 attention/DN/router）。
+- 持续 100 s 负载后 GPU 腿从 95 漂到 190 ms（热降频），正式判定需 M4 的稳定性口径。
+
+### 87.5 未验证与边界
+
+- 不是 TG：host head 1.9-2.0 s/token 仍在；k=5 是 teacher-forced 诊断，不是接受/回滚。
+- 10K/长上下文未跑；store 未整体驻留，miss 腿速率含磁盘/页缓存影响。
+- `--generate-batch` 只在 decode 诊断使用；未提交（无提交授权）。
+
+## 88. M3-4 每 pass telemetry：CSV 行接进 decode（2026-10-26）
+<!-- slug: m3-4-telemetry -->
+
+口径：`build-vulkan`，4 层、32+3、512 MiB 缓存、auto split；`--telemetry 1
+--telemetry-path bench/raw/m3-4/tel.csv`。单次诊断，不是性能批次。
+
+- `--generate` 在 decode 前打开 `qrt_telemetry`；每 token 一行，字段与 `bench/README.md`
+  第 2 节一致：`pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,
+  draft_ms,gpu_ms,cpu_leg_ms,pass_ms`（X-2 的 schema，未改）。
+- 实测行（step 1/2）：
+
+```
+1,32,1,1,0,32,24,8,15204352,0.000,7.639,7.876,2505.630
+2,33,1,1,1,31,19,12,22806528,0.000,9.586,10.051,2404.031
+```
+
+  `gpu_ms` 是 pass1+pass2 的 submit->fence 和，`cpu_leg_ms` 是 CPU 专家腿；`pass_ms` 含
+  host head（约 2.4 s），所以不能当 TG。`draft_ms=0` 因为还没有 MTP（M3-3）。
+- 关闭时零开销：`--telemetry 0` 只保留每 pass 一次 `NULL` 判断，不建文件、不写行。
+- 打不开 sink 时打印 `generate_telemetry disabled: ...` 继续跑，不中止（design 9 的降级）；
+  中途写失败在结束时打印失败行数。
+- 未验证：k>1 的 accepted（要 M3-3）、跨 10K/128 token 的连续行、telemetry 对 TG 的影响（关闭
+  路径的常数开销未单独计时）。

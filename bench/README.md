@@ -17,14 +17,15 @@
 |---|---|
 | 模型 | `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`（21.28 GiB，`qwen35moe`，40 主层 + 1 MTP，256 专家 top-8） |
 | prompt | `bench/prompts/prompt10k.txt` = **10428 token**；文中写 10.4K，不写"10K" |
-| ctx | 256K，由 q8_0 K + q4_0 V + 16384 token 常驻窗口支持（U-10，design 5.5）；窗口外页面在主机，不计入 TG |
+| ctx | 256K；q8_0 K + q4_0 V，常驻窗口按显存预算推导（上限 ctx，U-12），窗口外页面在主机；长上下文 decode 不计入 TG |
 | 采样 | greedy，单流；推测解码按 k=4 验收 |
 | 目标 | PP >= 1000、TG >= 130（硬地板，用户重设前不变） |
 | 环境 | 平衡电源 + AC（`bench/env/power.txt`）、dGPU 无其它推理进程、`-lm none`（resident，>= 27.6 GiB 空闲 RAM）；任一不满足就不跑 |
 | 显存档位 | `GGML_VK_VRAM_LIMIT_MIB` 模拟 hold back；本机空闲约 7378 MiB，8176 档等价"不限" |
-| 重复 | r >= 3，相对极差 <= 15%；超了该批作废，报中位与极差 |
+| 重复 | 正式性能 r >= 3，相对极差 <= 15%；超了作废，报中位与极差 |
 
 性能数字只能来自新 runtime。fork 只作参考（路由 / 接受率口径、硬件探针），它的 TG/PP 不作结论。
+短输入/单次诊断可用于排错，注明真实输入与次数；不替代正式档位或宣称过门。确定性回归按测试契约执行，不伪造重复读数。
 
 ## 2. 必报列
 
@@ -46,9 +47,9 @@ date | commit | phase | task | model | ctx | prompt tokens | n_gen | k | draft v
 6. `llama-bench` 不可用（它把 `n_ctx` 设成 `p+n`）；用 `llama-cli` 或运行时自己的计时。
 7. 电源方案与热漂移是乘性因子：跨电源态、连跑多轮后的读数不可直接比。
 8. Git Bash 里跑 `build-*/bin/*.exe` 要先把 `/d/Scoop/apps/mingw/current/bin` 放进 PATH，否则子进程秒退、日志 0 字节。
-9. 改完代码先确认二进制含本次改动（看构建时间戳），再做 A/B。
+9. A/B 前核对源码/diff、构建配置与实际二进制路径；不能只看时间戳，详见 `docs/agent/build.md`。
 10. 外部推理进程在 GPU 上时整批数据作废；容量类失败先看 RAM 再怀疑显存。
-11. 编译、repack、第二个模型进程都会扰动计时：跑数前确认 `state_check.py` 的 `lock` 行是 `free`。
+11. 编译、repack、第二个模型进程会扰动计时；所需资源须空闲或由本人本任务持有，不能要求领用后 `lock=free`。同一任务也不并行计时与构建。
 12. KV 精度（默认 q8_0 K + q4_0 V）改动注意力数值路径：该默认档由 U-11 豁免 L-MODEL，且按 U-12 **只报读数不判**（KLD 1e-4 判 f16/f16 A 侧与非默认档）；其他组合不过 L-MODEL 不许当默认。常驻窗口按显存余量推导（上限 ctx），窗口外页面在主机、需要时换入；长上下文 decode 不计入 TG。
 13. 两臂对比前必须各跑一次预热 pass：首触缺页会造假加速比（`DECISIONS` 35）。
 
@@ -65,7 +66,7 @@ bench/prompts/     prompt10k.txt (10428 tok)  prompt20k.txt (19758 tok)
 bench/env/         power.txt  machine.txt                    口径依赖的机器事实
 bench/tools/       state_check.py（一致性 + lint + --brief + --selftest）
                    m0-trace.cpp  m0-sim.py  m0-analyze.py  membw_probe.py
-                   gguf_dims.py  roofline.py  ssd_probe.py  quality/（G-QUAL）
+                   gguf_dims.py  roofline.py  ssd_probe.py  quality/（G-QUAL，run 为全流程入口）
 bench/raw/         每次跑的 .out/.err/.bin 产物（不入库）
 ```
 
