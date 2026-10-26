@@ -84,6 +84,10 @@ if(Vulkan_GLSLC_EXECUTABLE)
     foreach(_q IN ITEMS q4k q5k q6k q8k)
         list(APPEND _qrt_gemm_spv "${CMAKE_CURRENT_BINARY_DIR}/gemm_${_q}.spv")
     endforeach()
+    # One-token Q8_0 variant for decode: the shared expert and the dense projections
+    # cannot use the 32-token Q8K tile at m=1. Same prepared weights, TILE_M=1.
+    set(_qrt_gemm_q8k_m1_spv "${CMAKE_CURRENT_BINARY_DIR}/gemm_q8k_m1.spv")
+    list(APPEND _qrt_gemm_spv ${_qrt_gemm_q8k_m1_spv})
     add_custom_command(
         OUTPUT  ${_qrt_read_spv}
         COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O ${_qrt_read_comp} -o ${_qrt_read_spv}
@@ -107,6 +111,16 @@ if(Vulkan_GLSLC_EXECUTABLE)
             COMMENT "Compiling kernels/gemm_${_q}.comp (dot product variant)"
             VERBATIM)
     endforeach()
+    add_custom_command(
+        OUTPUT  ${_qrt_gemm_q8k_m1_spv}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1 -DQ4K_DOT4
+                -DQ8K_TOKENS=1 -DQ8K_SUBS=1 -DQ8K_ROWS=2
+                -I${_qrt_kernels} ${_qrt_kernels}/gemm_q8k.comp
+                -o ${_qrt_gemm_q8k_m1_spv}
+        DEPENDS ${_qrt_kernels}/gemm_q8k.comp ${_qrt_kernels}/tiles.h
+                ${_qrt_kernels}/common.glsl
+        COMMENT "Compiling the one-token Q8_0 GEMM variant"
+        VERBATIM)
     add_custom_command(
         OUTPUT  ${_qrt_swiglu_spv}
         COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1 -I${_qrt_kernels}

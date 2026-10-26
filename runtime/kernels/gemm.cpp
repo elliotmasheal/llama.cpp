@@ -142,6 +142,7 @@ VkShaderModule load_module(VkDevice dev, const char * dir, const char * name, ch
 struct qrt_gemm {
     qrt_vk_dev *    dev;
     VkPipeline      gemm_pipe[QRT_QUANT_TYPES];
+    VkPipeline      gemm_q8k_m1;   // one-token Q8_0 tile for decode
     VkPipeline      swiglu_pipe;
     VkPipelineLayout gemm_layout;
     VkPipelineLayout swiglu_layout;
@@ -277,6 +278,19 @@ int qrt_gemm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_gemm ** out,
             return -1;
         }
     }
+    VkShaderModule m1_mod = load_module(dev->device, spv_dir, "gemm_q8k_m1.spv", err,
+                                        err_size);
+    if (m1_mod == VK_NULL_HANDLE) {
+        qrt_gemm_close(dev, g);
+        return -1;
+    }
+    g->gemm_q8k_m1 = make_pipeline(dev->device, m1_mod, g->gemm_layout, pc[0].size, err,
+                                   err_size);
+    vkDestroyShaderModule(dev->device, m1_mod, nullptr);
+    if (g->gemm_q8k_m1 == VK_NULL_HANDLE) {
+        qrt_gemm_close(dev, g);
+        return -1;
+    }
     VkShaderModule sw_mod = load_module(dev->device, spv_dir, "swiglu_q8.spv", err, err_size);
     if (sw_mod == VK_NULL_HANDLE) {
         qrt_gemm_close(dev, g);
@@ -368,6 +382,9 @@ void qrt_gemm_close(qrt_vk_dev * dev, qrt_gemm * g) {
         }
         if (g->swiglu_pipe != VK_NULL_HANDLE) {
             vkDestroyPipeline(dev->device, g->swiglu_pipe, nullptr);
+        }
+        if (g->gemm_q8k_m1 != VK_NULL_HANDLE) {
+            vkDestroyPipeline(dev->device, g->gemm_q8k_m1, nullptr);
         }
         for (int i = 0; i < QRT_QUANT_TYPES; ++i) {
             if (g->gemm_pipe[i] != VK_NULL_HANDLE) {
@@ -493,9 +510,16 @@ int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t er
     if (g == NULL || a == NULL || a->w == VK_NULL_HANDLE || a->out == VK_NULL_HANDLE) {
         return fail(err, err_size, "the GEMM needs a weight buffer and an output buffer");
     }
-    if (a->n % Q4K_TILE_N != 0 || a->m % Q4K_TILE_M != 0 || a->k % Q4K_QK != 0) {
-        return fail(err, err_size, "n=%u must be a multiple of %d, m=%u of %d, k=%u of %d",
-                    a->n, Q4K_TILE_N, a->m, Q4K_TILE_M, a->k, Q4K_QK);
+    // The Q8_0 kernel stages a whole 32-token tile; a one-token variant (same prepared
+    // weights, TILE_M=1) covers the decode projections and shared expert. The K-quant
+    // kernels mask each subgroup's 8 tokens, so a k<=8 expert batch only needs 8.
+    const int small_q8 = a->type == QRT_QUANT_Q8_0 && a->m <= 8u;
+    const uint32_t m_tile = a->type == QRT_QUANT_Q8_0
+                                ? (small_q8 ? 1u : Q4K_TILE_M)
+                                : Q4K_TOKENS;
+    if (a->n % Q4K_TILE_N != 0 || a->m % m_tile != 0 || a->k % Q4K_QK != 0) {
+        return fail(err, err_size, "n=%u must be a multiple of %d, m=%u of %u, k=%u of %d",
+                    a->n, Q4K_TILE_N, a->m, m_tile, a->k, Q4K_QK);
     }
     if (a->type < 0 || a->type >= QRT_QUANT_TYPES) {
         return fail(err, err_size, "unknown quant type %d", (int) a->type);
@@ -508,14 +532,17 @@ int qrt_gemm_record(qrt_gemm * g, const qrt_gemm_args * a, char * err, size_t er
         }
     }
     VkCommandBuffer cmd = g->ext != VK_NULL_HANDLE ? g->ext : g->cmd[g->cur];
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_pipe[a->type]);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      small_q8 ? g->gemm_q8k_m1 : g->gemm_pipe[a->type]);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g->gemm_layout, 0, 1,
                             &set, 0, nullptr);
     const uint32_t pc[7] = { a->n, a->k, a->m, a->wbase, a->obase, a->abase,
                              a->token_major != 0 ? 1u : 0u };
     vkCmdPushConstants(cmd, g->gemm_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(pc), pc);
-    vkCmdDispatch(cmd, a->n / Q4K_TILE_N, a->m / Q4K_TILE_M, 1);
+    const uint32_t groups_y = small_q8 ? a->m
+                                       : (a->m + Q4K_TILE_M - 1u) / Q4K_TILE_M;
+    vkCmdDispatch(cmd, a->n / Q4K_TILE_N, groups_y, 1);
     ++g->dispatches;
     return 0;
 }

@@ -13,10 +13,19 @@
 #include "tiles.h"
 #include "common.glsl"
 
-#define ROWS   2u
-#define TOKENS 8u
+#ifndef Q8K_ROWS
+#define Q8K_ROWS 2u
+#endif
+#ifndef Q8K_TOKENS
+#define Q8K_TOKENS 8u
+#endif
+#ifndef Q8K_SUBS
+#define Q8K_SUBS 4u
+#endif
+#define ROWS   Q8K_ROWS
+#define TOKENS Q8K_TOKENS
 #define LANES  32u
-#define SUBS   4u
+#define SUBS   Q8K_SUBS
 #define QTILE  64u                // rows per weight tile, must match QK_TILE_ROWS
 #define TILE_N (ROWS * LANES)     // 64 rows per workgroup
 #define TILE_M (TOKENS * SUBS)    // 32 tokens per workgroup
