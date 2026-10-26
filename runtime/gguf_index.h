@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include <vector>
+
 // Read-only GGUF index: metadata, tensor table and absolute byte offsets. The
 // runtime reads the container itself (design 3.3) and nothing here aborts: a
 // truncated, crafted or foreign file comes back as an error string.
@@ -91,6 +93,11 @@ int qrt_gguf_read_tensor(qrt_gguf * g, const qrt_gguf_tensor * t, void * dst,
                          size_t cap, char * err, size_t err_size);
 int qrt_gguf_read_range(qrt_gguf * g, uint64_t file_offset, void * dst, size_t bytes,
                         char * err, size_t err_size);
+
+// Reads a whole f32 tensor into out, sized from the tensor's dimensions. A missing
+// tensor or a non-f32 type is a caller error and comes back as a message.
+int qrt_gguf_read_f32(qrt_gguf * g, const char * name, std::vector<float> * out,
+                      char * err, size_t err_size);
 
 int qrt_gguf_account_compute(const qrt_gguf * g, qrt_gguf_account * out, char * err, size_t err_size);
 

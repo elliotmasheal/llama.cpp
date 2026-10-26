@@ -1,9 +1,11 @@
 #include "moe.h"
+#include "vk_transfer.h"
+#include "vk_pass.h"
 
 #include "ffn.h"
 #include "gguf_index.h"
+#include "qrt_util.h"
 
-#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -11,16 +13,6 @@
 #include <vector>
 
 namespace {
-
-int fail(char * err, size_t err_size, const char * fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    if (err != NULL && err_size != 0) {
-        vsnprintf(err, err_size, fmt, ap);
-    }
-    va_end(ap);
-    return -1;
-}
 
 bool bytes_for(uint32_t tokens, uint64_t per_token, uint64_t * out) {
     if (tokens == 0 || per_token > UINT64_MAX / tokens) {

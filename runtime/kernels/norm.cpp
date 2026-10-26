@@ -3,80 +3,22 @@
 // writes are exactly the ones the dense GEMM reads.
 
 #include "norm.h"
+#include "vk_pipeline.h"
+
+#include "qrt_half.h"
+#include "qrt_util.h"
 
 #include <math.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <chrono>
 #include <vector>
 
 #ifdef QRT_HAVE_VULKAN
 
 #define QRT_NORM_RINGS 2
 #define QRT_NORM_SETS_PER_RING 64
-
-namespace {
-
-int fail(char * err, size_t err_size, const char * fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(err, err_size, fmt, ap);
-    va_end(ap);
-    return -1;
-}
-
-int vk_fail(char * err, size_t err_size, const char * what, VkResult r) {
-    return fail(err, err_size, "%s failed: VkResult %d", what, (int) r);
-}
-
-int read_spv(const char * dir, const char * name, unsigned char ** out, size_t * out_bytes,
-             char * err, size_t err_size) {
-    char path[1024];
-    if (dir != NULL && *dir != '\0') {
-        snprintf(path, sizeof(path), "%s/%s", dir, name);
-    } else {
-        snprintf(path, sizeof(path), "%s", name);
-    }
-    FILE * f = fopen(path, "rb");
-    if (f == NULL) {
-        return fail(err, err_size, "cannot open '%s'", path);
-    }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return fail(err, err_size, "cannot size '%s'", path);
-    }
-    const long n = ftell(f);
-    if (n <= 0) {
-        fclose(f);
-        return fail(err, err_size, "'%s' is empty", path);
-    }
-    rewind(f);
-    unsigned char * buf = (unsigned char *) malloc((size_t) n);
-    if (buf == NULL) {
-        fclose(f);
-        return fail(err, err_size, "out of memory for '%s'", path);
-    }
-    if (fread(buf, 1, (size_t) n, f) != (size_t) n) {
-        free(buf);
-        fclose(f);
-        return fail(err, err_size, "short read on '%s'", path);
-    }
-    fclose(f);
-    *out = buf;
-    *out_bytes = (size_t) n;
-    return 0;
-}
-
-double now_ms(void) {
-    using clock = std::chrono::steady_clock;
-    static const clock::time_point t0 = clock::now();
-    return std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-}
-
-} // namespace
 
 // Must match the push constant block of kernels/qrt_norm.comp in order and size.
 struct qrt_norm_pc {
@@ -90,8 +32,6 @@ struct qrt_norm_pc {
     uint32_t do_norm;
     uint32_t do_out;
 };
-
-void write_set(qrt_vk_dev * dev, VkDescriptorSet set, VkBuffer * bufs, uint32_t n);
 
 struct qrt_norm_ring {
     VkDescriptorPool pool;     // reset by attach/record: one set per dispatch (DECISIONS 65.2)
@@ -133,7 +73,7 @@ int alloc_set(qrt_norm * n, uint32_t ring, const VkBuffer * bufs, VkDescriptorSe
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkAllocateDescriptorSets (norm)", r);
     }
-    write_set(n->dev, set, (VkBuffer *) bufs, 5);
+    qrt_vk_write_set(n->dev, set, bufs, 5);
     ++n->ring[ring].sets_used;
     *out = set;
     return 0;
@@ -157,70 +97,18 @@ int qrt_norm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_norm ** out,
     }
     n->dev = dev;
 
-    VkDescriptorSetLayoutBinding b[5];
-    memset(b, 0, sizeof(b));
-    for (uint32_t i = 0; i < 5; ++i) {
-        b[i].binding         = i;
-        b[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        b[i].descriptorCount = 1;
-        b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo dlci;
-    memset(&dlci, 0, sizeof(dlci));
-    dlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 5;
-    dlci.pBindings    = b;
-    if (vkCreateDescriptorSetLayout(dev->device, &dlci, nullptr, &n->dsl) != VK_SUCCESS) {
-        qrt_norm_close(dev, n);
-        return fail(err, err_size, "vkCreateDescriptorSetLayout (norm) failed");
-    }
-    VkPushConstantRange pcr;
-    memset(&pcr, 0, sizeof(pcr));
-    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcr.size       = sizeof(qrt_norm_pc);
-    VkPipelineLayoutCreateInfo plci;
-    memset(&plci, 0, sizeof(plci));
-    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount         = 1;
-    plci.pSetLayouts            = &n->dsl;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges    = &pcr;
-    if (vkCreatePipelineLayout(dev->device, &plci, nullptr, &n->layout) != VK_SUCCESS) {
-        qrt_norm_close(dev, n);
-        return fail(err, err_size, "vkCreatePipelineLayout (norm) failed");
-    }
-
-    unsigned char * code = NULL;
-    size_t code_bytes = 0;
-    if (read_spv(spv_dir, "qrt_norm.spv", &code, &code_bytes, err, err_size) != 0) {
+    if (qrt_vk_make_set_layout(dev, 5, &n->dsl, err, err_size) != 0) {
         qrt_norm_close(dev, n);
         return -1;
     }
-    VkShaderModuleCreateInfo smci;
-    memset(&smci, 0, sizeof(smci));
-    smci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    smci.codeSize = code_bytes;
-    smci.pCode    = (const uint32_t *) code;
-    VkShaderModule mod = VK_NULL_HANDLE;
-    VkResult r = vkCreateShaderModule(dev->device, &smci, nullptr, &mod);
-    free(code);
-    if (r != VK_SUCCESS) {
+    if (qrt_vk_make_layout(dev, n->dsl, sizeof(qrt_norm_pc), &n->layout, err, err_size) != 0) {
         qrt_norm_close(dev, n);
-        return vk_fail(err, err_size, "vkCreateShaderModule (norm)", r);
+        return -1;
     }
-    VkComputePipelineCreateInfo cpci;
-    memset(&cpci, 0, sizeof(cpci));
-    cpci.sType       = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = mod;
-    cpci.stage.pName = "main";
-    cpci.layout      = n->layout;
-    r = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &cpci, nullptr, &n->pipe);
-    vkDestroyShaderModule(dev->device, mod, nullptr);
-    if (r != VK_SUCCESS) {
+    if (qrt_vk_make_pipeline(dev, n->layout, spv_dir, "qrt_norm.spv", nullptr, 0, &n->pipe,
+                             err, err_size) != 0) {
         qrt_norm_close(dev, n);
-        return vk_fail(err, err_size, "vkCreateComputePipelines (norm)", r);
+        return -1;
     }
 
     VkDescriptorPoolSize psize;
@@ -292,26 +180,6 @@ void qrt_norm_close(qrt_vk_dev * dev, qrt_norm * n) {
         if (n->dsl != VK_NULL_HANDLE)    vkDestroyDescriptorSetLayout(dev->device, n->dsl, nullptr);
     }
     free(n);
-}
-
-// write_set stays a plain helper: the set it fills is always a fresh one.
-void write_set(qrt_vk_dev * dev, VkDescriptorSet set, VkBuffer * bufs, uint32_t n) {
-    VkDescriptorBufferInfo info[5];
-    VkWriteDescriptorSet wr[5];
-    memset(info, 0, sizeof(info));
-    memset(wr, 0, sizeof(wr));
-    for (uint32_t i = 0; i < n; ++i) {
-        info[i].buffer        = bufs[i];
-        info[i].offset        = 0;
-        info[i].range         = VK_WHOLE_SIZE;
-        wr[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet          = set;
-        wr[i].dstBinding      = i;
-        wr[i].descriptorCount = 1;
-        wr[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        wr[i].pBufferInfo     = &info[i];
-    }
-    vkUpdateDescriptorSets(dev->device, n, wr, 0, nullptr);
 }
 
 int qrt_norm_attach(qrt_norm * n, uint32_t ring, VkCommandBuffer cmd, char * err,
@@ -504,55 +372,6 @@ void qrt_norm_detach(qrt_norm *) {}
 
 // ---- double precision reference (built either way: the gate compares against it) ----
 
-namespace {
-
-// Round-to-nearest-even fp32 -> binary16, the packHalf2x16 rule. The deltas here are
-// positive and normal, the subnormal and overflow branches only keep it total.
-uint16_t f32_to_f16(float f) {
-    uint32_t x = 0;
-    memcpy(&x, &f, sizeof(x));
-    const uint32_t sign = (x >> 16) & 0x8000u;
-    const uint32_t mag  = x & 0x7FFFFFFFu;
-    if (mag >= 0x7F800000u) {
-        return (uint16_t) (sign | (mag > 0x7F800000u ? 0x7E00u : 0x7C00u));
-    }
-    if (mag >= 0x47800000u) {
-        return (uint16_t) (sign | 0x7C00u);
-    }
-    if (mag < 0x38800000u) {
-        if (mag < 0x33000000u) {
-            return (uint16_t) sign;
-        }
-        const uint32_t exp   = mag >> 23;
-        const uint32_t mant  = (mag & 0x7FFFFFu) | 0x800000u;
-        const uint32_t shift = 126u - exp;
-        uint32_t q = mant >> shift;
-        const uint32_t rem  = mant & ((1u << shift) - 1u);
-        const uint32_t half = 1u << (shift - 1u);
-        if (rem > half || (rem == half && (q & 1u) != 0u)) {
-            q++;
-        }
-        return (uint16_t) (sign | q);
-    }
-    uint32_t mant = mag & 0x7FFFFFu;
-    uint32_t exp  = ((mag >> 23) - 127u) + 15u;
-    const uint32_t rem = mant & 0x1FFFu;
-    mant >>= 13;
-    if (rem > 0x1000u || (rem == 0x1000u && (mant & 1u) != 0u)) {
-        mant++;
-        if (mant == 0x400u) {
-            mant = 0;
-            exp++;
-            if (exp >= 31u) {
-                return (uint16_t) (sign | 0x7C00u);
-            }
-        }
-    }
-    return (uint16_t) (sign | (exp << 10) | mant);
-}
-
-} // namespace
-
 void qrt_norm_cpu(uint32_t tokens, uint32_t k, const float * x, const float * w, float eps,
                   float * out, signed char * qs_out, uint32_t * ds_out) {
     const uint32_t blocks = k / 32u;
@@ -589,7 +408,7 @@ void qrt_norm_cpu(uint32_t tokens, uint32_t k, const float * x, const float * w,
                 q[i] = (signed char) v;
                 sum += v;
             }
-            const uint32_t dh = f32_to_f16(d);
+            const uint32_t dh = (uint16_t) f32_to_f16_bits(d);
             ds_out[(size_t) t * blocks + b] = dh | ((uint32_t) (uint16_t) (sum + 32768) << 16);
         }
     }
@@ -622,7 +441,7 @@ void qrt_norm_quant_cpu(uint32_t tokens, uint32_t k, const float * x, float * ou
                 q[i] = (signed char) v;
                 sum += v;
             }
-            const uint32_t dh = f32_to_f16(d);
+            const uint32_t dh = (uint16_t) f32_to_f16_bits(d);
             ds_out[(size_t) t * blocks + b] = dh | ((uint32_t) (uint16_t) (sum + 32768) << 16);
         }
     }

@@ -703,6 +703,29 @@ int qrt_gguf_read_tensor(qrt_gguf * g, const qrt_gguf_tensor * t, void * dst,
     return qrt_gguf_read_range(g, t->offset, dst, (size_t) t->nbytes, err, err_size);
 }
 
+int qrt_gguf_read_f32(qrt_gguf * g, const char * name, std::vector<float> * out,
+                      char * err, size_t err_size) {
+    const qrt_gguf_tensor * t = NULL;
+    if (qrt_gguf_require(g, name, &t, err, err_size) != 0) {
+        return -1;
+    }
+    if (t->type != 0) {
+        snprintf(err, err_size, "%s is %s, expected f32", name, qrt_gguf_type_name(t->type));
+        return -1;
+    }
+    uint64_t count = 1;
+    for (uint32_t i = 0; i < t->n_dims; ++i) {
+        count *= t->ne[i];
+    }
+    if (count > SIZE_MAX / sizeof(float)) {
+        snprintf(err, err_size, "%s holds %llu floats, more than a buffer can carry", name,
+                 (unsigned long long) count);
+        return -1;
+    }
+    out->assign((size_t) count, 0.0f);
+    return qrt_gguf_read_tensor(g, t, out->data(), out->size() * sizeof(float), err, err_size);
+}
+
 int qrt_gguf_account_compute(const qrt_gguf * g, qrt_gguf_account * out, char * err, size_t err_size) {
     memset(out, 0, sizeof(*out));
     const uint32_t need = QRT_HP_BLOCK_COUNT | QRT_HP_EXPERT_COUNT;

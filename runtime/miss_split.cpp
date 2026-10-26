@@ -3,8 +3,8 @@
 #include "miss_split.h"
 
 #include "qrt_config.h"
+#include "qrt_util.h"
 
-#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -12,16 +12,6 @@
 #include <vector>
 
 namespace {
-
-int fail(char * err, size_t err_size, const char * fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    if (err != NULL && err_size != 0) {
-        vsnprintf(err, err_size, fmt, ap);
-    }
-    va_end(ap);
-    return -1;
-}
 
 double h2d_ms(const qrt_split_rates * rates, uint64_t bytes) {
     return (double) bytes * 1000.0 / rates->h2d_bytes_per_s;

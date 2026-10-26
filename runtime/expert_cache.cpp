@@ -1,7 +1,8 @@
 #include "expert_cache.h"
 
+#include "qrt_util.h"
+
 #include <math.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,16 +13,6 @@
 #include <vector>
 
 namespace {
-
-int fail(char * err, size_t err_size, const char * fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    if (err != NULL && err_size != 0) {
-        vsnprintf(err, err_size, fmt, ap);
-    }
-    va_end(ap);
-    return -1;
-}
 
 bool add_bytes(uint64_t * sum, uint64_t bytes) {
     if (bytes > UINT64_MAX - *sum) {

@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 #include "qrt_config.h"
+#include "qrt_util.h"
 
 #ifdef QRT_HAVE_VULKAN
 #include <vulkan/vulkan.h>
@@ -16,6 +17,13 @@ typedef uint32_t                 VkBufferUsageFlags;
 #ifndef VK_NULL_HANDLE
 #define VK_NULL_HANDLE 0
 #endif
+#endif
+
+#ifdef QRT_HAVE_VULKAN
+// A failed vkCreate/vkCmd call is a message, never an abort (design 9).
+static inline int vk_fail(char * err, size_t err_size, const char * what, VkResult r) {
+    return fail(err, err_size, "%s failed: VkResult %d", what, (int) r);
+}
 #endif
 
 // VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, spelled here so the CLI builds without the SDK.
@@ -96,80 +104,5 @@ int qrt_vk_plan_budget(qrt_vk_dev * dev, const qrt_config * cfg, uint64_t expert
 int qrt_vk_alloc(qrt_vk_dev * dev, uint64_t bytes, VkBufferUsageFlags usage,
                  VkBuffer * buf, VkDeviceMemory * mem, char * err, size_t err_size);
 void qrt_vk_free(qrt_vk_dev * dev, VkBuffer buf, VkDeviceMemory mem);
-
-// Host-visible staging buffer plus its own command buffer and fence. Mapped once
-// at creation; a copy is one vkCmdCopyBuffer and one submit+wait. M2-5 keeps two
-// of them to overlap the upload of block n+1 with the compute of block n.
-struct qrt_vk_staging;
-int qrt_vk_staging_create(qrt_vk_dev * dev, uint64_t bytes, qrt_vk_staging ** out,
-                          char * err, size_t err_size);
-void qrt_vk_staging_destroy(qrt_vk_dev * dev, qrt_vk_staging * stg);
-uint64_t qrt_vk_staging_bytes(const qrt_vk_staging * stg);
-// One line saying which memory type and heap the staging buffer landed in.
-const char * qrt_vk_staging_label(const qrt_vk_staging * stg);
-
-// Copies host memory into a device buffer, or back out of it, and returns only
-// after the fence signals. Both report failure instead of aborting (design 9).
-int qrt_vk_upload(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer dst,
-                  uint64_t dst_offset, const void * src, uint64_t bytes,
-                  char * err, size_t err_size);
-int qrt_vk_download(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer src,
-                    uint64_t src_offset, void * dst, uint64_t bytes,
-                    char * err, size_t err_size);
-
-// The variants the engine uses: the caller writes straight into the mapping (a
-// file read lands there, so one memcpy disappears) and only the copy runs here.
-void * qrt_vk_staging_map(qrt_vk_staging * stg);
-int qrt_vk_upload_mapped(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer dst,
-                         uint64_t dst_offset, uint64_t bytes, char * err, size_t err_size);
-int qrt_vk_download_mapped(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer src,
-                           uint64_t src_offset, uint64_t bytes, char * err, size_t err_size);
-
-// Several device copies from one staging buffer in one submit (M3-2a): the sources
-// are packed back to back into the mapping by the caller, and the regions may target
-// different buffers and offsets (the decode cache slots are not contiguous). The
-// sum of bytes must fit the staging buffer. Waits for the submit before returning.
-struct qrt_vk_copy_region {
-    const void * src;          // inside the staging mapping
-    VkBuffer     dst;
-    uint64_t     dst_offset;
-    uint64_t     bytes;
-};
-int qrt_vk_upload_regions(qrt_vk_dev * dev, qrt_vk_staging * stg,
-                          const qrt_vk_copy_region * regions, uint32_t count,
-                          char * err, size_t err_size);
-
-// Fire and forget: the copy is in flight when this returns. Keep one staging
-// buffer per copy in flight and wait before touching its mapping again; this is
-// how M2-5 overlaps the upload of block n+1 with the compute of block n.
-int qrt_vk_upload_submit(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer dst,
-                         uint64_t dst_offset, uint64_t bytes, char * err, size_t err_size);
-int qrt_vk_staging_wait(qrt_vk_dev * dev, qrt_vk_staging * stg, char * err, size_t err_size);
-
-// One layer pass (design 4.6, DECISIONS 64.2/68): every module of a layer records its
-// dispatches into the same command buffer, so the layer costs one submit instead of one
-// per module. The modules keep their own descriptor pools; a module attaches to a ring,
-// records, and the caller submits and waits once. Two rings so the next pass can be
-// recorded while the current one is in flight.
-struct qrt_vk_cmd;
-int qrt_vk_cmd_create(qrt_vk_dev * dev, uint32_t rings, qrt_vk_cmd ** out,
-                      char * err, size_t err_size);
-void qrt_vk_cmd_destroy(qrt_vk_dev * dev, qrt_vk_cmd * c);
-uint32_t qrt_vk_cmd_rings(const qrt_vk_cmd * c);
-// Waits a previous submission on this ring, resets its fence and begins the buffer.
-int qrt_vk_cmd_begin(qrt_vk_cmd * c, uint32_t ring, char * err, size_t err_size);
-VkCommandBuffer qrt_vk_cmd_buffer(qrt_vk_cmd * c, uint32_t ring);
-// Compute-to-compute memory barrier: the next dispatch sees the previous ones' writes.
-int qrt_vk_cmd_barrier(qrt_vk_cmd * c, uint32_t ring, char * err, size_t err_size);
-// TRANSFER -> COMPUTE barrier, for a vkCmdFillBuffer the same pass recorded.
-int qrt_vk_cmd_barrier_transfer(qrt_vk_cmd * c, uint32_t ring, char * err, size_t err_size);
-void qrt_vk_cmd_record_barrier_transfer(VkCommandBuffer cmd);
-// Records a compute->compute barrier into a buffer another module is recording into.
-void qrt_vk_cmd_record_barrier(VkCommandBuffer cmd);
-// How many dispatches the pass recorded, for the readings.
-void qrt_vk_cmd_count(qrt_vk_cmd * c, uint32_t dispatches);
-uint32_t qrt_vk_cmd_dispatches(const qrt_vk_cmd * c);
-int qrt_vk_cmd_submit(qrt_vk_cmd * c, uint32_t ring, char * err, size_t err_size);
-int qrt_vk_cmd_wait(qrt_vk_cmd * c, uint32_t ring, char * err, size_t err_size);
 
 void qrt_vk_print_info(const qrt_vk_dev * dev, FILE * f);

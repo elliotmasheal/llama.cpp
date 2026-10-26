@@ -4,12 +4,15 @@
 #endif
 
 #include "model.h"
+#include "model_file.h"
+#include "model_io.h"
 #include "attn_full.h"
 #include "ffn.h"
 #include "gguf_index.h"
 #include "layer.h"
 #include "qrt_config.h"
 #include "vk_dev.h"
+#include "vk_transfer.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -100,7 +103,9 @@ void reset() {
     s.hp.present = QRT_HP_N_EMBD | QRT_HP_BLOCK_COUNT | QRT_HP_NEXTN;
 }
 
-struct memory_file {
+} // namespace model_test
+
+struct qrt_model_file {
     std::string path;
     std::vector<unsigned char> bytes;
     size_t pos = 0;
@@ -108,67 +113,52 @@ struct memory_file {
     bool read_error = false;
 };
 
-// Only the production translation unit sees these stdio replacements; no paths are written.
-FILE * open_file(const char * path, const char * mode) {
-    if (s.open_error) return nullptr;
+// The model module's file port, replaced here so no production path is written and every
+// short write, read error and failed close is an injected event.
+qrt_model_file * qrt_model_file_open(const char * path, const char * mode) {
+    if (model_test::s.open_error) return nullptr;
     const bool reading = mode[0] == 'r';
-    const auto it = s.files.find(path);
-    if (reading && it == s.files.end()) return nullptr;
-    memory_file * f = new memory_file;
+    const auto it = model_test::s.files.find(path);
+    if (reading && it == model_test::s.files.end()) return nullptr;
+    qrt_model_file * f = new qrt_model_file;
     f->path = path;
     f->reading = reading;
     if (reading) f->bytes = it->second;
-    ++s.file_live;
-    ++s.file_opened;
-    return reinterpret_cast<FILE *>(f);
+    ++model_test::s.file_live;
+    ++model_test::s.file_opened;
+    return f;
 }
 
-int close_file(FILE * stream) {
-    memory_file * f = reinterpret_cast<memory_file *>(stream);
-    if (!f->reading) s.files[f->path] = f->bytes;
+int qrt_model_file_close(qrt_model_file * f) {
+    if (f == nullptr) return EOF;
+    if (!f->reading) model_test::s.files[f->path] = f->bytes;
     delete f;
-    --s.file_live;
-    ++s.file_closed;
-    return s.close_error ? EOF : 0;
+    --model_test::s.file_live;
+    ++model_test::s.file_closed;
+    return model_test::s.close_error ? EOF : 0;
 }
 
-size_t write_file(const void * src, size_t size, size_t count, FILE * stream) {
-    memory_file * f = reinterpret_cast<memory_file *>(stream);
-    require(!f->reading && count > 0 && size > 0, "valid write request");
-    ++s.writes;
-    const size_t written = s.writes == s.short_write_at ? count - 1 : count;
+size_t qrt_model_file_write(qrt_model_file * f, const void * src, size_t size, size_t count) {
+    model_test::require(!f->reading && count > 0 && size > 0, "valid write request");
+    ++model_test::s.writes;
+    const size_t written = model_test::s.writes == model_test::s.short_write_at ? count - 1 : count;
     const unsigned char * p = static_cast<const unsigned char *>(src);
     f->bytes.insert(f->bytes.end(), p, p + written * size);
     return written;
 }
 
-int get_file(FILE * stream) {
-    memory_file * f = reinterpret_cast<memory_file *>(stream);
-    require(f->reading, "read from input stream");
-    if (++s.get_count == s.read_error_at) {
+int qrt_model_file_getc(qrt_model_file * f) {
+    model_test::require(f->reading, "read from input stream");
+    if (++model_test::s.get_count == model_test::s.read_error_at) {
         f->read_error = true;
         return EOF;
     }
     return f->pos < f->bytes.size() ? f->bytes[f->pos++] : EOF;
 }
 
-int error_file(FILE * stream) {
-    return reinterpret_cast<memory_file *>(stream)->read_error ? 1 : 0;
+int qrt_model_file_error(qrt_model_file * f) {
+    return f->read_error ? 1 : 0;
 }
-
-} // namespace model_test
-
-#define fopen model_test::open_file
-#define fclose model_test::close_file
-#define fwrite model_test::write_file
-#define fgetc model_test::get_file
-#define ferror model_test::error_file
-#include "model.cpp"
-#undef fopen
-#undef fclose
-#undef fwrite
-#undef fgetc
-#undef ferror
 
 struct VkBuffer_T {
     std::vector<float> values;
@@ -273,6 +263,23 @@ const qrt_gguf_tensor * qrt_gguf_find(const qrt_gguf * g, const char * name) {
         if (strcmp(g->tensors[i].name, name) == 0) return &g->tensors[i];
     }
     return nullptr;
+}
+
+int qrt_gguf_read_f32(qrt_gguf * g, const char * name, std::vector<float> * out,
+                      char * err, size_t cap) {
+    const qrt_gguf_tensor * t = qrt_gguf_find(g, name);
+    if (t == nullptr) {
+        snprintf(err, cap, "%s is not in the tensor table", name);
+        return -1;
+    }
+    if (t->type != 0) {
+        snprintf(err, cap, "%s is not f32", name);
+        return -1;
+    }
+    uint64_t count = 1;
+    for (uint32_t i = 0; i < t->n_dims; ++i) count *= t->ne[i];
+    out->assign((size_t) count, 0.0f);
+    return qrt_gguf_read_tensor(g, t, out->data(), out->size() * sizeof(float), err, cap);
 }
 
 int qrt_gguf_read_tensor(qrt_gguf *, const qrt_gguf_tensor * t, void * dst, size_t bytes,
@@ -501,7 +508,7 @@ void test_dump() {
         s.close_error = fault == 6;
         s.open_error = fault == 7;
         char err[256] = {};
-        const int rc = write_dump("model-test.dump", 2, 2, 1, ids, values, 3, err, sizeof(err));
+        const int rc = qrt_model_write_dump("model-test.dump", 2, 2, 1, ids, values, 3, err, sizeof(err));
         require((rc == 0) == (fault == 0), "dump write failures propagate");
         if (fault != 0) require(err[0] != '\0', "dump error has a message");
         if (fault >= 1 && fault <= 5) require(s.writes == fault, "stop immediately on short write");

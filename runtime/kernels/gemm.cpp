@@ -1,8 +1,9 @@
 #include "kernels/gemm.h"
+#include "vk_pipeline.h"
 
 #include "kernels/tiles.h"
+#include "qrt_util.h"
 
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,74 +70,6 @@ namespace {
 // most 256 experts, so 2048 covers a whole layer plus the dense projections.
 const uint32_t QRT_GEMM_SETS_PER_RING = 2048;
 
-int fail(char * err, size_t err_size, const char * fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(err, err_size, fmt, ap);
-    va_end(ap);
-    return -1;
-}
-
-int vk_fail(char * err, size_t err_size, const char * what, VkResult r) {
-    return fail(err, err_size, "%s failed: VkResult %d", what, (int) r);
-}
-
-int read_spv(const char * dir, const char * name, unsigned char ** out, size_t * out_bytes,
-             char * err, size_t err_size) {
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/%s", dir, name);
-    FILE * f = fopen(path, "rb");
-    if (f == NULL) {
-        return fail(err, err_size, "cannot open %s", path);
-    }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return fail(err, err_size, "cannot size %s", path);
-    }
-    const long bytes = ftell(f);
-    rewind(f);
-    if (bytes <= 0) {
-        fclose(f);
-        return fail(err, err_size, "%s is empty", path);
-    }
-    unsigned char * buf = (unsigned char *) malloc((size_t) bytes);
-    if (buf == NULL) {
-        fclose(f);
-        return fail(err, err_size, "out of memory for %ld bytes of SPIR-V", bytes);
-    }
-    const size_t got = fread(buf, 1, (size_t) bytes, f);
-    fclose(f);
-    if (got != (size_t) bytes) {
-        free(buf);
-        return fail(err, err_size, "short read on %s", path);
-    }
-    *out = buf;
-    *out_bytes = got;
-    return 0;
-}
-
-VkShaderModule load_module(VkDevice dev, const char * dir, const char * name, char * err,
-                           size_t err_size) {
-    unsigned char * code = NULL;
-    size_t code_bytes = 0;
-    if (read_spv(dir, name, &code, &code_bytes, err, err_size) != 0) {
-        return VK_NULL_HANDLE;
-    }
-    VkShaderModuleCreateInfo smci;
-    memset(&smci, 0, sizeof(smci));
-    smci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    smci.codeSize = code_bytes;
-    smci.pCode    = (const uint32_t *) code;
-    VkShaderModule mod = VK_NULL_HANDLE;
-    const VkResult r = vkCreateShaderModule(dev, &smci, nullptr, &mod);
-    free(code);
-    if (r != VK_SUCCESS) {
-        fail(err, err_size, "vkCreateShaderModule(%s) failed: VkResult %d", name, (int) r);
-        return VK_NULL_HANDLE;
-    }
-    return mod;
-}
-
 } // namespace
 
 struct qrt_gemm {
@@ -162,50 +95,6 @@ struct qrt_gemm {
     uint32_t        dispatches;
 };
 
-namespace {
-
-// Four storage buffers bound at once; the order matches the shader bindings.
-void write_set(VkDevice dev, VkDescriptorSet set, const VkBuffer * bufs) {
-    VkDescriptorBufferInfo info[4];
-    VkWriteDescriptorSet wr[4];
-    memset(info, 0, sizeof(info));
-    memset(wr, 0, sizeof(wr));
-    for (int i = 0; i < 4; ++i) {
-        info[i].buffer = bufs[i];
-        info[i].offset = 0;
-        info[i].range  = VK_WHOLE_SIZE;
-        wr[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet          = set;
-        wr[i].dstBinding      = (uint32_t) i;
-        wr[i].descriptorCount = 1;
-        wr[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        wr[i].pBufferInfo     = &info[i];
-    }
-    vkUpdateDescriptorSets(dev, 4, wr, 0, nullptr);
-}
-
-VkPipeline make_pipeline(VkDevice dev, VkShaderModule mod, VkPipelineLayout layout,
-                         uint32_t pc_bytes, char * err, size_t err_size) {
-    (void) pc_bytes;
-    VkComputePipelineCreateInfo cpci;
-    memset(&cpci, 0, sizeof(cpci));
-    cpci.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = mod;
-    cpci.stage.pName  = "main";
-    cpci.layout       = layout;
-    VkPipeline p = VK_NULL_HANDLE;
-    const VkResult r = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, nullptr, &p);
-    if (r != VK_SUCCESS) {
-        fail(err, err_size, "vkCreateComputePipelines failed: VkResult %d", (int) r);
-        return VK_NULL_HANDLE;
-    }
-    return p;
-}
-
-} // namespace
-
 int qrt_gemm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_gemm ** out,
                  char * err, size_t err_size) {
     *out = NULL;
@@ -218,91 +107,41 @@ int qrt_gemm_open(qrt_vk_dev * dev, const char * spv_dir, qrt_gemm ** out,
     }
     g->dev = dev;
 
-    VkDescriptorSetLayoutBinding binds[4];
-    memset(binds, 0, sizeof(binds));
-    for (int i = 0; i < 4; ++i) {
-        binds[i].binding         = (uint32_t) i;
-        binds[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        binds[i].descriptorCount = 1;
-        binds[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo dlci;
-    memset(&dlci, 0, sizeof(dlci));
-    dlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = 4;
-    dlci.pBindings    = binds;
-    VkResult r = vkCreateDescriptorSetLayout(dev->device, &dlci, nullptr, &g->dsl);
-    if (r != VK_SUCCESS) {
+    if (qrt_vk_make_set_layout(dev, 4, &g->dsl, err, err_size) != 0) {
         qrt_gemm_close(dev, g);
-        return vk_fail(err, err_size, "vkCreateDescriptorSetLayout", r);
+        return -1;
     }
-
-    VkPushConstantRange pc[2];
-    memset(pc, 0, sizeof(pc));
-    pc[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pc[0].size       = 7 * sizeof(uint32_t);   // n, k, m, wbase, obase, abase, token_major
-    pc[1]            = pc[0];
-    pc[1].size       = 5 * sizeof(uint32_t);   // m, nk32, hid, qsbase, dsbase
-    VkPipelineLayoutCreateInfo plci;
-    memset(&plci, 0, sizeof(plci));
-    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount         = 1;
-    plci.pSetLayouts            = &g->dsl;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges    = &pc[0];
-    r = vkCreatePipelineLayout(dev->device, &plci, nullptr, &g->gemm_layout);
-    if (r != VK_SUCCESS) {
+    // GEMM push block: n, k, m, wbase, obase, abase, token_major.
+    if (qrt_vk_make_layout(dev, g->dsl, 7 * sizeof(uint32_t), &g->gemm_layout, err,
+                           err_size) != 0) {
         qrt_gemm_close(dev, g);
-        return vk_fail(err, err_size, "vkCreatePipelineLayout (gemm)", r);
+        return -1;
     }
-    plci.pPushConstantRanges = &pc[1];
-    r = vkCreatePipelineLayout(dev->device, &plci, nullptr, &g->swiglu_layout);
-    if (r != VK_SUCCESS) {
+    // Swiglu push block: m, nk32, hid, qsbase, dsbase.
+    if (qrt_vk_make_layout(dev, g->dsl, 5 * sizeof(uint32_t), &g->swiglu_layout, err,
+                           err_size) != 0) {
         qrt_gemm_close(dev, g);
-        return vk_fail(err, err_size, "vkCreatePipelineLayout (swiglu)", r);
+        return -1;
     }
 
     const char * names[QRT_QUANT_TYPES] = { "gemm_q4k.spv", "gemm_q5k.spv", "gemm_q6k.spv",
                                            "gemm_q8k.spv" };
     for (int i = 0; i < QRT_QUANT_TYPES; ++i) {
-        VkShaderModule mod = load_module(dev->device, spv_dir, names[i], err, err_size);
-        if (mod == VK_NULL_HANDLE) {
-            qrt_gemm_close(dev, g);
-            return -1;
-        }
-        g->gemm_pipe[i] = make_pipeline(dev->device, mod, g->gemm_layout, pc[0].size,
-                                        err, err_size);
-        vkDestroyShaderModule(dev->device, mod, nullptr);
-        if (g->gemm_pipe[i] == VK_NULL_HANDLE) {
+        if (qrt_vk_make_pipeline(dev, g->gemm_layout, spv_dir, names[i], nullptr, 0,
+                                 &g->gemm_pipe[i], err, err_size) != 0) {
             qrt_gemm_close(dev, g);
             return -1;
         }
     }
-    VkShaderModule m1_mod = load_module(dev->device, spv_dir, "gemm_q8k_m1.spv", err,
-                                        err_size);
-    if (m1_mod == VK_NULL_HANDLE) {
-        qrt_gemm_close(dev, g);
-        return -1;
-    }
-    g->gemm_q8k_m1 = make_pipeline(dev->device, m1_mod, g->gemm_layout, pc[0].size, err,
-                                   err_size);
-    vkDestroyShaderModule(dev->device, m1_mod, nullptr);
-    if (g->gemm_q8k_m1 == VK_NULL_HANDLE) {
-        qrt_gemm_close(dev, g);
-        return -1;
-    }
-    VkShaderModule sw_mod = load_module(dev->device, spv_dir, "swiglu_q8.spv", err, err_size);
-    if (sw_mod == VK_NULL_HANDLE) {
-        qrt_gemm_close(dev, g);
-        return -1;
-    }
-    g->swiglu_pipe = make_pipeline(dev->device, sw_mod, g->swiglu_layout, pc[1].size, err, err_size);
-    vkDestroyShaderModule(dev->device, sw_mod, nullptr);
-    if (g->swiglu_pipe == VK_NULL_HANDLE) {
+    if (qrt_vk_make_pipeline(dev, g->gemm_layout, spv_dir, "gemm_q8k_m1.spv", nullptr, 0,
+                             &g->gemm_q8k_m1, err, err_size) != 0 ||
+        qrt_vk_make_pipeline(dev, g->swiglu_layout, spv_dir, "swiglu_q8.spv", nullptr, 0,
+                             &g->swiglu_pipe, err, err_size) != 0) {
         qrt_gemm_close(dev, g);
         return -1;
     }
 
+    VkResult r = VK_SUCCESS;
     VkDescriptorPoolSize size;
     memset(&size, 0, sizeof(size));
     size.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -430,7 +269,7 @@ int alloc_set(qrt_gemm * g, const VkBuffer * bufs, VkDescriptorSet * out, char *
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkAllocateDescriptorSets (gemm)", r);
     }
-    write_set(g->dev->device, set, bufs);
+    qrt_vk_write_set(g->dev, set, bufs, 4);
     ++g->sets_used[ring];
     *out = set;
     return 0;

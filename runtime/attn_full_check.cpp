@@ -3,6 +3,7 @@
 // reference formula. The attention body is added by the next step of M2-6d.
 
 #include "attn_full.h"
+#include "vk_transfer.h"
 
 #include "gguf_index.h"
 #include "qrt_config.h"
@@ -32,24 +33,6 @@ struct rng_t {
         return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
     }
 };
-
-int read_tensor_f32(qrt_gguf * g, const char * name, std::vector<float> * out,
-                    char * err, size_t err_size) {
-    const qrt_gguf_tensor * t = NULL;
-    if (qrt_gguf_require(g, name, &t, err, err_size) != 0) {
-        return -1;
-    }
-    if (t->type != 0) {
-        snprintf(err, err_size, "%s is %s, expected f32", name, qrt_gguf_type_name(t->type));
-        return -1;
-    }
-    uint64_t count = 1;
-    for (uint32_t i = 0; i < t->n_dims; ++i) {
-        count *= t->ne[i];
-    }
-    out->assign((size_t) count, 0.0f);
-    return qrt_gguf_read_tensor(g, t, out->data(), out->size() * sizeof(float), err, err_size);
-}
 
 double rel_l1(const float * got, const float * want, size_t n, double * max_abs) {
     double num = 0.0, den = 0.0, mx = 0.0;
@@ -114,10 +97,10 @@ int qrt_full_check(const char * gguf_path, uint32_t layer, uint32_t tokens, cons
     char name[128];
     std::vector<float> qnw, knw;
     snprintf(name, sizeof(name), "blk.%u.attn_q_norm.weight", layer);
-    int rc = read_tensor_f32(g, name, &qnw, err, sizeof(err));
+    int rc = qrt_gguf_read_f32(g, name, &qnw, err, sizeof(err));
     if (rc == 0) {
         snprintf(name, sizeof(name), "blk.%u.attn_k_norm.weight", layer);
-        rc = read_tensor_f32(g, name, &knw, err, sizeof(err));
+        rc = qrt_gguf_read_f32(g, name, &knw, err, sizeof(err));
     }
     const qrt_gguf_hparams * hp = &hp_copy;
     qrt_gguf_close(g);

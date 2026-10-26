@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "vk_dev.h"
+#include "vk_transfer.h"
 
 // Host side of the repacked expert store (design 5.1 `weights`, M2-3).
 // Reads <prefix>.qwen36rt.idx into a page table and hands out expert byte

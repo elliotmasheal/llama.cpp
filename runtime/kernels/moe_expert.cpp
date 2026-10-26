@@ -1,11 +1,13 @@
 #include "kernels/moe_expert.h"
+#include "vk_transfer.h"
 
 #include "kernels/gemm.h"
 #include "kernels/norm.h"
+#include "qrt_half.h"
+#include "qrt_util.h"
 #include "weights.h"
 
 #include <math.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,14 +20,6 @@ namespace {
 
 const uint32_t HIDDEN = 2048;
 const uint32_t FFN    = 512;
-
-int fail(char * err, size_t err_size, const char * fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(err, err_size, fmt, ap);
-    va_end(ap);
-    return -1;
-}
 
 // Deterministic Q8_1 activations for the harness. The real path quantizes the layer
 // input; until that exists, a fixed pattern keeps two runs comparable.
@@ -49,35 +43,6 @@ void fill_acts(uint32_t tokens, uint32_t hidden, unsigned char * qs, uint32_t * 
         const uint32_t d = 0x2800u + (lcg(&seed) & 0x0FFFu);   // f16 ~0.0098..0.0195
         ds[b] = d | ((uint32_t) (uint16_t) (sum + 32768) << 16);
     }
-}
-
-uint32_t f16_to_f32_bits(uint32_t h) {
-    const uint32_t sign = (h & 0x8000u) << 16;
-    const uint32_t exp  = (h >> 10) & 0x1Fu;
-    const uint32_t man  = h & 0x3FFu;
-    if (exp == 0) {
-        if (man == 0) {
-            return sign;
-        }
-        uint32_t e = 127 - 15 + 1;
-        uint32_t m = man;
-        while ((m & 0x400u) == 0) {
-            m <<= 1;
-            --e;
-        }
-        return sign | (e << 23) | ((m & 0x3FFu) << 13);
-    }
-    if (exp == 31) {
-        return sign | 0x7F800000u | (man << 13);
-    }
-    return sign | ((exp + 127 - 15) << 23) | (man << 13);
-}
-
-float f16_to_f32(uint32_t h) {
-    const uint32_t bits = f16_to_f32_bits(h & 0xFFFFu);
-    float f;
-    memcpy(&f, &bits, sizeof(f));
-    return f;
 }
 
 } // namespace

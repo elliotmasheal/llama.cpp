@@ -1,9 +1,12 @@
 #include "attn_deltanet.h"
+#include "vk_transfer.h"
+#include "vk_pass.h"
+#include "vk_pipeline.h"
 
 #include "gguf_index.h"
+#include "qrt_util.h"
 
 #include <math.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,125 +15,9 @@
 
 #ifdef QRT_HAVE_VULKAN
 
-#include <chrono>
-
 namespace {
 
 const uint32_t DN_BINDINGS = 8;
-
-int fail(char * err, size_t err_size, const char * fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(err, err_size, fmt, ap);
-    va_end(ap);
-    return -1;
-}
-
-int vk_fail(char * err, size_t err_size, const char * what, VkResult r) {
-    return fail(err, err_size, "%s failed: VkResult %d", what, (int) r);
-}
-
-int read_spv(const char * dir, const char * name, unsigned char ** out, size_t * out_bytes,
-             char * err, size_t err_size) {
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/%s", dir, name);
-    FILE * f = fopen(path, "rb");
-    if (f == NULL) {
-        return fail(err, err_size, "cannot open %s", path);
-    }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return fail(err, err_size, "cannot size %s", path);
-    }
-    const long bytes = ftell(f);
-    rewind(f);
-    if (bytes <= 0) {
-        fclose(f);
-        return fail(err, err_size, "%s is empty", path);
-    }
-    unsigned char * buf = (unsigned char *) malloc((size_t) bytes);
-    if (buf == NULL) {
-        fclose(f);
-        return fail(err, err_size, "out of memory for %ld bytes of SPIR-V", bytes);
-    }
-    const size_t got = fread(buf, 1, (size_t) bytes, f);
-    fclose(f);
-    if (got != (size_t) bytes) {
-        free(buf);
-        return fail(err, err_size, "short read on %s", path);
-    }
-    *out = buf;
-    *out_bytes = got;
-    return 0;
-}
-
-VkShaderModule load_module(VkDevice dev, const char * dir, const char * name, char * err,
-                           size_t err_size) {
-    unsigned char * code = NULL;
-    size_t code_bytes = 0;
-    if (read_spv(dir, name, &code, &code_bytes, err, err_size) != 0) {
-        return VK_NULL_HANDLE;
-    }
-    VkShaderModuleCreateInfo smci;
-    memset(&smci, 0, sizeof(smci));
-    smci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    smci.codeSize = code_bytes;
-    smci.pCode    = (const uint32_t *) code;
-    VkShaderModule mod = VK_NULL_HANDLE;
-    const VkResult r = vkCreateShaderModule(dev, &smci, nullptr, &mod);
-    free(code);
-    if (r != VK_SUCCESS) {
-        fail(err, err_size, "vkCreateShaderModule(%s) failed: VkResult %d", name, (int) r);
-        return VK_NULL_HANDLE;
-    }
-    return mod;
-}
-
-double now_ms(void) {
-    using clock = std::chrono::steady_clock;
-    static const clock::time_point t0 = clock::now();
-    return std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-}
-
-// DeltaNet recurrence pipelines share one layout and one descriptor set, so the
-// only thing that differs between the variants is the SPIR-V and its spec block.
-int make_dn_pipeline(qrt_vk_dev * dev, VkPipelineLayout layout, const char * spv_dir,
-                     const char * name, const uint32_t * spec, uint32_t n_spec,
-                     VkPipeline * out, char * err, size_t err_size) {
-    VkShaderModule mod = load_module(dev->device, spv_dir, name, err, err_size);
-    if (mod == VK_NULL_HANDLE) {
-        return -1;
-    }
-    VkSpecializationMapEntry sme[4];
-    memset(sme, 0, sizeof(sme));
-    for (uint32_t i = 0; i < n_spec; ++i) {
-        sme[i].constantID = i;
-        sme[i].offset     = i * sizeof(uint32_t);
-        sme[i].size       = sizeof(uint32_t);
-    }
-    VkSpecializationInfo sinfo;
-    memset(&sinfo, 0, sizeof(sinfo));
-    sinfo.mapEntryCount = n_spec;
-    sinfo.pMapEntries   = sme;
-    sinfo.dataSize      = n_spec * sizeof(uint32_t);
-    sinfo.pData         = spec;
-
-    VkComputePipelineCreateInfo cpci;
-    memset(&cpci, 0, sizeof(cpci));
-    cpci.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = mod;
-    cpci.stage.pName  = "main";
-    cpci.stage.pSpecializationInfo = n_spec > 0 ? &sinfo : nullptr;
-    cpci.layout       = layout;
-    const VkResult r = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &cpci, nullptr, out);
-    vkDestroyShaderModule(dev->device, mod, nullptr);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkCreateComputePipelines (deltanet)", r);
-    }
-    return 0;
-}
 
 } // namespace
 
@@ -243,48 +130,21 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     dn->bufs.y = dn->mem_owner[6];
     dn->bufs.state_out = dn->mem_owner[7];
 
-    VkDescriptorSetLayoutBinding binds[DN_BINDINGS];
-    memset(binds, 0, sizeof(binds));
-    for (uint32_t i = 0; i < DN_BINDINGS; ++i) {
-        binds[i].binding         = i;
-        binds[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        binds[i].descriptorCount = 1;
-        binds[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo dlci;
-    memset(&dlci, 0, sizeof(dlci));
-    dlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = DN_BINDINGS;
-    dlci.pBindings    = binds;
-    VkResult r = vkCreateDescriptorSetLayout(dev->device, &dlci, nullptr, &dn->dsl);
-    if (r != VK_SUCCESS) {
+    if (qrt_vk_make_set_layout(dev, DN_BINDINGS, &dn->dsl, err, err_size) != 0) {
         qrt_dn_close(dev, dn);
-        return vk_fail(err, err_size, "vkCreateDescriptorSetLayout (deltanet)", r);
+        return -1;
     }
-
-    // n_tokens, heads, kq_ch, k_ratio, qscale
-    VkPushConstantRange pcr;
-    memset(&pcr, 0, sizeof(pcr));
-    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    // one layout for every DeltaNet kernel, so the range covers the widest push block
-    // (the prep kernel: 7 uint + 1 float)
-    pcr.size       = 8 * sizeof(uint32_t);
-    VkPipelineLayoutCreateInfo plci;
-    memset(&plci, 0, sizeof(plci));
-    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount         = 1;
-    plci.pSetLayouts            = &dn->dsl;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges    = &pcr;
-    r = vkCreatePipelineLayout(dev->device, &plci, nullptr, &dn->layout);
-    if (r != VK_SUCCESS) {
+    // One layout for every DeltaNet kernel, so the range covers the widest push block
+    // (the prep kernel: 7 uint + 1 float).
+    if (qrt_vk_make_layout(dev, dn->dsl, 8 * sizeof(uint32_t), &dn->layout, err, err_size) != 0) {
         qrt_dn_close(dev, dn);
-        return vk_fail(err, err_size, "vkCreatePipelineLayout (deltanet)", r);
+        return -1;
     }
+    VkResult r = VK_SUCCESS;
 
     // S_V and the real subgroup size; the lane tiling depends on both
     const uint32_t spec_serial[2] = { sh->head_dim, subgroup };
-    if (make_dn_pipeline(dev, dn->layout, spv_dir, "deltanet_recur.spv", spec_serial, 2,
+    if (qrt_vk_make_pipeline(dev, dn->layout, spv_dir, "deltanet_recur.spv", spec_serial, 2,
                          &dn->pipe, err, err_size) != 0) {
         qrt_dn_close(dev, dn);
         return -1;
@@ -292,7 +152,7 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     // the column variant only needs S_V: the row split is fixed at four threads
     if (sh->head_dim % 32 == 0) {
         const uint32_t spec_cols[1] = { sh->head_dim };
-        if (make_dn_pipeline(dev, dn->layout, spv_dir, "deltanet_recur_cols.spv", spec_cols, 1,
+        if (qrt_vk_make_pipeline(dev, dn->layout, spv_dir, "deltanet_recur_cols.spv", spec_cols, 1,
                              &dn->pipe_cols, err, err_size) != 0) {
             qrt_dn_close(dev, dn);
             return -1;
@@ -391,52 +251,14 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     dn->bufs.z = dn->z_buf;
     dn->bufs.ssm_norm_w = dn->ssm_norm_w;
 
-    VkShaderModule pmod = load_module(dev->device, spv_dir, "deltanet_prep.spv", err, err_size);
-    if (pmod == VK_NULL_HANDLE) {
+    if (qrt_vk_make_pipeline(dev, dn->layout, spv_dir, "deltanet_prep.spv", nullptr, 0,
+                             &dn->prep_pipe, err, err_size) != 0 ||
+        qrt_vk_make_pipeline(dev, dn->layout, spv_dir, "deltanet_gate.spv", nullptr, 0,
+                             &dn->gate_pipe, err, err_size) != 0 ||
+        qrt_vk_make_pipeline(dev, dn->layout, spv_dir, "deltanet_gnorm.spv", nullptr, 0,
+                             &dn->gnorm_pipe, err, err_size) != 0) {
         qrt_dn_close(dev, dn);
         return -1;
-    }
-    VkComputePipelineCreateInfo pcp;
-    memset(&pcp, 0, sizeof(pcp));
-    pcp.sType         = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    pcp.stage.sType   = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    pcp.stage.stage   = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcp.stage.module  = pmod;
-    pcp.stage.pName   = "main";
-    pcp.layout        = dn->layout;
-    r = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &pcp, nullptr, &dn->prep_pipe);
-    vkDestroyShaderModule(dev->device, pmod, nullptr);
-    if (r != VK_SUCCESS) {
-        qrt_dn_close(dev, dn);
-        return vk_fail(err, err_size, "vkCreateComputePipelines (deltanet prep)", r);
-    }
-
-    VkShaderModule gmod = load_module(dev->device, spv_dir, "deltanet_gate.spv", err, err_size);
-    if (gmod == VK_NULL_HANDLE) {
-        qrt_dn_close(dev, dn);
-        return -1;
-    }
-    pcp.stage.module = gmod;
-    pcp.stage.pSpecializationInfo = nullptr;
-    r = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &pcp, nullptr, &dn->gate_pipe);
-    vkDestroyShaderModule(dev->device, gmod, nullptr);
-    if (r != VK_SUCCESS) {
-        qrt_dn_close(dev, dn);
-        return vk_fail(err, err_size, "vkCreateComputePipelines (deltanet gate)", r);
-    }
-
-    VkShaderModule nmod = load_module(dev->device, spv_dir, "deltanet_gnorm.spv", err, err_size);
-    if (nmod == VK_NULL_HANDLE) {
-        qrt_dn_close(dev, dn);
-        return -1;
-    }
-    pcp.stage.module = nmod;
-    pcp.stage.pSpecializationInfo = nullptr;
-    r = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &pcp, nullptr, &dn->gnorm_pipe);
-    vkDestroyShaderModule(dev->device, nmod, nullptr);
-    if (r != VK_SUCCESS) {
-        qrt_dn_close(dev, dn);
-        return vk_fail(err, err_size, "vkCreateComputePipelines (deltanet gnorm)", r);
     }
 
     VkCommandPoolCreateInfo cpi;
@@ -1024,138 +846,3 @@ int qrt_dn_gnorm_run(qrt_deltanet * dn, const qrt_dn_weights * w, uint32_t token
 }
 
 #endif // QRT_HAVE_VULKAN
-
-
-
-
-void qrt_dn_gnorm_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * y,
-                      const float * z, const float * norm_w, float eps, float * out) {
-    const uint32_t hd = sh->head_dim;
-    for (uint32_t t = 0; t < tokens; ++t) {
-        for (uint32_t h = 0; h < sh->n_v_heads; ++h) {
-            const float * yrow = y + (size_t) t * sh->d_inner + (size_t) h * hd;
-            float * orow = out + (size_t) t * sh->d_inner + (size_t) h * hd;
-            double ss = 0.0;
-            for (uint32_t i = 0; i < hd; ++i) {
-                ss += (double) yrow[i] * (double) yrow[i];
-            }
-            const double scale = 1.0 / sqrt(ss / (double) hd + (double) eps);
-            for (uint32_t i = 0; i < hd; ++i) {
-                const double g = (double) z[(size_t) t * sh->n_v_heads * hd + (size_t) h * hd + i];
-                orow[i] = (float) ((double) yrow[i] * scale * (double) norm_w[i] *
-                                   (g / (1.0 + exp(-g))));
-            }
-        }
-    }
-}
-
-void qrt_dn_gate_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * xnorm,
-                     const float * alpha_w, const float * beta_w, const float * dt,
-                     const float * a, float * decay, float * beta) {
-    for (uint32_t t = 0; t < tokens; ++t) {
-        for (uint32_t h = 0; h < sh->n_v_heads; ++h) {
-            double alpha = 0.0;
-            double braw = 0.0;
-            for (uint32_t c = 0; c < sh->n_embd; ++c) {
-                const double xv = (double) xnorm[(size_t) t * sh->n_embd + c];
-                alpha += xv * (double) alpha_w[(size_t) c + (size_t) h * sh->n_embd];
-                braw  += xv * (double) beta_w[(size_t) c + (size_t) h * sh->n_embd];
-            }
-            const double sp = log1p(exp(alpha + (double) dt[h]));
-            decay[(size_t) t * sh->n_v_heads + h] = (float) exp((double) a[h] * sp);
-            beta[(size_t) t * sh->n_v_heads + h] = (float) (1.0 / (1.0 + exp(-braw)));
-        }
-    }
-}
-
-void qrt_dn_prep_cpu(const qrt_dn_shapes * sh, uint32_t tokens, const float * qkv,
-                     const float * conv_w, const float * conv_state_in, float l2_eps,
-                     float * q, float * k, float * v, float * conv_state_out) {
-    const uint32_t taps = sh->conv_taps;
-    const uint32_t ch = sh->conv_ch;
-    const uint32_t qk = sh->qk_ch;
-    const uint32_t hd = sh->head_dim;
-    const uint32_t heads = qk / hd;
-    const double eps_term = (double) l2_eps * (double) hd;
-    std::vector<double> conv((size_t) ch);
-    for (uint32_t t = 0; t < tokens; ++t) {
-        for (uint32_t c = 0; c < ch; ++c) {
-            double acc = 0.0;
-            for (uint32_t j = 0; j < taps; ++j) {
-                const int src = (int) t - (int) taps + 1 + (int) j;
-                const double val = src < 0
-                    ? (double) conv_state_in[(size_t) (taps - 1 + (uint32_t) src) * ch + c]
-                    : (double) qkv[(size_t) src * ch + c];
-                acc += (double) conv_w[(size_t) c * taps + j] * val;
-            }
-            conv[c] = acc / (1.0 + exp(-acc));      // silu
-        }
-        for (uint32_t h = 0; h < heads; ++h) {
-            for (uint32_t half = 0; half < 2; ++half) {
-                const uint32_t off = half * qk + h * hd;
-                double ss = 0.0;
-                for (uint32_t i = 0; i < hd; ++i) {
-                    const double val = conv[(size_t) off + i];
-                    ss += val * val;
-                }
-                const double inv = 1.0 / sqrt(ss + eps_term);
-                float * dst = half == 0 ? q : k;
-                for (uint32_t i = 0; i < hd; ++i) {
-                    dst[(size_t) t * qk + (size_t) h * hd + i] = (float) (conv[(size_t) off + i] * inv);
-                }
-            }
-        }
-        for (uint32_t c = 0; c < sh->d_inner; ++c) {
-            v[(size_t) t * sh->d_inner + c] = (float) conv[(size_t) 2 * qk + c];
-        }
-    }
-    (void) conv_state_out;
-}
-
-void qrt_dn_recur_cpu(const qrt_dn_shapes * sh, uint32_t tokens,
-                      const float * q, const float * k, const float * v,
-                      const float * decay, const float * beta,
-                      double * state, float * y) {
-    const uint32_t sd = sh->head_dim;
-    const uint32_t ratio = sh->n_v_heads / sh->n_k_heads;
-    const double qscale = 1.0 / sqrt((double) sd);
-    std::vector<double> kcol((size_t) sd), qcol((size_t) sd), acc((size_t) sd);
-    for (uint32_t h = 0; h < sh->n_v_heads; ++h) {
-        double * s = state + (size_t) h * sd * sd;
-        const uint32_t kh = h % (sh->n_v_heads / ratio);
-        for (uint32_t t = 0; t < tokens; ++t) {
-            const double d = (double) decay[(size_t) t * sh->n_v_heads + h];
-            const double b = (double) beta[(size_t) t * sh->n_v_heads + h];
-            const float * qrow = q + ((size_t) t * sh->qk_ch + (size_t) kh * sd);
-            const float * krow = k + ((size_t) t * sh->qk_ch + (size_t) kh * sd);
-            const float * vrow = v + ((size_t) t * sh->d_inner + (size_t) h * sd);
-            for (uint32_t i = 0; i < sd; ++i) {
-                kcol[i] = (double) krow[i];
-                qcol[i] = (double) qrow[i];
-            }
-            // s *= d; sk[j] = sum_i s[i][j] k[i]
-            // the state is stored column major, the same layout the kernel keeps in
-            // registers, so a saved state can be handed to either side unchanged
-            for (uint32_t j = 0; j < sd; ++j) {
-                double sum = 0.0;
-                for (uint32_t i = 0; i < sd; ++i) {
-                    double & e = s[(size_t) j * sd + i];
-                    e *= d;
-                    sum += e * kcol[i];
-                }
-                acc[j] = ((double) vrow[j] - sum) * b;
-            }
-            float * yrow = y + ((size_t) t * sh->d_inner + (size_t) h * sd);
-            for (uint32_t j = 0; j < sd; ++j) {
-                const double delta = acc[j];
-                double sum = 0.0;
-                for (uint32_t i = 0; i < sd; ++i) {
-                    double & e = s[(size_t) j * sd + i];
-                    e += kcol[i] * delta;
-                    sum += e * qcol[i];
-                }
-                yrow[j] = (float) (sum * qscale);
-            }
-        }
-    }
-}

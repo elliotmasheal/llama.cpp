@@ -5,6 +5,14 @@
 add_library(qrt_core STATIC
     qrt_config.cpp
     qrt_cli.cpp
+    qrt_check_support.cpp
+    qrt_selftest.cpp
+    qrt_check_moe.cpp
+    qrt_check_gemm.cpp
+    qrt_check_norm.cpp
+    qrt_check_prefill.cpp
+    qrt_checks_io.cpp
+    qrt_checks_moe.cpp
     expert_cache.cpp
     miss_split.cpp
     cpu_moe.cpp
@@ -12,18 +20,31 @@ add_library(qrt_core STATIC
     gguf_index.cpp
     weights.cpp
     prefill.cpp
+    prefill_probe.cpp
     attn_deltanet.cpp
+    attn_deltanet_ref.cpp
     attn_deltanet_check.cpp
     attn_full.cpp
+    attn_full_ref.cpp
     attn_full_check.cpp
     kernels/gemm.cpp
     kernels/norm.cpp
     kernels/moe_expert.cpp
     layer.cpp
+    layer_ref.cpp
     model.cpp
+    model_file.cpp
+    model_host.cpp
+    model_generate.cpp
+    model_io.cpp
     ffn.cpp
+    ffn_ref.cpp
+    ffn_store.cpp
     moe.cpp
-    vk_dev.cpp)
+    vk_dev.cpp
+    vk_transfer.cpp
+    vk_pass.cpp
+    vk_pipeline.cpp)
 
 target_include_directories(qrt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(qrt_core PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
@@ -37,8 +58,8 @@ if (NOT MSVC)
         COMPILE_OPTIONS "-O3;-mavx2;-mfma;-fopenmp")
 endif()
 
-# vk_dev.cpp compiles to a stub when the SDK is absent, so qrt still builds and
-# --vk-info reports why it cannot open a device.
+# The Vulkan TUs (vk_dev, vk_transfer, vk_pass, vk_pipeline) compile to stubs when the SDK
+# is absent, so qrt still builds and --vk-info reports why it cannot open a device.
 find_package(Vulkan QUIET)
 if (Vulkan_FOUND)
     target_compile_definitions(qrt_core PUBLIC QRT_HAVE_VULKAN)
@@ -263,7 +284,11 @@ endif()
 if (BUILD_TESTING)
     add_test(NAME qrt_selftest COMMAND qrt --selftest)
     set_tests_properties(qrt_selftest PROPERTIES LABELS "qrt;cpu")
-    add_executable(qrt_model_test model_test.cpp qrt_config.cpp)
+    # The contract test drives the prefill/logits path against its own fakes: the file port
+    # in model_file.h, the device layer and the GGUF reader. The decode slice
+    # (model_generate.cpp) needs the real cache and telemetry modules, so it stays out.
+    add_executable(qrt_model_test model_test.cpp model.cpp model_host.cpp model_io.cpp
+                                   qrt_config.cpp)
     set_target_properties(qrt_model_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     add_test(NAME qrt_model_contract COMMAND qrt_model_test)
     set_tests_properties(qrt_model_contract PROPERTIES LABELS "qrt;cpu")

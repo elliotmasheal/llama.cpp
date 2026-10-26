@@ -5,6 +5,7 @@
 // their direction is what matters; decay comes from the real ssm_a and ssm_dt.
 
 #include "attn_deltanet.h"
+#include "vk_transfer.h"
 
 #include "gguf_index.h"
 
@@ -34,24 +35,6 @@ struct rng_t {
         return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
     }
 };
-
-int read_tensor_f32(qrt_gguf * g, const char * name, std::vector<float> * out,
-                    char * err, size_t err_size) {
-    const qrt_gguf_tensor * t = NULL;
-    if (qrt_gguf_require(g, name, &t, err, err_size) != 0) {
-        return -1;
-    }
-    if (t->type != 0) {
-        snprintf(err, err_size, "%s is %s, expected f32", name, qrt_gguf_type_name(t->type));
-        return -1;
-    }
-    uint64_t count = 1;
-    for (uint32_t i = 0; i < t->n_dims; ++i) {
-        count *= t->ne[i];
-    }
-    out->assign((size_t) count, 0.0f);
-    return qrt_gguf_read_tensor(g, t, out->data(), out->size() * sizeof(float), err, err_size);
-}
 
 double rel_l1(const float * got, const float * want, size_t n, double * max_abs) {
     double num = 0.0, den = 0.0, mx = 0.0;
@@ -89,14 +72,14 @@ int qrt_dn_check(const char * gguf_path, uint32_t layer, uint32_t tokens, const 
     char name[128];
     std::vector<float> ssm_a, ssm_dt, ssm_norm;
     snprintf(name, sizeof(name), "blk.%u.ssm_a", layer);
-    int shape_rc = read_tensor_f32(g, name, &ssm_a, err, sizeof(err));
+    int shape_rc = qrt_gguf_read_f32(g, name, &ssm_a, err, sizeof(err));
     if (shape_rc == 0) {
         snprintf(name, sizeof(name), "blk.%u.ssm_dt.bias", layer);
-        shape_rc = read_tensor_f32(g, name, &ssm_dt, err, sizeof(err));
+        shape_rc = qrt_gguf_read_f32(g, name, &ssm_dt, err, sizeof(err));
     }
     if (shape_rc == 0) {
         snprintf(name, sizeof(name), "blk.%u.ssm_norm.weight", layer);
-        shape_rc = read_tensor_f32(g, name, &ssm_norm, err, sizeof(err));
+        shape_rc = qrt_gguf_read_f32(g, name, &ssm_norm, err, sizeof(err));
     }
     const qrt_gguf_tensor * qkv = NULL;
     const qrt_gguf_tensor * conv = NULL;

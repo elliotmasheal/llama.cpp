@@ -3,6 +3,9 @@
 // buffer; the grouping step between the passes is host work and is timed apart.
 
 #include "ffn.h"
+#include "vk_transfer.h"
+#include "vk_pass.h"
+#include "vk_pipeline.h"
 
 #include "cpu_moe.h"
 #include "expert_cache.h"
@@ -10,61 +13,24 @@
 #include "kernels/gemm.h"
 #include "kernels/moe_expert.h"
 #include "kernels/norm.h"
+#include "qrt_util.h"
 #include "weights.h"
 
 #include <math.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <atomic>
-#include <chrono>
 #include <algorithm>
 #include <new>
 #include <thread>
 #include <vector>
 
+#include "ffn_internal.h"
 #ifdef QRT_HAVE_VULKAN
 
 namespace {
-
-int fail(char * err, size_t err_size, const char * fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(err, err_size, fmt, ap);
-    va_end(ap);
-    return -1;
-}
-
-double now_ms(void) {
-    using clock = std::chrono::steady_clock;
-    static const clock::time_point t0 = clock::now();
-    return std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-}
-
-int vk_fail(char * err, size_t err_size, const char * what, VkResult r) {
-    return fail(err, err_size, "%s failed: VkResult %d", what, (int) r);
-}
-
-int read_f32(qrt_gguf * g, const char * name, std::vector<float> * out, char * err,
-             size_t err_size) {
-    const qrt_gguf_tensor * t = NULL;
-    if (qrt_gguf_require(g, name, &t, err, err_size) != 0) {
-        return -1;
-    }
-    if (t->type != 0) {
-        return fail(err, err_size, "%s is %s, expected f32", name,
-                    qrt_gguf_type_name(t->type));
-    }
-    uint64_t n = 1;
-    for (uint32_t i = 0; i < t->n_dims; ++i) {
-        n *= t->ne[i];
-    }
-    out->assign((size_t) n, 0.0f);
-    return qrt_gguf_read_tensor(g, t, out->data(), out->size() * sizeof(float), err,
-                                err_size);
-}
 
 int read_q8_0(qrt_gguf * g, const char * name, uint32_t n, uint32_t k,
               std::vector<unsigned char> * raw, VkBuffer * buf, VkDeviceMemory * mem,
@@ -102,165 +68,13 @@ struct qrt_ffn_pc {
 
 const uint32_t FFN_BINDINGS = 5;
 const uint32_t FFN_SETS_PER_RING = 1024;
-const uint32_t FFN_STAGING_BYTES = 32u << 20;
-
-int make_pipeline(qrt_vk_dev * dev, VkPipelineLayout layout, const char * spv_dir,
-                  const char * name, VkPipeline * out, char * err, size_t err_size) {
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/%s", spv_dir, name);
-    FILE * fp = fopen(path, "rb");
-    if (fp == NULL) {
-        return fail(err, err_size, "cannot open '%s'", path);
-    }
-    fseek(fp, 0, SEEK_END);
-    const long bytes = ftell(fp);
-    rewind(fp);
-    std::vector<unsigned char> code((size_t) (bytes > 0 ? bytes : 0));
-    if (bytes <= 0 || fread(code.data(), 1, code.size(), fp) != code.size()) {
-        fclose(fp);
-        return fail(err, err_size, "cannot read '%s'", path);
-    }
-    fclose(fp);
-    VkShaderModuleCreateInfo smci;
-    memset(&smci, 0, sizeof(smci));
-    smci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    smci.codeSize = code.size();
-    smci.pCode    = (const uint32_t *) code.data();
-    VkShaderModule mod = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev->device, &smci, nullptr, &mod) != VK_SUCCESS) {
-        return fail(err, err_size, "vkCreateShaderModule (%s) failed", name);
-    }
-    VkComputePipelineCreateInfo cpci;
-    memset(&cpci, 0, sizeof(cpci));
-    cpci.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = mod;
-    cpci.stage.pName  = "main";
-    cpci.layout       = layout;
-    const VkResult r = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &cpci,
-                                                 nullptr, out);
-    vkDestroyShaderModule(dev->device, mod, nullptr);
-    if (r != VK_SUCCESS) {
-        return vk_fail(err, err_size, "vkCreateComputePipelines", r);
-    }
-    return 0;
-}
 
 } // namespace
 
-struct qrt_ffn {
-    qrt_vk_dev *    dev;
-    qrt_ffn_cfg     cfg;
-    uint32_t        layer;
-    qrt_gemm *      gemm;
-    qrt_weights *   store;
-    qrt_vk_staging * stg;
 
-    VkDescriptorSetLayout dsl;
-    VkPipelineLayout      layout;
-    VkPipeline            pipe_router;
-    VkPipeline            pipe_topk;
-    VkPipeline            pipe_gather;
-    VkPipeline            pipe_accum;
-    VkPipeline            pipe_out;
-    VkDescriptorPool      pool[2];
-    uint32_t              sets_used[2];
-    uint32_t              cur;
-    VkCommandBuffer       ext;
-
-    VkBuffer       router_w, sgate_w;
-    VkDeviceMemory router_mem, sgate_mem;
-    VkBuffer       sgate_gate, sgate_up, sgate_down;
-    VkDeviceMemory sg_mem[3];
-
-    VkBuffer       logits, ids, wts, sgate;
-    VkDeviceMemory logits_mem, ids_mem, wts_mem, sgate_mem_out;
-    VkBuffer       gather_qs, gather_ds, h_qs, h_ds;
-    VkDeviceMemory gq_mem, gd_mem, hq_mem, hd_mem;
-    VkBuffer       shexp_qs, shexp_ds, g_out, u_out;
-    VkDeviceMemory sq_mem, sd_mem, go_mem, uo_mem;
-    VkBuffer       shexp, moe, scratch;
-    VkDeviceMemory sh_mem, mo_mem, sc_mem;
-    VkBuffer       slot, tab_tok, tab_w;
-    VkDeviceMemory slot_mem, tt_mem, tw_mem;
-
-    // host copies the reference reads
-    std::vector<float>         h_router;
-    std::vector<float>         h_sgate_w;
-    std::vector<unsigned char> h_gate, h_up, h_down;
-    std::vector<uint32_t>      h_ids;
-    std::vector<float>         h_wts;
-
-    // grouping the layer pass produced
-    std::vector<uint32_t> cnt;      // routed pairs per expert
-    std::vector<uint32_t> rows_e;   // padded rows per expert
-    std::vector<uint32_t> row0;     // first row of the expert in the gather planes
-    std::vector<uint32_t> dev_off;  // fixed byte offset of the expert's block in the slot
-    std::vector<uint8_t>  loaded;   // expert bytes already resident in the slot
-    std::vector<uint32_t> h_tab_tok;
-    std::vector<float>    h_tab_w;
-
-    uint32_t rows;
-    uint32_t pairs;
-    uint32_t experts_used;
-    uint64_t store_bytes;
-    uint64_t uploaded_bytes;        // expert bytes actually copied into the slot
-    uint64_t slot_bytes;            // slot capacity (external cap or the whole layer)
-    uint64_t planes_bytes;
-    uint32_t max_rows;
-    uint32_t run_tokens;            // route/group/expert rows for this call
-    int      owns_slot;             // 0 for a caller-owned shared slot
-    int      transient;             // 1 = pack only this call's experts into the slot
-
-    // Decode expert cache (M3-2a). Off unless qrt_ffn_set_cache arms it.
-    int               cache_active;
-    qrt_cache *       cache;
-    VkBuffer          cache_buf;
-    uint64_t          cache_slot_bytes;
-    qrt_cpu_moe *     cpu;
-    int               miss_split;
-    qrt_split_rates   rates;
-    qrt_split_carry * carry;
-    qrt_ffn_legs      legs;
-    std::vector<uint8_t>         use_gpu;
-    std::vector<uint32_t>        uniq;
-    std::vector<qrt_cache_lookup> lookups;
-    std::vector<uint8_t>         h2d_mask;
-    std::vector<uint32_t>        cpu_pos;    // entries of uniq computed on the CPU
-    std::vector<int8_t>          h_x_qs;     // device Q8_1 planes, one row per token
-    std::vector<uint32_t>        h_x_ds;
-    std::vector<float>           h_x_d;      // unpacked delta and delta*sum
-    std::vector<float>           h_x_s;
-    std::vector<float>           cpu_out;    // [run_tokens][n_embd], routed CPU sum
-    std::vector<float>           cpu_res;    // [cpu experts][n_embd], per-expert down
-
-    uint32_t dispatches;
-    qrt_ffn_in in;      // what the layer handed over this chunk
-    qrt_ffn_bufs bufs;
-};
 
 
 namespace {
-
-void write_set(qrt_vk_dev * dev, VkDescriptorSet set, const VkBuffer * bufs, uint32_t n) {
-    VkDescriptorBufferInfo info[FFN_BINDINGS];
-    VkWriteDescriptorSet wr[FFN_BINDINGS];
-    memset(info, 0, sizeof(info));
-    memset(wr, 0, sizeof(wr));
-    for (uint32_t i = 0; i < FFN_BINDINGS; ++i) {
-        info[i].buffer        = bufs[i];
-        info[i].offset        = 0;
-        info[i].range         = VK_WHOLE_SIZE;
-        wr[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet          = set;
-        wr[i].dstBinding      = i;
-        wr[i].descriptorCount = 1;
-        wr[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        wr[i].pBufferInfo     = &info[i];
-    }
-    vkUpdateDescriptorSets(dev->device, n, wr, 0, nullptr);
-}
 
 // One set per dispatch: a command buffer references the set object, not its contents
 // (DECISIONS 65.2), and a pass records hundreds of dispatches.
@@ -289,7 +103,7 @@ int record(qrt_ffn * f, VkPipeline pipe, const VkBuffer * bufs, const qrt_ffn_pc
     if (alloc_set(f, &set, err, err_size) != 0) {
         return -1;
     }
-    write_set(f->dev, set, bufs, FFN_BINDINGS);
+    qrt_vk_write_set(f->dev, set, bufs, FFN_BINDINGS);
     vkCmdBindPipeline(f->ext, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(f->ext, VK_PIPELINE_BIND_POINT_COMPUTE, f->layout, 0, 1, &set, 0,
                             nullptr);
@@ -401,48 +215,24 @@ int qrt_ffn_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_pr
     memset(&f->bufs, 0, sizeof(f->bufs));
     const int external_slot = cfg->slot != VK_NULL_HANDLE && cfg->slot_bytes != 0;
 
-    VkDescriptorSetLayoutBinding b[FFN_BINDINGS];
-    memset(b, 0, sizeof(b));
-    for (uint32_t i = 0; i < FFN_BINDINGS; ++i) {
-        b[i].binding         = i;
-        b[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        b[i].descriptorCount = 1;
-        b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo dlci;
-    memset(&dlci, 0, sizeof(dlci));
-    dlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dlci.bindingCount = FFN_BINDINGS;
-    dlci.pBindings    = b;
-    if (vkCreateDescriptorSetLayout(dev->device, &dlci, nullptr, &f->dsl) != VK_SUCCESS) {
+    if (qrt_vk_make_set_layout(dev, FFN_BINDINGS, &f->dsl, err, err_size) != 0) {
         qrt_ffn_close(dev, f);
-        return fail(err, err_size, "vkCreateDescriptorSetLayout (ffn) failed");
+        return -1;
     }
-    VkPushConstantRange pcr;
-    memset(&pcr, 0, sizeof(pcr));
-    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pcr.size       = sizeof(qrt_ffn_pc);
-    VkPipelineLayoutCreateInfo plci;
-    memset(&plci, 0, sizeof(plci));
-    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount         = 1;
-    plci.pSetLayouts            = &f->dsl;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges    = &pcr;
-    if (vkCreatePipelineLayout(dev->device, &plci, nullptr, &f->layout) != VK_SUCCESS) {
+    if (qrt_vk_make_layout(dev, f->dsl, sizeof(qrt_ffn_pc), &f->layout, err, err_size) != 0) {
         qrt_ffn_close(dev, f);
-        return fail(err, err_size, "vkCreatePipelineLayout (ffn) failed");
+        return -1;
     }
-    if (make_pipeline(dev, f->layout, spv_dir, "ffn_router.spv", &f->pipe_router, err,
-                      err_size) != 0 ||
-        make_pipeline(dev, f->layout, spv_dir, "ffn_topk.spv", &f->pipe_topk, err,
-                      err_size) != 0 ||
-        make_pipeline(dev, f->layout, spv_dir, "ffn_gather.spv", &f->pipe_gather, err,
-                      err_size) != 0 ||
-        make_pipeline(dev, f->layout, spv_dir, "ffn_accum.spv", &f->pipe_accum, err,
-                      err_size) != 0 ||
-        make_pipeline(dev, f->layout, spv_dir, "ffn_out.spv", &f->pipe_out, err,
-                      err_size) != 0) {
+    if (qrt_vk_make_pipeline(dev, f->layout, spv_dir, "ffn_router.spv", nullptr, 0,
+                             &f->pipe_router, err, err_size) != 0 ||
+        qrt_vk_make_pipeline(dev, f->layout, spv_dir, "ffn_topk.spv", nullptr, 0,
+                             &f->pipe_topk, err, err_size) != 0 ||
+        qrt_vk_make_pipeline(dev, f->layout, spv_dir, "ffn_gather.spv", nullptr, 0,
+                             &f->pipe_gather, err, err_size) != 0 ||
+        qrt_vk_make_pipeline(dev, f->layout, spv_dir, "ffn_accum.spv", nullptr, 0,
+                             &f->pipe_accum, err, err_size) != 0 ||
+        qrt_vk_make_pipeline(dev, f->layout, spv_dir, "ffn_out.spv", nullptr, 0,
+                             &f->pipe_out, err, err_size) != 0) {
         qrt_ffn_close(dev, f);
         return -1;
     }
@@ -472,11 +262,11 @@ int qrt_ffn_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_pr
     do {
         char name[128];
         snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", layer);
-        if (read_f32(g, name, &f->h_router, err, err_size) != 0) {
+        if (qrt_gguf_read_f32(g, name, &f->h_router, err, err_size) != 0) {
             break;
         }
         snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp_shexp.weight", layer);
-        if (read_f32(g, name, &f->h_sgate_w, err, err_size) != 0) {
+        if (qrt_gguf_read_f32(g, name, &f->h_sgate_w, err, err_size) != 0) {
             break;
         }
         if (f->h_router.size() != (size_t) cfg->n_expert * cfg->n_embd ||
@@ -486,7 +276,7 @@ int qrt_ffn_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_pr
                  cfg->n_embd, cfg->n_embd);
             break;
         }
-        if (qrt_vk_staging_create(dev, FFN_STAGING_BYTES, &f->stg, err, err_size) != 0) {
+        if (qrt_vk_staging_create(dev, QRT_FFN_STAGING_BYTES, &f->stg, err, err_size) != 0) {
             break;
         }
         if (qrt_vk_alloc(dev, f->h_router.size() * 4,
@@ -553,7 +343,7 @@ int qrt_ffn_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_pr
             qrt_ffn_close(dev, f);
             return -1;
         }
-        if (loc.bytes > FFN_STAGING_BYTES || loc.bytes > UINT32_MAX - slot_bytes) {
+        if (loc.bytes > QRT_FFN_STAGING_BYTES || loc.bytes > UINT32_MAX - slot_bytes) {
             qrt_ffn_close(dev, f);
             return fail(err, err_size, "expert %u exceeds staging capacity or the layer slot exceeds 32-bit offsets", e);
         }
@@ -706,339 +496,6 @@ int qrt_ffn_route(qrt_ffn * f, const qrt_ffn_in * in, char * err, size_t err_siz
     return 0;
 }
 
-namespace {
-
-float half_bits_to_float(uint32_t h) {
-    const uint32_t sign = (h & 0x8000u) << 16;
-    const uint32_t exp = (h >> 10) & 0x1fu;
-    uint32_t mant = h & 0x3ffu;
-    uint32_t bits;
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            int e = 0;
-            while ((mant & 0x400u) == 0) {
-                mant <<= 1;
-                ++e;
-            }
-            bits = sign | ((uint32_t) (113 - e) << 23) | ((mant & 0x3ffu) << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7f800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp + 112u) << 23) | (mant << 13);
-    }
-    float v;
-    memcpy(&v, &bits, sizeof(v));
-    return v;
-}
-
-int expert_type_of(uint64_t bytes, uint32_t rows, uint32_t cols) {
-    const uint64_t vals = (uint64_t) rows * cols;
-    if (vals % 256u != 0) {
-        return -1;
-    }
-    const uint64_t q4 = vals / 256u * 144u;
-    const uint64_t q5 = vals / 256u * 176u;
-    const uint64_t q6 = vals / 256u * 210u;
-    if (bytes == q4) {
-        return QRT_CPU_Q4K;
-    }
-    if (bytes == q5) {
-        return QRT_CPU_Q5K;
-    }
-    if (bytes == q6) {
-        return QRT_CPU_Q6K;
-    }
-    return -1;
-}
-
-// One layer of the decode cache (M3-2a): unique experts -> residency probe -> split ->
-// slot assignment -> CPU leg and H2D leg, which is measured while the other runs.
-int cache_plan_layer(qrt_ffn * f, char * err, size_t err_size) {
-    const uint32_t NE = f->cfg.n_expert;
-    const uint32_t T = f->run_tokens;
-    const uint32_t E = f->cfg.n_embd;
-    const uint32_t K = f->cfg.top_k;
-    f->legs = {};
-    f->uniq.clear();
-    f->use_gpu.assign(NE, 1);
-    uint64_t layer_bytes = 0;
-    if (qrt_weights_layer_expert_bytes(f->store, f->layer, &layer_bytes) != 0) {
-        return fail(err, err_size, "layer %u has no expert size", f->layer);
-    }
-    std::vector<qrt_split_miss> miss;
-    std::vector<uint32_t> miss_uniq;
-    for (uint32_t e = 0; e < NE; ++e) {
-        if (f->cnt[e] == 0) {
-            continue;
-        }
-        const uint32_t u = (uint32_t) f->uniq.size();
-        f->uniq.push_back(e);
-        if (!qrt_cache_resident(f->cache, f->layer, e)) {
-            qrt_expert_loc loc;
-            if (qrt_weights_locate(f->store, f->layer, e, &loc, err, err_size) != 0) {
-                return -1;
-            }
-            qrt_split_miss m{};
-            m.expert = e;
-            m.bytes = loc.bytes;
-            m.tokens = f->cnt[e];
-            miss.push_back(m);
-            miss_uniq.push_back(u);
-        }
-    }
-    f->h2d_mask.assign(f->uniq.size(), 1);
-    std::vector<uint8_t> mm(miss.size(), 1);
-    qrt_split_stats ss{};
-    if (qrt_miss_split_plan(miss.data(), (uint32_t) miss.size(), f->miss_split, &f->rates,
-                            f->carry, mm.data(), &ss, err, err_size) != 0) {
-        return -1;
-    }
-    for (size_t i = 0; i < miss.size(); ++i) {
-        f->h2d_mask[miss_uniq[i]] = mm[i];
-    }
-    f->lookups.assign(f->uniq.size(), qrt_cache_lookup{});
-    if (qrt_cache_acquire_mask(f->cache, f->layer, f->uniq.data(),
-                               (uint32_t) f->uniq.size(), f->h2d_mask.data(),
-                               f->lookups.data(), err, err_size) != 0) {
-        f->legs.misses = (uint32_t) miss.size();
-        return -1;
-    }
-    f->cpu_pos.clear();
-    for (uint32_t i = 0; i < f->uniq.size(); ++i) {
-        const uint32_t e = f->uniq[i];
-        const qrt_cache_lookup & r = f->lookups[i];
-        if (r.hit) {
-            f->dev_off[e] = (uint32_t) ((uint64_t) r.slot * f->cache_slot_bytes);
-            ++f->legs.hits;
-        } else if (!r.failed && r.slot >= 0) {
-            f->dev_off[e] = (uint32_t) ((uint64_t) r.slot * f->cache_slot_bytes);
-            ++f->legs.h2d;
-        } else {
-            f->use_gpu[e] = 0;
-            f->cnt[e] = 0;
-            f->cpu_pos.push_back(i);
-            ++f->legs.cpu;
-        }
-    }
-    f->legs.misses = f->legs.h2d + f->legs.cpu;
-    if (f->uniq.empty()) {
-        return 0;
-    }
-
-    // The CPU leg reads the same Q8_1 planes the device produced for the layer row.
-    // ds packs the f16 delta in the low half and sum(q)+32768 in the high half.
-    const uint32_t nb = E / 32u;
-    f->cpu_out.clear();
-    f->cpu_res.clear();
-    if (!f->cpu_pos.empty()) {
-        f->cpu_out.assign((size_t) T * E, 0.0f);
-        f->cpu_res.assign((size_t) f->cpu_pos.size() * E, 0.0f);
-    }
-    std::vector<std::thread> workers;
-    std::vector<double> cpu_worker_ms;
-    std::atomic<int> cpu_failed{0};
-    if (!f->cpu_pos.empty()) {
-        f->h_x_qs.resize((size_t) T * E);
-        f->h_x_ds.resize((size_t) T * nb);
-        f->h_x_d.resize((size_t) T * nb);
-        f->h_x_s.resize((size_t) T * nb);
-        if (qrt_vk_download(f->dev, f->stg, f->in.x_qs, 0, f->h_x_qs.data(),
-                            (uint64_t) T * E, err, err_size) != 0 ||
-            qrt_vk_download(f->dev, f->stg, f->in.x_ds, 0, f->h_x_ds.data(),
-                            (uint64_t) T * nb * 4u, err, err_size) != 0) {
-            return -1;
-        }
-        for (uint32_t t = 0; t < T; ++t) {
-            for (uint32_t b = 0; b < nb; ++b) {
-                const uint32_t word = f->h_x_ds[(size_t) t * nb + b];
-                const float d = half_bits_to_float(word & 0xffffu);
-                const int32_t sum = (int32_t) (word >> 16) - 32768;
-                f->h_x_d[(size_t) t * nb + b] = d;
-                f->h_x_s[(size_t) t * nb + b] = d * (float) sum;
-            }
-        }
-        std::atomic<uint32_t> next{0};
-        uint32_t nthreads = (uint32_t) f->cpu_pos.size();
-        if (nthreads > 8) {
-            nthreads = 8;
-        }
-        cpu_worker_ms.assign(nthreads, 0.0);
-        for (uint32_t w = 0; w < nthreads; ++w) {
-            workers.emplace_back([&, w]() {
-                const double t_thread = now_ms();
-                char tls[256] = {0};
-                std::vector<unsigned char> buf((size_t) layer_bytes);
-                std::vector<float> row((size_t) E);
-                for (;;) {
-                    const uint32_t j = next.fetch_add(1);
-                    if (j >= f->cpu_pos.size()) {
-                        break;
-                    }
-                    const uint32_t e = f->uniq[f->cpu_pos[j]];
-                    qrt_expert_loc loc;
-                    if (qrt_weights_locate(f->store, f->layer, e, &loc, tls, sizeof(tls)) != 0 ||
-                        qrt_weights_read_expert(f->store, f->layer, e, buf.data(),
-                                                buf.size(), tls, sizeof(tls)) != 0) {
-                        cpu_failed = 1;
-                        break;
-                    }
-                    const int tg = expert_type_of(loc.gate, f->cfg.ffn, E);
-                    const int tu = expert_type_of(loc.up, f->cfg.ffn, E);
-                    const int td = expert_type_of(loc.down, E, f->cfg.ffn);
-                    if (tg < 0 || tu < 0 || td < 0) {
-                        cpu_failed = 1;
-                        break;
-                    }
-                    float * out = f->cpu_res.data() + (size_t) j * E;
-                    for (uint32_t t = 0; t < T; ++t) {
-                        for (uint32_t k = 0; k < K; ++k) {
-                            if (f->h_ids[(size_t) t * K + k] != e) {
-                                continue;
-                            }
-                            const float wgt = f->h_wts[(size_t) t * K + k];
-                            qrt_cpu_moe_expert_q8(
-                                f->cpu, tg, tu, td, buf.data(), buf.data() + loc.gate,
-                                buf.data() + loc.gate + loc.up,
-                                f->h_x_qs.data() + (size_t) t * E,
-                                f->h_x_d.data() + (size_t) t * nb,
-                                f->h_x_s.data() + (size_t) t * nb, (int) E,
-                                (int) f->cfg.ffn, row.data());
-                            for (uint32_t i = 0; i < E; ++i) {
-                                out[i] += wgt * row[i];
-                            }
-                        }
-                    }
-                }
-                cpu_worker_ms[w] = now_ms() - t_thread;
-            });
-        }
-    }
-
-    // H2D leg on this thread, beside the CPU workers. The misses are packed into the
-    // staging buffer and copied in one submit per staging load: a copy per expert costs
-    // a submit+fence each and measured 2.3 GB/s instead of the design's 9.9.
-    if (f->legs.h2d != 0) {
-        const double t_h = now_ms();
-        unsigned char * stage = (unsigned char *) qrt_vk_staging_map(f->stg);
-        if (stage == NULL) {
-            for (size_t w = 0; w < workers.size(); ++w) {
-                workers[w].join();
-            }
-            return fail(err, err_size, "staging is not mapped for the expert cache");
-        }
-        std::vector<qrt_vk_copy_region> regions;
-        uint64_t fill = 0;
-        auto join_workers = [&]() {
-            for (size_t w = 0; w < workers.size(); ++w) {
-                workers[w].join();
-            }
-        };
-        int h2d_rc = 0;
-        auto flush = [&]() -> int {
-            if (regions.empty()) {
-                return 0;
-            }
-            if (qrt_vk_upload_regions(f->dev, f->stg, regions.data(),
-                                      (uint32_t) regions.size(), err, err_size) != 0) {
-                return -1;
-            }
-            uint64_t bytes = 0;
-            for (size_t r = 0; r < regions.size(); ++r) {
-                bytes += regions[r].bytes;
-            }
-            qrt_cache_note_upload(f->cache, f->layer, bytes);
-            regions.clear();
-            fill = 0;
-            return 0;
-        };
-        for (uint32_t i = 0; i < f->uniq.size() && h2d_rc == 0; ++i) {
-            const qrt_cache_lookup & r = f->lookups[i];
-            if (r.hit || r.failed || r.slot < 0) {
-                continue;
-            }
-            const uint32_t e = f->uniq[i];
-            qrt_expert_loc loc;
-            if (qrt_weights_locate(f->store, f->layer, e, &loc, err, err_size) != 0 ||
-                loc.bytes > FFN_STAGING_BYTES) {
-                h2d_rc = -1;
-                break;
-            }
-            if (fill + loc.bytes > FFN_STAGING_BYTES && flush() != 0) {
-                h2d_rc = -1;
-                break;
-            }
-            if (qrt_weights_read_expert(f->store, f->layer, e, stage + fill,
-                                        FFN_STAGING_BYTES - fill, err, err_size) != 0) {
-                h2d_rc = -1;
-                break;
-            }
-            qrt_vk_copy_region reg;
-            reg.src = stage + fill;
-            reg.dst = f->cache_buf;
-            reg.dst_offset = (uint64_t) r.slot * f->cache_slot_bytes;
-            reg.bytes = loc.bytes;
-            regions.push_back(reg);
-            fill += loc.bytes;
-            f->legs.h2d_bytes += loc.bytes;
-        }
-        if (h2d_rc == 0 && flush() != 0) {
-            h2d_rc = -1;
-        }
-        if (h2d_rc != 0) {
-            join_workers();
-            return -1;
-        }
-        f->legs.h2d_ms = now_ms() - t_h;
-    }
-    if (!workers.empty()) {
-        for (size_t w = 0; w < workers.size(); ++w) {
-            workers[w].join();
-        }
-        if (cpu_failed) {
-            return fail(err, err_size, "layer %u CPU expert leg failed", f->layer);
-        }
-        // Busy time of the whole CPU leg: the mean over workers is its wall time while
-        // the H2D leg ran beside it.
-        double busy = 0.0;
-        for (size_t w = 0; w < cpu_worker_ms.size(); ++w) {
-            busy += cpu_worker_ms[w];
-        }
-        f->legs.cpu_ms = cpu_worker_ms.empty() ? 0.0 : busy / (double) cpu_worker_ms.size();
-    }
-
-    // Merge the per-expert CPU rows into the per-token routed sum.
-    for (uint32_t j = 0; j < f->cpu_pos.size(); ++j) {
-        const uint32_t e = f->uniq[f->cpu_pos[j]];
-        const float * res = f->cpu_res.data() + (size_t) j * E;
-        for (uint32_t t = 0; t < T; ++t) {
-            for (uint32_t k = 0; k < K; ++k) {
-                if (f->h_ids[(size_t) t * K + k] != e) {
-                    continue;
-                }
-                float * dst = f->cpu_out.data() + (size_t) t * E;
-                for (uint32_t i = 0; i < E; ++i) {
-                    dst[i] += res[i];  // the worker already applied the router weight
-                }
-            }
-        }
-    }
-
-    if (f->carry != NULL) {
-        f->carry->h2d_ms += f->legs.h2d_ms;
-        f->carry->cpu_ms += f->legs.cpu_ms;
-    }
-    if (f->legs.h2d != 0) {
-        qrt_miss_split_update(&f->rates, f->legs.h2d, f->legs.h2d_bytes, f->legs.h2d_ms,
-                              0, 0, 0.0);
-    }
-    return 0;
-}
-
-} // namespace
-
 int qrt_ffn_set_cache(qrt_ffn * f, const qrt_ffn_cache * cfg, char * err, size_t err_size) {
     if (f == NULL || cfg == NULL || cfg->cache == NULL) {
         return fail(err, err_size, "the expert cache needs a cache object");
@@ -1128,7 +585,7 @@ int qrt_ffn_group(qrt_ffn * f, char * err, size_t err_size) {
     if (f->cache_active) {
         // Residency, split and both miss legs. CPU-leg experts leave cnt at zero, so the
         // GPU rows and expert dispatches below cover the hit + H2D experts only.
-        if (cache_plan_layer(f, err, err_size) != 0) {
+        if (qrt_ffn_plan_cache_layer(f, err, err_size) != 0) {
             return -1;
         }
     } else {
@@ -1228,7 +685,7 @@ int qrt_ffn_group(qrt_ffn * f, char * err, size_t err_size) {
             rc = -1;
             break;
         }
-        if (loc.bytes > FFN_STAGING_BYTES || loc.bytes > tmp_bytes) {
+        if (loc.bytes > QRT_FFN_STAGING_BYTES || loc.bytes > tmp_bytes) {
             rc = fail(err, err_size, "expert %u exceeds upload capacity", e);
             break;
         }
@@ -1242,7 +699,7 @@ int qrt_ffn_group(qrt_ffn * f, char * err, size_t err_size) {
         }
         // Flush when the staging buffer is full or the slot offset is not contiguous.
         if (chunk_fill != 0 &&
-            (chunk_fill + loc.bytes > FFN_STAGING_BYTES ||
+            (chunk_fill + loc.bytes > QRT_FFN_STAGING_BYTES ||
              chunk_base + chunk_fill != (uint64_t) f->dev_off[e])) {
             if (flush() != 0) {
                 rc = -1;
@@ -1436,272 +893,5 @@ int qrt_ffn_experts(qrt_ffn * f, char * err, size_t err_size) {
     return 0;
 }
 
-// ---------------------------------------------------------------- reference
-
-namespace {
-
-float f16_to_f32_ref(uint32_t h) {
-    const uint32_t sign = (h & 0x8000u) << 16;
-    const uint32_t exp  = (h >> 10) & 0x1Fu;
-    uint32_t mant = h & 0x3FFu;
-    uint32_t bits;
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            int e = 0;
-            while ((mant & 0x400u) == 0) {
-                mant <<= 1;
-                ++e;
-            }
-            bits = sign | ((uint32_t) (113 - e) << 23) | ((mant & 0x3FFu) << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7F800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp + 112u) << 23) | (mant << 13);
-    }
-    float v;
-    memcpy(&v, &bits, sizeof(v));
-    return v;
-}
-
-// Q8_0 x Q8_1 row in double over the canonical 34-byte blocks.
-void q8_0_ref_row(const unsigned char * raw_row, uint32_t k, const signed char * a_qs,
-                  const uint32_t * a_ds, uint32_t tokens, std::vector<double> * out) {
-    out->assign(tokens, 0.0);
-    const uint32_t nb = k / 32u;
-    for (uint32_t t = 0; t < tokens; ++t) {
-        double acc = 0.0;
-        for (uint32_t b = 0; b < nb; ++b) {
-            const unsigned char * blk = raw_row + (size_t) b * 34u;
-            const double dw = (double) f16_to_f32_ref((uint32_t) blk[0] |
-                                                      ((uint32_t) blk[1] << 8));
-            const double aq = (double) f16_to_f32_ref(a_ds[(size_t) t * nb + b] & 0xFFFFu);
-            double sub = 0.0;
-            for (uint32_t e = 0; e < 32u; ++e) {
-                sub += (double) (int8_t) blk[2 + e] *
-                       (double) a_qs[((size_t) t * nb + b) * 32u + e];
-            }
-            acc += dw * aq * sub;
-        }
-        (*out)[t] = acc;
-    }
-}
-
-float silu(float x) { return x / (1.0f + expf(-x)); }
-
-} // namespace
-
-int qrt_ffn_ref_cpu(qrt_ffn * f, const float * xpost, const signed char * xpost_qs,
-                    const uint32_t * xpost_ds, uint32_t ref_tokens, float * logits,
-                    uint32_t * ids, float * weights, float * sgate, float * shexp,
-                    float * moe, char * err, size_t err_size) {
-    if (f == NULL || xpost == NULL || ref_tokens == 0 || ref_tokens > f->cfg.tokens) {
-        return fail(err, err_size, "the FFN reference needs a chunk and its post norm row");
-    }
-    const uint32_t E  = f->cfg.n_embd;
-    const uint32_t FF = f->cfg.ffn;
-    const uint32_t NE = f->cfg.n_expert;
-    const uint32_t K  = f->cfg.top_k;
-    const uint32_t T  = ref_tokens;
-
-    // the same Q8_1 rule the device applies to the post norm row, on the device's own planes
-    // when the caller passes them
-    std::vector<signed char> qs((size_t) T * E);
-    std::vector<uint32_t> ds((size_t) T * (E / 32u));
-    if (xpost_qs != NULL && xpost_ds != NULL) {
-        memcpy(qs.data(), xpost_qs, qs.size());
-        memcpy(ds.data(), xpost_ds, ds.size() * sizeof(uint32_t));
-    } else {
-        qrt_norm_quant_cpu(T, E, xpost, nullptr, qs.data(), ds.data());
-    }
-
-    std::vector<float> probs((size_t) T * NE);
-    std::vector<float> picked((size_t) K);
-    for (uint32_t t = 0; t < T; ++t) {
-        const float * row = xpost + (size_t) t * E;
-        double mx = -1e300;
-        for (uint32_t e = 0; e < NE; ++e) {
-            const float * w = f->h_router.data() + (size_t) e * E;
-            double acc = 0.0;
-            for (uint32_t i = 0; i < E; ++i) {
-                acc += (double) w[i] * (double) row[i];
-            }
-            probs[(size_t) t * NE + e] = (float) acc;
-            if (acc > mx) {
-                mx = acc;
-            }
-        }
-        double sum = 0.0;
-        for (uint32_t e = 0; e < NE; ++e) {
-            sum += exp((double) probs[(size_t) t * NE + e] - mx);
-        }
-        // selection: strict greater on the softmax value, so ties keep the lower id
-        std::vector<unsigned char> taken(NE, 0);
-        float norm = 0.0f;
-        for (uint32_t k = 0; k < K; ++k) {
-            float best = -3.0e38f;
-            uint32_t bi = 0;
-            for (uint32_t e = 0; e < NE; ++e) {
-                const float p = (float) (exp((double) probs[(size_t) t * NE + e] - mx) / sum);
-                if (taken[e] == 0 && p > best) {
-                    best = p;
-                    bi = e;
-                }
-            }
-            taken[bi] = 1;
-            picked[k] = best;
-            if (ids != NULL) {
-                ids[(size_t) t * K + k] = bi;
-            }
-            norm += best;
-        }
-        const float denom = norm > 6.103515625e-5f ? norm : 6.103515625e-5f;
-        if (weights != NULL) {
-            for (uint32_t k = 0; k < K; ++k) {
-                weights[(size_t) t * K + k] = picked[k] / denom * f->cfg.scale;
-            }
-        }
-        if (logits != NULL) {
-            memcpy(logits + (size_t) t * NE, probs.data() + (size_t) t * NE,
-                   (size_t) NE * sizeof(float));
-        }
-    }
-
-    // shared expert: q8_0 gate/up, silu*up, the Q8_1 rule again, q8_0 down
-    std::vector<float> gh((size_t) T * FF), uh((size_t) T * FF);
-    std::vector<double> row;
-    for (uint32_t r = 0; r < FF; ++r) {
-        q8_0_ref_row(f->h_gate.data() + (size_t) r * (E / 32u) * 34u, E, qs.data(),
-                     ds.data(), T, &row);
-        for (uint32_t t = 0; t < T; ++t) {
-            gh[(size_t) t * FF + r] = (float) row[t];
-        }
-        q8_0_ref_row(f->h_up.data() + (size_t) r * (E / 32u) * 34u, E, qs.data(), ds.data(),
-                     T, &row);
-        for (uint32_t t = 0; t < T; ++t) {
-            uh[(size_t) t * FF + r] = (float) row[t];
-        }
-    }
-    std::vector<float> h((size_t) T * FF);
-    for (size_t i = 0; i < h.size(); ++i) {
-        h[i] = silu(gh[i]) * uh[i];
-    }
-    std::vector<signed char> hqs((size_t) T * FF);
-    std::vector<uint32_t> hds((size_t) T * (FF / 32u));
-    qrt_norm_quant_cpu(T, FF, h.data(), nullptr, hqs.data(), hds.data());
-    std::vector<float> gate_out((size_t) T);
-    for (uint32_t t = 0; t < T; ++t) {
-        double acc = 0.0;
-        for (uint32_t i = 0; i < E; ++i) {
-            acc += (double) f->h_sgate_w[i] * (double) xpost[(size_t) t * E + i];
-        }
-        gate_out[t] = (float) acc;
-    }
-    if (sgate != NULL) {
-        memcpy(sgate, gate_out.data(), (size_t) T * sizeof(float));
-    }
-    if (shexp != NULL) {
-        for (uint32_t r = 0; r < E; ++r) {
-            q8_0_ref_row(f->h_down.data() + (size_t) r * (FF / 32u) * 34u, FF, hqs.data(),
-                         hds.data(), T, &row);
-            for (uint32_t t = 0; t < T; ++t) {
-                shexp[(size_t) t * E + r] = (float) row[t];
-            }
-        }
-    }
-
-    // routed experts over the pairs of the first ref_tokens tokens
-    if (moe != NULL) {
-        memset(moe, 0, (size_t) T * E * sizeof(float));
-        std::vector<std::vector<uint32_t>> tok_of(NE), slot_of(NE);
-        for (uint32_t t = 0; t < T; ++t) {
-            for (uint32_t k = 0; k < K; ++k) {
-                const uint32_t e = ids[(size_t) t * K + k];
-                tok_of[e].push_back(t);
-                slot_of[e].push_back(k);
-            }
-        }
-        unsigned char * blk = (unsigned char *) malloc((size_t) qrt_weights_max_expert_bytes(f->store));
-        std::vector<signed char> rqs((size_t) T * E);
-        std::vector<uint32_t> rds((size_t) T * (E / 32u));
-        std::vector<float> rh((size_t) T * FF);
-        std::vector<float> rgh((size_t) T * FF), ruh((size_t) T * FF);
-        std::vector<signed char> rhqs((size_t) T * FF);
-        std::vector<uint32_t> rhds((size_t) T * (FF / 32u));
-        std::vector<float> sums((size_t) T * E);
-        int rc = blk == NULL ? -1 : 0;
-        for (uint32_t e = 0; e < NE && rc == 0; ++e) {
-            const uint32_t n = (uint32_t) tok_of[e].size();
-            if (n == 0) {
-                continue;
-            }
-            qrt_expert_loc loc;
-            if (qrt_weights_locate(f->store, f->layer, e, &loc, err, err_size) != 0 ||
-                qrt_weights_read_expert(f->store, f->layer, e, blk, (size_t) loc.bytes, err,
-                                        err_size) != 0) {
-                rc = -1;
-                break;
-            }
-            const int t_gate = qrt_gemm_type_of(FF, E, loc.gate);
-            const int t_up   = qrt_gemm_type_of(FF, E, loc.up);
-            const int t_down = qrt_gemm_type_of(E, FF, loc.down);
-            if (t_gate < 0 || t_up < 0 || t_down < 0) {
-                rc = fail(err, err_size, "reference: expert %u has an unknown type", e);
-                break;
-            }
-            for (uint32_t r = 0; r < n; ++r) {
-                memcpy(rqs.data() + (size_t) r * E, qs.data() + (size_t) tok_of[e][r] * E,
-                       E);
-                memcpy(rds.data() + (size_t) r * (E / 32u),
-                       ds.data() + (size_t) tok_of[e][r] * (E / 32u), (E / 32u) * 4);
-            }
-            const unsigned char * wg = blk;
-            const unsigned char * wu = blk + loc.gate;
-            const unsigned char * wd = blk + loc.gate + loc.up;
-            const uint32_t nb_g = E / 256u;
-            const uint32_t nb_d = FF / 256u;
-            for (uint32_t r = 0; r < FF; ++r) {
-                qrt_moe_ref_row(wg + (size_t) r * nb_g * qrt_gemm_block_bytes((qrt_quant) t_gate),
-                                (qrt_quant) t_gate, (const unsigned char *) rqs.data(),
-                                rds.data(), E, n, row.data());
-                for (uint32_t j = 0; j < n; ++j) {
-                    rgh[(size_t) j * FF + r] = (float) row[j];
-                }
-                qrt_moe_ref_row(wu + (size_t) r * nb_g * qrt_gemm_block_bytes((qrt_quant) t_up),
-                                (qrt_quant) t_up, (const unsigned char *) rqs.data(),
-                                rds.data(), E, n, row.data());
-                for (uint32_t j = 0; j < n; ++j) {
-                    ruh[(size_t) j * FF + r] = (float) row[j];
-                }
-            }
-            for (uint32_t j = 0; j < n; ++j) {
-                for (uint32_t r = 0; r < FF; ++r) {
-                    rh[(size_t) j * FF + r] =
-                        silu(rgh[(size_t) j * FF + r]) * ruh[(size_t) j * FF + r];
-                }
-            }
-            qrt_norm_quant_cpu(n, FF, rh.data(), nullptr, rhqs.data(), rhds.data());
-            for (uint32_t r = 0; r < E; ++r) {
-                qrt_moe_ref_row(wd + (size_t) r * nb_d * qrt_gemm_block_bytes((qrt_quant) t_down),
-                                (qrt_quant) t_down, (const unsigned char *) rhqs.data(),
-                                rhds.data(), FF, n, row.data());
-                for (uint32_t j = 0; j < n; ++j) {
-                    const uint32_t t = tok_of[e][j];
-                    const uint32_t k = slot_of[e][j];
-                    moe[(size_t) t * E + r] +=
-                        weights[(size_t) t * K + k] * (float) row[j];
-                }
-            }
-        }
-        free(blk);
-        if (rc != 0) {
-            return -1;
-        }
-    }
-    return 0;
-}
 
 #endif // QRT_HAVE_VULKAN
-

@@ -1,5 +1,6 @@
 #include "prefill.h"
 #include "weights.h"
+#include "vk_transfer.h"
 
 #include <algorithm>
 #include <atomic>
