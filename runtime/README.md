@@ -519,7 +519,37 @@ result of all of them (M3-2c). `--generate-batch K`
 feeds K prompt rows per pass: a teacher-forced diagnostic for the k=5 legs, not an acceptance
 path. `--miss-split` takes auto or the fixed 0..100 control arms.
 
-## Speculation cycle (M3-3)
+## MTP draft (M3-3b)
+
+`qrt --generate <gguf> ... --spec-mtp [--spec-k 4] [--draft-vocab 16384
+--draft-vocab-path bench/vocab/draft-16k.bin]` replaces the one-token serial decode with
+design 5.4's cycle: the MTP block drafts k-1 tokens, one pass verifies them beside the last
+accepted token, and the cycle emits the accepted prefix plus the verified bonus.
+`--spec-check --spec-mtp` runs the same cycles against a serial greedy arm, which is how the
+accept/rollback contract is gated against a draft source that nobody controls.
+
+The block is `blk.<block_count - nextn>`, a full-attention MoE layer of the same store that
+shares `token_embd` and `output` with the main model. Its `ffn_gate_inp` is bf16 while the
+main layers' are f32, so the router is read through `qrt_gguf_read_f32_any` (f32/f16/bf16
+only; everything gated on f32 storage keeps demanding it). A draft step is:
+
+```
+h_prev = last kept row of the verified pass, normed by output_norm   (the fork's t_h_nextn)
+concat = [ rms_norm(token_embd[tok], enorm ), rms_norm(h_prev, hnorm) ]
+x      = nextn.eh_proj . concat
+out    = blk.40(x) at the position the draft would take
+h_next = rms_norm(out, shared_head_norm)      -> also the draft head's input
+```
+
+The head reads only the candidate rows of `output.weight`, which is why `QRT_DRAFT_VOCAB` is
+16384 by default: the whole vocabulary is 512 MiB per step against 42.5 MiB gathered.
+`--draft-vocab 0` keeps the full-vocabulary draft, the correctness baseline of design 4.1.
+The block takes part of the decode expert cache (its own slot array in the same plan, indexed
+by its position in the session, which is why `qrt_ffn_cache` carries a cache layer distinct
+from the block index), and its KV rows need no rollback: a rejected draft leaves a row that
+the next cycle overwrites before anything reads it.
+
+
 
 `qrt --spec-check <gguf> --logits-tokens <ids> --generate-new 12 --layer-store <prefix>
 --logits-layers 4 --spec-k 4 [--spec-rollback off] [--telemetry 1 --telemetry-path f.csv]`
