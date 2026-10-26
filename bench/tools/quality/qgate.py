@@ -155,10 +155,12 @@ def main(argv):
     q = sub.add_parser("selftest", help="synthetic format and metric tests")
     q.set_defaults(fn=cmd_selftest)
 
+    import workflow
+    workflow.add_parser(sub)
     args = p.parse_args(argv)
     try:
         return args.fn(args)
-    except logitio.DumpError as e:
+    except (logitio.DumpError, OSError) as e:
         print("ERROR: %s" % e, file=sys.stderr)
         return 2
 

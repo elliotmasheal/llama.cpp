@@ -81,7 +81,15 @@ python bench/tools/quality/qgate.py verify dump.bin
 
 # 合成数据自测（格式 + 指标，应 9/9）
 python bench/tools/quality/selftest.py
+
+# 全流程：构建 -> qrt CTest -> 自检 -> 配置 -> 索引 -> 40 层前向 -> 格式校验 [-> 对比]
+python bench/tools/quality/qgate.py run --qrt build-vulkan/bin/qrt.exe \
+    --model <gguf> --store <repack-prefix> --tokens <ids> \
+    --output-dir bench/raw/<新目录> --rows 16 [--baseline <同 token 流转储> --align]
 ```
+
+`run` 不覆盖已有输出目录，首个非 0 退出即停，命令/退出码/日志路径进 `workflow.json`；
+`--baseline` 的对比退出码 3 原样保留。它是诊断链，不判性能或独立模型质量门。
 
 ## 5. 生成参考基线的命令
 
@@ -107,4 +115,4 @@ powershell -File bench/tools/quality/reference.ps1 -Out bench/raw/x-1/ref-t5.bin
 - fork 转储的 KLD 分辨率受 16 nat 地板与 u16 量化限制，`< 1e-6` 的差异读不出来；要更细就得改成 fp32 转储（rt 格式已经是 fp32）。
 - 地板把尾部抹掉：两份转储在地板以下都只看到夹值，所以"被测实现把某些低频词的排序打乱"这类错误不会被 KLD 抓到。
 - PPL 只覆盖被转储的行（每个 chunk 的后半窗口），不是标准 wikitext PPL；跨口径不可比。
-- rt 转储还没实现，阻塞在 qrt 有 logits 出口（M2-7）。工具侧不需要再改。
+- `qrt --logits-dump` 已提供 rt 转储；成功写盘或格式校验不代表独立模型质量门通过。
