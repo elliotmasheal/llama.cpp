@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <vector>
+
 #ifdef QRT_HAVE_VULKAN
 
 namespace {
@@ -1086,6 +1088,93 @@ int qrt_vk_upload_mapped(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer dst,
     return staging_copy(dev, stg, dst, dst_offset, bytes, 1, err, err_size);
 }
 
+int qrt_vk_upload_regions(qrt_vk_dev * dev, qrt_vk_staging * stg,
+                          const qrt_vk_copy_region * regions, uint32_t count,
+                          char * err, size_t err_size) {
+    if (stg == NULL || regions == NULL || count == 0) {
+        ++dev->io_failures;
+        return fail(err, err_size, "region upload needs a staging buffer and regions");
+    }
+    if (stg->map == NULL || stg->pending) {
+        ++dev->io_failures;
+        return fail(err, err_size, "the staging buffer is not free for a region upload");
+    }
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (regions[i].src == NULL || regions[i].bytes == 0) {
+            ++dev->io_failures;
+            return fail(err, err_size, "region %u has no source or size", i);
+        }
+        if (regions[i].bytes > stg->bytes - total ||
+            buf_reg_check(regions[i].dst, regions[i].dst_offset, regions[i].bytes, err,
+                          err_size) != 0) {
+            ++dev->io_failures;
+            return -1;
+        }
+        total += regions[i].bytes;
+    }
+    // Pack the sources only when they are not already in packed order: the cache path
+    // reads experts straight to their packed offsets, so this is the common case.
+    {
+        const unsigned char * base = (const unsigned char *) stg->map;
+        uint64_t packed = 0;
+        int in_place = 1;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (regions[i].src != base + packed) {
+                in_place = 0;
+                break;
+            }
+            packed += regions[i].bytes;
+        }
+        if (!in_place) {
+            std::vector<unsigned char> tmp((size_t) total);
+            packed = 0;
+            for (uint32_t i = 0; i < count; ++i) {
+                memcpy(tmp.data() + packed, regions[i].src, (size_t) regions[i].bytes);
+                packed += regions[i].bytes;
+            }
+            memcpy(stg->map, tmp.data(), (size_t) total);
+        }
+    }
+    VkResult r = vkResetFences(dev->device, 1, &stg->fence);
+    if (r != VK_SUCCESS) {
+        return staging_fail(dev, err, err_size, "vkResetFences", r);
+    }
+    VkCommandBufferBeginInfo bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    r = vkBeginCommandBuffer(stg->cmd, &bi);
+    if (r != VK_SUCCESS) {
+        return staging_fail(dev, err, err_size, "vkBeginCommandBuffer", r);
+    }
+    uint64_t src_off = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        VkBufferCopy region;
+        memset(&region, 0, sizeof(region));
+        region.srcOffset = src_off;
+        region.dstOffset = regions[i].dst_offset;
+        region.size      = regions[i].bytes;
+        vkCmdCopyBuffer(stg->cmd, stg->buffer, regions[i].dst, 1, &region);
+        src_off += regions[i].bytes;
+    }
+    r = vkEndCommandBuffer(stg->cmd);
+    if (r != VK_SUCCESS) {
+        return staging_fail(dev, err, err_size, "vkEndCommandBuffer", r);
+    }
+    VkSubmitInfo si;
+    memset(&si, 0, sizeof(si));
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &stg->cmd;
+    r = vkQueueSubmit(dev->transfer_queue, 1, &si, stg->fence);
+    if (r != VK_SUCCESS) {
+        return staging_fail(dev, err, err_size, "vkQueueSubmit", r);
+    }
+    stg->pending = 1;
+    return qrt_vk_staging_wait(dev, stg, err, err_size);
+}
+
 int qrt_vk_upload_submit(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer dst,
                          uint64_t dst_offset, uint64_t bytes, char * err, size_t err_size) {
     if (stg == NULL || bytes == 0) {
@@ -1244,6 +1333,17 @@ int qrt_vk_download_mapped(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer src,
     (void) src;
     (void) src_offset;
     (void) bytes;
+    snprintf(err, err_size, "this build has no Vulkan");
+    return -1;
+}
+
+int qrt_vk_upload_regions(qrt_vk_dev * dev, qrt_vk_staging * stg,
+                          const qrt_vk_copy_region * regions, uint32_t count,
+                          char * err, size_t err_size) {
+    (void) dev;
+    (void) stg;
+    (void) regions;
+    (void) count;
     snprintf(err, err_size, "this build has no Vulkan");
     return -1;
 }

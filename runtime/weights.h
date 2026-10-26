@@ -34,6 +34,11 @@ const char * qrt_weights_arch(const qrt_weights * w);
 uint64_t qrt_weights_max_expert_bytes(const qrt_weights * w);
 uint64_t qrt_weights_min_expert_bytes(const qrt_weights * w);
 
+// Expert block bytes of one layer. Every expert of a layer has the same type mix in
+// this model, and the cache sizes its slots per layer from this value (M3-2a).
+// Returns -1 for an out-of-range layer or a missing record.
+int qrt_weights_layer_expert_bytes(const qrt_weights * w, uint32_t layer, uint64_t * out);
+
 // Returns -1 with a message when the pair is unknown or out of range.
 int qrt_weights_locate(const qrt_weights * w, uint32_t layer, uint32_t expert,
                        qrt_expert_loc * out, char * err, size_t err_size);

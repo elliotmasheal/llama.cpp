@@ -11,6 +11,7 @@
 #else
 typedef struct VkBuffer_T *      VkBuffer;
 typedef struct VkDeviceMemory_T *VkDeviceMemory;
+typedef struct VkCommandBuffer_T *VkCommandBuffer;
 typedef uint32_t                 VkBufferUsageFlags;
 #ifndef VK_NULL_HANDLE
 #define VK_NULL_HANDLE 0
@@ -123,6 +124,20 @@ int qrt_vk_upload_mapped(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer dst,
                          uint64_t dst_offset, uint64_t bytes, char * err, size_t err_size);
 int qrt_vk_download_mapped(qrt_vk_dev * dev, qrt_vk_staging * stg, VkBuffer src,
                            uint64_t src_offset, uint64_t bytes, char * err, size_t err_size);
+
+// Several device copies from one staging buffer in one submit (M3-2a): the sources
+// are packed back to back into the mapping by the caller, and the regions may target
+// different buffers and offsets (the decode cache slots are not contiguous). The
+// sum of bytes must fit the staging buffer. Waits for the submit before returning.
+struct qrt_vk_copy_region {
+    const void * src;          // inside the staging mapping
+    VkBuffer     dst;
+    uint64_t     dst_offset;
+    uint64_t     bytes;
+};
+int qrt_vk_upload_regions(qrt_vk_dev * dev, qrt_vk_staging * stg,
+                          const qrt_vk_copy_region * regions, uint32_t count,
+                          char * err, size_t err_size);
 
 // Fire and forget: the copy is in flight when this returns. Keep one staging
 // buffer per copy in flight and wait before touching its mapping again; this is

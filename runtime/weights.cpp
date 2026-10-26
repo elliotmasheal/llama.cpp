@@ -321,6 +321,18 @@ const char * qrt_weights_arch(const qrt_weights * w) { return w->arch; }
 uint64_t qrt_weights_max_expert_bytes(const qrt_weights * w) { return w->max_expert; }
 uint64_t qrt_weights_min_expert_bytes(const qrt_weights * w) { return w->min_expert; }
 
+int qrt_weights_layer_expert_bytes(const qrt_weights * w, uint32_t layer, uint64_t * out) {
+    if (w == NULL || out == NULL || layer >= w->layers) {
+        return -1;
+    }
+    const qrt_expert_loc & loc = w->loc[(size_t) layer * w->experts];
+    if (loc.bytes == 0) {
+        return -1;
+    }
+    *out = loc.bytes;
+    return 0;
+}
+
 int qrt_weights_locate(const qrt_weights * w, uint32_t layer, uint32_t expert,
                        qrt_expert_loc * out, char * err, size_t err_size) {
     if (layer >= w->layers || expert >= w->experts) {
