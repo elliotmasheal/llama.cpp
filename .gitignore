@@ -157,6 +157,7 @@ AGENTS.local.md
 # Local scratch and bench byproducts
 
 /.worktrees/
+/.qoder/
 /.research/
 /.dsh-acl-recovery/
 /pocs/
