@@ -3952,8 +3952,8 @@ M3-3 的常驻回归（教师强制、`--miss-split 0`，k=2/4/8）在同一二�
 ## 93. M3-7：输出头与 argmax 上设备，端到端流程第一次跑通真实规模（2026-10-26）
 <!-- slug: m3-7-device-head -->
 
-口径：工作区 `c7db2599a` + 未提交 diff；`build-vulkan`（Release/MinGW/Ninja，Vulkan）；模型与
-store 同 92；日志在 `bench/raw/m3-7/`。这一轮的动机是端到端可用：`--generate` 的 pass 里
+口径：`7fccae9df`（工作区 `c7db2599a` 上的未提交增量，与本轮 M2-8a/M3-3c 一并合入）；
+`build-vulkan`（Release/MinGW/Ninja，Vulkan）；模型与 store 同 92；日志在 `bench/raw/m3-7/`。这一轮的动机是端到端可用：`--generate` 的 pass 里
 **3.3 s 中有 3.0 s 是 host 输出头**（`qrt_model_head_rows` 逐行 pread 2176 B、用 double 做
 248320 x 2048 点积，还要与 CPU 专家腿抢核），design 4.6 本来就把采样放在设备上。
 
@@ -4055,15 +4055,14 @@ store 同 92；日志在 `bench/raw/m3-7/`。这一轮的动机是端到端可�
 - 没做：批量草稿（仍是 k-1 次 1 行块前向）、`nextn.eh_proj` 上设备（草稿步 40 ms 里约 25 ms 是它）、
   每 pass 单条命令缓冲（M3-2b，绑定腿 235 -> ~23 ms 的那一步）、256K 上下文、r>=3 的正式性能批次
   （本表的 ms 是单次读数，不是正式批次）。
-- 未提交（无提交授权）。
+- 已提交 `7fccae9df`。
 
 
 
 ## 94. M2-8a：会话级 scratch arena + 共享 staging，40 层常驻的 prefill chunk 从 32 提到 2048（2026-10-27）
 <!-- slug: m2-8a-shared-arena -->
 
-口径：工作区 `c7db2599a` + 未提交 diff（M3-7 设备头 + 本轮 M2-8a）；`build-vulkan`（Release/MinGW/Ninja，
-Vulkan）；模型与 store 同 92/93。`--prefill-chunk` 覆盖 `QRT_PREFILL_CHUNK`。日志、dump 与复现脚本在
+口径：`7fccae9df`（M3-7 设备头 + 本轮 M2-8a 一并合入）；`build-vulkan`（Release/MinGW/Ninja，Vulkan）；模型与 store 同 92/93。`--prefill-chunk` 覆盖 `QRT_PREFILL_CHUNK`。日志、dump 与复现脚本在
 `bench/raw/m2-8a/`，`v2-*` 是修好 sizing 公式后的最终二进制（本节的读数全部来自它）。prefill 计时是两个
 入口的单次读数：会话的 `generate_prefill_total`，以及 `--logits-dump` 的 40 个 `model_layer ms` 之和；
 不是 r>=3 的正式性能批次。
@@ -4153,12 +4152,12 @@ Vulkan）；模型与 store 同 92/93。`--prefill-chunk` 覆盖 `QRT_PREFILL_CH
 - 16 token 的 E 是诊断，不是 TG 读数；本节所有 ms 都是单次，不是正式批次（r>=3）。
 - 未在 256K 上下文、paged KV、`--layer-pass off` 的会话组合上重跑；`--logits-dump` 与 check 路径
   不挂 arena，行为不变。
-- 未提交（无提交授权）。
+- 已提交 `7fccae9df`。
 
 ## 95. M3-3c：MTP 块的 prompt/验证行 KV 就是 E 的缺口，E 2.31 -> 2.76-2.84（2026-10-27）
 <!-- slug: m3-3c-mtp-kv -->
 
-口径：工作区 `c7db2599a` + 未提交 diff；`build-vulkan`（Release/MinGW/Ninja，Vulkan）；模型/store 同 92/93；
+口径：`7fccae9df`；`build-vulkan`（Release/MinGW/Ninja，Vulkan）；模型/store 同 92/93；
 10.4K prompt 用 `bench/raw/review-20261026/tokens10428.txt`（10428 token，fork 第 19 节用的是模板后的
 10438，差 10 个 token）；k=4、16K 候选、q8_0 K + q4_0 V、`--expert-cache-mib 4198` + `auto`、device 头、
 chunk 2048、128 new。日志在 `bench/raw/m3-3c/`。E 按 bench/README 口径是"生成 token / 周期数"；
@@ -4222,4 +4221,4 @@ chunk 2048、128 new。日志在 `bench/raw/m3-3c/`。E 按 bench/README 口径�
 
 - 缓存开启的 E 流与 93.3 的 128 个 ids 在第 47 个分叉：两轮的缓存档不同（3385/3072 MiB）且
   `auto` 分担不同，属于 93.4 已记录的缓存腿敏感；正确性由缓存关闭的 spec-check 判（逐位）。
-- 未提交（无提交授权）。
+- 已提交 `7fccae9df`。
