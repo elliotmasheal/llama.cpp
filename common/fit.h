@@ -44,6 +44,7 @@ bool common_moe_plan_get(
      const llama_context_params * cparams,
                     const size_t * margins,      // margins of memory to leave per device in bytes
                              bool   kv_page_auto, // fill plan.kv_page from the budget
+                          int32_t   fit_plan,     // 1 = tier-scaled margins + per-group rings, 0 = legacy
               common_moe_plan * out,
                 ggml_log_level log_level);       // minimum log level to print during the measurement
 

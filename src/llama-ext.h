@@ -95,6 +95,9 @@ struct llama_moe_geometry {
     int32_t n_expert_used  = 0;
     int32_t n_layer_expert = 0;        // number of layers with expert tensors
     std::vector<int64_t> expert_bytes; // [n_layer] bytes of the expert tensors of each layer, 0 if none
+    // [n_layer] hash of the expert tensor types, the grouping key of the MoE cache: layers with the same
+    // layout share one bank, so the prefetch rings have to fit in each group separately
+    std::vector<uint64_t> expert_layout;
 };
 
 LLAMA_API llama_moe_geometry llama_model_get_moe_geometry(const struct llama_model * model);

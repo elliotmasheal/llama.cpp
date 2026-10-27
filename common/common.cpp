@@ -1287,7 +1287,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         if (env_plan == nullptr || atoi(env_plan) != 0) {
             common_moe_plan plan;
             const bool planned = common_moe_plan_get(params.model.path.c_str(), &mparams, &cparams,
-                    params.fit_params_target.data(), params.kv_page < 0, &plan,
+                    params.fit_params_target.data(), params.kv_page < 0, params.fit_plan, &plan,
                     params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
             if (planned && !params.moe_cache_size_set && plan.cache_bytes > 0) {
                 params.moe_cache_size = plan.cache_bytes;

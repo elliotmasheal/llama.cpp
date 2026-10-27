@@ -606,6 +606,7 @@ struct common_params {
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     bool moe_cache_size_set = false; // whether --moe-cache-mib was given, otherwise the memory plan may set it
     bool moe_hybrid = false;   // small batches compute the experts that are not in the MoE cache on the CPU
+    int32_t fit_plan = 1;      // memory plan rules: 1 = tier-scaled margins and per-group prefetch, 0 = legacy
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

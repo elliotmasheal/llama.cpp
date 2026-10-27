@@ -3544,14 +3544,18 @@ llama_moe_geometry llama_model_get_moe_geometry(const struct llama_model * model
     res.n_expert       = model->hparams.n_expert;
     res.n_expert_used  = model->hparams.n_expert_used_max();
     res.expert_bytes.assign(model->layers.size(), 0);
+    res.expert_layout.assign(model->layers.size(), 0);
 
     for (size_t il = 0; il < model->layers.size(); ++il) {
         const llama_layer & layer = model->layers[il];
+        uint64_t layout = 0;
         for (const ggml_tensor * t : {layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps}) {
             if (t != nullptr) {
                 res.expert_bytes[il] += (int64_t) ggml_nbytes(t);
+                layout = (layout << 8) | (uint64_t) (int64_t) t->type;
             }
         }
+        res.expert_layout[il] = layout;
         if (res.expert_bytes[il] > 0) {
             res.n_layer_expert++;
         }

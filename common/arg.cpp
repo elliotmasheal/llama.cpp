@@ -2465,6 +2465,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_BLOCK"));
     add_opt(common_arg(
+        {"--fit-plan"}, "N",
+        "rules the MoE memory plan uses: 0 = the flat fit margin, the score reserve always on the device\n"
+        "and the prefetch rings checked against the whole bank; 1 = the margin scales with the tier, the\n"
+        "score reserve follows the attention placement and the rings are checked per expert group\n"
+        "(default: 1, bench/RESULTS.md 0.5)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1) {
+                throw std::invalid_argument("expected 0 or 1");
+            }
+            params.fit_plan = value;
+        }
+    ).set_env("LLAMA_ARG_FIT_PLAN"));
+    add_opt(common_arg(
         {"--kv-gather-mib"}, "N",
         "MiB of dense workspace that the paged prefill path gathers the K/V blocks into: the long-span\n"
         "attention reads the workspace instead of the block table, so paging keeps the -fac gain\n"

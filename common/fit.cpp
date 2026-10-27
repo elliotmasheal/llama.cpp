@@ -900,10 +900,18 @@ static bool common_moe_plan_impl(
         const llama_context_params * cparams,
         const size_t * margins_s,
         bool kv_page_auto,
+        int32_t fit_plan,
         common_moe_plan * out,
         ggml_log_level log_level) {
     constexpr int64_t MiB = 1024*1024;
     constexpr int64_t GiB = 1024*MiB;
+
+    // plan v2: the margin scales with the tier, the score reserve follows the attention placement and the
+    // prefetch rings are checked per expert group. LLAMA_FIT_PLAN overrides --fit-plan for the A/B runs
+    if (const char * env_plan = getenv("LLAMA_FIT_PLAN")) {
+        fit_plan = atoi(env_plan);
+    }
+    const bool plan_v2 = fit_plan != 0;
 
     *out = common_moe_plan{};
 
@@ -942,11 +950,19 @@ static bool common_moe_plan_impl(
     int64_t compute     = 0;
     int64_t model_bytes = (int64_t) dmds.back().mb.model;
     int64_t surplus     = 0;
+    int64_t margin_used = 0;
     for (size_t id = 0; id < nd; id++) {
+        // a flat margin costs 25% of a 4 GiB tier and 17% of a 6 GiB one; the bank only needs allocation
+        // slack, so scale the configured margin down to an eighth of the free memory
+        int64_t margin = (int64_t) margins_s[id];
+        if (plan_v2) {
+            margin = std::max<int64_t>(256*MiB, std::min<int64_t>(margin, (int64_t) dmds[id].free/8));
+        }
+        margin_used += margin;
         kv_bytes    += (int64_t) dmds[id].mb.context;
         compute     += (int64_t) dmds[id].mb.compute;
         model_bytes += (int64_t) dmds[id].mb.model;
-        surplus     += (int64_t) dmds[id].free - (int64_t) dmds[id].mb.total() - (int64_t) margins_s[id];
+        surplus     += (int64_t) dmds[id].free - (int64_t) dmds[id].mb.total() - margin;
     }
 
     int64_t expert_total = 0;
@@ -956,8 +972,13 @@ static bool common_moe_plan_impl(
     // at n_kv = n_ctx the criterion declines it, so the compute size measured above is short by that much.
     // Keep it out of the bank, otherwise the device spills in the middle of a long prompt
     // (bench/RESULTS.md 2.2: +1276.7 MiB measured, nothing reserved).
-    const int64_t fa_score = cparams_plan.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ? 0 :
+    int64_t fa_score = cparams_plan.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ? 0 :
         llama_fa_long_kv_reserve_bytes(meas.n_head, meas.n_ubatch, meas.n_ctx, cparams_plan.fa_chunk_mib);
+    // without offload_kqv the whole attention subgraph is pinned to the host (llama-graph.cpp), so the
+    // score buffer is host memory and must not be taken from the device surplus
+    if (plan_v2 && !cparams_plan.offload_kqv) {
+        fa_score = 0;
+    }
 
     // --kv-page auto: `surplus` is what the MoE bank would get, i.e. the device room left after the model,
     // the initial K/V and the compute buffers. If even the score reserve does not fit, the configuration is
@@ -990,9 +1011,37 @@ static bool common_moe_plan_impl(
     if (bank < per_expert*geo.n_expert_used) {
         bank = 0;
     }
+    // a bank far below one token of expert working set only pays for the lookup splits: at the 4 GiB tier
+    // 116 MiB made decode 12.4 -> 10.3 t/s, so stay with the host path instead (bench/RESULTS.md 0.7)
+    if (plan_v2 && bank > 0) {
+        const int64_t min_useful = (int64_t) geo.n_expert_used*per_expert*geo.n_layer_expert/4;
+        if (bank < min_useful) {
+            bank = 0;
+        }
+    }
 
     const int64_t slots  = bank/per_expert;
-    const int64_t ring   = 2*(int64_t) geo.n_expert*per_expert;
+    // the cache splits its budget across groups (one per expert layout) and needs two whole layers per
+    // group: bank * bytes_g / total >= 2 * layer_bytes_g, i.e. bank >= 2 * total / n_layers_of_that_group
+    int64_t ring = 2*(int64_t) geo.n_expert*per_expert;
+    if (plan_v2 && geo.expert_layout.size() == geo.expert_bytes.size()) {
+        int64_t ring_need = 0;
+        for (size_t i = 0; i < geo.expert_bytes.size(); ++i) {
+            if (geo.expert_bytes[i] <= 0) {
+                continue;
+            }
+            int64_t n_same = 0;
+            for (size_t j = 0; j < geo.expert_bytes.size(); ++j) {
+                n_same += geo.expert_layout[j] == geo.expert_layout[i] && geo.expert_bytes[j] > 0 ? 1 : 0;
+            }
+            if (n_same > 0) {
+                ring_need = std::max(ring_need, 2*expert_total/n_same);
+            }
+        }
+        if (ring_need > 0) {
+            ring = ring_need;
+        }
+    }
     const int64_t n_full = layer_bytes > 0 ? bank/layer_bytes : 0;
 
     const int64_t host_free     = (int64_t) dmds.back().free;
@@ -1033,6 +1082,11 @@ static bool common_moe_plan_impl(
         LOG_INF("%s: paged prefill gather keeps %.1f MiB of the surplus for its dense K/V workspace\n",
                 __func__, (double) kv_gather/MiB);
     }
+    if (plan_v2) {
+        LOG_INF("%s: plan v2: margins %.1f MiB, score reserve %.1f MiB (%s), prefetch ring need %.1f MiB\n",
+                __func__, (double) margin_used/MiB, (double) fa_score/MiB,
+                cparams_plan.offload_kqv ? "device attention" : "host attention", (double) ring/MiB);
+    }
     if (kv_page_auto) {
         LOG_INF("%s: %.1f MiB left after the initial K/V (%.1f MiB) and the %.1f MiB score reserve -> kv-page %s\n",
                 __func__, (double) kv_slack/MiB, (double) kv_bytes/MiB, (double) fa_score/MiB, kv_page ? "on" : "off");
@@ -1068,9 +1122,10 @@ bool common_moe_plan_get(
         const llama_context_params * cparams,
         const size_t * margins,
         bool kv_page_auto,
+        int32_t fit_plan,
         common_moe_plan * out,
         ggml_log_level log_level) {
-    return common_moe_plan_impl(path_model, mparams, cparams, margins, kv_page_auto, out, log_level);
+    return common_moe_plan_impl(path_model, mparams, cparams, margins, kv_page_auto, fit_plan, out, log_level);
 }
 
 enum common_params_fit_status common_fit_params(
