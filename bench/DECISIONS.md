@@ -203,9 +203,9 @@
 
 | 序 | 事项 | 本节条目 |
 |---|---|---|
-| 1 | 补一条 256K + `GGML_SCHED_TRACE=1` 的握手实测，替掉借用的 32K/2026-10-20 锚点；顺带给 session 级台阶定性 | 第 20 条 |
+| 1 | ~~补 256K + `GGML_SCHED_TRACE=1` 的握手实测~~ **已补**（`RESULTS.md` 0.7：`cpy_sync` 42.3 ms = 单步 72%，气泡约 20 ms）；仍缺 `session id` / `n_kv` 两列与台阶定性 | 第 20 条 |
 | 2 | ~~修 PERF_LOGGER 的 GEMM/FA 行~~ 已证为脚本误判并修好（`--agg`）；改用新排名：**prefill 口径 MUL_MAT 39.1% + MUL_MAT_ID 31.7%** | 第 21 条（已关闭） |
-| 3 | 去掉每层整设备 drain：单 backend 的 fence ring，或把 ids 回读改成显式 timeline 等待 | 第 19 条 |
+| 3 | 给单 GPU 调度加**目的缓冲深度**（`n_copies = 2`，事件随之存在），并把 ids 可见性协议从"靠 drain"改成靠 event / 序号等待 | 第 19 条 |
 | 4 | ~~`:1910` 改回退 + 计数~~ **已关闭**（2026-10-27，`RESULTS.md` 0.6 A/B）；F1 剩下的 4 处 abort 转成第 1 条的尾巴 | 第 1 条（F1） |
 | 5 | 算子轴改靶：id GEMM 的 tile 宽度已按真实分布算成净负（第 3 节），现在排第一的是 **dense MUL_MAT 39.1%** 里的 q6_K 段（`m=8192 n=2048 k=2048` 单 key 4.7%，3.6 TF 对 q4_K 6.3-6.6 TF） | 第 9 条 |
 | 6 | 464 MiB 未归因的设备 compute（4096 档 bank 要非零的唯一剩余来源） | 第 15 条 |
@@ -356,11 +356,22 @@ F7 状态解耦、F9 有界 pinned 窗口仍按 `THREE-TIER.md` 第 4 节的位�
     `ggml_backend_sched` 在 `n_copies == 1` 时仍走整设备 fence（`:1909-1914`、`:1920-1925`），
     MoE cache 的 ids 回读也仍带一次 `ggml_backend_synchronize`（`src/llama-moe-cache.cpp:1928-1929`）。
     把这两处换成序号等待，才算真正去掉每层 drain。
+    **2026-10-27 目标口径实测后改靶**（`RESULTS.md` 0.7）：光换等待粒度不会赢——单队列上宿主等 split i 时
+    队列里只有 0..i-1，event 等待与整设备 fence 等的是同一个点（这也解释了第 3 节"目标化 wait / 5 槽 ring"
+    为何只是搬时间）。真正的缺口是**目的缓冲深度**：`n_copies == 1` 时下一条 split 的拷贝必须等旧的用完，
+    而"把回调挪到等待之前"能到 pp512 920 却输出垃圾，正是同一件事的反证。所以本条要做的是：
+    单 GPU 也给 `n_copies = 2`（事件随之被创建），并把 ids 的可见性协议从"靠 drain"改成靠 event /
+    序号等待（`post_split` 现只在 `!parallel` 注册，`src/llama-context.cpp:836-840`）。
+    收益上限按 0.7 是约 **20 ms/token（TG 17.1 -> 约 26）**，风险是数值正确性，验收必须含输出逐字对比。
 20. **P0，目标口径的调度读数缺失**（2026-10-27）：splits / copy / cpy_sync 三个数仍然只有 32K 口径
     （`RESULTS.md` 3：2026-10-20、`09cacdfd8`、cache 6144、tg32、hit 60.9%），而统一工况是 256K + 10K + hit 57.6%。
     要补：一条 `256K + GGML_SCHED_TRACE=1` 的 run，跑批器必报列加 `session id` 与 `n_kv`（`bench/README.md` 第 3 节）。
     同时给 session 级台阶定性：`RESULTS.md` 0.5 的 8176 档是 511.7，0.4 是 679.5（低约 25%，同臂 r1/r2 只差 1%）。
     **在定性之前，任何 <15% 的收益都不能验收**（0.5 读数 6 已禁止两节混算）。
+    **2026-10-27 目标口径读数已补**（`RESULTS.md` 0.7）：解码单步 58.5 ms 里 `cpy_sync` 占 **42.3 ms（72%）**、
+    38 次宿主权重回调每次约 1.1 ms、拷贝本体只有 2.7 ms；prefill 每 ubatch 墙钟 4.03 s 里 `cpy_sync` 2.70 s。
+    纯串行气泡约 **20 ms/token**，抹平的终点约 26 t/s，与第 3 节整层扫实测的 27.1 t/s 平台一致。
+    仍缺：跑批器必报列的 `session id` 与 `n_kv`，以及 session 级台阶（-25%）的定性。
 21. **已关闭（2026-10-27）：所谓"PERF_LOGGER 不输出 GEMM 与 FA 行"是汇总脚本的误判，不是 profiler 坏了**。
     `GGML_VK_PERF_LOGGER` 的 key 带形状后缀（`MUL_MAT_VEC q4_K m=2048 n=2 k=4096`、`MUL_MAT_ID ... n_expert=821 batch=2048`、
     `FLASH_ATTN_EXT ...`），按"纯 op 名"过滤求和会把 GEMM/FA 整类丢掉。已给 `bench/tools/summarize_perf.py` 加
