@@ -104,7 +104,7 @@
 | id m/l tile 上 BK_STEP=4 | pp2048 565.04 → 557.33（-1.36%），LDS 3840 → 14592 B，常驻 WG 8 → 2 |
 | 单一 SPIR-V 内全 tile BK4 | batch2048 5.11 → 4.51（-12%），q6_K 5.03 → 3.79 |
 | id GEMM 结构性重写 | 只占 wall 18.4%，dense 平价也只有 474 对 448.6，低于 485 门 |
-| q6_K dense `_bk2`（工作区默认开） | bank 6144 pp512 -37%、bank 3584 pp2048 -5.8%、pp8192 -4.5%，两个方向都是负的 |
+| q6_K dense `_bk2`（工作区默认开） | bank 6144 pp512 -37%、bank 3584 pp2048 -5.8%、pp8192 -4.5%，两个方向都是负的。**机制已知**（未结项 9 / `RESULTS.md` 0.8）：缺口在 mmq 的解包指令数，改 BK/tile 几何不会碰到它 |
 | 跨 token routing 预测预取 | top-8 recall 33.6-55.6%，token 回退率 100%，superset 驻留需 1.27-3.18 GB/token → 4.4-16.0 t/s |
 | GPU 侧 slot plan（单独） | Option A 上限 32-35 t/s；B 非法（ids(L) 依赖 MoE(L-1)）；C 在 AMD 上不可能 |
 | 层内重叠（不改 backend） | 上限 29.5-30.5 t/s：每层上传 0.50 ms 是可重叠计算 0.16 ms 的 3 倍 |
@@ -164,6 +164,7 @@
 | `--kv-gather-mib` / `LLAMA_ARG_KV_GATHER_MIB`（F11 L1） | **256**；0 = 关 | 分页 prefill 的稠密 K/V 工作区上限：长跨距注意力先把块 gather 进工作区，再走 `-fac` 的 chunked matmul；按工作集 2 倍增长，失败退回分页 FA 并计数 | 正确性：gather 与连续布局逐字节相同（`test-kv-page`，CPU+Vulkan）；10K prompt 下分页与连续布局的输出逐字相同（`RESULTS.md` 6.6）。目标口径 PP（r=2 均值）：6144 档 378.9 对连续 385.6、4096 档 360.6 对 379.5；`--kv-gather-mib 0` 是 311.6 / 307.6（`RESULTS.md` 6.5） |
 | `LLAMA_MOE_IDS_TRACE` | 未设（关） | 探针：在 slot lookup 处回读 ids，按 bank slot 打印每层的路由分布（`touched/mean/max/分桶`）。**会强制一次整设备同步**，只用于测量分布 | 已测出 prefill 真实分布 `touched 252-256 mean 64.3 max 322-734`（`RESULTS.md` 0.6 D）；带它跑 PP 502.8 对不带 502.4 |
 | `GGML_VK_ID_TILE_TRACE` | 未设（关） | 探针：每个 MUL_MAT_ID 打印 `m/n/k/n_as/n_sel/bn/max_tiles`，即 tile 选择器按平均行数选完的结果 | bank 路径 `n_as=821 -> n_sel=20 -> bn=32`，非 bank `n_as=256 -> n_sel=64 -> bn=64`（`RESULTS.md` 0.6 D） |
+| `GGML_VK_MM_PIPELINE_TRACE` | 未设（关） | 探针：dense MUL_MAT 打印 `a=类型 m/n/k aligned 选中的 pipeline 名`，用来判断某个量化类型走没走 mmq | 定位 q6_K 缺口的关键一步：q4_K/q5_K/q6_K 分别是 `matmul_q{4,5,6}_k_q8_1_1`，无 dequant 回退（`RESULTS.md` 0.8） |
 | `GGML_SCHED_TRACE` / `GGML_MOE_COPY_TRACE` / `GGML_VK_TIME_COPIES` / `GGML_VK_MEMORY_LOGGER` / `GGML_VK_PERF_LOGGER` | 关 | 诊断；PERF_LOGGER 拖慢 decode 端到端约 2.6x（这是**端到端**系数，不是每个 kernel 的系数：大 prefill kernel 的读数接近真值） | 看份额要用 `bench/tools/summarize_perf.py <log> --agg`；按精确 key 求和会漏掉所有带形状后缀的 GEMM/FA 行（见未结项 21） |
 | `GGML_VK_FA_TRACE` | 未设 | 每个不同的 FA 形状打一行（path/Br/Bc/D_split/sparse/dequant_kv），F10 M0b 用它定案 | 诊断，只打几种形状 |
 | `GGML_SCHED_HW_SIGNAL` / `_HW_PIPELINE` / `_HW_NOWAIT`、`GGML_MOE_CACHE_MAX_FULL` / `_LRU_DIV`、`LLAMA_ROUTING_DIAG` | 已回退，不在树里 | 见第 3 节 | - |
@@ -266,9 +267,15 @@ F7 状态解耦、F9 有界 pinned 窗口仍按 `THREE-TIER.md` 第 4 节的位�
    这条门禁关闭。
 7. repack 的 KLD != 0 未修，这是混合精度分层路线（唯一能改 TG 屋顶线的选项）的前置门。
 8. 独立小 draft 模型（需要同 tokenizer/vocab 且受 arch 裁剪限制）与 ReBAR/SAM 两项可行性筛查至今没做。
-9. q6_K dense 的真实缺口（1.4x）还没定位到 MMQ 的哪一段；GEMV 向量化已被判无空间。
-   **2026-10-27 更新**：定位手段没坏（第 21 条），新排名的 `MUL_MAT` 39.1% 里就含 q6_K 的
-   `m=8192 n=2048 k=2048` key（4.7%），可以直接用 `--agg` 的 top 精确 key 起手指。
+9. **已定位（2026-10-27，`RESULTS.md` 0.8）：q6_K dense 慢 1.5x 的原因是 mmq 内循环的解包算术**，不是字节、
+   不是 tile、不是走错 kernel。三条独立证据：q8_0（1.78x 字节）与 f16（3.6x 字节）都跑 6.0-6.3 TF，
+   与 q4_K 同档；`GGML_VK_MM_PIPELINE_TRACE` 显示 q4_K/q5_K/q6_K 各自落在 `matmul_q{4,5,6}_k_q8_1_1`，
+   没有 dequant 回退；掉速只发生在"高位平面 + 双级 scale"的 q5_K/q6_K 上，而完全不解包的 f16 matmul
+   反而比 q4_K 慢（6.04 对 6.40 TF），说明限制在解包而不是乘加。
+   in-situ 份额：`MUL_MAT q6_K m=8192 n=2048 k=2048` 每 eval 56 次 = 单 ubatch 的 22.6%，改 q4_K 约 **PP +7.5%**。
+   两条出路各自的门：(a) 共享专家重排成 q4_K——被未结项 7（repack KLD != 0）阻塞，且共享专家每 token 都用，
+   精度代价比稀疏专家高；(b) 改成每 tile 解一次进 LDS——是 kernel 改写，第 3 节那三条调几何的实验对它无效
+   （现在有了机制解释：它们没减少解包指令数）。
 10. **F6 已关闭**（2026-10-23）：`tools/perplexity/` 从 git 历史恢复，`bench/tools/quality-gate.sh` 一条命令给出
     PPL 与 KLD（基线 PPL 5.798313、logits 基线 2.0 GB 在 `F:/LLM/kld/`），B2 用它验收过（`RESULTS.md` 7.1）。
     限制：10K 文本最多 `-c 4096`（要求 >= 2 x n_ctx tokens），质量门验证算法等价，不是 256K 数值。
