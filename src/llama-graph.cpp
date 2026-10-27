@@ -3120,9 +3120,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // ~1 TFLOPS against 4 for the matmul path. Decode and short spans keep FA (bench/RESULTS.md 2.2).
     const int64_t n_tok_q  = q->ne[1];
     const int64_t n_tok_kv = k->ne[1];
+    // LLAMA_FA_SPAN_SQUARE=1 also moves the square spans (the first ubatch of a prompt, n_kv == n_q) to the
+    // matmul path, where the score buffer still has to fit fa_score_max, otherwise the span falls back to FA
+    static const bool fa_span_square = getenv("LLAMA_FA_SPAN_SQUARE") && atoi(getenv("LLAMA_FA_SPAN_SQUARE")) != 0;
+    const bool span_ok_len = fa_span_square ? n_tok_kv >= n_tok_q : n_tok_kv > n_tok_q + n_tok_q / 2;
     const bool fa_span = paged ? (span_ok_raw && dense) :
                          fa_score_max > 0 && kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
-                         n_tok_q >= 512 && n_tok_kv > n_tok_q + n_tok_q / 2;
+                         n_tok_q >= 512 && span_ok_len;
     // the score buffer is n_kv x n_head x 4B per query row, so the query dim is what the budget splits
     const int64_t score_row = n_tok_kv * q->ne[2] * (int64_t) sizeof(float);
     const int64_t chunk_cap = (int64_t) cparams.fa_chunk_mib << 20;
