@@ -40,6 +40,11 @@ struct qrt_dn_bufs {
     // step 2a: the prep chain around the recurrence
     VkBuffer qkv;       // [tokens][conv_ch]  projection output (input of the conv)
     VkBuffer conv_state; // [conv_taps-1][conv_ch], may be NULL until written
+    // Speculative carry (M2-8a): the entry window a snapshot pass started from and the rows
+    // it projected, so a rollback can rebuild conv_state for any kept prefix without the
+    // qkv plane surviving the pass (the session arena shares that plane across layers).
+    VkBuffer conv_entry; // [conv_taps-1][conv_ch], VK_NULL_HANDLE without snapshots
+    VkBuffer pass_rows;  // [state_slots-1][conv_ch], VK_NULL_HANDLE without snapshots
     VkBuffer xnorm;     // [tokens][n_embd]  normalised input, input of the gate GEMV
     VkBuffer z;         // [tokens][d_inner] gate projection output (silu input)
     VkBuffer gnorm;     // [tokens][d_inner] gated norm output (ssm_out input)
@@ -56,6 +61,10 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
                 uint32_t max_tokens, uint32_t state_slots, qrt_deltanet ** out,
                 char * err, size_t err_size);
 void qrt_dn_close(qrt_vk_dev * dev, qrt_deltanet * dn);
+
+// The chunk-sized scratch (q/k/v/decay/beta/y/qkv/norm/gnorm/z) qrt_dn_open takes from the
+// session arena. The state ring, the conv carry and the weights are persistent and excluded.
+uint64_t qrt_dn_scratch_bytes(const qrt_dn_shapes * sh, uint32_t max_tokens);
 
 const qrt_dn_shapes * qrt_dn_shapes_of(const qrt_deltanet * dn);
 const qrt_dn_bufs *   qrt_dn_buffers(const qrt_deltanet * dn);

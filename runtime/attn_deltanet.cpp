@@ -45,6 +45,11 @@ struct qrt_deltanet {
     VkBuffer       ssm_norm_w;  // [head_dim] gated norm weight
     VkPipeline     gnorm_pipe;
     VkDeviceMemory prep_mem[6];
+    // Speculative carry (M2-8a): persistent copies that let a rollback rebuild conv_state
+    // after the shared qkv plane is gone.
+    VkBuffer       conv_entry;
+    VkBuffer       pass_rows;
+    VkDeviceMemory snap_mem[2];
     VkPipeline     prep_pipe;
     VkDescriptorSet prep_set;
     VkPipeline     gate_pipe;
@@ -78,7 +83,30 @@ int alloc_buf(qrt_deltanet * dn, uint32_t idx, uint64_t bytes, char * err, size_
     return 0;
 }
 
+int alloc_scratch(qrt_deltanet * dn, uint32_t idx, uint64_t bytes, char * err,
+                  size_t err_size) {
+    if (qrt_vk_alloc_scratch(dn->dev, bytes, QRT_VK_USAGE_STORAGE |
+                             QRT_VK_USAGE_TRANSFER_SRC | QRT_VK_USAGE_TRANSFER_DST,
+                             &dn->mem_owner[idx], &dn->mem[idx], err, err_size) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 } // namespace
+
+uint64_t qrt_dn_scratch_bytes(const qrt_dn_shapes * sh, uint32_t max_tokens) {
+    if (sh == NULL || max_tokens == 0) {
+        return 0;
+    }
+    const uint64_t qk = (uint64_t) max_tokens * sh->qk_ch * 4;
+    const uint64_t v = (uint64_t) max_tokens * sh->d_inner * 4;
+    const uint64_t gb = (uint64_t) max_tokens * sh->n_v_heads * 4;
+    return 2u * qk + 2u * v + 2u * gb +                        // q,k / v,y / decay,beta
+           (uint64_t) max_tokens * sh->conv_ch * 4 +           // qkv
+           (uint64_t) max_tokens * sh->n_embd * 4 +            // norm
+           v + v;                                              // gnorm, z
+}
 
 int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh,
                 uint32_t max_tokens, uint32_t state_slots, qrt_deltanet ** out,
@@ -121,11 +149,17 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     const uint64_t gb_bytes = (uint64_t) max_tokens * sh->n_v_heads * 4;
     dn->state_bytes = (uint64_t) sh->n_v_heads * sh->head_dim * sh->head_dim * 4;
     // Binding 7 (the write side) is the same allocation as binding 5, so it carries no size
-    // and no free of its own.
+    // and no free of its own. The state ring is the one persistent buffer here; every other
+    // plane is chunk-sized and comes from the session arena when one is attached (M2-8a).
     const uint64_t sizes[DN_BINDINGS] = { qk_bytes, qk_bytes, v_bytes, gb_bytes, gb_bytes,
                                           dn->state_bytes * state_slots, v_bytes, 0 };
     for (uint32_t i = 0; i < DN_BINDINGS; ++i) {
-        if (sizes[i] != 0 && alloc_buf(dn, i, sizes[i], err, err_size) != 0) {
+        if (sizes[i] == 0) {
+            continue;
+        }
+        const int rc = i == 5u ? alloc_buf(dn, i, sizes[i], err, err_size)
+                               : alloc_scratch(dn, i, sizes[i], err, err_size);
+        if (rc != 0) {
             qrt_dn_close(dev, dn);
             return -1;
         }
@@ -223,9 +257,9 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     // step 2a buffers: the projected qkv of this chunk and the conv state
     const uint64_t qkv_bytes = (uint64_t) max_tokens * sh->conv_ch * 4;
     const uint64_t cst_bytes = (uint64_t) (sh->conv_taps - 1) * sh->conv_ch * 4;
-    if (qrt_vk_alloc(dev, qkv_bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
-                     QRT_VK_USAGE_TRANSFER_DST, &dn->prep_qkv, &dn->prep_mem[0], err,
-                     err_size) != 0) {
+    if (qrt_vk_alloc_scratch(dev, qkv_bytes, QRT_VK_USAGE_STORAGE |
+                             QRT_VK_USAGE_TRANSFER_SRC | QRT_VK_USAGE_TRANSFER_DST,
+                             &dn->prep_qkv, &dn->prep_mem[0], err, err_size) != 0) {
         qrt_dn_close(dev, dn);
         return -1;
     }
@@ -238,9 +272,9 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     }
     dn->bufs.conv_state = dn->prep_state;
     const uint64_t norm_bytes = (uint64_t) max_tokens * sh->n_embd * 4;
-    if (qrt_vk_alloc(dev, norm_bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
-                     QRT_VK_USAGE_TRANSFER_DST, &dn->prep_norm, &dn->prep_mem[2], err,
-                     err_size) != 0) {
+    if (qrt_vk_alloc_scratch(dev, norm_bytes, QRT_VK_USAGE_STORAGE |
+                             QRT_VK_USAGE_TRANSFER_SRC | QRT_VK_USAGE_TRANSFER_DST,
+                             &dn->prep_norm, &dn->prep_mem[2], err, err_size) != 0) {
         qrt_dn_close(dev, dn);
         return -1;
     }
@@ -249,9 +283,16 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     const uint64_t small[3] = { gn_bytes, gn_bytes, (uint64_t) sh->head_dim * 4 };
     VkBuffer * slots[3] = { &dn->gnorm_out, &dn->z_buf, &dn->ssm_norm_w };
     for (uint32_t i = 0; i < 3; ++i) {
-        if (qrt_vk_alloc(dev, small[i], QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
-                         QRT_VK_USAGE_TRANSFER_DST, slots[i], &dn->prep_mem[3 + i], err,
-                         err_size) != 0) {
+        const int rc = i < 2u
+                           ? qrt_vk_alloc_scratch(dev, small[i], QRT_VK_USAGE_STORAGE |
+                                                  QRT_VK_USAGE_TRANSFER_SRC |
+                                                  QRT_VK_USAGE_TRANSFER_DST, slots[i],
+                                                  &dn->prep_mem[3 + i], err, err_size)
+                           : qrt_vk_alloc(dev, small[i], QRT_VK_USAGE_STORAGE |
+                                          QRT_VK_USAGE_TRANSFER_SRC |
+                                          QRT_VK_USAGE_TRANSFER_DST, slots[i],
+                                          &dn->prep_mem[3 + i], err, err_size);
+        if (rc != 0) {
             qrt_dn_close(dev, dn);
             return -1;
         }
@@ -259,6 +300,24 @@ int qrt_dn_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_dn_shapes * sh
     dn->bufs.gnorm = dn->gnorm_out;
     dn->bufs.z = dn->z_buf;
     dn->bufs.ssm_norm_w = dn->ssm_norm_w;
+    // Snapshot ring sessions also keep the two carry copies the rollback rebuilds from.
+    if (state_slots > 2u) {
+        if (qrt_vk_alloc(dev, cst_bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
+                         QRT_VK_USAGE_TRANSFER_DST, &dn->conv_entry, &dn->snap_mem[0],
+                         err, err_size) != 0) {
+            qrt_dn_close(dev, dn);
+            return -1;
+        }
+        const uint64_t rows_bytes = (uint64_t) (state_slots - 1u) * sh->conv_ch * 4;
+        if (qrt_vk_alloc(dev, rows_bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
+                         QRT_VK_USAGE_TRANSFER_DST, &dn->pass_rows, &dn->snap_mem[1],
+                         err, err_size) != 0) {
+            qrt_dn_close(dev, dn);
+            return -1;
+        }
+        dn->bufs.conv_entry = dn->conv_entry;
+        dn->bufs.pass_rows = dn->pass_rows;
+    }
 
     if (qrt_vk_make_pipeline(dev, dn->layout, spv_dir, "deltanet_prep.spv", nullptr, 0,
                              &dn->prep_pipe, err, err_size) != 0 ||
@@ -316,6 +375,12 @@ void qrt_dn_close(qrt_vk_dev * dev, qrt_deltanet * dn) {
     for (uint32_t i = 0; i < 3; ++i) {
         if (dn->prep_mem[i] != VK_NULL_HANDLE) {
             qrt_vk_free(dev, prepbuf[i], dn->prep_mem[i]);
+        }
+    }
+    const VkBuffer snapbuf[2] = { dn->conv_entry, dn->pass_rows };
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (dn->snap_mem[i] != VK_NULL_HANDLE) {
+            qrt_vk_free(dev, snapbuf[i], dn->snap_mem[i]);
         }
     }
     if (dn->prep_pipe != VK_NULL_HANDLE) vkDestroyPipeline(dev->device, dn->prep_pipe, nullptr);

@@ -99,6 +99,12 @@ int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes 
                   qrt_full ** out, char * err, size_t err_size);
 void qrt_full_close(qrt_vk_dev * dev, qrt_full * f);
 
+// The per-chunk planes qrt_full_open takes from the session arena (qg/kin/vin/q/out, the
+// two softmax states and the paged row stages). The KV cache itself stays persistent and is
+// excluded, like the norm weights.
+uint64_t qrt_full_scratch_bytes(const qrt_full_shapes * sh, uint32_t max_tokens,
+                                uint32_t n_ctx, const qrt_full_kv_cfg * kv);
+
 const qrt_full_shapes * qrt_full_shapes_of(const qrt_full * f);
 const qrt_full_bufs *   qrt_full_buffers(const qrt_full * f);
 int32_t                 qrt_full_kv_k(const qrt_full * f);

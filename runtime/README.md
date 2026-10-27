@@ -3,7 +3,7 @@
 This directory holds the runtime that replaces the fork's decode path (design section 3.3).
 It links neither ggml nor llama: the runtime parses the GGUF itself and drives Vulkan directly.
 
-## Status: M2 prefill, model diagnostics, a k=1 decode slice and the speculation cycle
+## Status: M2 prefill, model diagnostics, the persistent decode slice and the speculation cycle
 
 What exists now:
 
@@ -30,14 +30,17 @@ What exists now:
   contract (M3-0); `moe.*` - routed-only k=1..8 batch over the same kernels (M3-1).
 - `spec.*` - the speculation decision (longest accepted prefix, the verified token at the
   first mismatch) and the rollback of the layers that carry it (M3-3).
+- `head.*` - the device output head: resident `output.weight`, the norm/GEMM/argmax recorded
+  into one command buffer, and the candidate mask the MTP draft samples through (M3-7).
 - `qrt_main.cpp` - the `qrt` binary: checks, model logits, cache plan and MoE batch.
 - `CMakeLists.txt` - `qrt_core`, `qrt`, `qrt_checks` and the CPU contract tests.
 
-What does not exist yet: the MTP draft (the `spec` module verifies and rolls back, it does not
-draft yet), the pre-recorded per-k command buffers, GPU-side route/cache lookup and indirect
-expert dispatch, and the GPU head/argmax. The layer chain, the prefill scheduler and the
-persistent decode session all run; prefill at 2048-token chunks across 40 layers still needs
-the shared scratch arena, so `--generate` caps the resident chunk at 64.
+What does not exist yet: the pre-recorded per-k command buffers, GPU-side route/cache lookup
+and indirect expert dispatch (the router's top-k still round-trips to the host once per layer,
+which is what keeps a pass at two submits per layer), and text in / text out: the runtime
+reads token ids and writes token ids, the tokenizer stays in the fork. The session scratch
+arena and its shared staging buffer exist (M2-8a); they are what lets `--generate` run a
+2048-row prefill chunk across all 40 resident layers.
 
 ## Routed MoE batch (M3-1)
 
@@ -425,6 +428,35 @@ build-vulkan/bin/qrt.exe --layer-check <gguf> --layer 3 --layer-tokens 512 --lay
   re-read once per row block), and GPU-side grouping plus indirect dispatch is what a true
   one-submit layer needs.
 
+## Session scratch arena (M2-8a)
+
+```
+build-vulkan/bin/qrt.exe --generate <gguf> --logits-tokens <ids> --generate-new 8 \
+    --layer-store <prefix> --logits-layers 40 --prefill-chunk 2048
+```
+
+- A decode session keeps all 40 layers open. Their chunk-sized planes (the `T x ...`
+  activations of layer, DeltaNet, full attention and FFN) and one host staging buffer are
+  allocated once and shared: `qrt_vk_arena` in `vk_dev.*` is one device-local allocation the
+  session rewinds before each layer opens, so every layer's `VkBuffer` handles alias the same
+  regions. The layers run strictly one at a time, which is what makes that safe; persistent
+  per-layer state (the DeltaNet state ring and conv carry, the full-attention KV cache, the
+  weights) stays outside the arena.
+- `qrt_layer_budget_of()` (`layer.*`, backed by `qrt_dn_scratch_bytes`,
+  `qrt_full_scratch_bytes`, `qrt_ffn_plane_bytes` and `layer_staging_bytes`) is the one place
+  that says how many bytes a layer takes at a given chunk width. The session sizes the arena
+  and the shared staging buffer from the maximum over its layers, prints
+  `generate_arena mib=... predicted_mib=... used_mib=... staging_mib=...`, and refuses a
+  chunk that is not a 32-aligned 32..2048.
+- The FFN used to create its own 32 MiB packer per layer and the layer its own staging
+  buffer; `QRT_FFN_STAGING_BYTES` is now only the session's minimum width, and every capacity
+  check reads the real buffer (`qrt_vk_staging_bytes`).
+- The DeltaNet conv carry moved from the start of the next pass to the end of the pass that
+  produced the rows: the qkv plane it read from is now shared, so it cannot be the place a
+  carry waits between calls. A snapshot pass also saves its entry window and projected rows
+  (`pass_rows`), and a rollback rebuilds `conv_state` for any kept prefix from those two
+  before the next pass reads it.
+
 ## Whole model run and the reference chain (M2-7a)
 
 ```
@@ -485,7 +517,7 @@ pass,pos,k,accepted,hit_experts,miss_experts,miss_cpu,miss_h2d,h2d_bytes,draft_m
 | `qrt_config.h/.cpp` | switch table, defaults, parsing, validation, notes |
 | `qrt_telemetry.h/.cpp` | per-pass CSV sink |
 | `gguf_index.h/.cpp` | GGUF metadata, tensor table, absolute offsets, byte account |
-| `vk_dev.h/.cpp` | device, queues, memory types, budget planner, allocator, staging transfers |
+| `vk_dev.h/.cpp` | device, queues, memory types, budget planner, allocator, session scratch arena, staging transfers |
 | `weights.h/.cpp` | repacked expert store (index page table, expert reads) and dense residency |
 | `prefill.h/.cpp` | layer-first prefill scheduler, staging ring, read-probe compute leg |
 | `attn_deltanet.h/.cpp`, `attn_deltanet_check.cpp` | DeltaNet delta-rule recurrence (M2-6c) and its CPU reference |
@@ -541,13 +573,56 @@ out    = blk.40(x) at the position the draft would take
 h_next = rms_norm(out, shared_head_norm)      -> also the draft head's input
 ```
 
-The head reads only the candidate rows of `output.weight`, which is why `QRT_DRAFT_VOCAB` is
-16384 by default: the whole vocabulary is 512 MiB per step against 42.5 MiB gathered.
-`--draft-vocab 0` keeps the full-vocabulary draft, the correctness baseline of design 4.1.
-The block takes part of the decode expert cache (its own slot array in the same plan, indexed
-by its position in the session, which is why `qrt_ffn_cache` carries a cache layer distinct
-from the block index), and its KV rows need no rollback: a rejected draft leaves a row that
-the next cycle overwrites before anything reads it.
+The head has two arms. `--head host` gathers the candidate rows of `output.weight` on the
+host and dots them in double (42.5 MiB per step against 512 MiB for the whole vocabulary,
+which is why `QRT_DRAFT_VOCAB` is 16384 by default; `--draft-vocab 0` keeps the
+full-vocabulary draft, the correctness baseline of design 4.1). `--head gpu` reads the
+resident head weight on the device through a candidate mask (head.cpp below) and hands back
+only the id, its logit and the runner-up. The block takes part of the decode expert cache
+(its own slot array in the same plan, indexed by its position in the session, which is why
+`qrt_ffn_cache` carries a cache layer distinct from the block index).
+
+The block's KV is filled the way the fork's `draft-mtp` driver fills it (M3-3c): every
+prompt position and every kept row of a verified pass gets a row of
+`(token_p, target h_{p-1})`, so a draft attends over the real context instead of
+uninitialised cache. `mtp_run_rows()` builds the concat rows on the host, packs them with
+`no_norm`, projects them with the prepared `nextn.eh_proj` through the dense GEMM into the
+block's input plane and runs the block; the prompt pass costs 1.7 s for 10.4K tokens and the
+per-cycle refresh reruns only the kept rows. The draft step uses the same projection, which
+moved the per-step host work from 8.5 MiB / 40.8 ms to 0.2 MiB / 21.9 ms. The output rows of
+the verified positions are overwritten again by the next cycle's drafts before anything
+reads them if they were rejected.
+
+## Device output head (M3-7)
+
+Design 4.6 puts the greedy sample on the GPU: `head.{h,cpp}` records the final RMS norm with
+its Q8_1 packing, the full-vocabulary Q8_0 x Q8_1 GEMM (`output.weight` prepared and resident,
+`gemm_q8k` with `n = vocabulary`) and a two-stage argmax into one command buffer, so a pass
+returns `rows` token ids instead of pushing 0.5 GiB of logits through the host. `--head gpu`
+selects it; `--head host` keeps the double host head, which is what `--logits-dump` and
+`--model-check` still use as the reference.
+
+`kernels/head_max1.comp` reduces each segment of a row to (best, index, runner-up) and
+`head_max2.comp` combines the segments. Both use the total order "value descending, index
+ascending", so the winner does not depend on the segment layout and a tie lands on the lower
+vocabulary id, as the host reference does. A candidate mask decides which entries may win: the
+verification pass uses the all-ones mask, the MTP draft the 16K candidate table, so one head
+serves both without gathering weight rows. The tile is 32 rows because that is the GEMM's
+token tile; up to two rows use the one-token kernel instead, which reads the weight once per
+row rather than once per pass.
+
+`--head-check <gguf> --head-rows N` is the numeric gate: the head runs over deterministic
+hidden rows and a CPU double chain re-does the dot product from the raw q8_0 rows and the
+planes the *device* packed (the shared-packing convention of E-CHAIN1, so the gate measures
+the head's arithmetic, not the activation quantiser). It reports `rel_l1` over the whole
+vocabulary per row, `ids_equal`, and two mask arms - a two-candidate mask and a
+counterexample mask that leaves the true winner out.
+
+The head is 0.57 GiB of weight plus a 32 MiB logits tile, so `gen_decode_cache` re-reads the
+VRAM budget and lets the expert cache give up the difference (design 5.5: 100 MiB is about
+0.5 pp of coverage). If the head itself cannot be allocated the session prints
+`generate_head disabled` and keeps sampling on the host.
+
 
 
 

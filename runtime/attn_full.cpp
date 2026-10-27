@@ -159,6 +159,31 @@ int qrt_full_shapes_from_gguf(const qrt_gguf_hparams * hp, qrt_full_shapes * out
     return 0;
 }
 
+uint64_t qrt_full_scratch_bytes(const qrt_full_shapes * sh, uint32_t max_tokens,
+                                uint32_t n_ctx, const qrt_full_kv_cfg * kv) {
+    if (sh == NULL || kv == NULL || max_tokens == 0 || n_ctx == 0) {
+        return 0;
+    }
+    qrt_kv_row_layout klay, vlay;
+    if (qrt_kv_row_layout_of(kv->k_type, sh->head_dim, &klay) != 0 ||
+        qrt_kv_row_layout_of(kv->v_type, sh->head_dim, &vlay) != 0) {
+        return 0;
+    }
+    uint32_t resident = kv->resident_tokens;
+    if (resident == 0 || resident > n_ctx) {
+        resident = n_ctx;
+    }
+    const uint64_t attn = (uint64_t) max_tokens * sh->n_head * sh->head_dim * 4;
+    uint64_t bytes = (uint64_t) max_tokens * sh->qg_ch * 4 +       // qg
+                     2u * (uint64_t) max_tokens * sh->kv_ch * 4 +  // kin, vin
+                     2u * attn +                                  // q, out
+                     2u * (uint64_t) max_tokens * sh->n_head * 4; // state_m, state_l
+    if (resident < n_ctx) {
+        bytes += (uint64_t) max_tokens * sh->n_kv * (klay.row_bytes + vlay.row_bytes);
+    }
+    return bytes;
+}
+
 int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes * sh,
                   uint32_t max_tokens, uint32_t n_ctx, const qrt_full_kv_cfg * kv,
                   qrt_full ** out, char * err, size_t err_size) {
@@ -227,16 +252,27 @@ int qrt_full_open(qrt_vk_dev * dev, const char * spv_dir, const qrt_full_shapes 
     const uint64_t vst_bytes = f->paged ? (uint64_t) sh->n_kv * max_tokens * f->v_row : 4;
     const uint64_t state_bytes = (uint64_t) sh->n_head * max_tokens * 4;
     const uint64_t w_bytes  = (uint64_t) sh->head_dim * 4;
-    struct slot { VkBuffer * b; uint64_t bytes; } slots[FULL_BUFFER_COUNT] = {
-        { &f->bufs.qg, qg_bytes }, { &f->bufs.kin, kvi_bytes }, { &f->bufs.vin, kvi_bytes },
-        { &f->bufs.q, q_bytes }, { &f->bufs.kcache, k_bytes }, { &f->bufs.vcache, v_bytes },
-        { &f->bufs.out, q_bytes }, { &f->bufs.q_norm_w, w_bytes }, { &f->bufs.k_norm_w, w_bytes },
-        { &f->bufs.kstage, kst_bytes }, { &f->bufs.vstage, vst_bytes },
-        { &f->bufs.state_m, state_bytes }, { &f->bufs.state_l, state_bytes },
+    // scratch = 1 for the per-chunk planes, which the session arena shares across layers;
+    // the KV cache and the two norm weights stay persistent per layer.
+    struct slot { VkBuffer * b; uint64_t bytes; int scratch; } slots[FULL_BUFFER_COUNT] = {
+        { &f->bufs.qg, qg_bytes, 1 }, { &f->bufs.kin, kvi_bytes, 1 },
+        { &f->bufs.vin, kvi_bytes, 1 },
+        { &f->bufs.q, q_bytes, 1 }, { &f->bufs.kcache, k_bytes, 0 },
+        { &f->bufs.vcache, v_bytes, 0 },
+        { &f->bufs.out, q_bytes, 1 }, { &f->bufs.q_norm_w, w_bytes, 0 },
+        { &f->bufs.k_norm_w, w_bytes, 0 },
+        { &f->bufs.kstage, kst_bytes, 1 }, { &f->bufs.vstage, vst_bytes, 1 },
+        { &f->bufs.state_m, state_bytes, 1 }, { &f->bufs.state_l, state_bytes, 1 },
     };
     for (uint32_t i = 0; i < FULL_BUFFER_COUNT; ++i) {
-        if (qrt_vk_alloc(dev, slots[i].bytes, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
-                         QRT_VK_USAGE_TRANSFER_DST, slots[i].b, &f->mem[i], err, err_size) != 0) {
+        const VkBufferUsageFlags usage = QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
+                                         QRT_VK_USAGE_TRANSFER_DST;
+        const int rc = slots[i].scratch
+                           ? qrt_vk_alloc_scratch(dev, slots[i].bytes, usage, slots[i].b,
+                                                  &f->mem[i], err, err_size)
+                           : qrt_vk_alloc(dev, slots[i].bytes, usage, slots[i].b,
+                                          &f->mem[i], err, err_size);
+        if (rc != 0) {
             qrt_full_close(dev, f);
             return -1;
         }

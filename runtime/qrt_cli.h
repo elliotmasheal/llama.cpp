@@ -29,6 +29,7 @@ enum qrt_command {
     QRT_CMD_MOE_BATCH,
     QRT_CMD_GENERATE,
     QRT_CMD_SPEC_CHECK,
+    QRT_CMD_HEAD_CHECK,
 };
 
 struct qrt_cli_options {
@@ -90,6 +91,9 @@ struct qrt_cli_options {
     const char * spec_check_gguf = nullptr;
     int spec_rollback = 1;    // off keeps every draft row, the counterexample arm
     int spec_mtp = 0;         // draft with blk.40 instead of the serial reference
+    int head_gpu = 0;         // 1 = the device output head, 0 = the host double head
+    const char * head_check_gguf = nullptr;
+    int head_check_rows = 4;  // hidden rows the head check runs over
     const char * draft_vocab_path = nullptr;
     const char * cache_prefix = nullptr;
     const char * cache_trace = nullptr;

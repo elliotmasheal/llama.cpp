@@ -21,6 +21,7 @@
 // double chain and not against each kernel separately (DECISIONS 63.4).
 
 struct qrt_layer;
+struct qrt_vk_staging;
 
 struct qrt_layer_cfg {
     int ffn;             // 1 = include the shared expert and the routed MoE
@@ -38,6 +39,9 @@ struct qrt_layer_cfg {
     // opens 40 layers with one shared slot; each layer packs its used experts before use.
     VkBuffer ffn_slot;
     uint64_t ffn_slot_bytes;
+    // A caller-owned staging buffer (NULL = the layer allocates its own). Sessions share one
+    // across every layer, since layers run strictly one at a time (M2-8a).
+    qrt_vk_staging * stg;
 };
 
 struct qrt_layer_info {
@@ -57,6 +61,18 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_
                    const qrt_layer_cfg * cfg, qrt_layer ** out, char * err, size_t err_size);
 void qrt_layer_close(qrt_vk_dev * dev, qrt_layer * l);
 const qrt_layer_info * qrt_layer_shape(const qrt_layer * l);
+
+// The chunk-sized scratch qrt_layer_open takes from the attached session arena, and the
+// staging capacity it needs. Persistent per-layer state (the DeltaNet ring and conv carry,
+// the full-attention KV cache, the weights) is excluded. The session sizes its arena and
+// its one shared staging buffer from the maximum over the layers it opens.
+struct qrt_layer_budget {
+    uint64_t scratch_bytes;   // device-local planes shared across layers
+    uint64_t staging_bytes;   // host-visible transfer buffer
+};
+int qrt_layer_budget_of(const char * gguf_path, uint32_t layer, uint32_t tokens,
+                     const qrt_layer_cfg * cfg, qrt_layer_budget * out,
+                     char * err, size_t err_size);
 
 // The residual stream the layer starts from; also the buffer the residual add writes.
 int qrt_layer_set_input(qrt_layer * l, const float * x, char * err, size_t err_size);

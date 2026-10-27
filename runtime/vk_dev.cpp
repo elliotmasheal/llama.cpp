@@ -466,6 +466,164 @@ int qrt_vk_plan_budget(qrt_vk_dev * dev, const qrt_config * cfg, uint64_t expert
     return 0;
 }
 
+struct qrt_vk_arena {
+    VkDeviceMemory mem;
+    uint64_t       alloc_size;  // bytes the device reserved
+    uint64_t       used;        // bump cursor, sub-buffer bind offsets stay below this
+};
+
+int qrt_vk_arena_create(qrt_vk_dev * dev, uint64_t bytes, qrt_vk_arena ** out, char * err,
+                        size_t err_size) {
+    *out = NULL;
+    if (dev == NULL || bytes == 0) {
+        return fail(err, err_size, "the arena needs a device and a size");
+    }
+    if (bytes > dev->budget_bytes) {
+        ++dev->alloc_failures;
+        return fail(err, err_size, "arena of %llu MiB is above the %llu MiB budget",
+                    (unsigned long long) (bytes / QRT_VK_MIB),
+                    (unsigned long long) (dev->budget_bytes / QRT_VK_MIB));
+    }
+    // The memory type and the real allocation size come from a probe buffer: the binds that
+    // follow must satisfy the same storage-buffer requirements.
+    VkBufferCreateInfo bci;
+    memset(&bci, 0, sizeof(bci));
+    bci.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size        = bytes;
+    bci.usage       = QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
+                      QRT_VK_USAGE_TRANSFER_DST;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer probe = VK_NULL_HANDLE;
+    VkResult r = vkCreateBuffer(dev->device, &bci, nullptr, &probe);
+    if (r != VK_SUCCESS) {
+        ++dev->alloc_failures;
+        return vk_fail(err, err_size, "vkCreateBuffer (arena probe)", r);
+    }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(dev->device, probe, &req);
+    vkDestroyBuffer(dev->device, probe, nullptr);
+    const uint32_t type = pick_memory_type(dev, req.memoryTypeBits,
+                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type == UINT32_MAX) {
+        ++dev->alloc_failures;
+        return fail(err, err_size, "no device-local memory type for the %llu MiB arena",
+                    (unsigned long long) (bytes / QRT_VK_MIB));
+    }
+    qrt_vk_arena * a = new qrt_vk_arena();
+    a->mem        = VK_NULL_HANDLE;
+    a->alloc_size = req.size > bytes ? req.size : bytes;
+    a->used       = 0;
+    VkMemoryAllocateInfo mai;
+    memset(&mai, 0, sizeof(mai));
+    mai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize  = a->alloc_size;
+    mai.memoryTypeIndex = type;
+    r = vkAllocateMemory(dev->device, &mai, nullptr, &a->mem);
+    if (r != VK_SUCCESS) {
+        ++dev->alloc_failures;
+        delete a;
+        return vk_fail(err, err_size, "vkAllocateMemory (arena)", r);
+    }
+    ++dev->alloc_count;
+    dev->alloc_bytes += a->alloc_size;
+    if (dev->alloc_bytes > dev->alloc_peak_bytes) {
+        dev->alloc_peak_bytes = dev->alloc_bytes;
+    }
+    *out = a;
+    return 0;
+}
+
+void qrt_vk_arena_destroy(qrt_vk_dev * dev, qrt_vk_arena * arena) {
+    if (arena == NULL) {
+        return;
+    }
+    if (dev != NULL && dev->arena == arena) {
+        dev->arena = NULL;
+    }
+    if (dev != NULL && dev->device != VK_NULL_HANDLE) {
+        dev->alloc_bytes -= dev->alloc_bytes >= arena->alloc_size ? arena->alloc_size
+                                                                 : dev->alloc_bytes;
+        vkFreeMemory(dev->device, arena->mem, nullptr);
+    }
+    delete arena;
+}
+
+int qrt_vk_arena_attach(qrt_vk_dev * dev, qrt_vk_arena * arena, char * err, size_t err_size) {
+    if (dev == NULL || arena == NULL) {
+        return fail(err, err_size, "the arena attach needs a device and an arena");
+    }
+    if (dev->arena != NULL && dev->arena != arena) {
+        return fail(err, err_size, "a scratch arena is already attached");
+    }
+    dev->arena = arena;
+    return 0;
+}
+
+uint64_t qrt_vk_arena_bytes(const qrt_vk_arena * arena) {
+    return arena != NULL ? arena->alloc_size : 0;
+}
+
+uint64_t qrt_vk_arena_used(const qrt_vk_arena * arena) {
+    return arena != NULL ? arena->used : 0;
+}
+
+void qrt_vk_arena_rewind(qrt_vk_arena * arena) {
+    if (arena != NULL) {
+        arena->used = 0;
+    }
+}
+
+static int arena_alloc(qrt_vk_dev * dev, qrt_vk_arena * arena, uint64_t bytes,
+                       VkBufferUsageFlags usage, VkBuffer * buf, VkDeviceMemory * mem,
+                       char * err, size_t err_size) {
+    if (bytes == 0) {
+        ++dev->alloc_failures;
+        return fail(err, err_size, "allocation of 0 bytes");
+    }
+    VkBufferCreateInfo bci;
+    memset(&bci, 0, sizeof(bci));
+    bci.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size        = bytes;
+    bci.usage       = usage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer b = VK_NULL_HANDLE;
+    VkResult r = vkCreateBuffer(dev->device, &bci, nullptr, &b);
+    if (r != VK_SUCCESS) {
+        ++dev->alloc_failures;
+        return vk_fail(err, err_size, "vkCreateBuffer (arena sub-buffer)", r);
+    }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(dev->device, b, &req);
+    const uint64_t align = req.alignment != 0 ? req.alignment : 1;
+    const uint64_t off = (arena->used + align - 1u) / align * align;
+    if (off > arena->alloc_size || req.size > arena->alloc_size - off) {
+        vkDestroyBuffer(dev->device, b, nullptr);
+        ++dev->alloc_failures;
+        return fail(err, err_size,
+                    "the %llu MiB arena is short: %llu bytes at offset %llu does not fit",
+                    (unsigned long long) (arena->alloc_size / QRT_VK_MIB),
+                    (unsigned long long) req.size, (unsigned long long) off);
+    }
+    if (vkBindBufferMemory(dev->device, b, arena->mem, off) != VK_SUCCESS) {
+        vkDestroyBuffer(dev->device, b, nullptr);
+        ++dev->alloc_failures;
+        return fail(err, err_size, "vkBindBufferMemory (arena sub-buffer) failed");
+    }
+    arena->used = off + req.size;
+    qrt_vk_buf_reg_add(b, bytes);
+    *buf = b;
+    *mem = arena->mem;
+    return 0;
+}
+
+int qrt_vk_alloc_scratch(qrt_vk_dev * dev, uint64_t bytes, VkBufferUsageFlags usage,
+                         VkBuffer * buf, VkDeviceMemory * mem, char * err, size_t err_size) {
+    if (dev != NULL && dev->arena != NULL) {
+        return arena_alloc(dev, dev->arena, bytes, usage, buf, mem, err, err_size);
+    }
+    return qrt_vk_alloc(dev, bytes, usage, buf, mem, err, err_size);
+}
+
 int qrt_vk_alloc(qrt_vk_dev * dev, uint64_t bytes, VkBufferUsageFlags usage,
                  VkBuffer * buf, VkDeviceMemory * mem, char * err, size_t err_size) {
     *buf = VK_NULL_HANDLE;
@@ -537,6 +695,13 @@ void qrt_vk_free(qrt_vk_dev * dev, VkBuffer buf, VkDeviceMemory mem) {
         return;
     }
     qrt_vk_buf_reg_del(buf);
+    if (dev->arena != NULL && mem == dev->arena->mem) {
+        // A sub-allocation: the handle goes, the arena's memory stays until the session ends.
+        if (buf != VK_NULL_HANDLE) {
+            vkDestroyBuffer(dev->device, buf, nullptr);
+        }
+        return;
+    }
     if (mem != VK_NULL_HANDLE) {
         vkFreeMemory(dev->device, mem, nullptr);
     }
@@ -607,6 +772,52 @@ void qrt_vk_free(qrt_vk_dev * dev, VkBuffer buf, VkDeviceMemory mem) {
     (void) dev;
     (void) buf;
     (void) mem;
+}
+
+int qrt_vk_arena_create(qrt_vk_dev * dev, uint64_t bytes, qrt_vk_arena ** out, char * err,
+                        size_t err_size) {
+    (void) dev;
+    (void) bytes;
+    *out = NULL;
+    snprintf(err, err_size, "this build has no Vulkan");
+    return -1;
+}
+
+void qrt_vk_arena_destroy(qrt_vk_dev * dev, qrt_vk_arena * arena) {
+    (void) dev;
+    (void) arena;
+}
+
+int qrt_vk_arena_attach(qrt_vk_dev * dev, qrt_vk_arena * arena, char * err, size_t err_size) {
+    (void) dev;
+    (void) arena;
+    snprintf(err, err_size, "this build has no Vulkan");
+    return -1;
+}
+
+uint64_t qrt_vk_arena_bytes(const qrt_vk_arena * arena) {
+    (void) arena;
+    return 0;
+}
+
+uint64_t qrt_vk_arena_used(const qrt_vk_arena * arena) {
+    (void) arena;
+    return 0;
+}
+
+void qrt_vk_arena_rewind(qrt_vk_arena * arena) {
+    (void) arena;
+}
+
+int qrt_vk_alloc_scratch(qrt_vk_dev * dev, uint64_t bytes, VkBufferUsageFlags usage,
+                         VkBuffer * buf, VkDeviceMemory * mem, char * err, size_t err_size) {
+    (void) dev;
+    (void) bytes;
+    (void) usage;
+    *buf = NULL;
+    *mem = NULL;
+    snprintf(err, err_size, "this build has no Vulkan");
+    return -1;
 }
 
 void qrt_vk_print_info(const qrt_vk_dev * dev, FILE * f) {

@@ -62,6 +62,19 @@ class RuntimeCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("--spec-mtp needs", result.stderr)
 
+    def test_device_head_only_changes_a_decode_command(self):
+        # --head picks where the sample runs: a command that never samples must reject it,
+        # and a third choice is a parse error rather than a silent fall back to the host
+        result = self.run_qrt("--print-config", "--head", "gpu")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("--head gpu needs", result.stderr)
+        result = self.run_qrt("--generate", "missing", "--head", "both")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("expected host or gpu", result.stderr)
+        result = self.run_qrt("--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--head-check", result.stdout)
+
     def test_invalid_numbers(self):
         for flag, value in [("--layer", "3junk"), ("--prefill-pipeline", "maybe"),
                             ("--prefill-pipeline", "2"), ("--prefill-group-kib", "abc"),

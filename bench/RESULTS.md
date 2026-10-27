@@ -3948,3 +3948,278 @@ M3-3 的常驻回归（教师强制、`--miss-split 0`，k=2/4/8）在同一二�
   E/p 全部来自 `--generate --spec-mtp`。
 - 未在 40 层 + 缓存档上做过 float 级硬判据（该档两臂天然不同腿，见 92.2）；未跑 256K 上下文。
 - 未提交（无提交授权）。
+
+## 93. M3-7：输出头与 argmax 上设备，端到端流程第一次跑通真实规模（2026-10-26）
+<!-- slug: m3-7-device-head -->
+
+口径：工作区 `c7db2599a` + 未提交 diff；`build-vulkan`（Release/MinGW/Ninja，Vulkan）；模型与
+store 同 92；日志在 `bench/raw/m3-7/`。这一轮的动机是端到端可用：`--generate` 的 pass 里
+**3.3 s 中有 3.0 s 是 host 输出头**（`qrt_model_head_rows` 逐行 pread 2176 B、用 double 做
+248320 x 2048 点积，还要与 CPU 专家腿抢核），design 4.6 本来就把采样放在设备上。
+
+### 93.1 实现：一次提交做完 norm + 全词表 GEMM + 两段 argmax
+
+- 新模块 `runtime/head.{h,cpp}`：`output.weight` 以 prepared Q8_0 常驻（572 MiB），一次
+  `--generate` 打开时读一次、重排一次、上传一次（`qrt_gemm_q8k_prepare`，与稠密投影同一套）。
+  一个 pass 把头录进**一条命令缓冲**：`qrt_norm`（output_norm + Q8_1 打包，`no_out`）->
+  `gemm_q8k`（`n = 248320`、`k = 2048`、token-major 输出）-> `head_max1` -> `head_max2`，
+  host 只拿回 rows 个 (id, logit, runner-up)。
+- `kernels/head_max1.comp` 每段（4096 项）报 (最大值, 下标, 次大值)，`head_max2.comp` 合并成
+  一行的答案。两段的比较序都是「值降、下标升」这个全序，所以结果与分段方式无关，平票取下标小者，
+  与 host 参考的 `gen_pick` 同语义。候选词表用一张 mask（全词表 = 全 1，草稿 = 16K 候选），
+  因此验证 pass 与草稿步共用同一个头，不再 gather 权重行。
+- 词元 tile：1..2 行用 `gemm_q8k_m1`（每行读一次权重），3 行以上补到 32 行 tile（整 pass 读一次
+  权重），交叉点在 2-3 行之间，按带宽算的。
+- 草稿头（M3-3b 的 gather GEMV）换成同一个设备头的 mask 臂 + `shared_head_norm` 的 norm 槽；
+  `nextn.eh_proj` 仍在 host（每步 8.9 MiB），是草稿步剩下的主要 host 工作。
+- 显存归属：头占 572 MiB 权重 + 31.8 MiB logits tile。`gen_decode_cache` 在头打开后重读
+  `VK_EXT_memory_budget`，让专家缓存让出差额（design 5.5 的「计算缓冲每多 100 MiB 缓存掉约
+  0.5 pp」）；头本身分配失败时打印 `generate_head disabled` 并退回 host 头，不当崩溃。
+- 开关：`--head host|gpu`（默认 host，见 93.4），`--head-check` / `--head-rows` 是它的门。
+
+### 93.2 L-KERN：`--head-check`（对独立 CPU 双精度参考，共享打包口径）
+
+参考不复制设备算术：下载**设备自己打包的 Q8_1 平面**，与 GGUF 里原始 q8_0 权重行在 double 下
+重做点积（E-CHAIN1 (a) 的口径，量化打包由 `--norm-check` 单独判）。两档 rows，覆盖整个词表。
+
+| 档 | rel_L1（全词表逐行） | max_abs | ids_equal | mask 臂 | 判决 |
+|---|---:|---:|---|---|---|
+| rows=2 tile=2 | **1.243e-07** | 4.607e-06 | 1（两行都同） | 两候选选中较大者；单候选反例如期移位 | PASS |
+
+- 头本身 `ms=9.92`（rows=2，含一次提交与回读）。
+- mask 的反例臂是必要的：只测「mask 全选」看不出 mask 是否生效。
+
+### 93.3 端到端读数：同一 prompt、同一 k、只换采样这一处
+
+4 层 256+8（f16 KV、无缓存、MTP+16K，两臂只差 `--head`）：
+
+| 臂 | 每周期 pass_ms | 每草稿步 | 生成 ids | 显存 |
+|---|---:|---:|---|---:|
+| host | 2864.0 | 142.46 ms / 42.5 MiB | 382,261,261,173759,6147,582,165030,319 | 843.6 MiB |
+| device | **71.8** | **35.78 ms / 8.5 MiB** | 与 host 臂逐个相同 | 1421.6 MiB |
+
+40 层常驻（`--spec-check` 的接受/回滚门，两臂同二进制）：
+
+| 档 | 判决 |
+|---|---|
+| `--spec-check --head gpu` 40 层 32+12、k=4、无缓存、MTP+16K | `ids_equal=1 rows_bad=0 worst_rel_l1=0.000e+00 legs=exact E=1.833 cycles=6` PASS |
+| `--spec-check --head gpu --spec-rollback off` 4 层（反例臂） | `ids_equal=0 first_diff=3` PASS |
+| `--generate --head gpu` 40 层 32+8 | ids 与 86.2/92.2 金标准 8/8 相同 |
+
+10.4K prompt、128 token、k=4、16K、q8_0 K + q4_0 V（AGENTS 第 2 节的 TG 口径形状，chunk 仍 32）：
+
+| 项 | `--head host`（92.3） | `--head gpu` |
+|---|---:|---:|
+| 每周期 pass_ms（55 周期均值） | 3331.6 | **412.8** |
+| 每草稿步 | 155.89 ms / 42.5 MiB | 40.76 ms / 8.5 MiB |
+| E（生成/周期） | 2.327 | **2.309**（accepted 15/18/12/10/0） |
+| 周期墙钟 = pass + 3 x 草稿 | 3.80 s | 0.535 s |
+| **TG = E / 周期** | **0.59 tok/s** | **4.3 tok/s** |
+| 专家缓存 | 4198 MiB（2298 槽，命中 31374/46868 = 67.0%） | 3228 MiB（1681 槽，命中 26454/47132 = 56.1%） |
+| 显存 peak | 7253.8 MiB | 6705.1 MiB |
+| 三条腿合计（55 周期） | gpu 13664 / h2d 3744 / cpu 3827 ms | gpu 12918 / h2d 3662 / cpu 3693 ms，spread 71.7% |
+
+- 参照：这一档的绑定腿是 GPU 读（2.17 GB 稠密 + 467 命中专家 x 1.93 MB = 3.07 GB/pass -> 19.6 ms），
+  `0.85 x roofline` = 23.1 ms/pass；实测 GPU 设备腿 235 ms/pass，还差 10 倍，差的不是带宽而是
+  每层两次提交与每层一次 top-k 回读（design 4.6 要求每 pass 1 次同步）。
+- E 基本没动（2.327 -> 2.309）：换头不换接受率。
+- 头本身的单价在 40 层 32+8 档实测：`head_calls=18 head_ms=80.7`，即 **4.5 ms/次**（6 次验证
+  pass + 12 次草稿步），对照同一档的 host 头 1.5-3.0 s/次。
+- prefill 仍是 15-18 分钟量级（chunk 32、326 chunks/层、13-17 s/层 x 40 层），端到端墙钟被
+  prefill 主导；这条压在 M2-8a（共享 scratch arena + chunk 2048）。
+
+**单变量对照（缓存关掉，腿路径两臂相同）**：
+
+| 档 | host 头 | device 头 |
+|---|---|---|
+| `--spec-check` 40 层 32+12、k=4、无缓存、MTP+16K | `E=1.833 cycles=6 ids_equal=1 worst=0.000e+00` PASS | `E=1.833 cycles=6 ids_equal=1 worst=0.000e+00` PASS（逐字段相同） |
+| `--generate` 40 层 32+8、无缓存 | 86.2/92.2 金标准 8 个 ids | 与金标准 8/8 相同 |
+| `--generate` 4 层 256+8、无缓存 | 382,261,261,173759,6147,582,165030,319 | 与 host 臂逐个相同 |
+| 常驻教师强制回归 k=2/4/8、`--miss-split 0`、device 头 | - | `ids_equal=1 worst=0.000e+00`，E=1.375/2.200/2.200 PASS |
+
+回归其余部分在同一二进制上重跑：`ctest -L qrt` 9/9、`--selftest` 0 failed、`--norm-check`
+`qs_bad=0`、DeltaNet 14 PASS / 0 FAIL、`--gguf-index` 正常。
+
+### 93.4 边界与未验证
+
+- 10.4K/128 token 的两臂 streams **不是单变量对照**：设备头把缓存从 4198 挤到 3072 MiB（1681 槽，
+  host@4198 是 2298 槽，host@3228 是 1767 槽），命中 67.0% -> 56.1%，而缓存档位自己就会移动这条
+  stream（同 prompt 同 k：E = 2.327 / 2.396 / 2.309 三档），加上 `--miss-split auto` 的
+  run-to-run 抖动（89.5）。这两臂的 128 个 ids 在第 25 个之后分叉，**不能归因给头**；能归因的
+  是上面那张缓存关闭的单表（无腿噪声、无 auto 抖动时逐字段相同）。
+- 因此 `--head` 的默认值保持 `host`：设备头还没过 L-MODEL 的 C 锚——外部质量锚（对 fork 的
+  KLD/top-1）目前只走 `--logits-dump` 的 host 头，解码路径的设备头 logits 没进那条链。
+  解码档的 C 锚（`--spec-check` 的 capture 已经能取回设备 logits 行）是 flipping 的前置。
+- 头的 606 MiB 挤掉 11 pp 命中，是**用显存换时间**的账：等 M2-8a 把 40 份 T 尺寸平面收成一份，
+  缓存有可能回到 4198 MiB 并同时留住头，那时再量一次命中与 E。
+- 没做：批量草稿（仍是 k-1 次 1 行块前向）、`nextn.eh_proj` 上设备（草稿步 40 ms 里约 25 ms 是它）、
+  每 pass 单条命令缓冲（M3-2b，绑定腿 235 -> ~23 ms 的那一步）、256K 上下文、r>=3 的正式性能批次
+  （本表的 ms 是单次读数，不是正式批次）。
+- 未提交（无提交授权）。
+
+
+
+## 94. M2-8a：会话级 scratch arena + 共享 staging，40 层常驻的 prefill chunk 从 32 提到 2048（2026-10-27）
+<!-- slug: m2-8a-shared-arena -->
+
+口径：工作区 `c7db2599a` + 未提交 diff（M3-7 设备头 + 本轮 M2-8a）；`build-vulkan`（Release/MinGW/Ninja，
+Vulkan）；模型与 store 同 92/93。`--prefill-chunk` 覆盖 `QRT_PREFILL_CHUNK`。日志、dump 与复现脚本在
+`bench/raw/m2-8a/`，`v2-*` 是修好 sizing 公式后的最终二进制（本节的读数全部来自它）。prefill 计时是两个
+入口的单次读数：会话的 `generate_prefill_total`，以及 `--logits-dump` 的 40 个 `model_layer ms` 之和；
+不是 r>=3 的正式性能批次。
+
+### 94.1 实现：一份 arena、一块 staging，层与层别名
+
+- `vk_dev.*` 新增 `qrt_vk_arena`：一次 `vkAllocateMemory` 的 device-local 分配，每个子 buffer 按自己的
+  `VkMemoryRequirements.alignment` 在偏移上 `vkBindBufferMemory`。`qrt_vk_alloc_scratch()` 在 arena
+  挂上时走它，否则退回 `qrt_vk_alloc()`（所有 check 路径与 `--logits-dump` 因此完全不变）；
+  `qrt_vk_free()` 识别 arena 内存，只销毁 VkBuffer handle，显存留到 arena 销毁。
+- 会话在开层前用 `qrt_layer_budget_of()` 算每层在 `chunk` 行下的用量（layer 自己的平面 + DN/full/FFN
+  各自的 `*_scratch_bytes`/`*_plane_bytes` + `layer_staging_bytes`），取所有主层与 MTP 块的最大值，
+  建 arena 与一块共享 staging；每层 open 前 `qrt_vk_arena_rewind()`。层严格串行，所以 40 层看到同一
+  组偏移。持久状态不进 arena：DeltaNet 状态环、conv_state 与 snapshot 副本、full-attn KV、权重、
+  专家 slot 都还是每层常驻。
+- 每层自己的 staging（原先 max(权重上传, T x max(E,inter) x 4, 2 MiB 状态)）和 FFN 的 32 MiB packer
+  合并成会话的一块；`QRT_FFN_STAGING_BYTES` 只作为会话 staging 的下限，专家打包的所有容量判断改读
+  `qrt_vk_staging_bytes()`。
+- DeltaNet 的 conv carry 从"下一次 pass 开头从 qkv 平面读"改成"本 pass 末尾写进 conv_state"：qkv
+  平面现在是 40 层别名，不能跨调用保存数据。snapshot pass 另存 entry window（3 行）与 pass rows
+  （k 行），rollback 后第一个 pass 先按 kept 前缀重建 conv_state（kept<3 时 entry 尾部 + pass 前
+  kept 行，否则 pass 的末 3 行）。
+- `--generate` 的 chunk 上限从 64 提到 **2048**（32 对齐，越界报错），每个会话打印
+  `generate_arena mib=... predicted_mib=... used_mib=... staging_mib=...`。
+
+### 94.2 正确性：同一二进制上的逐位对齐
+
+| 检查 | 读数 | 判决 |
+|---|---|---|
+| `--layer-check` 层 0 / 层 39 @64（FFN+merged pass） | `fails=0`；state `chunks=60,1,2,1 mismatches=0` | PASS |
+| `--layer-check` 层 0 @64、`--layer-pass off --layer-ffn off`（模块路径，carry 走独立 submit） | `fails=0`，state mismatches=0 | PASS |
+| `--deltanet-check` 256 / `--fullattn-check` 64 | 14 PASS / 0 FAIL；qk q 1.179e-07、attn 8.736e-07 | PASS |
+| `--spec-check` 4 层 32+12、k=4、无缓存、MTP+16K、device 头 | `ids_equal=1 first_diff=0 worst_rel_l1=0.000e+00` | PASS |
+| 同上 `--spec-rollback off`（反例臂） | `ids_equal=0 first_diff=3` | PASS（如期分叉） |
+| `--spec-check` 40 层 32+12、k=4、无缓存、MTP+16K、device 头 | `E=1.833 ids_equal=1 worst=0.000e+00`（与 92/93 逐字段相同） | PASS |
+| `--generate` 4 层、256 token prompt、8 new、chunk 32 / 256 | ids `382,261,261,173759,6147,582,165030,319`，两档相同且等于 92.3 金标准 | PASS |
+| `--generate` 40 层 32+8、device 头 | 与 `bench/raw/m3-3b/golden8.ids` 逐 token 相同 | PASS |
+| 2048 token prompt：`--logits-dump` 16 行 chunk 32 vs 2048 | raw/logp `rel_L1=0.000e+00`，top-1 16/16 | PASS |
+| 2048 token prompt：会话 `--generate` 8 new，chunk 32 vs 2048 | ids 相同；8 个 step 的 id/logit/margin 逐字段相同 | PASS |
+| **10.4K prompt：`--logits-dump` 16 行 chunk 32 vs 2048** | raw/logp `rel_L1=0.000e+00`，top-1 **16/16** | PASS |
+| **10.4K prompt：会话 `--generate` 8 new，chunk 32 vs 2048** | ids 相同；8 个 step 逐字段相同；step0 = M3-7 金标准 `271 / 16.4599 / 0.4060` | PASS |
+
+- 10.4K 两档的 ids 都是 `271,248068,271,248069,271,109455,96762,97990`；比较脚本
+  `bench/raw/m2-8a/cmp_logits.py`（raw logits 行的 rel_L1 + log-prob rel_L1 + top-1）。
+- 这两条是 B 层的共享打包口径：dump 走 host 头、与 M3-7 的 C 锚同一条链；会话走 host 头 + 40 层常驻。
+- 审计回归：`--selftest` 0 failed，`ctest -L qrt` 9/9。
+
+### 94.3 读数：prefill 与显存
+
+**10.4K prompt、40 层、greedy 8 token、缓存关闭（会话）**：
+
+| chunk | chunks/层 | prefill | tok/s | arena（predicted/used） | staging | peak_mib |
+|---:|---:|---:|---:|---|---:|---:|
+| 32 | 326 | **675.75 s** | 15.4 | 12.6 / 11.5 / 11.5 MiB | 32.0 MiB | 2387.4 |
+| 2048 | 6 | **53.44 s** | **195.1** | 428.4 / 427.3 / 427.3 MiB | 32.0 MiB | 2803.2 |
+
+- 提速 **12.64x**。显存差 415.8 MiB 正是 arena 从 12.6 涨到 428.4 的那部分：会话其他分配（权重、KV、
+  专家 slot）两档相同。
+- 每行字节（实测拟合）：`(427.3-11.5) MiB / (2048-32) = 216,260 B/行`（layer 39,680 + DN 123,136 +
+  FFN 53,444），另加 FFN 固定填充 `1792 行 x 2,888 B = 5.18 MiB`。按 2048 行是 427.3 MiB，
+  **低于 design 5.5 的 700 MiB 计算缓冲下限**（原先 40 份在 2048 行会到 17 GiB）。
+- 同一 prompt 的 `--logits-dump`（单层驻留的 model 链）为 237.0 s -> 33.6 s（44.0 -> 310.7 tok/s，
+  7.06x，wall 283 s -> 67 s）。会话比它慢 1.6-2.9x，见 94.4。
+
+**默认口径（q8_0 K + q4_0 V，`--expert-cache-mib 4198`、MTP k=4 + 16K、device 头、2048 chunk）**：
+
+| 项 | 读数 |
+|---|---|
+| prefill（10.4K） | 53.39 s（195.3 tok/s） |
+| 专家缓存 | 4198 -> **3327 MiB**（1822 槽；头让出 606 MiB 后仍是 3327，与 93.3 的 3228 同档） |
+| 显存 peak | 6938.5 MiB |
+| 解码（16 token 诊断） | 8 周期、`E=2.000`、hits 1842、h2d 721 / cpu 744 / gpu 1683 ms |
+
+### 94.4 边界与未验证
+
+- **PP 仍只有 195 tok/s**（会话）/ 311 tok/s（model 链），离 M2-8 的 1000 还远。本轮只拆掉 chunk
+  上限；下一个瓶颈是会话 prefill 本身：共享 FFN slot 的 `transient` 路径每个 chunk 都把该层路由到的
+  专家重新打包上传（chunk 32 时每层 326 次，chunk 2048 时 6 次），这是会话比单层驻留的 model 链慢
+  2.9x（chunk 32）/1.6x（2048）的主因。归 M2-8/M2-5，不在 M2-8a。
+- arena 在 2048 行是 428 MiB，和旧的 40 份 chunk-32 平面（约 460 MiB）基本同量；"arena 让出显存给
+  缓存"只在小 chunk 的 decode-only 会话里兑现（chunk 32 时 arena 12.6 MiB）。10.4K 的缓存档因此
+  与 93.3 同档（3327 vs 3228 MiB），不是 4198。
+- chunk > 2048 会被拒绝（arena 按 2048 行预算；再大要重新算行预算并重新评估 8 GiB 的余量）。
+- 下一个显存优化点：arena 只在 prefill 需要 2048 行，decode 每 pass 至多 9 行。prefill 结束后按
+  实际 rows 重开一个 9 行的 arena（约 2 MiB）可把约 425 MiB 还给专家缓存，这是 M3-2b/M2-8 的题目，
+  本轮没做。
+- 16 token 的 E 是诊断，不是 TG 读数；本节所有 ms 都是单次，不是正式批次（r>=3）。
+- 未在 256K 上下文、paged KV、`--layer-pass off` 的会话组合上重跑；`--logits-dump` 与 check 路径
+  不挂 arena，行为不变。
+- 未提交（无提交授权）。
+
+## 95. M3-3c：MTP 块的 prompt/验证行 KV 就是 E 的缺口，E 2.31 -> 2.76-2.84（2026-10-27）
+<!-- slug: m3-3c-mtp-kv -->
+
+口径：工作区 `c7db2599a` + 未提交 diff；`build-vulkan`（Release/MinGW/Ninja，Vulkan）；模型/store 同 92/93；
+10.4K prompt 用 `bench/raw/review-20261026/tokens10428.txt`（10428 token，fork 第 19 节用的是模板后的
+10438，差 10 个 token）；k=4、16K 候选、q8_0 K + q4_0 V、`--expert-cache-mib 4198` + `auto`、device 头、
+chunk 2048、128 new。日志在 `bench/raw/m3-3c/`。E 按 bench/README 口径是"生成 token / 周期数"；
+`generate_spec` 行里的 E 是 kept/周期，最后一个周期不满时两者差 1 个以内，本节两个数都给。
+
+### 95.1 归因：fork 的草稿块在 prompt 上写过 KV，runtime 没有
+
+- **chunk 形状先排除**：M2-8a 已经证明同一 10.4K prompt 在 chunk 32 与 2048 下 logits 逐位相同
+  （RESULTS#m2-8a-shared-arena），所以 92.4 的 E=2.327 不是"chunk 32 的算术形状"造成的。
+  hnorm、KV 精度、词表限制在 92.3 已排除。
+- **MTP 块 KV**：fork 的 `common/speculative.cpp` 里 `draft-mtp` 的 `process()` 钩子在**每一个 target
+  batch**（prompt 与验证 pass）上跑 MTP 上下文：位置 p 的输入是
+  `eh_proj(concat(enorm(token_p), hnorm(t_h_nextn(p-1))))`，`t_h_nextn` 来自 target 图（主层最后的
+  hidden 过 `output_norm`，`src/models/qwen35moe.cpp` 199-233），第一个 batch 的第一行 h=0。
+  因此 fork 的草稿块 KV 每个 prompt/验证位置都有一行。runtime 只在草稿位置跑块，prompt 的 10428 行
+  从未写过，第一个草稿的注意力就在未初始化的缓存上做——这是 18% 缺口的主因。
+- **seed 不是缺口**：target 图的 `t_h_nextn` 用 `output_norm`，MTP 块自己的链式 h 用
+  `nextn.shared_head_norm`（两者在本模型相差 rel_L1 11.4%）；runtime 的 `mtp_seed` 用 output_norm、
+  `mtp_step` 的链用 shnorm，与 fork 一致，不改。
+- **候选头语义一致**：fork 是 top_k=10 + 候选 mask 的 argmax，runtime 是完整头的候选 mask argmax，
+  取最大者相同。
+
+### 95.2 修复：设备侧 eh_proj + prompt 行 + 每周期验证行刷新
+
+- 新增 `mtp_run_rows()`（`model_generate.cpp`）：把 (token, h_prev) 行在 host 上做 enorm/hnorm
+  （double），`no_norm` 的 Q8_1 打包后由 dense GEMM 用 prepared `nextn.eh_proj` 直接投影进
+  MTP 层的输入平面，再 `qrt_layer_run_chunk`。host 不再做每行 8.9 MB 的 GEMV（10.4K 行会要
+  ~260 s）；MTP 模块自带 `qrt_gemm`/`qrt_norm` 与一块 concat/plane 缓冲（chunk 2048 时约 43 MB）。
+- `mtp_prefill()`：prefill 之后、decode cache 接管共享专家 slot 之前，按 chunk 跑完 prompt 的
+  0..N-1 行（第一行 h=0），写满草稿块的 KV。10.4K 用时 **1.71 s**（prefill 53.3 s 的 3.2%）。
+- `gen_cycle()`：每个验证 pass 后按 kept 行用 target 的 h 重跑草稿块（fork 的 process() 行为），
+  覆盖草稿链写下的 KV；cycle 起点的 seed 作为第 0 行的 h_prev。
+- 草稿步改走同一条路径：host 字节 8.5 MiB -> 0.2 MiB，单步 40.76 -> **21.9 ms**（块本身 device 13 ms）。
+- 顺序调整：第一个 token 在 MTP prompt pass 与 cache plan 之前采样（两者都会覆盖最后一层的输出平面），
+  prompt pass 在 `gen_decode_cache` 之前（它要用共享 prefill slot）。
+
+### 95.3 读数
+
+| 档（10.4K、k=4、16K、q8_0/q4_0、4198+auto、device 头、chunk 2048） | 周期 | E（生成/周期） | `generate_spec` E | p | 草稿步 |
+|---|---:|---:|---:|---:|---:|
+| 93.3 基线（chunk 32、缓存 3072） | 55 | 2.327 | 2.309 | - | 40.76 ms / 8.5 MiB |
+| 修复 r1 | 46 | **2.783** | 2.761 | 0.591（81/137） | 21.93 ms / 0.2 MiB |
+| 修复 r2 | 45 | **2.844** | 2.844 | 0.591（约） | 22.18 ms / 0.2 MiB |
+| fork（第 19 节，10438 token、`--cpu-moe`） | 40 | 2.850 | - | 0.632 | - |
+
+- design 6.3 的两条 k=4 线是 2.90（CPU 0.118）/2.72（CPU 0.090）：**2.72 过，2.90 差 0-5%**。
+  两次读数差 2.2% 来自 `auto` 分担与缓存腿的 run-to-run 抖动（89.5 已记录同类现象），不是 prompt 行。
+- 接受分布 r2：accepted 0/1/2/3 = 8/10/8/19；与 fork 的 p=0.632 相差约 6%。
+- 草稿块 KV 的 prompt 行不是"可空"的：这正是 18% 缺口的来源；剩余 0-3% 与 fork 的差在 prompt
+  长度（-10 token）、target h 的专家腿算术（fork 是 `--cpu-moe`）与 q8 GEMM 的舍入上，未再拆分。
+
+### 95.4 正确性
+
+| 检查 | 读数 | 判决 |
+|---|---|---|
+| 10.4K `--spec-check` 40 层 12 new、k=4、16K、**缓存关闭**、device 头 | `ids_equal=1 first_diff=0 rows_bad=0 worst_rel_l1=0.000e+00` | PASS |
+| 40 层 32+8 device 头 | 8 个 ids 与 `m3-3b/golden8.ids` 相同 | PASS |
+| 4 层 256-token prompt 8 new、host 头 | `382,261,261,173759,6147,582,165030,319`（92.3 金标准） | PASS |
+| 4 层 `--spec-rollback off` 反例 | `ids_equal=0 first_diff=3` | PASS（如期分叉） |
+| `--selftest` / `ctest -L qrt` | 0 failed / 9/9 | PASS |
+
+- 缓存开启的 E 流与 93.3 的 128 个 ids 在第 47 个分叉：两轮的缓存档不同（3385/3072 MiB）且
+  `auto` 分担不同，属于 93.4 已记录的缓存腿敏感；正确性由缓存关闭的 spec-check 判（逐位）。
+- 未提交（无提交授权）。

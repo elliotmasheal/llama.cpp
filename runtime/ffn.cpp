@@ -154,7 +154,9 @@ void qrt_ffn_close(qrt_vk_dev * dev, qrt_ffn * f) {
         if (f->layout != VK_NULL_HANDLE)      vkDestroyPipelineLayout(dev->device, f->layout, nullptr);
         if (f->dsl != VK_NULL_HANDLE)         vkDestroyDescriptorSetLayout(dev->device, f->dsl, nullptr);
         qrt_gemm_close(dev, f->gemm);
-        qrt_vk_staging_destroy(dev, f->stg);
+        if (f->owns_stg) {
+            qrt_vk_staging_destroy(dev, f->stg);
+        }
     }
     if (f->store != NULL) {
         qrt_weights_close(f->store);
@@ -180,6 +182,31 @@ uint32_t qrt_ffn_dispatches(const qrt_ffn * f) { return f != NULL ? f->dispatche
 
 const qrt_ffn_bufs * qrt_ffn_buffers(const qrt_ffn * f) {
     return f != NULL ? &f->bufs : NULL;
+}
+
+// The routed rows after padding to the 8-token tile; the three plane families whose size
+// depends on it (gather, expert hidden, row tables) all use this one count.
+static uint32_t ffn_max_rows_of(const qrt_ffn_cfg * cfg) {
+    return cfg->tokens * cfg->top_k + cfg->n_expert * 7u;
+}
+
+uint64_t qrt_ffn_plane_bytes(const qrt_ffn_cfg * cfg) {
+    if (cfg == NULL) {
+        return 0;
+    }
+    const uint64_t max_rows = ffn_max_rows_of(cfg);
+    return (uint64_t) cfg->tokens * cfg->n_expert * 4 +          // logits
+           2u * (uint64_t) cfg->tokens * cfg->top_k * 4 +        // ids, weights
+           (uint64_t) cfg->tokens * 4 +                          // shared gate
+           max_rows * cfg->n_embd +                              // gathered qs
+           max_rows * (cfg->n_embd / 32u) * 4 +                  // gathered ds
+           max_rows * cfg->ffn +                                 // expert hidden qs
+           max_rows * (cfg->ffn / 32u) * 4 +                     // expert hidden ds
+           (uint64_t) cfg->tokens * cfg->ffn +                   // shared qs
+           (uint64_t) cfg->tokens * (cfg->ffn / 32u) * 4 +       // shared ds
+           2u * (uint64_t) cfg->tokens * cfg->ffn * 4 +          // gate/up scratch
+           3u * (uint64_t) cfg->tokens * cfg->n_embd * 4 +       // shexp, moe, expert out
+           2u * max_rows * 4;                                    // row tables
 }
 
 int qrt_ffn_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_prefix,
@@ -278,8 +305,17 @@ int qrt_ffn_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_pr
                  cfg->n_embd, cfg->n_embd);
             break;
         }
-        if (qrt_vk_staging_create(dev, QRT_FFN_STAGING_BYTES, &f->stg, err, err_size) != 0) {
+        if (cfg->stg != NULL) {
+            // Borrowed: the packing loop flushes on the actual capacity, so any buffer that
+            // holds the largest expert works; a session makes it at least the 32 MiB the
+            // packer was tuned on.
+            f->stg = cfg->stg;
+            f->owns_stg = 0;
+        } else if (qrt_vk_staging_create(dev, QRT_FFN_STAGING_BYTES, &f->stg, err,
+                                         err_size) != 0) {
             break;
+        } else {
+            f->owns_stg = 1;
         }
         if (qrt_vk_alloc(dev, f->h_router.size() * 4,
                          QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST, &f->router_w,
@@ -345,7 +381,8 @@ int qrt_ffn_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_pr
             qrt_ffn_close(dev, f);
             return -1;
         }
-        if (loc.bytes > QRT_FFN_STAGING_BYTES || loc.bytes > UINT32_MAX - slot_bytes) {
+        if (loc.bytes > qrt_vk_staging_bytes(f->stg) ||
+            loc.bytes > UINT32_MAX - slot_bytes) {
             qrt_ffn_close(dev, f);
             return fail(err, err_size, "expert %u exceeds staging capacity or the layer slot exceeds 32-bit offsets", e);
         }
@@ -362,46 +399,52 @@ int qrt_ffn_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_pr
         f->slot_bytes = cfg->slot_bytes;
     }
     const uint32_t max_pairs = cfg->tokens * cfg->top_k;
-    f->max_rows = max_pairs + cfg->n_expert * 7u;
+    f->max_rows = ffn_max_rows_of(cfg);
     const uint64_t gather_qs_bytes = (uint64_t) f->max_rows * cfg->n_embd;
     const uint64_t gather_ds_bytes = (uint64_t) f->max_rows * (cfg->n_embd / 32u) * 4;
     const uint64_t h_qs_bytes      = (uint64_t) f->max_rows * cfg->ffn;
     const uint64_t h_ds_bytes      = (uint64_t) f->max_rows * (cfg->ffn / 32u) * 4;
     f->planes_bytes = gather_qs_bytes + gather_ds_bytes + h_qs_bytes + h_ds_bytes;
 
+    // scratch = 1 for the per-chunk planes, which the session arena shares across layers.
     const struct {
         uint64_t bytes;
         VkBuffer * buf;
         VkDeviceMemory * mem;
         const char * what;
+        int scratch;
     } slots[] = {
-        { (uint64_t) cfg->tokens * cfg->n_expert * 4, &f->logits, &f->logits_mem, "logits" },
-        { (uint64_t) max_pairs * 4, &f->ids, &f->ids_mem, "top-k ids" },
-        { (uint64_t) max_pairs * 4, &f->wts, &f->wts_mem, "top-k weights" },
-        { (uint64_t) cfg->tokens * 4, &f->sgate, &f->sgate_mem_out, "shared gate" },
-        { gather_qs_bytes, &f->gather_qs, &f->gq_mem, "gathered qs" },
-        { gather_ds_bytes, &f->gather_ds, &f->gd_mem, "gathered ds" },
-        { h_qs_bytes, &f->h_qs, &f->hq_mem, "expert hidden qs" },
-        { h_ds_bytes, &f->h_ds, &f->hd_mem, "expert hidden ds" },
-        { (uint64_t) cfg->tokens * cfg->ffn, &f->shexp_qs, &f->sq_mem, "shared qs" },
+        { (uint64_t) cfg->tokens * cfg->n_expert * 4, &f->logits, &f->logits_mem, "logits", 1 },
+        { (uint64_t) max_pairs * 4, &f->ids, &f->ids_mem, "top-k ids", 1 },
+        { (uint64_t) max_pairs * 4, &f->wts, &f->wts_mem, "top-k weights", 1 },
+        { (uint64_t) cfg->tokens * 4, &f->sgate, &f->sgate_mem_out, "shared gate", 1 },
+        { gather_qs_bytes, &f->gather_qs, &f->gq_mem, "gathered qs", 1 },
+        { gather_ds_bytes, &f->gather_ds, &f->gd_mem, "gathered ds", 1 },
+        { h_qs_bytes, &f->h_qs, &f->hq_mem, "expert hidden qs", 1 },
+        { h_ds_bytes, &f->h_ds, &f->hd_mem, "expert hidden ds", 1 },
+        { (uint64_t) cfg->tokens * cfg->ffn, &f->shexp_qs, &f->sq_mem, "shared qs", 1 },
         { (uint64_t) cfg->tokens * (cfg->ffn / 32u) * 4, &f->shexp_ds, &f->sd_mem,
-          "shared ds" },
-        { (uint64_t) cfg->tokens * cfg->ffn * 4, &f->g_out, &f->go_mem, "gate scratch" },
-        { (uint64_t) cfg->tokens * cfg->ffn * 4, &f->u_out, &f->uo_mem, "up scratch" },
-        { (uint64_t) cfg->tokens * cfg->n_embd * 4, &f->shexp, &f->sh_mem, "shared out" },
-        { (uint64_t) cfg->tokens * cfg->n_embd * 4, &f->moe, &f->mo_mem, "routed out" },
-        { (uint64_t) cfg->tokens * cfg->n_embd * 4, &f->scratch, &f->sc_mem, "expert out" },
-        { external_slot ? 0 : slot_bytes, &f->slot, &f->slot_mem, "layer expert slot" },
-        { (uint64_t) f->max_rows * 4, &f->tab_tok, &f->tt_mem, "row table" },
-        { (uint64_t) f->max_rows * 4, &f->tab_w, &f->tw_mem, "row weights" },
+          "shared ds", 1 },
+        { (uint64_t) cfg->tokens * cfg->ffn * 4, &f->g_out, &f->go_mem, "gate scratch", 1 },
+        { (uint64_t) cfg->tokens * cfg->ffn * 4, &f->u_out, &f->uo_mem, "up scratch", 1 },
+        { (uint64_t) cfg->tokens * cfg->n_embd * 4, &f->shexp, &f->sh_mem, "shared out", 1 },
+        { (uint64_t) cfg->tokens * cfg->n_embd * 4, &f->moe, &f->mo_mem, "routed out", 1 },
+        { (uint64_t) cfg->tokens * cfg->n_embd * 4, &f->scratch, &f->sc_mem, "expert out", 1 },
+        { external_slot ? 0 : slot_bytes, &f->slot, &f->slot_mem, "layer expert slot", 0 },
+        { (uint64_t) f->max_rows * 4, &f->tab_tok, &f->tt_mem, "row table", 1 },
+        { (uint64_t) f->max_rows * 4, &f->tab_w, &f->tw_mem, "row weights", 1 },
     };
     for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); ++i) {
         if (slots[i].bytes == 0) {
             continue;
         }
-        if (qrt_vk_alloc(dev, slots[i].bytes, QRT_VK_USAGE_STORAGE |
-                         QRT_VK_USAGE_TRANSFER_DST | QRT_VK_USAGE_TRANSFER_SRC,
-                         slots[i].buf, slots[i].mem, err, err_size) != 0) {
+        const VkBufferUsageFlags usage = QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST |
+                                         QRT_VK_USAGE_TRANSFER_SRC;
+        if ((slots[i].scratch
+                 ? qrt_vk_alloc_scratch(dev, slots[i].bytes, usage, slots[i].buf,
+                                        slots[i].mem, err, err_size)
+                 : qrt_vk_alloc(dev, slots[i].bytes, usage, slots[i].buf, slots[i].mem, err,
+                                err_size)) != 0) {
             qrt_ffn_close(dev, f);
             return fail(err, err_size, "allocating the %s buffer", slots[i].what);
         }
@@ -643,6 +686,7 @@ int qrt_ffn_group(qrt_ffn * f, char * err, size_t err_size) {
     // been uploaded yet are read; a contiguous run of missing experts is one H2D copy.
     unsigned char * chunk = (unsigned char *) qrt_vk_staging_map(f->stg);
     const uint64_t tmp_bytes = qrt_weights_max_expert_bytes(f->store);
+    const uint64_t stg_cap = qrt_vk_staging_bytes(f->stg);
     if (tmp_bytes == 0 || tmp_bytes > SIZE_MAX) {
         return fail(err, err_size, "invalid maximum expert size for the upload");
     }
@@ -689,7 +733,7 @@ int qrt_ffn_group(qrt_ffn * f, char * err, size_t err_size) {
             rc = -1;
             break;
         }
-        if (loc.bytes > QRT_FFN_STAGING_BYTES || loc.bytes > tmp_bytes) {
+        if (loc.bytes > stg_cap || loc.bytes > tmp_bytes) {
             rc = fail(err, err_size, "expert %u exceeds upload capacity", e);
             break;
         }
@@ -703,7 +747,7 @@ int qrt_ffn_group(qrt_ffn * f, char * err, size_t err_size) {
         }
         // Flush when the staging buffer is full or the slot offset is not contiguous.
         if (chunk_fill != 0 &&
-            (chunk_fill + loc.bytes > QRT_FFN_STAGING_BYTES ||
+            (chunk_fill + loc.bytes > stg_cap ||
              chunk_base + chunk_fill != (uint64_t) f->dev_off[e])) {
             if (flush() != 0) {
                 rc = -1;

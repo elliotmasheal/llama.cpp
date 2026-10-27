@@ -20,6 +20,9 @@
 #include "expert_cache.h"
 #include "ffn.h"
 #include "gguf_index.h"
+#include "head.h"
+#include "kernels/gemm.h"
+#include "kernels/norm.h"
 #include "layer.h"
 #include "miss_split.h"
 #include "vk_dev.h"
@@ -48,7 +51,6 @@ struct qrt_mtp {
     const qrt_gguf_tensor * eh_proj = nullptr;
     std::vector<float> enorm, hnorm, shnorm;   // n_embd each
     std::vector<double> h;                     // the normed hidden the next step consumes
-    std::vector<double> concat;                // [2*n_embd] prefix input
     std::vector<float> x;                      // eh_proj output row, the block's input
     std::vector<float> out;                    // the block's raw output row
     std::vector<float> cand;                   // draft head logits
@@ -57,6 +59,26 @@ struct qrt_mtp {
     uint32_t steps = 0;
     uint64_t host_bytes = 0;                   // rows gathered and read on the host
     double step_ms = 0.0, gpu_ms = 0.0;
+
+    // M3-3c: the input projection on the device. The fork runs the MTP block over every
+    // target batch (prompt included), so its KV cache holds a row per position; the block
+    // input is eh_proj(concat(enorm(token), hnorm(h_prev))). A host GEMV per prompt row is
+    // ~25 ms, so the rows go through the dense GEMM: norm-pack them into Q8_1 planes and
+    // project straight into the layer's input plane.
+    qrt_gemm *   gemm = nullptr;
+    qrt_norm *   nrm = nullptr;
+    VkBuffer     eh_w = VK_NULL_HANDLE;      // prepared q8_0 eh_proj [E rows][2E]
+    VkDeviceMemory eh_mem = VK_NULL_HANDLE;
+    VkBuffer     concat_dev = VK_NULL_HANDLE; // [chunk][2E] f32 rows
+    VkDeviceMemory concat_mem = VK_NULL_HANDLE;
+    VkBuffer     c_qs = VK_NULL_HANDLE;      // [chunk][2E] Q8_1 quants
+    VkDeviceMemory c_qs_mem = VK_NULL_HANDLE;
+    VkBuffer     c_ds = VK_NULL_HANDLE;      // [chunk][2E/32] Q8_1 deltas
+    VkDeviceMemory c_ds_mem = VK_NULL_HANDLE;
+    std::vector<float>  concat_host;         // [chunk * 2E]
+    std::vector<float>  e_rows;              // [chunk * E] chunk token embeddings
+    std::vector<double> h_row;               // one h row, double
+    std::vector<double> e_norm;              // one normed embedding row, double
 };
 // Everything a decode session holds open. The owner frees the device, the GGUF reader and
 // the staging buffer when the frame ends; the layers, the cache and its buffers are closed
@@ -67,6 +89,12 @@ struct qrt_gen {
     qrt_vk_dev * dev = nullptr;
     qrt_gguf * g = nullptr;
     qrt_vk_staging * stg = nullptr;
+    // The session scratch (M2-8a): one device-local arena and one host staging buffer,
+    // shared by every layer because the layer chain runs strictly one layer at a time.
+    qrt_vk_arena * arena = nullptr;
+    uint64_t arena_bytes = 0;   // capacity, and the widest per-layer footprint observed
+    uint64_t arena_peak = 0;
+    uint64_t stg_bytes = 0;
     VkBuffer slot = VK_NULL_HANDLE;
     VkDeviceMemory slot_mem = VK_NULL_HANDLE;
     uint64_t slot_bytes = 0;
@@ -87,19 +115,51 @@ struct qrt_gen {
     std::vector<VkBuffer> cache_bufs;
     std::vector<VkDeviceMemory> cache_mems;
     std::vector<uint32_t> cache_slots;
+    // The device output head (design 4.6). NULL = the session samples with the host double
+    // head. last_out/sample_dev_row say where the rows the sample reads are: the last layer's
+    // output plane, whose tail row after a prefill is not at row 0.
+    qrt_head * head = nullptr;
+    VkBuffer   last_out = VK_NULL_HANDLE;
+    uint32_t   sample_dev_row = 0;
     qrt_split_rates rates{};
     qrt_split_carry carry{};
     int cache_on = 0;
     qrt_telemetry * tel = nullptr;
     // leg totals across the session, for the report at the end of the run
     double leg_gpu = 0.0, leg_h2d = 0.0, leg_cpu = 0.0;
+    double leg_head = 0.0;          // submit->fence of the device head, and how often it ran
+    uint32_t head_calls = 0;
     uint64_t leg_hits = 0, leg_miss = 0, leg_h2d_n = 0, leg_cpu_n = 0, leg_h2d_bytes = 0;
 };
 
 void gen_close(qrt_gen * s) {
+    if (s->head != NULL) {
+        qrt_head_close(s->dev, s->head);
+        s->head = NULL;
+    }
     if (s->mtp.layer != NULL) {
         qrt_layer_close(s->dev, s->mtp.layer);
         s->mtp.layer = NULL;
+    }
+    // MTP input projection (M3-3c): modules first, then their buffers.
+    if (s->mtp.gemm != NULL) {
+        qrt_gemm_close(s->dev, s->mtp.gemm);
+        s->mtp.gemm = NULL;
+    }
+    if (s->mtp.nrm != NULL) {
+        qrt_norm_close(s->dev, s->mtp.nrm);
+        s->mtp.nrm = NULL;
+    }
+    {
+        const VkBuffer mbuf[4] = { s->mtp.eh_w, s->mtp.concat_dev, s->mtp.c_qs, s->mtp.c_ds };
+        VkDeviceMemory mmem[4] = { s->mtp.eh_mem, s->mtp.concat_mem, s->mtp.c_qs_mem,
+                                   s->mtp.c_ds_mem };
+        for (uint32_t i = 0; i < 4; ++i) {
+            if (mmem[i] != VK_NULL_HANDLE) {
+                qrt_vk_free(s->dev, mbuf[i], mmem[i]);
+            }
+        }
+        s->mtp.eh_mem = s->mtp.concat_mem = s->mtp.c_qs_mem = s->mtp.c_ds_mem = VK_NULL_HANDLE;
     }
     qrt_spec_vocab_free(s->mtp.vocab);
     s->mtp.vocab = NULL;
@@ -109,6 +169,12 @@ void gen_close(qrt_gen * s) {
         }
     }
     s->layers.clear();
+    // Every layer's chunk planes were sub-allocated from the arena; destroying the buffers
+    // above left the memory free for this one call.
+    if (s->arena != NULL) {
+        qrt_vk_arena_destroy(s->dev, s->arena);
+        s->arena = NULL;
+    }
     if (s->tel != NULL) {
         qrt_telemetry_close(s->tel);
         s->tel = NULL;
@@ -167,6 +233,45 @@ int mtp_open(qrt_gen * s, const char * gguf_path, const char * store_prefix,
              const char * spv_dir, const qrt_layer_cfg & lcfg, const qrt_mtp_cfg & mc,
              char * err, size_t err_size);
 
+// The device head holds output.weight resident (0.57 GiB prepared) plus a logits tile. When
+// that does not fit the VRAM budget the session keeps sampling on the host: slower, but a
+// capacity miss is a counted fallback and not a crash (design 9).
+int gen_head_open(qrt_gen * s, const char * spv_dir, char * err, size_t err_size) {
+    qrt_head * h = NULL;
+    if (qrt_head_open(s->dev, spv_dir, s->E, s->V, &h, err, err_size) != 0) {
+        printf("generate_head disabled: %s\n", err[0] ? err : "open");
+        err[0] = '\0';
+        return 0;
+    }
+    int ok = 0;
+    std::vector<unsigned char> raw((size_t) s->outw->nbytes);
+    std::vector<unsigned char> prepared((size_t) qrt_head_weight_bytes(s->E, s->V));
+    do {
+        if (qrt_gguf_read_tensor(s->g, s->outw, raw.data(), raw.size(), err, err_size) != 0) {
+            break;
+        }
+        qrt_gemm_q8k_prepare(raw.data(), (uint32_t) s->outw->ne[1], s->E, prepared.data());
+        raw.clear();
+        raw.shrink_to_fit();
+        if (qrt_head_set_weights(h, prepared.data(), prepared.size(), err, err_size) != 0 ||
+            qrt_head_set_norm(h, 0, s->onorm.data(), err, err_size) != 0) {
+            break;
+        }
+        ok = 1;
+    } while (false);
+    if (ok == 0) {
+        printf("generate_head disabled: %s\n", err[0] ? err : "load");
+        err[0] = '\0';
+        qrt_head_close(s->dev, h);
+        return 0;
+    }
+    s->head = h;
+    printf("generate_head device vocab=%u tile=%u mib=%.1f\n", s->V, QRT_HEAD_ROWS,
+           (double) (qrt_head_weight_bytes(s->E, s->V) + (uint64_t) QRT_HEAD_ROWS * s->V * 4) /
+               (1024.0 * 1024.0));
+    return 0;
+}
+
 int gen_open(qrt_gen * s, const qrt_config * cfg, const qrt_model_options * opt,
              const char * gguf_path, const char * store_prefix, const char * spv_dir,
              uint32_t n_tokens, uint32_t n_reserve, uint32_t snap_rows,
@@ -217,13 +322,10 @@ int gen_open(qrt_gen * s, const qrt_config * cfg, const qrt_model_options * opt,
     }
     s->n_ctx = (uint32_t) n_ctx64;
     s->chunk = (uint32_t) cfg->prefill_chunk;
-    if (s->chunk > 64u) {
-        // The 40-layer slice is sized for a small resident chunk. A 2048-token chunk across
-        // 40 layers does not fit in 8 GiB; the shared scratch arena is the next step.
-        s->chunk = 32u;
-    }
-    if (s->chunk < 32u || (s->chunk % 32u) != 0u) {
-        return fail(err, err_size, "generate chunk %u is not a 32-aligned 32..64", s->chunk);
+    // The chunk is the arena's row count: every layer's chunk planes live at the same
+    // offsets, so one layer's worth of VRAM serves all forty (design 5.5, M2-8a).
+    if (s->chunk < 32u || (s->chunk % 32u) != 0u || s->chunk > 2048u) {
+        return fail(err, err_size, "generate chunk %u is not a 32-aligned 32..2048", s->chunk);
     }
     s->rows_max = std::max(s->chunk, snap_rows);
 
@@ -244,11 +346,6 @@ int gen_open(qrt_gen * s, const qrt_config * cfg, const qrt_model_options * opt,
                      &s->slot, &s->slot_mem, err, err_size) != 0) {
         return fail(err, err_size, "shared FFN slot: %s", err);
     }
-    const uint64_t out_row = (uint64_t) s->chunk * s->E * 4;
-    if (qrt_vk_staging_create(s->dev, out_row, &s->stg, err, err_size) != 0) {
-        return -1;
-    }
-    s->owner.stg = s->stg;
 
     qrt_layer_cfg lcfg{};
     lcfg.ffn = 1;
@@ -261,17 +358,63 @@ int gen_open(qrt_gen * s, const qrt_config * cfg, const qrt_model_options * opt,
     lcfg.n_ctx = s->n_ctx;
     lcfg.ffn_slot = s->slot;
     lcfg.ffn_slot_bytes = s->slot_bytes;
+
+    // Size the session's chunk hardware before opening anything: the arena holds the widest
+    // layer's planes, the staging buffer the widest transfer one layer makes.
+    uint64_t scratch_max = 0;
+    uint64_t staging_max = 0;
+    for (uint32_t l = 0; l < s->n_layers; ++l) {
+        qrt_layer_budget b;
+        if (qrt_layer_budget_of(gguf_path, l, s->chunk, &lcfg, &b, err, err_size) != 0) {
+            return fail(err, err_size, "layer %u budget: %s", l, err);
+        }
+        scratch_max = std::max(scratch_max, b.scratch_bytes);
+        staging_max = std::max(staging_max, b.staging_bytes);
+    }
+    if (mc.on != 0) {
+        qrt_layer_cfg mcfg = lcfg;
+        mcfg.dn_snap_rows = 0;
+        qrt_layer_budget b;
+        if (qrt_layer_budget_of(gguf_path, s->mtp_block, s->chunk, &mcfg, &b, err, err_size) != 0) {
+            return fail(err, err_size, "MTP block %u budget: %s", s->mtp_block, err);
+        }
+        scratch_max = std::max(scratch_max, b.scratch_bytes);
+        staging_max = std::max(staging_max, b.staging_bytes);
+    }
+    // One MiB covers the bind-alignment gaps between the sub-buffers.
+    s->arena_bytes = (scratch_max + (1u << 20) + 65535u) & ~(uint64_t) 65535u;
+    if (qrt_vk_arena_create(s->dev, s->arena_bytes, &s->arena, err, err_size) != 0 ||
+        qrt_vk_arena_attach(s->dev, s->arena, err, err_size) != 0) {
+        return fail(err, err_size, "session arena: %s", err);
+    }
+    s->stg_bytes = std::max(staging_max, (uint64_t) QRT_FFN_STAGING_BYTES);
+    if (qrt_vk_staging_create(s->dev, s->stg_bytes, &s->stg, err, err_size) != 0) {
+        return -1;
+    }
+    lcfg.stg = s->stg;
+    s->owner.stg = s->stg;
+
     s->layers.assign(s->n_layers, nullptr);
     for (uint32_t l = 0; l < s->n_layers; ++l) {
+        qrt_vk_arena_rewind(s->arena);
         if (qrt_layer_open(s->dev, gguf_path, store_prefix, l, s->chunk, spv_dir, &lcfg,
                            &s->layers[l], err, err_size) != 0) {
             return fail(err, err_size, "open layer %u: %s", l, err);
         }
+        s->arena_peak = std::max(s->arena_peak, qrt_vk_arena_used(s->arena));
         if (qrt_layer_zero_state(s->layers[l], err, err_size) != 0) {
             return fail(err, err_size, "zero layer %u: %s", l, err);
         }
     }
+    printf("generate_arena mib=%.1f predicted_mib=%.1f used_mib=%.1f staging_mib=%.1f "
+           "chunk=%u\n", (double) s->arena_bytes / (1024.0 * 1024.0),
+           (double) scratch_max / (1024.0 * 1024.0),
+           (double) s->arena_peak / (1024.0 * 1024.0), (double) s->stg_bytes / (1024.0 * 1024.0),
+           s->chunk);
     s->x.assign((size_t) s->rows_max * s->E, 0.0f);
+    if (opt->head_gpu != 0 && gen_head_open(s, spv_dir, err, err_size) != 0) {
+        return -1;
+    }
     if (mc.on != 0 && mtp_open(s, gguf_path, store_prefix, spv_dir, lcfg, mc, err,
                                err_size) != 0) {
         return -1;
@@ -290,6 +433,7 @@ int gen_prefill(qrt_gen * s, const uint32_t * ids, uint32_t n_tokens, std::vecto
     }
     std::vector<float> xnext((size_t) s->chunk * s->E);
     const uint32_t n_chunks = 1u + (n_tokens - 1u) / s->chunk;
+    const double prefill_t0 = now_ms();
     for (uint32_t l = 0; l < s->n_layers; ++l) {
         const double t0 = now_ms();
         for (uint32_t c = 0; c < n_chunks; ++c) {
@@ -306,6 +450,14 @@ int gen_prefill(qrt_gen * s, const uint32_t * ids, uint32_t n_tokens, std::vecto
         }
         printf("generate_prefill layer=%u chunks=%u ms=%.1f\n", l, n_chunks, now_ms() - t0);
     }
+    // The device head reads the rows where the last layer left them: its plane only holds
+    // the final chunk, so the tail row sits at last_len - 1, not at n_tokens - 1.
+    const double prefill_ms = now_ms() - prefill_t0;
+    printf("generate_prefill_total tokens=%u chunk=%u chunks_per_layer=%u ms=%.1f "
+           "tok_per_s=%.1f\n", n_tokens, s->chunk, n_chunks, prefill_ms,
+           prefill_ms > 0.0 ? (double) n_tokens * 1000.0 / prefill_ms : 0.0);
+    s->last_out = qrt_layer_out(s->layers[s->n_layers - 1u]);
+    s->sample_dev_row = (n_tokens - 1u) - (n_chunks - 1u) * s->chunk;
     return 0;
 }
 
@@ -348,10 +500,29 @@ int gen_decode_cache(qrt_gen * s, const qrt_config * cfg, const char * store_pre
     }
     const uint32_t store_experts = qrt_weights_experts(wstore);
     qrt_weights_close(wstore);
+    uint64_t want = (uint64_t) cfg->expert_cache_mib << 20;
+    if (s->head != NULL) {
+        // The head's resident weight and logits tile came out of the same budget the cache
+        // was sized from, so the cache takes what is left of it (design 5.5: the expert cache
+        // yields to the buffers, 100 MiB is about 0.5 pp of coverage). A whole page is kept
+        // back for the allocator's own rounding.
+        char bq[QRT_ERR_SIZE] = {0};
+        if (qrt_vk_query_budget(s->dev, bq, sizeof(bq)) == 0) {
+            const uint64_t left =
+                s->dev->budget_bytes > s->dev->usage_bytes + (128u << 20)
+                    ? s->dev->budget_bytes - s->dev->usage_bytes - (128u << 20)
+                    : 0;
+            if (want > left) {
+                printf("generate_cache shrunk for the device head: %llu -> %llu MiB\n",
+                       (unsigned long long) (want >> 20),
+                       (unsigned long long) (left >> 20));
+                want = left & ~(uint64_t) ((256u << 20) - 1u);
+            }
+        }
+    }
     qrt_cache_plan plan{};
     if (!size_ok ||
-        qrt_cache_plan_build(n_plan, store_experts, layer_slot, NULL,
-                            (uint64_t) cfg->expert_cache_mib << 20, cfg->cache_policy,
+        qrt_cache_plan_build(n_plan, store_experts, layer_slot, NULL, want, cfg->cache_policy,
                             QRT_CACHE_DEFAULT_PROTECTED_PCT, &plan, err, err_size) != 0) {
         return fail(err, err_size, "expert cache plan: %s", err[0] ? err : "no layer sizes");
     }
@@ -438,6 +609,86 @@ int gen_head(qrt_gen * s, const float * hidden, uint32_t rows, std::vector<float
                                rows, 0, &logits, NULL, err, err_size);
 }
 
+// The head output of the pass that just ran: `rows` greedy samples out of the hidden rows the
+// caller names. With the device head the vocabulary-sized logits never leave the GPU and the
+// window is the last layer's output plane at sample_dev_row; x/row_host address the same rows
+// in the host copy, which is all the host head can read. off steps inside the window, because
+// the two arms hold different row ranges after a prefill. capture is for --spec-check only:
+// it pulls rows * V floats back so two arms can be compared row by row.
+int gen_sample(qrt_gen * s, const float * x, uint32_t row_host, uint32_t off, uint32_t rows,
+               int capture, std::vector<float> * logits, std::vector<uint32_t> * ids,
+               std::vector<float> * best, std::vector<float> * second, char * err,
+               size_t err_size) {
+    ids->assign(rows, 0u);
+    if (best != NULL) {
+        best->assign(rows, 0.0f);
+    }
+    if (second != NULL) {
+        second->assign(rows, -INFINITY);
+    }
+    if (s->head != NULL) {
+        const uint32_t row_dev = s->sample_dev_row + off;
+        if (rows > QRT_HEAD_ROWS) {
+            return fail(err, err_size, "the device head samples %u rows at a time at most",
+                        (uint32_t) QRT_HEAD_ROWS);
+        }
+        if (qrt_head_run(s->head, s->last_out, row_dev, rows, 0, 0, ids->data(),
+                         best != NULL ? best->data() : NULL,
+                         second != NULL ? second->data() : NULL, err, err_size) != 0) {
+            return fail(err, err_size, "device head over %u rows at device row %u: %s", rows,
+                        row_dev, err);
+        }
+        s->leg_head += qrt_head_last_ms(s->head);
+        ++s->head_calls;
+        if (capture != 0) {
+            logits->assign((size_t) rows * s->V, 0.0f);
+            for (uint32_t r = 0; r < rows; ++r) {
+                // the head writes its tile from row 0, whatever row of the hidden plane it read
+                if (qrt_head_logits_row(s->head, r, logits->data() + (size_t) r * s->V, err,
+                                        err_size) != 0) {
+                    return fail(err, err_size, "device head logits row %u: %s", r, err);
+                }
+            }
+        }
+        return 0;
+    }
+    std::vector<float> all;
+    if (gen_head(s, x + (size_t) row_host * s->E, rows, all, err, err_size) != 0) {
+        return fail(err, err_size, "host head over %u rows at row %u: %s", rows, row_host,
+                    err);
+    }
+    for (uint32_t r = 0; r < rows; ++r) {
+        float b = 0.0f, m = 0.0f;
+        gen_pick(all, r, s->V, &(*ids)[r], &b, &m);
+        if (best != NULL) {
+            (*best)[r] = b;
+        }
+        if (second != NULL) {
+            (*second)[r] = b - m;
+        }
+    }
+    if (capture != 0) {
+        logits->swap(all);
+    }
+    return 0;
+}
+
+// The one-row shape every serial step and every first token uses: the sampled id, its logit
+// and the margin over the runner-up the fidelity gate reports.
+int gen_sample1(qrt_gen * s, const float * x, uint32_t row_host, uint32_t off, int capture,
+                std::vector<float> * logits, uint32_t * tok, float * best, float * margin,
+                char * err, size_t err_size) {
+    std::vector<uint32_t> ids;
+    std::vector<float> b, sec;
+    if (gen_sample(s, x, row_host, off, 1, capture, logits, &ids, &b, &sec, err, err_size) != 0) {
+        return -1;
+    }
+    *tok = ids[0];
+    *best = b[0];
+    *margin = b[0] - sec[0];
+    return 0;
+}
+
 // rel_L1 of one logits row against the serial arm's row for the same sequence index. A
 // batched pass and a single-row pass do not share a tile shape, so bit equality is not the
 // bar here (RESULTS 86.1: m=1 is its own kernel); 1e-4 is. Lost state is orders of magnitude
@@ -509,6 +760,8 @@ int gen_pass(qrt_gen * s, uint32_t pos0, const uint32_t * toks, uint32_t rows, i
         }
     }
     memcpy(s->x.data(), xin.data(), (size_t) rows * s->E * 4);
+    s->last_out = qrt_layer_out(s->layers[s->n_layers - 1u]);
+    s->sample_dev_row = 0;
     return 0;
 }
 
@@ -529,10 +782,12 @@ void gen_report(const qrt_gen * s, size_t n_ids) {
         }
     }
     printf("generate_done ids=%zu alloc_mib=%.1f peak_mib=%.1f failures=%u "
-           "submits_per_layer=%u dispatches_max=%u topk_readbacks_per_layer=1\n",
+           "submits_per_layer=%u dispatches_max=%u topk_readbacks_per_layer=1 head=%s "
+           "head_calls=%u head_ms=%.1f\n",
            n_ids, (double) s->dev->alloc_bytes / (1024.0 * 1024.0),
            (double) s->dev->alloc_peak_bytes / (1024.0 * 1024.0), s->dev->alloc_failures,
-           max_submits, max_dispatches);
+           max_submits, max_dispatches, s->head != NULL ? "device" : "host", s->head_calls,
+           s->leg_head);
     if (s->cache_on) {
         qrt_cache_stats cs{};
         qrt_cache_get_stats(s->cache, &cs);
@@ -587,19 +842,67 @@ int mtp_open(qrt_gen * s, const char * gguf_path, const char * store_prefix,
     }
     qrt_layer_cfg mcfg = lcfg;
     mcfg.dn_snap_rows = 0;   // full attention, and the draft is one row per step
+    qrt_vk_arena_rewind(s->arena);
     if (qrt_layer_open(s->dev, gguf_path, store_prefix, B, s->chunk, spv_dir, &mcfg,
                        &m.layer, err, err_size) != 0) {
         return fail(err, err_size, "open the MTP block %u: %s", B, err);
     }
+    s->arena_peak = std::max(s->arena_peak, qrt_vk_arena_used(s->arena));
     if (qrt_layer_zero_state(m.layer, err, err_size) != 0) {
         return -1;
     }
+    // The device side of the MTP input projection (M3-3c): the prepared eh_proj weight and
+    // one chunk of concat rows with their Q8_1 planes. These are regular allocations; they
+    // are not per-layer scratch and outlive every layer open.
+    {
+        const uint64_t eh_bytes = qrt_gemm_matrix_bytes(QRT_QUANT_Q8_0, E, 2u * E);
+        std::vector<unsigned char> raw((size_t) m.eh_proj->nbytes);
+        std::vector<unsigned char> prepared((size_t) eh_bytes);
+        if (qrt_gguf_read_tensor(s->g, m.eh_proj, raw.data(), raw.size(), err, err_size) != 0) {
+            return fail(err, err_size, "nextn.eh_proj read: %s", err);
+        }
+        qrt_gemm_q8k_prepare(raw.data(), E, 2u * E, prepared.data());
+        raw.clear();
+        raw.shrink_to_fit();
+        const VkBufferUsageFlags usage = QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST;
+        if (qrt_vk_alloc(s->dev, eh_bytes, usage, &m.eh_w, &m.eh_mem, err, err_size) != 0 ||
+            qrt_vk_upload(s->dev, s->stg, m.eh_w, 0, prepared.data(), eh_bytes, err,
+                          err_size) != 0) {
+            return fail(err, err_size, "nextn.eh_proj upload: %s", err);
+        }
+        const uint64_t concat_bytes = (uint64_t) s->chunk * 2u * E * 4;
+        const uint64_t qs_bytes = (uint64_t) s->chunk * 2u * E;
+        const uint64_t ds_bytes = (uint64_t) s->chunk * (2u * E / 32u) * 4;
+        if (qrt_vk_alloc(s->dev, concat_bytes, usage, &m.concat_dev, &m.concat_mem, err,
+                         err_size) != 0 ||
+            qrt_vk_alloc(s->dev, qs_bytes, usage, &m.c_qs, &m.c_qs_mem, err, err_size) != 0 ||
+            qrt_vk_alloc(s->dev, ds_bytes, usage, &m.c_ds, &m.c_ds_mem, err, err_size) != 0) {
+            return fail(err, err_size, "MTP input planes: %s", err);
+        }
+        if (qrt_gemm_open(s->dev, spv_dir, &m.gemm, err, err_size) != 0 ||
+            qrt_norm_open(s->dev, spv_dir, &m.nrm, err, err_size) != 0) {
+            return fail(err, err_size, "MTP projection modules: %s", err);
+        }
+        m.concat_host.assign((size_t) s->chunk * 2u * E, 0.0f);
+        m.e_rows.assign((size_t) s->chunk * E, 0.0f);
+        m.h_row.assign(E, 0.0);
+        m.e_norm.assign(E, 0.0);
+    }
     m.e_row.assign(E, 0.0f);
     m.h.assign(E, 0.0);
-    m.concat.assign((size_t) 2 * E, 0.0);
     m.x.assign(E, 0.0f);
     m.out.assign(E, 0.0f);
     m.cand.assign(m.vocab != NULL ? qrt_spec_vocab_count(m.vocab) : s->V, 0.0f);
+    if (s->head != NULL) {
+        // The draft reads the same resident weight through two switches: the block's own
+        // head norm in slot 1, and the candidate mask instead of the whole vocabulary.
+        const uint32_t * cid = m.vocab != NULL ? qrt_spec_vocab_ids(m.vocab) : NULL;
+        const uint32_t cn = m.vocab != NULL ? qrt_spec_vocab_count(m.vocab) : 0u;
+        if (qrt_head_set_norm(s->head, 1, m.shnorm.data(), err, err_size) != 0 ||
+            qrt_head_set_candidates(s->head, cid, cn, err, err_size) != 0) {
+            return fail(err, err_size, "draft head setup: %s", err);
+        }
+    }
     m.on = 1;
     printf("mtp_open block=%u candidates=%u rows=%s\n", B,
            m.vocab != NULL ? qrt_spec_vocab_count(m.vocab) : s->V,
@@ -613,6 +916,101 @@ void mtp_seed(qrt_gen * s, const float * hidden_row) {
     qrt_model_norm_row(hidden_row, s->onorm.data(), s->E, s->mtp.h.data());
 }
 
+// Build the MTP input rows and run the block over them (M3-3c). Row g (position pos0+g) is
+// (token_g, h_prev) with h_prev = norm(hidden at pos0+g-1, output_norm); row 0 of the
+// request uses h_first (zeros for the first prompt row, the chained seed for a draft or a
+// refresh). x_rows holds the hidden at position pos0 in its row 0. The block writes its KV
+// rows for pos0..pos0+rows-1 and leaves its output in qrt_layer_out().
+//
+// This is the fork's process() semantics: the draft block attends over one KV row per
+// prompt and verified position, not just over the rows its own drafts wrote.
+int mtp_run_rows(qrt_gen * s, const uint32_t * toks, uint32_t pos0, uint32_t rows,
+                 const float * x_rows, const double * h_first, char * err, size_t err_size) {
+    qrt_mtp & m = s->mtp;
+    const uint32_t E = s->E;
+    const uint32_t W = 2u * E;
+    if (m.on == 0 || m.gemm == NULL || m.nrm == NULL) {
+        return fail(err, err_size, "the MTP projection is not open");
+    }
+    if (rows == 0) {
+        return 0;
+    }
+    if (h_first != NULL) {
+        m.h_row.assign(h_first, h_first + E);
+    } else {
+        std::fill(m.h_row.begin(), m.h_row.end(), 0.0);
+    }
+    for (uint32_t done = 0; done < rows; ) {
+        const uint32_t n = std::min(s->chunk, rows - done);
+        const uint32_t pos = pos0 + done;
+        if (qrt_model_embed_rows(s->g, s->emb, E, s->V, toks + done, n, m.e_rows.data(),
+                                 err, err_size) != 0) {
+            return fail(err, err_size, "MTP embedding at pos %u: %s", pos, err);
+        }
+        m.host_bytes += (uint64_t) n * (E / 32u) * 34u;
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t g = done + i;
+            if (g != 0) {
+                qrt_model_norm_row(x_rows + (size_t) (g - 1u) * E, s->onorm.data(), E,
+                                   m.h_row.data());
+            }
+            qrt_model_norm_row(m.e_rows.data() + (size_t) i * E, m.enorm.data(), E,
+                               m.e_norm.data());
+            qrt_model_norm_row_d(m.h_row.data(), m.hnorm.data(), E, m.h_row.data());
+            for (uint32_t j = 0; j < E; ++j) {
+                m.concat_host[(size_t) i * W + j] = (float) m.e_norm[j];
+                m.concat_host[(size_t) i * W + E + j] = (float) m.h_row[j];
+            }
+        }
+        // The dense GEMM tiles m in 32s past the 8-row kernel; the padded rows only feed
+        // stage rows the block never reads (it runs exactly n), so zero them.
+        const uint32_t mp = n <= 8u ? n : ((n + 31u) & ~31u);
+        for (uint32_t i = n; i < mp; ++i) {
+            for (uint32_t j = 0; j < W; ++j) {
+                m.concat_host[(size_t) i * W + j] = 0.0f;
+            }
+        }
+        if (qrt_vk_upload(s->dev, s->stg, m.concat_dev, 0, m.concat_host.data(),
+                          (uint64_t) mp * W * 4, err, err_size) != 0) {
+            return fail(err, err_size, "MTP concat upload at pos %u: %s", pos, err);
+        }
+        qrt_norm_args na;
+        memset(&na, 0, sizeof(na));
+        na.x = m.concat_dev;
+        na.w = m.concat_dev;   // unused with no_norm, but the descriptor still needs a buffer
+        na.qs = m.c_qs;
+        na.ds = m.c_ds;
+        na.k = W;
+        na.tokens = mp;
+        na.eps = 1e-6f;
+        na.quant = 1;
+        na.no_norm = 1;
+        na.no_out = 1;
+        if (qrt_norm_run(m.nrm, &na, err, err_size) != 0) {
+            return fail(err, err_size, "MTP concat pack at pos %u: %s", pos, err);
+        }
+        qrt_gemm_args ga;
+        memset(&ga, 0, sizeof(ga));
+        ga.w = m.eh_w;
+        ga.a_qs = m.c_qs;
+        ga.a_ds = m.c_ds;
+        ga.out = qrt_layer_x(m.layer);
+        ga.n = E;
+        ga.k = W;
+        ga.m = mp;
+        ga.type = QRT_QUANT_Q8_0;
+        ga.token_major = 1;
+        if (qrt_gemm_dispatch(m.gemm, &ga, err, err_size) != 0) {
+            return fail(err, err_size, "MTP eh_proj at pos %u: %s", pos, err);
+        }
+        if (qrt_layer_run_chunk(m.layer, pos, n, err, err_size) != 0) {
+            return fail(err, err_size, "MTP block at pos %u: %s", pos, err);
+        }
+        done += n;
+    }
+    return 0;
+}
+
 // One draft step: enorm(embed) beside the running h, concat with the embedding first,
 // nextn.eh_proj, the block at `pos`, then shared_head_norm into both the draft head and the
 // next step's h.
@@ -624,35 +1022,37 @@ int mtp_step(qrt_gen * s, uint32_t tok, uint32_t pos, uint32_t * id, float * log
     }
     const uint32_t E = s->E;
     const double t0 = now_ms();
-    if (qrt_model_embed_rows(s->g, s->emb, E, s->V, &tok, 1, m.e_row.data(), err,
-                            err_size) != 0) {
-        return fail(err, err_size, "draft embedding: %s", err);
+    if (mtp_run_rows(s, &tok, pos, 1, NULL, m.h.data(), err, err_size) != 0) {
+        return -1;
     }
-    m.host_bytes += (uint64_t) (E / 32u) * 34u;
-    // both halves are normed here: enorm on the embedding, hnorm on the h the previous
-    // block or the verified pass produced (the fork's graph_mtp order)
-    qrt_model_norm_row(m.e_row.data(), m.enorm.data(), E, m.concat.data());
-    qrt_model_norm_row_d(m.h.data(), m.hnorm.data(), E, m.concat.data() + E);
-    if (qrt_model_gemv_q8_0(s->g, m.eh_proj, 2u * E, NULL, E, m.concat.data(), m.x.data(),
-                           err, err_size) != 0) {
-        return fail(err, err_size, "nextn.eh_proj: %s", err);
-    }
-    m.host_bytes += (uint64_t) E * (2u * E / 32u) * 34u;
-    if (qrt_layer_set_input_rows(m.layer, m.x.data(), 1, err, err_size) != 0 ||
-        qrt_layer_run_chunk(m.layer, pos, 1, err, err_size) != 0 ||
-        qrt_vk_download(s->dev, s->stg, qrt_layer_out(m.layer), 0, m.out.data(),
+    if (qrt_vk_download(s->dev, s->stg, qrt_layer_out(m.layer), 0, m.out.data(),
                         (uint64_t) E * 4, err, err_size) != 0) {
-        return fail(err, err_size, "MTP block at pos %u: %s", pos, err);
+        return fail(err, err_size, "MTP block output at pos %u: %s", pos, err);
     }
+    m.host_bytes += (uint64_t) E * 4;
     qrt_model_norm_row(m.out.data(), m.shnorm.data(), E, m.h.data());
-    const uint32_t * idx = m.vocab != NULL ? qrt_spec_vocab_ids(m.vocab) : NULL;
-    const uint32_t n = m.vocab != NULL ? qrt_spec_vocab_count(m.vocab) : s->V;
-    if (qrt_model_gemv_q8_0(s->g, s->outw, E, idx, n, m.h.data(), m.cand.data(), err,
-                           err_size) != 0) {
-        return fail(err, err_size, "draft head: %s", err);
+    if (s->head != NULL) {
+        float b = 0.0f, sec = 0.0f;
+        if (qrt_head_run(s->head, qrt_layer_out(m.layer), 0, 1, 1, m.vocab != NULL ? 1 : 0, id,
+                         &b, &sec, err, err_size) != 0) {
+            return fail(err, err_size, "draft head at pos %u: %s", pos, err);
+        }
+        // only the id and its two logits cross the bus; the mask is resident
+        m.host_bytes += 3u * sizeof(float) + sizeof(uint32_t);
+        s->leg_head += qrt_head_last_ms(s->head);
+        ++s->head_calls;
+        *logit = b;
+        *margin = b - sec;
+    } else {
+        const uint32_t * idx = m.vocab != NULL ? qrt_spec_vocab_ids(m.vocab) : NULL;
+        const uint32_t n = m.vocab != NULL ? qrt_spec_vocab_count(m.vocab) : s->V;
+        if (qrt_model_gemv_q8_0(s->g, s->outw, E, idx, n, m.h.data(), m.cand.data(), err,
+                               err_size) != 0) {
+            return fail(err, err_size, "draft head: %s", err);
+        }
+        m.host_bytes += (uint64_t) n * (E / 32u) * 34u;
+        *id = qrt_spec_draft(m.cand.data(), idx, n, logit, margin);
     }
-    m.host_bytes += (uint64_t) n * (E / 32u) * 34u;
-    *id = qrt_spec_draft(m.cand.data(), idx, n, logit, margin);
     ++m.steps;
     m.step_ms += now_ms() - t0;
     m.gpu_ms += qrt_layer_gpu_ms(m.layer);
@@ -676,6 +1076,22 @@ int mtp_draft(qrt_gen * s, uint32_t first, uint32_t pos, uint32_t n,
     return 0;
 }
 
+// The draft block's KV rows for the prompt: every position gets the fork's process() row
+// (token at p, target h at p-1), so the first draft attends over the same context the fork
+// does instead of uninitialised cache (M3-3c).
+int mtp_prefill(qrt_gen * s, const uint32_t * ids, uint32_t n_tokens, const float * x,
+                char * err, size_t err_size) {
+    if (s->mtp.on == 0) {
+        return 0;
+    }
+    const double t0 = now_ms();
+    if (mtp_run_rows(s, ids, 0, n_tokens, x, NULL, err, err_size) != 0) {
+        return -1;
+    }
+    printf("generate_mtp_prefill tokens=%u ms=%.1f\n", n_tokens, now_ms() - t0);
+    return 0;
+}
+
 // What one verified pass produced, in the shape both consumers report.
 struct qrt_cycle {
     std::vector<uint32_t> draft;     // the rows-1 tokens the cycle tested
@@ -695,8 +1111,8 @@ struct qrt_cycle {
 // at the first mismatch, and roll every layer back to that length. kept is both the number
 // of rows that stay and the number of tokens the cycle emits.
 int gen_cycle(qrt_gen * s, uint32_t pos, const std::vector<uint32_t> & pass_rows,
-              int keep_logits, int keep_all_rows, qrt_cycle * out, char * err,
-              size_t err_size) {
+              int keep_logits, int keep_all_rows, const double * h_prev, qrt_cycle * out,
+              char * err, size_t err_size) {
     const uint32_t rows = (uint32_t) pass_rows.size();
     *out = qrt_cycle{};
     out->rows = rows;
@@ -707,14 +1123,10 @@ int gen_cycle(qrt_gen * s, uint32_t pos, const std::vector<uint32_t> & pass_rows
                 &out->cpu_n, &out->h2d_bytes, err, err_size) != 0) {
         return -1;
     }
-    std::vector<float> all;
-    if (gen_head(s, s->x.data(), rows, all, err, err_size) != 0) {
+    std::vector<float> sb, ss;
+    if (gen_sample(s, s->x.data(), 0u, 0u, rows, keep_logits, &out->logits, &out->verified,
+                   &sb, &ss, err, err_size) != 0) {
         return fail(err, err_size, "cycle head at pos %u: %s", pos, err);
-    }
-    out->verified.assign(rows, 0u);
-    float best = 0.0f, margin = 0.0f;
-    for (uint32_t i = 0; i < rows; ++i) {
-        gen_pick(all, i, s->V, &out->verified[i], &best, &margin);
     }
     std::vector<uint32_t> emit(rows);
     uint32_t kept = 1;
@@ -731,12 +1143,16 @@ int gen_cycle(qrt_gen * s, uint32_t pos, const std::vector<uint32_t> & pass_rows
     out->accepted = kept - 1u;
     out->kept = kept;
     out->pass_ms = now_ms() - t0;
-    if (keep_logits) {
-        out->logits.swap(all);
-    }
     // the draft continues from the last row that stayed
     if (s->mtp.on != 0) {
         mtp_seed(s, s->x.data() + (size_t) (kept - 1u) * s->E);
+        // The fork re-runs the draft block over the verified rows with the target's h, so
+        // the accepted positions hold target rows in its KV. h_prev is the target h of the
+        // position before the pass (the seed this cycle's drafts started from).
+        if (mtp_run_rows(s, pass_rows.data(), pos, kept, s->x.data(), h_prev, err,
+                         err_size) != 0) {
+            return -1;
+        }
     }
     out->advance = keep_all_rows != 0 ? rows : kept;
     if (keep_all_rows != 0 || rows == 1u) {
@@ -784,6 +1200,25 @@ int qrt_model_generate(const qrt_config * cfg, const qrt_model_options * opt,
         if (gen_prefill(&s, ids, n_tokens, x, err, err_size) != 0) {
             break;
         }
+        // The first token is sampled before anything else touches the layer planes: the MTP
+        // prompt pass below and the cache plan both replace the buffers that hold the last
+        // layer's output rows.
+        std::vector<float> logits;
+        uint32_t tok = 0;
+        float best = 0.0f, margin = 0.0f;
+        if (gen_sample1(&s, x.data(), n_tokens - 1u, 0u, 0, nullptr, &tok, &best, &margin,
+                        err, err_size) != 0) {
+            fail(err, err_size, "prefill head: %s", err);
+            break;
+        }
+        generated.push_back(tok);
+        printf("generate_token step=0 pos=%u id=%u logit=%.4f margin=%.4f\n",
+               n_tokens, tok, best, margin);
+        // The draft block's prompt KV rows (M3-3c) need the shared prefill slot, so they run
+        // before the decode cache takes it over.
+        if (mtp_prefill(&s, ids, n_tokens, x.data(), err, err_size) != 0) {
+            break;
+        }
         if (gen_decode_cache(&s, cfg, store_prefix, err, err_size) != 0) {
             break;
         }
@@ -794,18 +1229,6 @@ int qrt_model_generate(const qrt_config * cfg, const qrt_model_options * opt,
                 printf("generate_telemetry disabled: %s\n", terr);
             }
         }
-        std::vector<float> logits;
-        uint32_t tok = 0;
-        float best = 0.0f, margin = 0.0f;
-        if (gen_head(&s, x.data() + (size_t) (n_tokens - 1u) * s.E, 1, logits, err,
-                     err_size) != 0) {
-            fail(err, err_size, "prefill head: %s", err);
-            break;
-        }
-        gen_pick(logits, 0, s.V, &tok, &best, &margin);
-        generated.push_back(tok);
-        printf("generate_token step=0 pos=%u id=%u logit=%.4f margin=%.4f\n",
-               n_tokens, tok, best, margin);
 
         uint32_t pos = n_tokens;
         if (BK > 1) {
@@ -827,12 +1250,11 @@ int qrt_model_generate(const qrt_config * cfg, const qrt_model_options * opt,
                              &h2d_n, &cpu_n, &h2d_bytes, err, err_size) != 0) {
                     break;
                 }
-                if (gen_head(&s, s.x.data() + (size_t) (k - 1u) * s.E, 1, logits, err,
-                             err_size) != 0) {
+                if (gen_sample1(&s, s.x.data(), k - 1u, k - 1u, 0, nullptr, &tok, &best,
+                                &margin, err, err_size) != 0) {
                     fail(err, err_size, "batch head pass %u: %s", pass, err);
                     break;
                 }
-                gen_pick(logits, 0, s.V, &tok, &best, &margin);
                 generated.push_back(tok);
                 printf("generate_batch pass=%u pos=%u k=%u id=%u logit=%.4f margin=%.4f "
                        "gpu_ms=%.2f h2d_ms=%.2f cpu_ms=%.2f hits=%u misses=%u h2d=%u cpu=%u "
@@ -862,6 +1284,9 @@ int qrt_model_generate(const qrt_config * cfg, const qrt_model_options * opt,
                 const uint32_t left = n_new - (uint32_t) generated.size();
                 const uint32_t rows = std::min(k, left + 1u);
                 std::vector<uint32_t> pass_rows;
+                // the cycle-start seed: the target h of the position before this pass, which
+                // the refresh of the verified rows needs (mtp_draft advances m.h)
+                const std::vector<double> seed_prev = s.mtp.h;
                 if (rows > 1u && mtp_draft(&s, generated.back(), pos, rows - 1u, &draft, err,
                                            err_size) != 0) {
                     break;
@@ -871,7 +1296,8 @@ int qrt_model_generate(const qrt_config * cfg, const qrt_model_options * opt,
                     pass_rows.push_back(draft[i]);
                 }
                 qrt_cycle c;
-                if (gen_cycle(&s, pos, pass_rows, 0, 0, &c, err, err_size) != 0) {
+                if (gen_cycle(&s, pos, pass_rows, 0, 0, seed_prev.data(), &c, err,
+                              err_size) != 0) {
                     break;
                 }
                 for (uint32_t i = 0; i < c.emit.size() && generated.size() < n_new; ++i) {
@@ -927,11 +1353,11 @@ int qrt_model_generate(const qrt_config * cfg, const qrt_model_options * opt,
                     break;
                 }
                 gen_legs(&s, "step", step, gpu, h2d, cpu, hits, miss, h2d_n, cpu_n);
-                if (gen_head(&s, s.x.data(), 1, logits, err, err_size) != 0) {
+                if (gen_sample1(&s, s.x.data(), 0u, 0u, 0, nullptr, &tok, &best, &margin,
+                                err, err_size) != 0) {
                     fail(err, err_size, "decode head step %u: %s", step, err);
                     break;
                 }
-                gen_pick(logits, 0, s.V, &tok, &best, &margin);
                 generated.push_back(tok);
                 printf("generate_token step=%u pos=%u id=%u logit=%.4f margin=%.4f "
                        "layer_ms=%.1f\n", step, pos, tok, best, margin, now_ms() - t0);
@@ -1022,11 +1448,10 @@ int qrt_model_spec_check(const qrt_config * cfg, const qrt_model_options * opt,
         std::vector<float> logits;
         uint32_t tok = 0;
         float best = 0.0f, margin = 0.0f;
-        if (gen_head(&s, x.data() + (size_t) (n_tokens - 1u) * s.E, 1, logits, err,
-                     err_size) != 0) {
+        if (gen_sample1(&s, x.data(), n_tokens - 1u, 0u, 1, &logits, &tok, &best, &margin,
+                        err, err_size) != 0) {
             break;
         }
-        gen_pick(logits, 0, s.V, &tok, &best, &margin);
         serial_ids.push_back(tok);
         serial_logits.insert(serial_logits.end(), logits.begin(), logits.end());
         uint32_t pos = n_tokens;
@@ -1036,10 +1461,10 @@ int qrt_model_spec_check(const qrt_config * cfg, const qrt_model_options * opt,
             uint64_t h2d_bytes = 0;
             if (gen_pass(&s, pos, &serial_ids.back(), 1, 0, &gpu, &h2d, &cpu, &hits, &miss,
                          &h2d_n, &cpu_n, &h2d_bytes, err, err_size) != 0 ||
-                gen_head(&s, s.x.data(), 1, logits, err, err_size) != 0) {
+                gen_sample1(&s, s.x.data(), 0u, 0u, 1, &logits, &tok, &best, &margin, err,
+                            err_size) != 0) {
                 break;
             }
-            gen_pick(logits, 0, s.V, &tok, &best, &margin);
             serial_ids.push_back(tok);
             serial_logits.insert(serial_logits.end(), logits.begin(), logits.end());
             printf("spec_serial step=%u pos=%u id=%u logit=%.4f\n", step, pos, tok, best);
@@ -1060,6 +1485,16 @@ int qrt_model_spec_check(const qrt_config * cfg, const qrt_model_options * opt,
         if (gen_prefill(&s, ids, n_tokens, x, err, err_size) != 0) {
             break;
         }
+        // The first token is sampled before the MTP prompt pass and the cache plan replace
+        // the last layer's output plane.
+        if (gen_sample1(&s, x.data(), n_tokens - 1u, 0u, 0, nullptr, &tok, &best, &margin,
+                        err, err_size) != 0) {
+            break;
+        }
+        spec_ids.push_back(tok);
+        if (mtp_prefill(&s, ids, n_tokens, x.data(), err, err_size) != 0) {
+            break;
+        }
         if (gen_decode_cache(&s, cfg, store_prefix, err, err_size) != 0) {
             break;
         }
@@ -1070,12 +1505,6 @@ int qrt_model_spec_check(const qrt_config * cfg, const qrt_model_options * opt,
                 printf("spec_telemetry disabled: %s\n", terr);
             }
         }
-        if (gen_head(&s, x.data() + (size_t) (n_tokens - 1u) * E, 1, logits, err,
-                     err_size) != 0) {
-            break;
-        }
-        gen_pick(logits, 0, V, &tok, &best, &margin);
-        spec_ids.push_back(tok);
         pos = n_tokens;
         // the first cycle drafts from the prefill's last hidden, like --generate does
         if (s.mtp.on != 0) {
@@ -1099,6 +1528,7 @@ int qrt_model_spec_check(const qrt_config * cfg, const qrt_model_options * opt,
             const uint32_t rows = nd + 1u;
             std::vector<uint32_t> draft(nd), pass_rows(rows);
             uint32_t break_at = 0;
+            const std::vector<double> seed_prev = s.mtp.h;
             if (s.mtp.on != 0) {
                 // Real drafts: the MTP block proposes the continuation and nothing is
                 // injected, so the accept lengths are whatever the draft actually achieves.
@@ -1126,7 +1556,8 @@ int qrt_model_spec_check(const qrt_config * cfg, const qrt_model_options * opt,
                 pass_rows[i + 1u] = draft[i];
             }
             qrt_cycle c;
-            if (gen_cycle(&s, pos, pass_rows, rollback_off ? 0 : 1, rollback_off, &c, err,
+            if (gen_cycle(&s, pos, pass_rows, rollback_off ? 0 : 1, rollback_off,
+                          s.mtp.on != 0 ? seed_prev.data() : nullptr, &c, err,
                           err_size) != 0) {
                 break;
             }

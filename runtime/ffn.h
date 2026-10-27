@@ -20,6 +20,7 @@
 struct qrt_ffn;
 struct qrt_gemm;
 struct qrt_weights;
+struct qrt_vk_staging;
 
 struct qrt_ffn_cfg {
     uint32_t tokens;    // chunk length, a multiple of 32
@@ -34,12 +35,26 @@ struct qrt_ffn_cfg {
     // layer's experts before the next layer overwrites it.
     VkBuffer slot;
     uint64_t slot_bytes;
+    // A caller-owned staging buffer (VK_NULL_HANDLE = the FFN allocates its own). Sessions
+    // hand every layer one buffer: the layers run strictly one at a time, and per-layer
+    // 32 MiB packers would hold 1.3 GiB of host memory (M2-8a).
+    qrt_vk_staging * stg;
 };
+
+// The staging window the expert packer fills before one H2D submit: the granularity the
+// packing loop was measured at. A session that shares one staging buffer across layers
+// should make it at least this wide.
+enum { QRT_FFN_STAGING_BYTES = 32u << 20 };
 
 int qrt_ffn_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_prefix,
                  const char * spv_dir, uint32_t layer, const qrt_ffn_cfg * cfg,
                  qrt_ffn ** out, char * err, size_t err_size);
 void qrt_ffn_close(qrt_vk_dev * dev, qrt_ffn * f);
+
+// The chunk-sized planes qrt_ffn_open takes from the session arena (logits, top-k, the
+// gathered expert planes, the shared-expert scratch and the row tables). Weights and the
+// expert slot are persistent and excluded.
+uint64_t qrt_ffn_plane_bytes(const qrt_ffn_cfg * cfg);
 
 // The buffers the layer hands over: the residual stream (read in place), the post-attention
 // norm row and its Q8_1 planes, and where the FFN leaves the layer output.

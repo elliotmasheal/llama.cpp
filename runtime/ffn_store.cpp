@@ -261,6 +261,7 @@ int qrt_ffn_plan_cache_layer(qrt_ffn * f, char * err, size_t err_size) {
         }
         std::vector<qrt_vk_copy_region> regions;
         uint64_t fill = 0;
+        const uint64_t stg_cap = qrt_vk_staging_bytes(f->stg);
         auto join_workers = [&]() {
             for (size_t w = 0; w < workers.size(); ++w) {
                 workers[w].join();
@@ -292,16 +293,16 @@ int qrt_ffn_plan_cache_layer(qrt_ffn * f, char * err, size_t err_size) {
             const uint32_t e = f->uniq[i];
             qrt_expert_loc loc;
             if (qrt_weights_locate(f->store, f->layer, e, &loc, err, err_size) != 0 ||
-                loc.bytes > QRT_FFN_STAGING_BYTES) {
+                loc.bytes > stg_cap) {
                 h2d_rc = -1;
                 break;
             }
-            if (fill + loc.bytes > QRT_FFN_STAGING_BYTES && flush() != 0) {
+            if (fill + loc.bytes > stg_cap && flush() != 0) {
                 h2d_rc = -1;
                 break;
             }
             if (qrt_weights_read_expert(f->store, f->layer, e, stage + fill,
-                                        QRT_FFN_STAGING_BYTES - fill, err, err_size) != 0) {
+                                        stg_cap - fill, err, err_size) != 0) {
                 h2d_rc = -1;
                 break;
             }

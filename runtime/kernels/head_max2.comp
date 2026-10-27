@@ -1,0 +1,94 @@
+#version 450
+// Stage 2 of the greedy argmax: combine the segment partials of one row into the token id,
+// its logit and the runner-up behind it. The runner-up of the row is the best of
+//   - the winner segment's own runner-up, and
+//   - the best value of every other segment,
+// which is what a two-stage reduction gives without a second look at the logits.
+//
+// The same (value descending, index ascending) order as stage 1, so what the two stages
+// report cannot depend on the segment layout.
+
+#define NEG_INF intBitsToFloat(0xFF800000)
+#define NO_ID   0xFFFFFFFFu
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint vocab;    // entries in one row, the stride between logits rows
+    uint n_seg;    // partials per row
+    uint pad0;
+    uint pad1;
+} pc;
+
+layout(binding = 0) readonly  buffer Part { uint pt[]; } part;
+layout(binding = 1) writeonly buffer Res  { uint rs[]; } res;
+
+shared float sb[256];
+shared uint  si[256];
+shared uint  sg[256];
+shared float sn[256];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint o0 = row * pc.n_seg * 4u;
+
+    float bv = NEG_INF;
+    uint  bi = NO_ID;
+    uint  bs = 0u;
+    for (uint s = tid; s < pc.n_seg; s += 256u) {
+        const float v = uintBitsToFloat(part.pt[o0 + s * 4u]);
+        const uint  i = part.pt[o0 + s * 4u + 1u];
+        if (i == NO_ID) {
+            continue;
+        }
+        if (bi == NO_ID || v > bv || (v == bv && i < bi)) {
+            bv = v;
+            bi = i;
+            bs = s;
+        }
+    }
+    sb[tid] = bv;
+    si[tid] = bi;
+    sg[tid] = bs;
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        barrier();
+        if (tid < s) {
+            const float b1 = sb[tid], b2 = sb[tid + s];
+            const uint  i1 = si[tid], i2 = si[tid + s];
+            if (i2 != NO_ID && (b2 > b1 || (b2 == b1 && i2 < i1))) {
+                sb[tid] = b2;
+                si[tid] = i2;
+                sg[tid] = sg[tid + s];
+            }
+        }
+    }
+    barrier();
+    const float best = sb[0];
+    const uint winner = sg[0];
+
+    float sc = NEG_INF;
+    for (uint s = tid; s < pc.n_seg; s += 256u) {
+        const uint rec = o0 + s * 4u;
+        const float v = s == winner
+            ? uintBitsToFloat(part.pt[rec + 2u])
+            : uintBitsToFloat(part.pt[rec]);
+        if (v > sc) {
+            sc = v;
+        }
+    }
+    sn[tid] = sc;
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        barrier();
+        if (tid < s && sn[tid + s] > sn[tid]) {
+            sn[tid] = sn[tid + s];
+        }
+    }
+    barrier();
+    if (tid == 0u) {
+        res.rs[row * 4u]      = si[0];
+        res.rs[row * 4u + 1u] = floatBitsToUint(best);
+        res.rs[row * 4u + 2u] = floatBitsToUint(sn[0]);
+        res.rs[row * 4u + 3u] = 0u;
+    }
+}

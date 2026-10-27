@@ -95,6 +95,9 @@ const option_desc options[] = {
     PATH("--spec-check", spec_check_gguf, QRT_CMD_SPEC_CHECK, "compare speculative cycles with a serial decode"),
     ENUM("--spec-rollback", spec_rollback, "off", "on", "off keeps every draft row: the counterexample arm"),
     ON("--spec-mtp", spec_mtp, "draft the next tokens with the model's MTP block (blk.N nextn)"),
+    ENUM("--head", head_gpu, "host", "gpu", "where the output head and the greedy sample run"),
+    PATH("--head-check", head_check_gguf, QRT_CMD_HEAD_CHECK, "check the device head against a CPU double reference"),
+    INT("--head-rows", head_check_rows, 1, 32, QRT_CMD_NONE, "hidden rows in --head-check"),
     PATH("--draft-vocab-path", draft_vocab_path, QRT_CMD_NONE, "candidate token ids for a restricted draft vocabulary"),
     PATH("--cache-check", cache_prefix, QRT_CMD_CACHE, "plan and simulate the decode expert cache (host only)"),
     PATH("--cache-trace", cache_trace, QRT_CMD_NONE, "routing trace for per-layer miss weights"),
@@ -282,6 +285,11 @@ int qrt_cli_parse(qrt_cli_options * out, qrt_config * cfg, int argc, char ** arg
     if (parsed.spec_mtp && parsed.command != QRT_CMD_GENERATE &&
         parsed.command != QRT_CMD_SPEC_CHECK) {
         snprintf(err, err_size, "--spec-mtp needs the --generate or --spec-check command");
+        return -1;
+    }
+    if (parsed.head_gpu && parsed.command != QRT_CMD_GENERATE &&
+        parsed.command != QRT_CMD_SPEC_CHECK) {
+        snprintf(err, err_size, "--head gpu needs the --generate or --spec-check command");
         return -1;
     }
     if (parsed.generate_out && parsed.command != QRT_CMD_GENERATE) {

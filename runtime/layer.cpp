@@ -373,11 +373,51 @@ static int add_run(qrt_layer * l, uint32_t count, VkBuffer a, VkBuffer b, VkBuff
              : fail(err, err_size, "vkResetFences (layer add) failed");
 }
 
+// The chunk-sized f32 planes come from the session arena when one is attached (M2-8a):
+// layers run one at a time, so every layer may use the same regions.
 static int alloc_f32(qrt_layer * l, uint64_t floats, VkBuffer * buf, VkDeviceMemory * mem,
                      char * err, size_t err_size) {
-    return qrt_vk_alloc(l->dev, floats * 4,
-                        QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
-                        QRT_VK_USAGE_TRANSFER_DST, buf, mem, err, err_size);
+    return qrt_vk_alloc_scratch(l->dev, floats * 4,
+                                QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_SRC |
+                                QRT_VK_USAGE_TRANSFER_DST, buf, mem, err, err_size);
+}
+
+// The staging capacity one layer needs: the largest thing that goes through it is a weight
+// matrix, one chunk row, or a recurrence state. Shared by qrt_layer_open and the session's
+// budget pass so the two cannot disagree.
+static int layer_staging_bytes(qrt_gguf * g, uint32_t layer, uint32_t T, uint32_t E,
+                               uint32_t inter, int linear, const qrt_dn_shapes * dsh,
+                               uint64_t * out, char * err, size_t err_size) {
+    uint64_t bytes = (uint64_t) T * (E > inter ? E : inter) * 4;
+    if (linear && dsh != NULL) {
+        const uint64_t st = (uint64_t) dsh->n_v_heads * dsh->head_dim * dsh->head_dim * 4;
+        if (st > bytes) {
+            bytes = st;
+        }
+    }
+    // The weight matrices go through this staging buffer too; their sizes are in the
+    // tensor table, so no data is read for this pass.
+    static const char * names_lin[3] = { "attn_qkv.weight", "attn_gate.weight",
+                                         "ssm_out.weight" };
+    static const char * names_full[4] = { "attn_q.weight", "attn_k.weight",
+                                          "attn_v.weight", "attn_output.weight" };
+    const uint32_t n_proj = linear ? 3u : 4u;
+    char name[128];
+    for (uint32_t i = 0; i < n_proj; ++i) {
+        snprintf(name, sizeof(name), "blk.%u.%s", layer, linear ? names_lin[i] : names_full[i]);
+        const qrt_gguf_tensor * t = NULL;
+        if (qrt_gguf_require(g, name, &t, err, err_size) != 0) {
+            return -1;
+        }
+        const uint32_t k = (i + 1 == n_proj) ? inter : E;
+        const uint64_t prepared = qrt_gemm_matrix_bytes(QRT_QUANT_Q8_0,
+                                                        (uint32_t) t->ne[1], k);
+        if (prepared > bytes) {
+            bytes = prepared;
+        }
+    }
+    *out = bytes;
+    return 0;
 }
 
 int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_prefix,
@@ -532,43 +572,35 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_
         l->proj_out[2] = fb->vin;
     }
 
-    // The staging buffer has to exist before the first weight upload; size it from the
-    // largest thing that goes through it: a weight matrix, one chunk row, or the state.
+    // The staging buffer has to exist before the first weight upload.
     {
-        uint64_t stg_bytes = (uint64_t) T * (E > l->info.inter ? E : l->info.inter) * 4;
-        if (l->info.linear) {
-            const uint64_t st = (uint64_t) l->dsh.n_v_heads * l->dsh.head_dim *
-                                l->dsh.head_dim * 4;
-            if (st > stg_bytes) {
-                stg_bytes = st;
-            }
-        }
-        // The weight matrices go through this staging buffer too; their sizes are in the
-        // tensor table, so no data is read for this pass.
-        static const char * names_lin[3] = { "attn_qkv.weight", "attn_gate.weight",
-                                             "ssm_out.weight" };
-        static const char * names_full[4] = { "attn_q.weight", "attn_k.weight",
-                                              "attn_v.weight", "attn_output.weight" };
-        for (uint32_t i = 0; i < l->n_proj; ++i) {
-            snprintf(name, sizeof(name), "blk.%u.%s", layer,
-                     l->info.linear ? names_lin[i] : names_full[i]);
-            const qrt_gguf_tensor * t = NULL;
-            if (qrt_gguf_require(g, name, &t, err, err_size) != 0) {
-                qrt_layer_close(dev, l);
-                qrt_gguf_close(g);
-                return -1;
-            }
-            const uint32_t k = (i + 1 == l->n_proj) ? l->info.inter : E;
-            const uint64_t prepared = qrt_gemm_matrix_bytes(QRT_QUANT_Q8_0,
-                                                            (uint32_t) t->ne[1], k);
-            if (prepared > stg_bytes) {
-                stg_bytes = prepared;
-            }
-        }
-        if (qrt_vk_staging_create(dev, stg_bytes, &l->stg, err, err_size) != 0) {
+        uint64_t stg_bytes = 0;
+        if (layer_staging_bytes(g, layer, T, E, l->info.inter, l->info.linear,
+                                l->info.linear ? &l->dsh : NULL, &stg_bytes, err,
+                                err_size) != 0) {
             qrt_layer_close(dev, l);
             qrt_gguf_close(g);
             return -1;
+        }
+        if (l->cfg.stg != NULL) {
+            // The session hands every layer the same buffer; a short one would make the
+            // chunk-row upload fail later, so it is a configuration error here.
+            const uint64_t have = qrt_vk_staging_bytes(l->cfg.stg);
+            if (have < stg_bytes) {
+                qrt_layer_close(dev, l);
+                qrt_gguf_close(g);
+                return fail(err, err_size, "the shared staging buffer holds %llu bytes, layer "
+                            "%u needs %llu", (unsigned long long) have, layer,
+                            (unsigned long long) stg_bytes);
+            }
+            l->stg = l->cfg.stg;
+            l->owns_stg = 0;
+        } else if (qrt_vk_staging_create(dev, stg_bytes, &l->stg, err, err_size) != 0) {
+            qrt_layer_close(dev, l);
+            qrt_gguf_close(g);
+            return -1;
+        } else {
+            l->owns_stg = 1;
         }
     }
 
@@ -611,15 +643,18 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_
     }
     const uint64_t nblocks = (uint64_t) T * (E / 32u);
     const uint64_t nblocks2 = (uint64_t) T * (l->info.inter / 32u);
-    if (qrt_vk_alloc(dev, (uint64_t) T * E, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
-                     &l->qs, &l->qs_mem, err, err_size) != 0 ||
-        qrt_vk_alloc(dev, nblocks * 4, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
-                     &l->ds, &l->ds_mem, err, err_size) != 0 ||
-        qrt_vk_alloc(dev, (uint64_t) T * l->info.inter,
-                     QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST, &l->p2_qs, &l->p2qs_mem,
-                     err, err_size) != 0 ||
-        qrt_vk_alloc(dev, nblocks2 * 4, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
-                     &l->p2_ds, &l->p2ds_mem, err, err_size) != 0 ||
+    if (qrt_vk_alloc_scratch(dev, (uint64_t) T * E,
+                             QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
+                             &l->qs, &l->qs_mem, err, err_size) != 0 ||
+        qrt_vk_alloc_scratch(dev, nblocks * 4,
+                             QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
+                             &l->ds, &l->ds_mem, err, err_size) != 0 ||
+        qrt_vk_alloc_scratch(dev, (uint64_t) T * l->info.inter,
+                             QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
+                             &l->p2_qs, &l->p2qs_mem, err, err_size) != 0 ||
+        qrt_vk_alloc_scratch(dev, nblocks2 * 4,
+                             QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
+                             &l->p2_ds, &l->p2ds_mem, err, err_size) != 0 ||
         qrt_vk_alloc(dev, (uint64_t) E * 4, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
                      &l->norm_w, &l->nw_mem, err, err_size) != 0 ||
         qrt_vk_alloc(dev, (uint64_t) E * 4, QRT_VK_USAGE_STORAGE | QRT_VK_USAGE_TRANSFER_DST,
@@ -674,6 +709,7 @@ int qrt_layer_open(qrt_vk_dev * dev, const char * gguf_path, const char * store_
         fc.scale    = 1.0f;
         fc.slot     = l->cfg.ffn_slot;
         fc.slot_bytes = l->cfg.ffn_slot_bytes;
+        fc.stg      = l->stg;
         if (qrt_ffn_open(dev, gguf_path, store_prefix, spv_dir, layer, &fc, &l->ffn, err,
                          err_size) != 0) {
             qrt_layer_close(dev, l);
@@ -714,7 +750,9 @@ void qrt_layer_close(qrt_vk_dev * dev, qrt_layer * l) {
         if (l->add_pipe != VK_NULL_HANDLE)               vkDestroyPipeline(dev->device, l->add_pipe, nullptr);
         if (l->add_layout != VK_NULL_HANDLE)             vkDestroyPipelineLayout(dev->device, l->add_layout, nullptr);
         if (l->add_dsl != VK_NULL_HANDLE)                vkDestroyDescriptorSetLayout(dev->device, l->add_dsl, nullptr);
-        qrt_vk_staging_destroy(dev, l->stg);
+        if (l->owns_stg) {
+            qrt_vk_staging_destroy(dev, l->stg);
+        }
         qrt_norm_close(dev, l->nrm);
         qrt_gemm_close(dev, l->gemm);
         qrt_vk_cmd_destroy(dev, l->pass);
@@ -724,6 +762,86 @@ void qrt_layer_close(qrt_vk_dev * dev, qrt_layer * l) {
         qrt_full_close(dev, l->full);
     }
     free(l);
+}
+
+// The session sizes its arena and its shared staging buffer from this: what qrt_layer_open
+// takes for one layer at `tokens`, excluding the persistent state, KV cache and weights.
+// The module helpers own the attention/FFN halves and layer_staging_bytes owns the staging
+// width, so the shapes cannot drift between sizing and allocation.
+int qrt_layer_budget_of(const char * gguf_path, uint32_t layer, uint32_t tokens,
+                        const qrt_layer_cfg * cfg, qrt_layer_budget * out, char * err,
+                        size_t err_size) {
+    memset(out, 0, sizeof(*out));
+    if (gguf_path == NULL || cfg == NULL || tokens == 0) {
+        return fail(err, err_size, "the layer budget needs a GGUF, a config and tokens");
+    }
+    qrt_gguf * g = NULL;
+    if (qrt_gguf_open(gguf_path, &g, err, err_size) != 0) {
+        return -1;
+    }
+    const qrt_gguf_hparams hp = *qrt_gguf_hparams_of(g);
+    const uint32_t E = (uint32_t) hp.n_embd;
+    if (E == 0 || E % 32u != 0) {
+        qrt_gguf_close(g);
+        return fail(err, err_size, "layer %u has n_embd %u", layer, E);
+    }
+    char name[128];
+    snprintf(name, sizeof(name), "blk.%u.attn_qkv.weight", layer);
+    const int linear = qrt_gguf_find(g, name) != NULL;
+    uint32_t inter = 0;
+    uint64_t attn_bytes = 0;
+    qrt_dn_shapes dsh;
+    memset(&dsh, 0, sizeof(dsh));
+    if (linear) {
+        if (dn_shapes_from_gguf(g, layer, &dsh, err, err_size) != 0) {
+            qrt_gguf_close(g);
+            return -1;
+        }
+        inter = dsh.d_inner;
+        attn_bytes = qrt_dn_scratch_bytes(&dsh, tokens);
+    } else {
+        qrt_full_shapes fsh;
+        if (qrt_full_shapes_from_gguf(&hp, &fsh, err, err_size) != 0 || fsh.n_embd != E) {
+            qrt_gguf_close(g);
+            return -1;
+        }
+        qrt_full_kv_cfg kvcfg;
+        memset(&kvcfg, 0, sizeof(kvcfg));
+        kvcfg.k_type = cfg->kv_k;
+        kvcfg.v_type = cfg->kv_v;
+        const uint32_t n_ctx = cfg->n_ctx > tokens ? cfg->n_ctx : tokens;
+        kvcfg.resident_tokens = n_ctx;
+        kvcfg.page_tokens = cfg->kv_page_tokens;
+        inter = fsh.n_head * fsh.head_dim;
+        attn_bytes = qrt_full_scratch_bytes(&fsh, tokens, n_ctx, &kvcfg);
+    }
+    if (layer_staging_bytes(g, layer, tokens, E, inter, linear, linear ? &dsh : NULL,
+                            &out->staging_bytes, err, err_size) != 0) {
+        qrt_gguf_close(g);
+        return -1;
+    }
+    uint64_t bytes = 4u * (uint64_t) tokens * E * 4 +              // x, attn_out, xpost, xout
+                     (uint64_t) tokens * E +                       // qs
+                     (uint64_t) tokens * (E / 32u) * 4 +           // ds
+                     (uint64_t) tokens * inter +                   // p2_qs, one byte a value
+                     (uint64_t) tokens * (inter / 32u) * 4;        // p2_ds
+    if (!linear) {
+        bytes += (uint64_t) tokens * E * 4;                        // xnorm
+    }
+    bytes += attn_bytes;
+    if (cfg->ffn) {
+        qrt_ffn_cfg fc;
+        memset(&fc, 0, sizeof(fc));
+        fc.tokens = tokens;
+        fc.n_embd = E;
+        fc.n_expert = (uint32_t) hp.expert_count;
+        fc.top_k = (uint32_t) hp.expert_used_count;
+        fc.ffn = (uint32_t) hp.expert_ff;
+        bytes += qrt_ffn_plane_bytes(&fc);
+    }
+    out->scratch_bytes = bytes;
+    qrt_gguf_close(g);
+    return 0;
 }
 
 int qrt_layer_set_input_rows(qrt_layer * l, const float * x, uint32_t rows, char * err,
@@ -751,8 +869,13 @@ static void stage_barrier(qrt_layer * l) {
 
 // The DeltaNet conv taps of the next chunk are the last conv_taps-1 projected rows of the
 // rows that stayed in the sequence. They only exist in the qkv plane, so one buffer copy
-// stages them; the recurrence state needs no copy at all because the ring cursor already
-// points at the slot the next chunk reads (M3-3).
+// stages them into the persistent conv_state; the recurrence state needs no copy at all
+// because the ring cursor already points at the slot the next chunk reads (M3-3).
+//
+// M2-8a moved this to the END of the pass: the qkv plane now lives in the session arena and
+// every layer aliases it, so it cannot be the place a carry waits between calls. At the end
+// of the pass the rows are still there and the copy also serves the next pass, whenever it
+// runs and whatever ran in between.
 static void record_dn_carry(qrt_layer * l, VkCommandBuffer cmd, uint32_t rows) {
     const qrt_dn_bufs * b = qrt_dn_buffers(l->dn);
     const uint32_t taps = l->dsh.conv_taps - 1u;
@@ -785,9 +908,66 @@ static void record_dn_carry(qrt_layer * l, VkCommandBuffer cmd, uint32_t rows) {
     qrt_vk_cmd_record_barrier_transfer(cmd);
 }
 
-// The module-by-module path has no pass buffer, so the carry gets its own submit on the
-// layer add's command buffer, which is idle between its own runs.
-static int dn_carry_submit(qrt_layer * l, uint32_t rows, char * err, size_t err_size) {
+// A snapshot pass keeps the window it started from and the rows it projected, because the
+// qkv plane it would otherwise read back is shared with every other layer. Recorded right
+// before record_dn_carry() updates conv_state.
+static void record_dn_snap_save(qrt_layer * l, VkCommandBuffer cmd, uint32_t rows) {
+    const qrt_dn_bufs * b = qrt_dn_buffers(l->dn);
+    const uint32_t taps = l->dsh.conv_taps - 1u;
+    const uint64_t row_bytes = (uint64_t) l->dsh.conv_ch * 4;
+    VkMemoryBarrier mb;
+    memset(&mb, 0, sizeof(mb));
+    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    const VkBufferCopy entry{0, 0, (uint64_t) taps * row_bytes};
+    vkCmdCopyBuffer(cmd, b->conv_state, b->conv_entry, 1, &entry);
+    const VkBufferCopy pass{0, 0, (uint64_t) rows * row_bytes};
+    vkCmdCopyBuffer(cmd, b->qkv, b->pass_rows, 1, &pass);
+    // The carry that follows reads qkv and writes conv_state; order the transfer ops.
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+}
+
+// Put conv_state back to the window after the first `kept` rows of the last snapshot pass.
+// For kept >= taps-1 those are the pass's own rows; a shorter prefix mixes the entry window
+// with the pass's first rows. The two reads are disjoint, so no overlap staging is needed.
+static void record_dn_rollback(qrt_layer * l, VkCommandBuffer cmd, uint32_t kept) {
+    const qrt_dn_bufs * b = qrt_dn_buffers(l->dn);
+    const uint32_t taps = l->dsh.conv_taps - 1u;
+    const uint64_t row_bytes = (uint64_t) l->dsh.conv_ch * 4;
+    VkMemoryBarrier mb;
+    memset(&mb, 0, sizeof(mb));
+    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (kept < taps) {
+        // The window keeps the entry rows the prefix did not consume, then the kept rows.
+        const uint64_t old = (uint64_t) (taps - kept) * row_bytes;
+        const VkBufferCopy head{(uint64_t) kept * row_bytes, 0, old};
+        vkCmdCopyBuffer(cmd, b->conv_entry, b->conv_state, 1, &head);
+        if (kept != 0) {
+            const VkBufferCopy tail{0, old, (uint64_t) kept * row_bytes};
+            vkCmdCopyBuffer(cmd, b->pass_rows, b->conv_state, 1, &tail);
+        }
+    } else {
+        const VkBufferCopy window{(uint64_t) (kept - taps) * row_bytes, 0,
+                                  (uint64_t) taps * row_bytes};
+        vkCmdCopyBuffer(cmd, b->pass_rows, b->conv_state, 1, &window);
+    }
+    qrt_vk_cmd_record_barrier_transfer(cmd);
+}
+
+// The module-by-module path has no pass buffer, so a carry or rollback copy gets its own
+// submit on the layer add's command buffer, which is idle between its own runs.
+static int dn_copy_submit(qrt_layer * l, uint32_t rows, int rollback, char * err,
+                          size_t err_size) {
     VkCommandBufferBeginInfo bi;
     memset(&bi, 0, sizeof(bi));
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -796,7 +976,11 @@ static int dn_carry_submit(qrt_layer * l, uint32_t rows, char * err, size_t err_
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkBeginCommandBuffer (deltanet carry)", r);
     }
-    record_dn_carry(l, l->add_cmd, rows);
+    if (rollback) {
+        record_dn_rollback(l, l->add_cmd, rows);
+    } else {
+        record_dn_carry(l, l->add_cmd, rows);
+    }
     r = vkEndCommandBuffer(l->add_cmd);
     if (r != VK_SUCCESS) {
         return vk_fail(err, err_size, "vkEndCommandBuffer (deltanet carry)", r);
@@ -873,17 +1057,16 @@ static int layer_attention_half(qrt_layer * l, char * err, size_t err_size) {
     const uint32_t T = l->run_tokens;
     const uint32_t E = l->info.n_embd;
     const uint32_t last = l->n_proj - 1;
-    // 0. the conv taps this chunk needs come from the rows the last chunk left in the qkv
-    // plane, and the qkv projection of this chunk overwrites exactly those rows, so the
-    // carry has to be the first thing in the pass. The recurrence state needs no move: the
-    // ring cursor already points at the slot this chunk reads (M3-3).
-    if (l->info.linear && l->dn_carry_rows != 0) {
+    // 0. A speculative rollback left the conv carry of its snapshot pass in the persistent
+    // copies; put conv_state back to the accepted prefix before this chunk's prep reads it.
+    // The serial carry needs nothing here: it was recorded at the end of the last pass (M2-8a).
+    if (l->info.linear && l->dn_kept != 0) {
         if (l->pass != NULL) {
-            record_dn_carry(l, qrt_vk_cmd_buffer(l->pass, 0), l->dn_carry_rows);
-        } else if (dn_carry_submit(l, l->dn_carry_rows, err, err_size) != 0) {
+            record_dn_rollback(l, qrt_vk_cmd_buffer(l->pass, 0), l->dn_kept);
+        } else if (dn_copy_submit(l, l->dn_kept, 1, err, err_size) != 0) {
             return -1;
         }
-        l->dn_carry_rows = 0;
+        l->dn_kept = 0;
     }
     // 1. input norm; DeltaNet's gate reads the f32 row, so norm_out points at its buffer
     if (layer_norm(l, l->x, l->norm_w, l->norm_out, l->qs, l->ds, E, 0, err, err_size) != 0) {
@@ -908,8 +1091,23 @@ static int layer_attention_half(qrt_layer * l, char * err, size_t err_size) {
                              err_size) != 0) {
             return -1;
         }
-        // the rows just computed are what the next chunk stages its conv taps from
-        l->dn_carry_rows = rows;
+        // The rows just computed are what the next chunk stages its conv taps from; it is
+        // recorded here, at the end of the pass, so the shared qkv plane need not survive
+        // (M2-8a). A snapshot pass also keeps the entry window and its rows for rollback.
+        if (l->pass != NULL) {
+            VkCommandBuffer cmd = qrt_vk_cmd_buffer(l->pass, 0);
+            if (l->dn_snap) {
+                record_dn_snap_save(l, cmd, rows);
+            }
+            record_dn_carry(l, cmd, rows);
+        } else {
+            if (l->dn_snap) {
+                return fail(err, err_size, "a snapshot pass needs the merged pass buffer");
+            }
+            if (dn_copy_submit(l, rows, 0, err, err_size) != 0) {
+                return -1;
+            }
+        }
     } else {
         if (qrt_full_qk(l->full, pos0, rows, err, err_size) != 0 ||
             qrt_full_attn(l->full, pos0, rows, err, err_size) != 0) {
@@ -1120,7 +1318,9 @@ int qrt_layer_rollback(qrt_layer * l, uint32_t kept, char * err, size_t err_size
     // where it was because a snapshot pass does not move it.
     const uint32_t slots = qrt_dn_state_slots(l->dn);
     qrt_dn_state_use(l->dn, (qrt_dn_state_cur(l->dn) + kept) % slots);
-    l->dn_carry_rows = kept;
+    // The conv carry the pass left is the window after its last row. A shorter prefix needs
+    // the rebuild the next pass records first; a full one is already right.
+    l->dn_kept = kept < l->run_tokens ? kept : 0;
     l->dn_snap = 0;
     return 0;
 }
@@ -1139,7 +1339,7 @@ int qrt_layer_zero_state(qrt_layer * l, char * err, size_t err_size) {
     const uint64_t cv = (uint64_t) (l->dsh.conv_taps - 1) * l->dsh.conv_ch * 4;
     std::vector<unsigned char> zero((size_t) (st > cv ? st : cv), 0);
     qrt_dn_state_use(l->dn, 0);
-    l->dn_carry_rows = 0;
+    l->dn_kept = 0;
     if (qrt_vk_upload(l->dev, l->stg, b->state, qrt_dn_state_offset(l->dn), zero.data(), st,
                       err, err_size) != 0) {
         return -1;

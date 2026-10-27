@@ -1,7 +1,7 @@
 {
   "schema": 3,
   "track": "qwen36-runtime",
-  "updated": "2026-10-26 21:56",
+  "updated": "2026-10-27 04:20",
   "phase": "M2",
   "phase_status": "in_progress",
   "decision_gate": {
@@ -152,8 +152,10 @@
     },
     {
       "lane": "impl",
-      "head": "M3-3c",
+      "head": "M3-2b",
       "order": [
+        "M3-7",
+        "M2-8a",
         "M3-3c",
         "M3-2c",
         "X-5",
@@ -180,7 +182,7 @@
         "X-1",
         "X-2"
       ],
-      "note": "M3-3b done: the MTP draft runs (blk.40 + gathered 16K head) and the accept/rollback gate holds against serial greedy at 40 layers. M3-3c next: runtime E is 2.327 against the fork 2.850 on the same 10.4K prompt, which blocks M3-6. M3-2b holds the three-leg 10%; X-8 after."
+      "note": "M2-8a and M3-3c are done: the session shares one arena + one staging across all 40 resident layers (chunk 32..2048, 10.4K prefill 675.75 -> 53.44 s bit-identical), and the MTP block now gets the fork's prompt/verified-row KV (E 2.31/2.33 -> 2.76/2.84 against the fork's 2.85). The queue head is M3-2b, the binding decode leg (two submits + one top-k readback per layer). Follow-ups left to their owners: the session prefill is still 2.9x/1.6x slower than the single-layer model chain because the shared FFN slot re-packs experts every chunk (M2-8/M2-5), and the arena could be reopened at the decode row count after prefill to hand ~425 MiB back to the expert cache (M3-2b/M2-8)."
     },
     {
       "lane": "data",
@@ -640,6 +642,7 @@
       "title": "PP >= 1000 tok/s（10K prompt + 256K ctx）",
       "deps": [
         "M2-7",
+        "M2-8a",
         "X-5"
       ],
       "resources": [
@@ -848,7 +851,7 @@
       "id": "M3-3c",
       "milestone": "M3",
       "lane": "impl",
-      "status": "todo",
+      "status": "done",
       "title": "runtime MTP 的 E 比 fork 短 18%：归因（chunk 形状 / h 链 / 候选头 / 草稿块 KV）",
       "deps": [
         "M3-3b"
@@ -867,7 +870,18 @@
         "bench/tools/**"
       ],
       "done_when": "在 10.4K prompt、k=4、16K 候选、q8_0 K + q4_0 V、4198 MiB + auto 下给出 E 的归因与修复后的读数：先复现 fork 在同一 prompt 的 E（bench/tools/mtp_accept.py 口径），再逐项排除候选（prefill chunk 32 与 2048 的算术形状、MTP 块 KV 里 prompt 行是否应为空、草稿头 gather 与 fork 候选集语义、链式 h 的精度），目标是 design 6.3 的 2.72/2.90 或有证据说明差距来自哪一项",
-      "note": "实测 E=2.327 vs fork 2.850（同 10.4K prompt、同 k=4、同 16K 候选），比 design 6.3 两条验收线低 14-20%。已排除：hnorm 漏用（修前 1.154/修后 2.000）、KV 精度（512 档 f16 与 q8_0/q4_0 同为 1.939）、词表限制（完整词表 E 与 16K 相同）。TG = E/周期，这条差距直接压 M3-6 的 130，故 M3-6 依赖它。证据 RESULTS.md#m3-3b-mtp-draft 92.3"
+      "note": "done 2026-10-27：缺口归因到 MTP 块的 KV——fork 的 draft-mtp 在每个 target batch（prompt 与验证 pass）上用 (token_p, t_h_nextn(p-1)) 跑草稿块并写 KV，runtime 只在草稿位置跑，10.4K prompt 的 10428 行从未写过，第一个草稿的注意力读未初始化缓存。修复：mtp_run_rows() 用 host enorm/hnorm + no_norm Q8_1 打包 + prepared nextn.eh_proj 的 dense GEMM 把 concat 直接投影进块输入平面（host 不再做每行 8.9 MB GEMV），prompt pass 1.71 s/10.4K，每周期按 kept 行用 target h 刷新，草稿步同路径（40.76 -> 21.9 ms/step，8.5 -> 0.2 MiB/step）。读数：10.4K/k=4/16K/q8_0+q4_0/4198+auto/device 头/chunk 2048，E 2.309/2.327 -> 2.761（46 周期）与 2.844（45 周期），+20-23%，fork 2.850；design 6.3 的 2.72 过、2.90 差 0-5%。正确性：10.4K --spec-check 40 层 k=4 缓存关闭 ids_equal=1 worst=0.000e+00；40 层 32+8 与 4 层 256-token 金标准相同；rollback-off 反例仍分叉；selftest 0 failed、ctest -L qrt 9/9。chunk 形状已由 M2-8a 逐位对齐排除；seed 用 output_norm（target 图语义）不改。残差 0-3% 归 prompt 长度（10438 vs 10428）、fork --cpu-moe 腿与 q8 GEMM 舍入，未再拆。未提交（无提交授权）。",
+      "owner": "qoder-agent@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-27T03:15:00+08:00",
+      "evidence": {
+        "results": [
+          "RESULTS.md#m3-3c-mtp-kv"
+        ],
+        "decisions": [
+          "DECISIONS.md#m3-3c-mtp-kv-verdict"
+        ]
+      }
     },
     {
       "id": "M3-4",
@@ -1795,6 +1809,94 @@
       ],
       "done_when": "解释 C 的 7 个 margin>=0.05 分叉（区分 fork 路径、Q8_1 量化、真实缺陷）；实现并跑通全模型无 Q8_1 激活的高精度锚；决定默认 q8/q4 dequant K/V staging 是否改 RNE 并给出数值/性能证据；读数进 RESULTS/DECISIONS",
       "note": "X-7 残余：C 7 flips worst 0.959；默认 q8/q4 dequant staging 仍 packHalf2x16 truncation；norm_gemm_f32 只覆盖 dense projection。不阻塞 M3-2。"
+    },
+    {
+      "id": "M3-7",
+      "milestone": "M3",
+      "lane": "impl",
+      "status": "done",
+      "title": "端到端第一块：输出头与 argmax 上设备（design 4.6 的 GPU 采样，每 pass 只回传 k 个 id）",
+      "deps": [
+        "M3-3b"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/CMakeLists.txt",
+        "runtime/README.md",
+        "runtime/head.*",
+        "runtime/kernels/**",
+        "runtime/model.h",
+        "runtime/model_generate.cpp",
+        "runtime/model_host.cpp",
+        "runtime/model_internal.h",
+        "runtime/qrt_cli.*",
+        "runtime/qrt_config.*",
+        "runtime/qrt_main.cpp",
+        "runtime/spec.*",
+        "bench/raw/m3-7/**"
+      ],
+      "done_when": "--head gpu 打开后：一次验证 pass 的完整词表 logits、argmax 与受限词表草稿头都在设备上算，host 只拿回 rows 个 id/margin；L-KERN 用同一批 Q8_1 平面做 CPU 双精度参考（rel_L1 <= 1e-6、ids 逐行相同），--spec-check 两臂 ids 仍与串行 greedy 一致，反例臂仍分叉；报每 pass 与每草稿步的 ms/字节前后对比，以及 40 层 + 缓存档的显存归属",
+      "note": "done 2026-10-26：设备头进运行时（head.{h,cpp} + kernels/head_max{1,2}.comp），norm+全词表 GEMM+两段 argmax 录进一条命令缓冲，只回传 rows 个 id。L-KERN --head-check rel_L1=1.243e-07（共享设备自己打包的 Q8_1 平面）ids_equal=1，mask 两臂含反例 PASS。单变量（无缓存）两臂逐字段相同：40 层 --spec-check E=1.833 ids_equal=1 worst=0.000e+00，40 层 32+8 ids 与金标准 8/8 同，4 层 256+8 同，教师强制 k=2/4/8 仍 0.000e+00；反例臂 first_diff=3。端到端 10.4K/k=4/16K/q8_0+q4_0：每周期 3331.6->412.8 ms、每草稿步 155.89->40.76 ms、TG 0.59->4.3 tok/s、E 2.327->2.309、头单价 4.5 ms/次。代价：头占 606 MiB，缓存 4198->3072 MiB（2298->1681 槽，命中 67.0%->56.1%）。默认保持 host：10.4K 两臂 stream 的分叉有缓存档位+auto 抖动两个变量，且解码路径没进 C 锚。翻转前置=M2-8a + 解码 logits 进 C 锚。未提交（无提交授权）。",
+      "owner": "qoder-agent@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-26T22:14:09+08:00",
+      "evidence": {
+        "results": [
+          "RESULTS.md#m3-7-device-head"
+        ],
+        "decisions": [
+          "DECISIONS.md#m3-7-device-head-verdict"
+        ]
+      }
+    },
+    {
+      "id": "M2-8a",
+      "milestone": "M2",
+      "lane": "impl",
+      "status": "done",
+      "title": "共享 scratch arena：40 层常驻会话把 prefill chunk 从 64 提到 2048",
+      "deps": [
+        "M3-2"
+      ],
+      "resources": [
+        "gpu",
+        "host-ram",
+        "machine-quiet"
+      ],
+      "paths": [
+        "runtime/CMakeLists.txt",
+        "runtime/README.md",
+        "runtime/attn_deltanet.*",
+        "runtime/attn_full.*",
+        "runtime/ffn.*",
+        "runtime/kernels/**",
+        "runtime/layer.*",
+        "runtime/layer_internal.h",
+        "runtime/model.cpp",
+        "runtime/model_generate.cpp",
+        "runtime/model_internal.h",
+        "runtime/vk_dev.*",
+        "runtime/ffn_store.cpp",
+        "runtime/qrt_main.cpp",
+        "bench/raw/m2-8a/**"
+      ],
+      "done_when": "层的 T 尺寸激活平面与 staging 由会话分配一次、40 层共用（design 5.5 的计算缓冲是一行预算，不是 40 份），--generate 允许 --prefill-chunk 2048；同一 10.4K prompt 在 chunk 32 与 2048 两档的 logits 与生成 ids 对齐（B 层：共享打包 rel_L1 <= 1e-4、top-1 100%），报 prefill 秒数与显存",
+      "note": "done 2026-10-27：会话持有一份 device-local arena（一次 vkAllocateMemory，每子 buffer 按自身对齐偏移 bind，每层 open 前 rewind）与一块共享 staging，40 层别名同一组 T 尺寸平面；持久状态（DN 状态环、conv carry、KV、权重、专家 slot）仍在 arena 外。尺寸只有一个来源 qrt_layer_budget_of()（复用 dn/full/ffn 的 scratch helper 与 layer_staging_bytes），会话按所有主层+MTP 的最大值开 arena 并打印 predicted/used。DeltaNet 的 conv carry 从下一次 pass 开头读 qkv 平面改成 pass 末尾写 conv_state（arena 让平面不能跨调用保存），snapshot pass 存 entry window + pass rows，rollback 后下一 pass 开头重建。chunk 上限 64 -> 2048（32 对齐，越界报错）。实测 10.4K prompt：会话 prefill 675.75 s/15.4 tok/s（chunk 32）-> 53.44 s/195.1 tok/s（2048），12.64x；arena chunk 32 12.6 MiB、2048 428.4 MiB（predicted=used=427.3，216,260 B/行 + FFN 固定 5.18 MiB，低于 design 5.5 的 700 MiB）；cache-off peak 2387.4 -> 2803.2 MiB（差=arena）。默认缓存档（MTP k=4/16K/device 头/chunk 2048）prefill 53.39 s、缓存 3327 MiB/1822 槽、peak 6938.5 MiB。正确性：10.4K chunk 32 vs 2048 的 --logits-dump 16 行 raw/logp rel_L1=0.000e+00、top-1 16/16，会话 8 个 ids 与 8 个 step 逐字段相同，step0=M3-7 金标准 271/16.4599/0.4060；4 层/40 层 --spec-check（含 rollback 正反例）、layer-check 0/39、4 层 256-token 与 40 层 32+8 金标准同二进制重跑通过；selftest 0 failed、ctest -L qrt 9/9。未验证：PP 仍 195 tok/s（会话比单层驻留 model 链慢，transient 专家重打包归 M2-8/M2-5）；chunk > 2048 未做；prefill 后按 decode rows 缩 arena 还没做。未提交（无提交授权）。",
+      "owner": "qoder-agent@ElliotMasheal",
+      "worktree": "E:/fastLlama",
+      "claimed_at": "2026-10-27T02:01:00+08:00",
+      "evidence": {
+        "results": [
+          "RESULTS.md#m2-8a-shared-arena"
+        ],
+        "decisions": [
+          "DECISIONS.md#m2-8a-shared-arena-verdict"
+        ]
+      }
     }
   ],
   "last_gate": {

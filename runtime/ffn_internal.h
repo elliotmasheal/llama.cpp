@@ -26,6 +26,7 @@ struct qrt_ffn {
     qrt_gemm *      gemm;
     qrt_weights *   store;
     qrt_vk_staging * stg;
+    int             owns_stg;   // 0 = the session handed the staging buffer over
 
     VkDescriptorSetLayout dsl;
     VkPipelineLayout      layout;
@@ -113,10 +114,6 @@ struct qrt_ffn {
     qrt_ffn_in in;      // what the layer handed over this chunk
     qrt_ffn_bufs bufs;
 };
-
-// The staging window the expert packer fills before one H2D submit: sized once so the
-// record path and the cache planner cannot disagree about when a flush is due.
-const uint32_t QRT_FFN_STAGING_BYTES = 32u << 20;
 
 // One layer of the decode cache: routed union -> residency probe -> miss split -> slot
 // packing, with the CPU leg measured beside the H2D leg. Implemented in ffn_store.cpp.

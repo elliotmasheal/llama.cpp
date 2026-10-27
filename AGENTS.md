@@ -55,7 +55,7 @@ RX 6700S 8 GiB（`-dev Vulkan1`）+ Ryzen 7 6800HS + 40172 MiB RAM，平衡电�
 phase: M2
 phase_status: in_progress
 decision_gate: M1 closed
-queues: bench=- impl=M3-3c data=Q-KV2 io=- user=-
+queues: bench=- impl=M3-2b data=Q-KV2 io=- user=-
 last_gate: G-REG unknown (2026-10-23)
 blockers: none
 <!-- STATE:END -->

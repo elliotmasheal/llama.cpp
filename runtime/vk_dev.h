@@ -37,6 +37,8 @@ static inline int vk_fail(char * err, size_t err_size, const char * what, VkResu
 // Device, queues, memory types and the VRAM budget of design 5.5. Opening the
 // device is a recoverable failure: no abort, no exit, a message in err instead.
 
+struct qrt_vk_arena;
+
 struct qrt_vk_dev {
 #ifdef QRT_HAVE_VULKAN
     VkInstance       instance;
@@ -64,6 +66,7 @@ struct qrt_vk_dev {
     int      has_dot_product;   // VK_KHR_shader_integer_dot_product enabled
     uint32_t subgroup_size;     // VkPhysicalDeviceSubgroupProperties, 0 if unknown
     int      has_subgroup_arithmetic; // subgroup add is available to kernels
+    qrt_vk_arena * arena;       // the session scratch pool qrt_vk_alloc_scratch uses
 };
 
 // The five buckets of design 5.5 plus what the planner had to give up.
@@ -104,5 +107,24 @@ int qrt_vk_plan_budget(qrt_vk_dev * dev, const qrt_config * cfg, uint64_t expert
 int qrt_vk_alloc(qrt_vk_dev * dev, uint64_t bytes, VkBufferUsageFlags usage,
                  VkBuffer * buf, VkDeviceMemory * mem, char * err, size_t err_size);
 void qrt_vk_free(qrt_vk_dev * dev, VkBuffer buf, VkDeviceMemory mem);
+
+// Session scratch (M2-8a): one device-local allocation that the chunk-sized activation
+// planes of every layer are sub-allocated from. The layers run strictly one at a time, so
+// the session rewinds the cursor before each layer opens and every layer sees the same
+// regions; the total is one layer's compute buffer, not forty. Buffers created inside the
+// arena are ordinary VkBuffers bound at an offset, and qrt_vk_free() destroys only the
+// handle: the memory goes when the arena does, after every layer is closed.
+struct qrt_vk_arena;
+int qrt_vk_arena_create(qrt_vk_dev * dev, uint64_t bytes, qrt_vk_arena ** out, char * err,
+                        size_t err_size);
+void qrt_vk_arena_destroy(qrt_vk_dev * dev, qrt_vk_arena * arena);
+// Attach the arena the allocation path below should use; detach is part of destroy.
+int qrt_vk_arena_attach(qrt_vk_dev * dev, qrt_vk_arena * arena, char * err, size_t err_size);
+uint64_t qrt_vk_arena_bytes(const qrt_vk_arena * arena);
+uint64_t qrt_vk_arena_used(const qrt_vk_arena * arena);
+void qrt_vk_arena_rewind(qrt_vk_arena * arena);
+// Allocates from the attached arena when there is one, otherwise a standalone buffer.
+int qrt_vk_alloc_scratch(qrt_vk_dev * dev, uint64_t bytes, VkBufferUsageFlags usage,
+                         VkBuffer * buf, VkDeviceMemory * mem, char * err, size_t err_size);
 
 void qrt_vk_print_info(const qrt_vk_dev * dev, FILE * f);

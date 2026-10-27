@@ -1,0 +1,91 @@
+#version 450
+// Stage 1 of the greedy argmax (design 4.6, the device output head). One workgroup owns a
+// contiguous segment of one logits row and reports its best value, the vocabulary index it
+// came from, and the best value behind it.
+//
+// The comparison order is (value descending, index ascending). It is a total order, so the
+// reduction is associative and the winner cannot depend on how the segments were cut; the
+// lower index wins a tie, which is what the host reference does.
+//
+// A candidate mask decides which entries may win: the verification pass sets every entry, a
+// restricted draft pass sets only its candidates, so one kernel serves both heads.
+
+#define NEG_INF intBitsToFloat(0xFF800000)
+#define NO_ID   0xFFFFFFFFu
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint vocab;   // entries in one row
+    uint span;    // entries a workgroup owns
+    uint pad0;
+    uint pad1;
+} pc;
+
+layout(binding = 0) readonly  buffer Logits { float lg[]; }  ins;
+layout(binding = 1) readonly  buffer Cands  { uint  mk[]; }  cands;
+layout(binding = 2) writeonly buffer Part    { uint  pt[]; }  part;   // 4 words per segment
+
+shared float sb[256];
+shared uint  si[256];
+shared float ss[256];
+
+// true when (v2, i2) beats (v1, i1)
+bool better(const float v1, const uint i1, const float v2, const uint i2) {
+    return v2 > v1 || (v2 == v1 && i2 < i1);
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.y;
+    const uint seg = gl_WorkGroupID.x;
+    const uint base = row * pc.vocab + seg * pc.span;
+    const uint span = min(pc.span, pc.vocab - seg * pc.span);
+    const uint tid = gl_LocalInvocationID.x;
+
+    float bv = NEG_INF;
+    uint  bi = NO_ID;
+    float sc = NEG_INF;
+    for (uint i = tid; i < span; i += 256u) {
+        // the candidate mask is one entry per vocabulary id, so it is indexed by the column
+        // inside the row and never by the flattened logits offset
+        const uint col = seg * pc.span + i;
+        if (cands.mk[col] == 0u) {
+            continue;
+        }
+        const float v = ins.lg[base + i];
+        if (bi == NO_ID || better(bv, bi, v, col)) {
+            sc = bv;
+            bv = v;
+            bi = col;
+        } else if (v > sc) {
+            sc = v;
+        }
+    }
+    sb[tid] = bv;
+    si[tid] = bi;
+    ss[tid] = sc;
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        barrier();
+        if (tid < s) {
+            const float b1 = sb[tid], b2 = sb[tid + s];
+            const uint  i1 = si[tid], i2 = si[tid + s];
+            const float c1 = ss[tid], c2 = ss[tid + s];
+            if (i2 != NO_ID && better(b1, i1, b2, i2)) {
+                sb[tid] = b2;
+                si[tid] = i2;
+                ss[tid] = max(c2, b1);
+            } else {
+                ss[tid] = max(c1, b2);
+            }
+        }
+    }
+    barrier();
+    if (tid == 0u) {
+        const uint o = (row * gl_NumWorkGroups.x + seg) * 4u;
+        part.pt[o]      = floatBitsToUint(sb[0]);
+        part.pt[o + 1u] = si[0];
+        part.pt[o + 2u] = floatBitsToUint(ss[0]);
+        part.pt[o + 3u] = 0u;
+    }
+}

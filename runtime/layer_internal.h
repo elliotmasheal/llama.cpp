@@ -41,6 +41,7 @@ struct qrt_layer {
     qrt_full *      full;
     qrt_ffn *       ffn;
     qrt_vk_staging * stg;
+    int             owns_stg;   // 0 = the session handed the staging buffer over
     qrt_vk_cmd *    pass;
     qrt_dn_shapes   dsh;
     qrt_full_shapes fsh;
@@ -67,7 +68,9 @@ struct qrt_layer {
     uint32_t           run_pos0;    // position of the chunk's first row, this run
     uint32_t           run_tokens;  // rows of the opened chunk that belong to the sequence
     uint32_t           dn_snap;     // 1 while the last pass kept a snapshot per row
-    uint32_t           dn_carry_rows;  // rows whose last taps stage the next chunk's conv
+    // Rows the next pass must put the conv carry back to (a speculative rollback); 0 = the
+    // carry the last pass left is already the right one. See record_dn_rollback().
+    uint32_t           dn_kept;
     double             last_ms;
     double             pass1_ms;
     double             group_ms;

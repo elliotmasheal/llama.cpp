@@ -38,6 +38,8 @@ add_library(qrt_core STATIC
     model_generate.cpp
     model_io.cpp
     spec.cpp
+    head.cpp
+    head_check.cpp
     ffn.cpp
     ffn_ref.cpp
     ffn_store.cpp
@@ -246,12 +248,25 @@ if(Vulkan_GLSLC_EXECUTABLE)
         DEPENDS ${_qrt_kernels}/attn_full_attn.comp ${_qrt_kernels}/common.glsl
         COMMENT "Compiling kernels/attn_full_attn.comp"
         VERBATIM)
+    # The device output head (M3-7, design 4.6): the two argmax stages over the logits tile.
+    set(_qrt_head_spv "")
+    foreach(_k IN ITEMS max1 max2)
+        set(_spv "${CMAKE_CURRENT_BINARY_DIR}/head_${_k}.spv")
+        add_custom_command(
+            OUTPUT  ${_spv}
+            COMMAND ${Vulkan_GLSLC_EXECUTABLE} -O --target-env=vulkan1.1
+                    ${_qrt_kernels}/head_${_k}.comp -o ${_spv}
+            DEPENDS ${_qrt_kernels}/head_${_k}.comp
+            COMMENT "Compiling kernels/head_${_k}.comp"
+            VERBATIM)
+        list(APPEND _qrt_head_spv ${_spv})
+    endforeach()
     add_custom_target(qrt_shaders DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv}
                       ${_qrt_norm_spv} ${_qrt_layer_add_spv} ${_qrt_deltanet_spv}
                       ${_qrt_dn_cols_spv}
                       ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv}
                       ${_qrt_dn_gnorm_spv} ${_qrt_full_qk_spv} ${_qrt_full_attn_spv}
-                      ${_qrt_ffn_spv})
+                      ${_qrt_ffn_spv} ${_qrt_head_spv})
 endif()
 
 add_executable(qrt qrt_main.cpp)
@@ -273,11 +288,12 @@ if(TARGET qrt_shaders)
                 ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_norm_spv}
                 ${_qrt_layer_add_spv} ${_qrt_deltanet_spv}
                 ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv}
-                ${_qrt_full_qk_spv} ${_qrt_full_attn_spv} ${_qrt_ffn_spv} $<TARGET_FILE_DIR:qrt>
+                ${_qrt_full_qk_spv} ${_qrt_full_attn_spv} ${_qrt_ffn_spv} ${_qrt_head_spv}
+                $<TARGET_FILE_DIR:qrt>
         DEPENDS ${_qrt_read_spv} ${_qrt_gemm_spv} ${_qrt_swiglu_spv} ${_qrt_norm_spv}
                 ${_qrt_layer_add_spv} ${_qrt_deltanet_spv}
                 ${_qrt_dn_cols_spv} ${_qrt_dn_prep_spv} ${_qrt_dn_gate_spv} ${_qrt_dn_gnorm_spv}
-                ${_qrt_full_qk_spv} ${_qrt_full_attn_spv} ${_qrt_ffn_spv}
+                ${_qrt_full_qk_spv} ${_qrt_full_attn_spv} ${_qrt_ffn_spv} ${_qrt_head_spv}
         COMMENT "Copying the runtime shaders next to qrt")
     add_dependencies(qrt qrt_spv_copy)
 endif()

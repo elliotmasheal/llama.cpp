@@ -2577,3 +2577,86 @@ done_when（重跑同一测量）。
   占错槽区。
 - **不要做**：不要把 32/512 短档的 E 当验收数（prompt 长度直接改接受率）；不要在 M3-3c 之前
   用 `--spec-mtp` 报 TG；不要把 MTP 块的 504 MiB 重新按 design 的 8 MiB 记账。
+
+## 91. M3-7 判决：设备输出头成立并跑通端到端，默认值仍是 host 头（2026-10-26）
+<!-- slug: m3-7-device-head-verdict -->
+
+- **采纳**：`--head gpu` 进运行时并作为这一轮所有 decode 读数的采集方式。理由不是"更快"，是
+  design 4.6 本来就规定采样在 GPU、每 pass 只回传 k 个 id；host 头是 M3-2 切片的临时件，
+  它把 0.5 GiB 权重逐行 pread 出来用 double 点积，既与 CPU 专家腿抢核，又让每周期 3.3 s 里
+  90% 是采样。`--head host` 保留为对照臂与参考出口（`--logits-dump`/`--model-check` 仍走它）。
+- **判决**：L-KERN 过（`rel_L1=1.243e-07`，共享设备自己打包的 Q8_1 平面，对独立 CPU 双精度
+  参考；mask 两臂含反例都 PASS）。单变量（缓存关闭、腿路径相同）下两臂逐字段相同：40 层
+  `--spec-check` 两臂都是 `E=1.833 ids_equal=1 worst_rel_l1=0.000e+00`，40 层 32+8 的 8 个 ids
+  与 86.2/92.2 金标准相同，4 层 256+8 相同，教师强制 k=2/4/8 仍 0.000e+00。M3-7 记 done。
+- **端到端效果是实测**：10.4K prompt、k=4、16K、q8_0 K + q4_0 V 下每周期 3331.6 -> **412.8 ms**、
+  每草稿步 155.89 -> 40.76 ms、TG 0.59 -> **4.3 tok/s**，E 2.327 -> 2.309（接受率没动）。
+  头的单价 4.5 ms/次。剩下的绑定腿是 GPU 设备腿 235 ms/pass，对 `0.85 x roofline` 的 23.1 ms
+  还差 10 倍——那是每层两次提交 + 每层一次 top-k 回读，属 M3-2b，不是头。
+- **不成为默认的理由（不放宽判据）**：设备头占 606 MiB 显存，缓存从 4198 让到 3072 MiB
+  （2298 -> 1681 槽，命中 67.0% -> 56.1%）。10.4K/128 的两臂 stream 在第 25 个 token 后分叉，
+  但那一对比有两个变量（缓存档位 + `auto` 分担的 run-to-run 抖动：同 prompt 同 k 在 4198/3228/3072
+  三档的 E 就分别是 2.327/2.396/2.309），**不能归因给头**；解码路径的 C 锚（对 fork 的 KLD/top-1）
+  现在只覆盖 `--logits-dump`，没有覆盖设备头。默认留在 host，翻转的前置是：M2-8a 把 40 份
+  T 尺寸平面收成一份（缓存能回到 4198 并同时留住头）+ 把解码 logits 接进 C 锚。
+- **顺带**：`gen_decode_cache` 在头打开后重读 `VK_EXT_memory_budget` 让缓存吃剩余（分配失败退回
+  host 头并计数，不用 abort）；`--head gpu` 只允许配 `--generate`/`--spec-check`，`--head` 的第三种
+  取值是解析错误而不是静默回退，这两条进了 CLI 契约测试。
+- **不要做**：不要把 10.4K 两臂 stream 的分叉当成头的缺陷证据（变量没隔离）；不要用设备头的单次
+  ms 申报 TG 过门（正式批次要 r>=3 且口径固定）；不要在 M2-8a 之前用 `--head gpu` 报缓存档的
+  命中/E 与 92.3 直接比——两档缓存不是同一口径。
+
+## 92. M2-8a 判决：会话级 scratch arena、共享 staging 与 pass 末 conv carry 成立，chunk 32..2048（2026-10-27）
+<!-- slug: m2-8a-shared-arena-verdict -->
+
+- **采纳**：会话（`--generate`/`--spec-check`）用一份 device-local arena 承载 40 层常驻时的 T 尺寸平面，
+  一份 host staging 承载所有层的上传/下载；`--prefill-chunk` 允许 32..2048。依据不是"省显存"（2048 行
+  时 428 MiB 与旧的 40 份 chunk-32 平面约 460 MiB 基本同量），而是 **同一份显存换 64 倍行数**：10.4K
+  prefill 从 675.75 s（15.4 tok/s）到 53.44 s（195.1 tok/s），12.64x（RESULTS#m2-8a-shared-arena 94.3）。
+- **结构判决**：arena 是一次 `vkAllocateMemory` + 每子 buffer 在自身对齐偏移上 bind，会话每层 open 前
+  rewind；`qrt_vk_alloc_scratch()` 无 arena 时退回普通分配，所以所有 check / `--logits-dump` 路径的
+  行为不变（这也是它们继续做单层驻留验证的原因）。尺寸只有一个来源：`qrt_layer_budget_of()` 复用
+  `qrt_dn_scratch_bytes`/`qrt_full_scratch_bytes`/`qrt_ffn_plane_bytes`/`layer_staging_bytes`，
+  open 与预算不会再各写一份。
+- **conv carry 必须改**：旧实现把 conv taps 留在 qkv 平面里、下一次 pass 开头再搬到 conv_state；
+  arena 让 40 层别名同一平面后这条"跨调用保存"不再成立。改成 pass 末尾写 conv_state，snapshot pass
+  另存 entry window + pass rows，rollback 后由下一个 pass 开头重建。验收是逐位的：4 层与 40 层
+  `--spec-check`（MTP+16K、device 头）`ids_equal=1 worst_rel_l1=0.000e+00`，rollback-off 反例仍
+  `first_diff=3`。**不要**把 conv carry / DN 状态环 / KV 缓存 / 权重放进 arena——它们必须跨调用。
+- **正确性口径**：10.4K prompt 在 chunk 32 与 2048 两档，`--logits-dump` 16 行的 raw 与 log-prob
+  都是 `rel_L1=0.000e+00`、top-1 16/16；会话 8 个生成 token 的 ids 与 8 个 step 的 logit/margin
+  逐字段相同，step0 = M3-7 金标准 `271 / 16.4599 / 0.4060`。layer-check 层 0/39、40 层 spec-check、
+  4 层 256-token 金标准、40 层 32+8 金标准都在同一二进制上重跑通过。
+- **预算判决**：实测 216,260 B/行 + FFN 固定 5.18 MiB，2048 行 = 427.3 MiB < design 5.5 的 700 MiB
+  计算缓冲；chunk 32 的 arena 12.6 MiB。第一次公式把 `p2_qs` 按 4 字节/值算，多出 24 MiB，已修并在
+  v2 二进制上确认 predicted == used（427.3/427.3）。chunk > 2048 由会话拒绝，不静默缩回。
+- **不改变的部分**：专家 slot、KV、权重、cache slot 数组仍是普通分配；FFN 的 32 MiB packer 常量降为
+  "会话 staging 的最小宽度"，打包容量按实际 buffer 判断，所以 layer check 里 FFN 用层自己的 17.8 MB
+  staging 仍然正确。
+- **剩下的绑定项（下一轮）**：会话 prefill 仍比单层驻留的 model 链慢 2.9x（chunk 32）/1.6x（2048），
+  主因是共享 FFN slot 的 transient 路径每个 chunk 重打包该层路由的专家（chunk 32 时每层 326 次），
+  归 M2-8/M2-5；PP 195 tok/s 距 1000 还远。显存上还有一个明确的机会：prefill 后按 decode 的 9 行
+  重开 arena，把约 425 MiB 还给专家缓存（M3-2b/M2-8）。
+- **不要做**：不要在 2048 行预算之外直接调大 chunk；不要用 arena 承载任何跨 pass 的状态；不要把本轮
+  的单次 ms 当正式 PP；不要把 16 token 的 E 当 TG/accept p 的读数。
+
+## 93. M3-3c 判决：草稿块的 prompt/验证行 KV 必须写，E 缺口归因成立（2026-10-27）
+<!-- slug: m3-3c-mtp-kv-verdict -->
+
+- **采纳**：MTP 块的 KV 按 fork 的 `process()` 语义填满——prompt 每一行、每个验证 pass 的 kept 行都要
+  用 (token_p, target h_{p-1}) 跑一遍块；草稿步、prompt pass、验证行刷新走同一条设备侧输入投影
+  （`mtp_run_rows`）。依据是读数：10.4K/k=4/16K/q8_0+q4_0/4198+auto 下 E 2.309/2.327 -> **2.761/2.844**
+  （两次，+20-23%），fork 2.850，design 6.3 的 2.72 线过、2.90 线差 0-5%
+  （RESULTS#m3-3c-mtp-kv 95.3）。草稿步同时从 40.76 ms/8.5 MiB 降到 21.9 ms/0.2 MiB。
+- **归因**：chunk 形状先由 M2-8a 的逐位对齐排除；hnorm/KV 精度/词表在 92.3 已排除；剩下的第一处
+  语义差是草稿块的 KV——fork 在 prompt 与验证 batch 上都写，runtime 只在草稿位置写，10.4K prompt 的
+  注意力因此读未初始化缓存。修复后残差 0-3% 归到 prompt 长度（10438 vs 10428）、fork 的 `--cpu-moe`
+  专家腿算术与 q8 GEMM 舍入，未再拆分。
+- **不改的部分**：`mtp_seed` 继续用 `output_norm`（target 图的 t_h_nextn 语义），链式 h 继续用
+  `shared_head_norm`；两者在 fork 里就是分开的，本模型两权重 rel_L1 11.4%，不能互换。
+- **实现约束**：prompt pass 必须排在第一个 token 采样之后、`gen_decode_cache` 之前（前者要读最后一层
+  输出平面，后者会换掉共享专家 slot）；host 不做每行 8.9 MB 的 eh_proj（10.4K 要 ~260 s），
+  投影走 Q8_1 打包 + dense GEMM，m 按 32 补齐（>8 行时），块本身仍只跑真实行。
+- **不要做**：不要为了省 1.7 s 的 prompt pass 把草稿块的 prompt KV 留空；不要把刷新行省掉再报 E
+  （fork 的验证行是 target h，不是草稿链 h）；不要把缓存开启的两轮 ids 分叉当缺陷（缓存关闭的
+  10.4K spec-check 逐位通过）。

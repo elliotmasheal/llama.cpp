@@ -26,3 +26,5 @@ int qrt_check_moe_batch(const qrt_config * cfg, const char * gguf_path,
                         const char * store_prefix, uint32_t layer, const char * spv_dir);
 int qrt_check_cache(const qrt_config * cfg, const char * prefix, const char * trace_path,
                     uint32_t decode_tokens, uint32_t protected_percent);
+int qrt_check_head(const qrt_config * cfg, const char * gguf_path, const char * spv_dir,
+                   uint32_t rows);

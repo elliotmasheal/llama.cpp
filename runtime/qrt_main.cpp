@@ -121,6 +121,7 @@ int main(int argc, char ** argv) {
         mo.batch_k = (uint32_t) options.generate_batch;
         mo.mtp = (uint32_t) options.spec_mtp;
         mo.draft_vocab_path = options.draft_vocab_path;
+        mo.head_gpu = (uint32_t) options.head_gpu;
         uint32_t * ids = NULL;
         uint32_t n_ids = 0;
         if (qrt_model_read_ids(options.logits_tokens, &ids, &n_ids, err, sizeof(err)) != 0) {
@@ -143,6 +144,7 @@ int main(int argc, char ** argv) {
         mo.batch_k = 1;
         mo.mtp = (uint32_t) options.spec_mtp;
         mo.draft_vocab_path = options.draft_vocab_path;
+        mo.head_gpu = (uint32_t) options.head_gpu;
         uint32_t * ids = NULL;
         uint32_t n_ids = 0;
         if (qrt_model_read_ids(options.logits_tokens, &ids, &n_ids, err, sizeof(err)) != 0) {
@@ -158,6 +160,10 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "qrt: %s\n", err);
         }
         return rc < 0 ? 2 : rc;
+    }
+    if (options.command == QRT_CMD_HEAD_CHECK) {
+        return qrt_check_head(&cfg, options.head_check_gguf, spv_dir.c_str(),
+                              (uint32_t) options.head_check_rows);
     }
     if (options.command == QRT_CMD_CHUNK_CHECK || options.command == QRT_CMD_MODEL_CHECK ||
         options.command == QRT_CMD_LOGITS) {
