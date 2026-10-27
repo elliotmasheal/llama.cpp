@@ -6592,6 +6592,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
 
+    // [GGML_VK_MM_PIPELINE_TRACE] which warptile a dense MUL_MAT lands on, the per-type tables differ
+    // (e.g. q3_K/q6_K use the cm1 k-tile split, q4_K does not)
+    static const bool mm_pipe_trace = getenv("GGML_VK_MM_PIPELINE_TRACE") != nullptr;
+    if (mm_pipe_trace) {
+        fprintf(stderr, "vk_mm_pipe: dense a=%s m=%u n=%u k=%u aligned=%d pipe=%s\n",
+                ggml_type_name(src0->type), ne01, ne11, ne00, (int) aligned, pipeline->name.c_str());
+    }
+
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
@@ -7661,8 +7669,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // per-slot counts from LLAMA_MOE_IDS_TRACE to judge how many times the expert weights get re-read
     static const bool id_tile_trace = getenv("GGML_VK_ID_TILE_TRACE") != nullptr;
     if (id_tile_trace) {
-        fprintf(stderr, "vk_id_tile: m=%u n=%u k=%u n_as=%u n_sel=%u bn=%u max_tiles=%llu\n",
-                ne01, nei0 * nei1, ne10, n_as, n_sel, bn, (unsigned long long) max_tiles);
+        fprintf(stderr, "vk_id_tile: m=%u n=%u k=%u n_as=%u n_sel=%u bn=%u max_tiles=%llu pipe=%s\n",
+                ne01, nei0 * nei1, ne10, n_as, n_sel, bn, (unsigned long long) max_tiles, pipeline->name.c_str());
     }
     const uint64_t row_ids_offset = 1 + 2 * max_tiles;
     const uint64_t row_map_words = row_ids_offset + max_tiles * bn;
