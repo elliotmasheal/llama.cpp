@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-store.h"
 
 #include "ggml-cpp.h"
 #include "ggml-cpu.h"
@@ -358,6 +359,14 @@ struct llama_moe_cache::impl {
     size_t pf_layers  = 0;
     size_t pf_waits   = 0;
     size_t pf_fallbacks = 0;
+
+    // 2c routing: when --store-exec >= 1, submissions/waits go through store-io (same entry points,
+    // mode 2 only waits for this batch's sequence number); when switching off, the pf field goes
+    // through the old path. Rings / the one-layer-lead policy are not controlled by the store (3a carries it).
+    llama_store * store_exec_p = nullptr;
+    bool           store_exec  = false;
+    uint64_t       pf_seq_prev = 0; // the sequence number of the batch previously submitted (waits for it when mode >= 2)
+    uint64_t       pf_seq_last = 0;
     size_t n_split_degrades = 0;          // lookups whose ids are produced in the same split (bench/THREE-TIER.md F1)
     int64_t pf_wait_us  = 0;              // [LLAMA_MOE_PREFETCH_TIME] host time spent waiting for the prefetch
     int64_t pf_copy_us  = 0;              // [LLAMA_MOE_PREFETCH_TIME] host time spent in the prefetch callback
@@ -1348,7 +1357,51 @@ struct llama_moe_cache::impl {
         if (!pf.ok()) {
             LLAMA_LOG_WARN("%s: the backend does not provide the prefetch API, disabled\n", __func__);
             pf_requested = false;
+            return;
         }
+
+        // --store-exec 1/2: route the submissions through store-io (2c). Same entry points in mode 1,
+        // so the ring semantics are unchanged; mode 2 also waits on the layer's own batch number only.
+        // The exec side is decided by the --store-exec value, the policy (rings, lead) stays here.
+        llama_store * st = llama_store_active();
+        if (st != nullptr && pf_requested && llama_store_bind_backend(st, devices[0].backend)) {
+            store_exec_p = st;
+            store_exec   = true;
+            LLAMA_LOG_INFO("%s: transfer submissions routed through llama-store (mode %d)\n",
+                    __func__, llama_store_exec_mode(st));
+        }
+    }
+
+    // routing helpers: the store path keeps its own accounting, the falls back to the old path on a failed bind
+    bool pf_tensor_route(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+        if (store_exec) {
+            return llama_store_pf_tensor(store_exec_p, backend, tensor, data, offset, size);
+        }
+        return pf.tensor(backend, tensor, data, offset, size);
+    }
+
+    void pf_submit_route(ggml_backend_t backend) {
+        uint64_t seq = 0;
+        if (store_exec) {
+            llama_store_pf_submit(store_exec_p, backend, &seq);
+        } else {
+            pf.submit(backend);
+            seq = ++pf_seq_last; // surrogate numbering, mode < 2 ignores it
+        }
+        pf_seq_prev = pf_seq_last;
+        pf_seq_last = seq;
+    }
+
+    // mode >= 2 waits for this batch's own number (pf_seq_last = the batch that has just been submitted
+    // and contains the tensors of this layer); in the double-ring mode there is only one batch in flight at any
+    // time, so the sequence number waiting and the drain waiting are equivalent in the current mode three.
+    // Actual benefit (wait timing advanced backward) = M2's use_step. mode < 2 waits for the latest batch, unchanged.
+    void pf_wait_route(ggml_backend_t backend) {
+        if (store_exec) {
+            llama_store_pf_wait(store_exec_p, backend, pf_seq_last);
+            return;
+        }
+        pf.wait(backend);
     }
 
     // [LLAMA_MOE_PREFETCH] the layers stream through the rings in execution order, the whole layers keep their static views
@@ -1412,7 +1465,7 @@ struct llama_moe_cache::impl {
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w = l.experts[ip];
             const size_t size = (size_t) n_expert * w->nb[2];
-            if (!pf.tensor(backend, g.banks[ip], w->data, (size_t) ring * w->nb[2], size)) {
+            if (!pf_tensor_route(backend, g.banks[ip], w->data, (size_t) ring * w->nb[2], size)) {
                 if (pf_fallbacks++ == 0) {
                     LLAMA_LOG_WARN("%s: prefetch of layer %d failed, is the transfer queue available and the source pinned?\n", __func__, pf_order[pos]);
                 }
@@ -1443,9 +1496,11 @@ struct llama_moe_cache::impl {
             if (!prefetch_layer(backend, 0)) {
                 return false;
             }
-            pf.submit(backend);
+            // this batch is layer 0's upload: mode < 2 waits for the latest (draining, unchanged semantics),
+            // mode 2 waits for its own batch number (nothing later in flight anyway at this point)
+            pf_submit_route(backend);
             const int64_t tw = time_it ? ggml_time_us() : 0;
-            pf.wait(backend);
+            pf_wait_route(backend);
             pf_waits++;
             pf_wait_us += time_it ? ggml_time_us() - tw : 0;
             if (time_it) {
@@ -1454,7 +1509,7 @@ struct llama_moe_cache::impl {
         } else {
             // issued when the previous layer was set up, normally complete because it overlapped that layer's compute
             const int64_t tw = time_it ? ggml_time_us() : 0;
-            pf.wait(backend);
+            pf_wait_route(backend);   // waits pf_seq_last = this layer's own batch
             pf_waits++;
             pf_wait_us += time_it ? ggml_time_us() - tw : 0;
         }
@@ -1472,7 +1527,7 @@ struct llama_moe_cache::impl {
         if (pos + 1 < (int32_t) pf_order.size() && !prefetch_layer(backend, pos + 1)) {
             return false;
         }
-        pf.submit(backend);
+        pf_submit_route(backend); // the batch submitted at this point contains the tensors of this layer + 1
         pf_copy_us += time_it ? ggml_time_us() - t0 : 0;
         if (time_it && pf_layers % 40 == 0) {
             fprintf(stderr, "moe_prefetch_timing: layers %zu, wait %.3f ms/layer, callback %.3f ms/layer\n",
