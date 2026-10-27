@@ -6,6 +6,7 @@
 #include "common.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-store.h"
 
 #include "fit.h"
 #include "log.h"
@@ -1156,6 +1157,10 @@ struct common_init_result::impl {
     llama_model_ptr   model;
     llama_context_ptr context;
 
+    // the store dies before the context (F13: the store must die before its backends)
+    struct llama_store_deleter { void operator()(llama_store * s) const { llama_store_free(s); } };
+    std::unique_ptr<llama_store, llama_store_deleter> store;
+
     std::vector<llama_adapter_lora_ptr> lora;
 
     std::vector<common_sampler_ptr> samplers;
@@ -1246,6 +1251,19 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // --store-vram-mib hold back (F0 path, F12 7): the visible tier doubles as the budget hard top.
+    // The device hold back still runs ggml-vulkan's own init hook, so the value has to be in place
+    // before any backend enumerates; the unset default leaves that env alone.
+    if (params.store_vram_mib > 0) {
+        static char env_buf[64];
+        snprintf(env_buf, sizeof(env_buf), "%" PRId64, params.store_vram_mib);
+#ifdef _WIN32
+        _putenv_s("GGML_VK_VRAM_LIMIT_MIB", env_buf);
+#else
+        setenv("GGML_VK_VRAM_LIMIT_MIB", env_buf, 1);
+#endif
+    }
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
@@ -1280,13 +1298,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    // the memory plan feeds the store's budgets (0.0.1: the ledger is the consumption face);
+    // computed here for the store even when the MoE cache sizing conditions below do not hold
+    common_moe_plan plan;
+    bool planned = false;
     if (!model_only && (!params.moe_cache_size_set || params.kv_page < 0)) {
         // the MoE cache is sized by the memory plan unless the user set --moe-cache-mib,
         // and --kv-page auto (the default) is decided by the same budget
         const char * env_plan = getenv("LLAMA_MOE_PLAN");
         if (env_plan == nullptr || atoi(env_plan) != 0) {
-            common_moe_plan plan;
-            const bool planned = common_moe_plan_get(params.model.path.c_str(), &mparams, &cparams,
+            planned = common_moe_plan_get(params.model.path.c_str(), &mparams, &cparams,
                     params.fit_params_target.data(), params.kv_page < 0, params.fit_plan, &plan,
                     params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
             if (planned && !params.moe_cache_size_set && plan.cache_bytes > 0) {
@@ -1312,6 +1333,24 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->model.reset(model);
+
+    // llama-store (F12, always-on): created before the context so its budgets can reserve device
+    // memory. The auto budgets come from the plan's ledger (0.0.1 1a); explicit knobs override.
+    if (!model_only) {
+        constexpr int64_t MiB = 1024*1024;
+        // system reserve of the auto RAM budget; the constant shows up in store_split so it is
+        // re-decidable per reading instead of being hidden inside a heuristic
+        constexpr int64_t LLAMA_STORE_RAM_RESERVE = 4*MiB;
+        llama_store_params sp{};
+        sp.vram_budget = params.store_vram_mib ? params.store_vram_mib*MiB :
+                         (planned ? plan.ledger.free_vram : 0);
+        sp.ram_budget  = params.store_ram_mib ? params.store_ram_mib*MiB :
+                         (planned ? std::max<int64_t>(plan.ledger.free_ram - LLAMA_STORE_RAM_RESERVE, 0) : 0);
+        sp.ssd_budget  = params.store_ssd_mib*MiB;
+        sp.threads     = params.store_threads;
+        sp.exec_mode   = params.store_exec;
+        pimpl->store.reset(llama_store_init(&sp));
+    }
 
     if (model_only) {
         return;
@@ -1406,6 +1445,38 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->context.reset(lctx);
+
+    // declares + adoption + the store_split print (F12 7/12). This is the consumption face of the
+    // plan ledger, not a placement authority yet: the transfer executor arrives with 2c, the KV
+    // page adoption with M3. The context class is still the KV + RS mix until F7 splits it.
+    if (pimpl->store) {
+        const llama_memory_breakdown mb = llama_get_memory_breakdown(lctx);
+        int64_t dense_v = 0, dense_r = 0, comp_v = 0, comp_r = 0;
+        for (const auto & it : mb) {
+            const bool on_host = ggml_backend_buft_is_host(it.first);
+            (on_host ? dense_r : dense_v) += (int64_t) it.second.model;
+            (on_host ? comp_r : comp_v)  += (int64_t) it.second.compute;
+        }
+        llama_store_declare(pimpl->store.get(), LLAMA_STORE_DECL_DENSE,   LLAMA_STORE_TIER_VRAM, dense_v);
+        llama_store_declare(pimpl->store.get(), LLAMA_STORE_DECL_DENSE,   LLAMA_STORE_TIER_RAM,  dense_r);
+        llama_store_declare(pimpl->store.get(), LLAMA_STORE_DECL_COMPUTE, LLAMA_STORE_TIER_VRAM, comp_v);
+        llama_store_declare(pimpl->store.get(), LLAMA_STORE_DECL_COMPUTE, LLAMA_STORE_TIER_RAM,  comp_r);
+
+        const llama_moe_geometry geo = llama_model_get_moe_geometry(model);
+        if (geo.n_expert > 0 && geo.n_layer_expert > 0) {
+            for (int32_t il = 0; il < (int32_t) geo.expert_bytes.size(); ++il) {
+                if (geo.expert_bytes[il] <= 0) {
+                    continue;
+                }
+                const int64_t per_expert = geo.expert_bytes[il]/geo.n_expert;
+                for (int32_t ie = 0; ie < geo.n_expert; ++ie) {
+                    llama_store_adopt_expert(pimpl->store.get(), il, ie, per_expert);
+                }
+            }
+        }
+
+        llama_store_commit(pimpl->store.get());
+    }
 
     set_process_priority(params.cpuparams.priority);
 
