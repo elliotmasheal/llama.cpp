@@ -40,6 +40,9 @@ set(LLAMA_CORE_SOURCES
     llama-model.cpp
     llama-quant.cpp
     llama-sampler.cpp
+    llama-store.cpp
+    llama-store-io.cpp
+    llama-store-policy.cpp
     llama-store-slab.cpp
     llama-vocab.cpp
     unicode-data.cpp
