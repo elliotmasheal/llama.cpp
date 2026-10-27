@@ -9,6 +9,113 @@
 每一条都是先测后改，都必须在 256K + 10K prompt 口径跑矩阵，并按 `README.md` 第 3 节报全列。
 下列数字除非标了实测，都是待验证的假设，不是结论。
 
+### 0.0 架构评审（2026-10-27）：三个结构风险与三步收敛（下面的顺序以此为准）
+
+结论登记在 `DECISIONS.md` 判决 27。评审判定方向不需要推翻：A/B2/F10-M0 的证据链、验收手段与四份文档
+的闭环纪律都成立，真正的问题是三处"主权分裂"，都属于"下一步会不会散"，不是"现在快不快"：
+
+1. **放置主权分裂**：KV、score 预留、bank、compute 预留各有一处"放置的所有权"，`common/fit.cpp`
+   靠分段扣减逼近，score 预留按设备扣的记错账（判决 18 之前的状态）就是它的已发生后果。
+   解法即 D（本评审升 P0）：一个式子 + 一张 Placement 表。
+2. **F12 句柄状态机只有文字守卫**：代际未变 / 无 in-flight / 无未消费句柄三道检查若分三处实现
+   （解引用、淘汰、回收各写一份），就是下一处 `:1910`（正确性绑在实现形状上）。
+   要求收敛成一个原语，判据落在 F12 第 8 节与 `DECISIONS.md` 第 5 节。
+3. **同步归属必须单一**：分页 KV 的"表更新在上一张图完成后"是调度层关切；store 若再自建等待就是双主。
+   归属不重复立项：等待只有"序号等待"一处，由未结项 19（drain）与 `DECISIONS.md` 第 24 条（F13 S2）负责，
+   store 只消费。
+
+三步收敛（依赖自下而上；每步都过 `README.md` 第 3 节全列与既有门禁）：
+
+| 步 | 内容 | 落点 | 验收形态 |
+|---|---|---|---|
+| 一 | 统一预算式（D，升 P0）：KV / score / compute / dense / RS / bank / staging 一个式子，产出 `Placement[资源][层] -> {vram, ram, ssd}` 表与总账 | `common/fit.cpp`（本期不进 store） | r=2 复现 0.4/0.5 三档读数、`reallocs` 不增；4096 档的 500 MiB 缺口（`DECISIONS.md` 第 6 节第 15 条）在表分解里逐项可读 |
+| 二 | `llama-moe-cache` 拆机械侧：保留策略侧（SLRU、整层驻留提示、use_step 观测）；槽分配、pin / 代际、预取环执行、统计进 store 三单元（`F13` 第 2 节点名的现行反例） | `llama-store` M1/M2（F12 第 4、11 节） | M1 用 ±1% 判等 + 越权差 <= 5%；M2 按 15% 门槛 |
+| 三 | KV 页接 store：页分配、host-visible 放置、延迟释放全走 store 入口；"host 块预取"与 MoE 共享同一池，不再是复用 | F10 M4 的落地路径 | 同口径读数复现 + `test-kv-page` 全绿；host 块读数借 F10 M4 的 256K 满填臂进矩阵 |
+
+顺序依据：第一步无风险且是后两步的总账前提（先记账再搬运）；第二步是收益主体（消灭平行子系统）；
+第三步依赖第二步（KV 进 store 时不能顺带改 store，否则 `tests/test-kv-page` 的等价验收层被打破）。
+
+另一条口径决定（2026-10-27）：默认值变更按证据强度判，A/B2 的位级等价是标准。F10 在等价性回归集冻结
+（第 13 条的评审补充）之前不改默认，session 级台阶未定性时尤其不动（`DECISIONS.md` 第 20 条）。
+
+#### 0.0.1 三步收敛执行清单（2026-10-27 生成，勾选式；本清单一行 = 一个改动 + 一次矩阵 + 四份文档更新）
+
+矩阵口径一律 256K + 10K prompt（`README.md` 第 3 节全列）；清单只挂本节，不另立文件。
+
+**第一步 D（P0）：统一预算式，落 `common/fit.cpp`，不动搬运代码**
+
+- [x] 1a. 定结构：`common/fit.h` 新增 Placement 解算结构（输入：dense、KV 按 `-kvg` 工作集口径、score 按
+      `-fac` 块口径、设备 compute 按 `RESULTS.md` 0.2 表 A 的 n_ctx 回归、host compute `96.18 + 0.2 x KV`、
+      RS、staging、margins；输出：`Placement[资源][层] -> {vram, ram, ssd}` 表 + 总账，以及 KV/RS/ub/bank 四项）。
+      现有三处放置改为**只报数**：`src/llama-kv-cache.cpp:233`（KV）、`src/llama-context.cpp:639`（bank）、`:642`（compute）。
+      **完成（2026-10-27）**：`common_moe_ledger` 落地并挂在 `common_moe_plan::ledger`；v1 是分层汇总（vram/ram/ssd 三列），
+      两处界定记进 `RESULTS.md` 0.10：RS 未拆分（留 F7，条目已留位）、逐层表随 store 2a/3a。
+- [x] 1b. `common_moe_plan_get()` 内部改读 Placement 表，删分段扣减；`--fit-plan 0` 保留旧规则作对照臂。
+- [x] 1c. 矩阵：三档 x r=2。8176/6144 两档与 `RESULTS.md` 0.4/0.5 读数逐列差 <= r=2 噪声、`reallocs` 不增；
+      4096 档日志打印 500 MiB 缺口的逐项分解（margins 地板 256 + 未归因 compute 464）。`ctest` 与当前树一致（34）。
+      **完成（2026-10-27，`RESULTS.md` 0.10）**：验收协议升级为同 session 新旧二进制 A/B（`git stash` 回退重编），
+      三档规划器决策**逐字相同**（bank 2989.1/1908.4/0）、两臂运行行为逐字相同、配对 PP/TG 三档两档 0.3% 内持平
+      （8176 判 session 漂移，读数 1）、12/12 `status = ok`、4096 档缺口逐项分解已在日志；`ctest` 33/33（当前树为 33）。
+- [x] 1d. 文档：`RESULTS.md` 新增 1c 臂；开关表核 `--fit-plan` 行；本清单勾选并写日期。
+      注：本步不动数值路径，不触发质量门；但 bank 变化会改配布，`status = ok` 是硬验收。
+      **完成（2026-10-27）**：0.10 节 + 日期已写；`--fit-plan` 行无语义变化（账本只是产出方式，判据逐项保留，
+      0.10 A 为证），无需改开关表。
+
+**第二步：`llama-moe-cache` 拆机械侧（= F12 M1；M2 收益步的前置）**
+
+> 依赖：2a 依赖第一步（总账存在，越权检查才有分母）。M2（2g-2h）另需 `DECISIONS.md` 第 24 条
+> `ggml-sched-plan` 先行（判决 26）：sched-plan 管"能不能重叠"，本清单管"给多少、谁来搬"。
+
+- [x] 2a. 骨架：`src/llama-store.{h,cpp}` 三单元（slab / io / policy）+ 薄壳五入口（F13 第 2 节）；
+      专家按"层 + 专家子对象"两级注册（层组 41、子句柄约 3 万，O(1) 数组索引，`store_adopt`）；
+      挂 `--store-*` 三预算（表见 F12 第 7 节）。slab 纯数据结构、无 GPU 可单测。
+      **完成（2026-10-27，`RESULTS.md` 0.11）**：`llama-store.{h,cpp}` + 三单元分文件编译（slab/io/policy），
+      常开挂在 `common_init_result::impl`（析构先于 context）；`--store-vram/ram/ssd-mib --store-threads`
+      四个 CLI 已进树（vram 参数 -> 旧 F0 hold-back 场直接生效：4096 参数臂 `VRAM limited to 4096.0`、
+      `held 3282.8` 与 4096 档臂逐字一致）；`--moe-cache-mib` 0/非 0 两态（0 = 旧行为复现、非 0 照显式值）。
+      slab 的"三道守卫一个原语"由 `tests/test-store-slab.cpp` 钉住；adopt 槽不足时分段 grow（不 abort）。
+      偏差记录：acquire/prefetch/wait/release 五入口在 2c 随传输执行子落地（骨架期调用面还没人用），
+      专家字节与 declared dense 同柜（`co-located` 项，2c repack 后自然并入 accounted sum）。
+- [ ] 2b. `store_declare` 接线：dense / compute / staging 报数进总预算；`store_split` 打进启动日志；
+      越权对账按 `DECISIONS.md` 第 5 节：差 > 5% release 计 `store_undeclared_bytes`，debug abort 属开发期不变量。
+      **部分完成（2026-10-27，随 2a 顺手落地）**：dense/compute 按机/主申报进总预算、`store_split` 进启动日志
+      （`RESULTS.md` 0.11，与 plan ledger 对得上）；staging 申报与 5% 越权对账（需 `GGML_VK_MEMORY_LOGGER`
+      的对账脚本）随 2c 收口，勾选推迟到那时。
+- [ ] 2c. 搬运换执行者（**策略不换**）：SLRU / 整层驻留提示 / 提前一层的 2 槽环照搬，执行归 store-io，
+      走 `ggml_backend_vk_prefetch_submit_seq` / `_wait_seq`；池大小 `min(2, max(1, hw/4))`、
+      `--store-threads` 可覆盖；池线程禁止阻塞等待；池不可用异步退化同步并计数，不 abort。
+      **第一刀完成（2026-10-27，`RESULTS.md` 0.12）**：`--store-exec 0/1/2` 进树（默认 0），
+      store-io 绑定面吃下了五个 proc 地址（含 seq），MoE cache 的环路径三条调用路由化，
+      A/B/A 验证"路由零行为差"（决策/hit/内存/行为行逐字同、PP 差 < 0.2%）+ 序号管线已接进主路径。
+      **未完**：就是 use_step 预取的收益本体和 M2 的 `store_prefetch_wasted`/TG>=15% 验收（2g）；
+      promotion/回填路径入 store 计数、staging 申报、5% 对账也在收口清单里。
+- [ ] 2d. 删旧执行体：`hybrid_tp`（`src/llama-moe-cache.cpp:471-482`）并入共享池后删除；
+      M1 结束同步删除影子模式（F12 第 11 节：留着就是事实上的总开关）。
+- [ ] 2e. M1 验收（±1% 不回退门，`RESULTS.md` 新臂）：8176 档 PP 506.7 / TG 17.2 同口径复核；
+      `hit %` 按层、按专家两口径各出一张新旧对照表；越权差 <= 5%；temp 0 输出逐字一致。
+- [ ] 2f. 文档：开关表 `--store-*` 置"已落地（默认 = fit/auto）"；未结项 23 记进展；勾选。
+
+**M2（收益步）：use_step 驱动预取（前置 = `DECISIONS.md` 第 24 条）**
+
+- [ ] 2g. policy 按 `(对象, use_step)` 排 deadline（store 不预测路由，判决 24）；
+      `store_prefetch_wasted` 是唯一自检指标：比 M1 高即 use_step 给错，先修调用方，不调参掩盖。
+- [ ] 2h. M2 验收（收益门）：`store_prefetch_wasted` 比 M1 降 >= 50%；**TG 提升 >= 15% 才算收益**
+      （未结项 20 规则）；decode 关键路径 0 次整设备 fence（`GGML_SCHED_TRACE` 证明）。
+
+**第三步：KV 页接 store（= F10 M4 的落地路径；依赖第二步）**
+
+- [ ] 3a. `ensure_blocks` / 延迟释放列表 / host-visible 逐块降级全改走 store 句柄；
+      逐块降级的判据用现成的 `alloc_buffer` 返回 nullptr（F10 第 5.6 节）；页固定 128 cells，不加新开关
+      （页级策略已由 `--kv-page*` 表达）；块表与 `store_acquire` / `store_wait` 同一套。
+- [ ] 3b. 验收（等价 + 容量两门）：`tests/test-kv-page` 全绿（含 F10 M1 评审补充冻结的等价性回归集清单）；10K 输出逐字相同；
+      `FLASH_ATTN_EXT -b Vulkan1` 5332/5332、`SET_ROWS` 319/319；256K 满填臂（F10 第 10 节 M4）三档
+      `status = ok`，host 块字节数与 decode 额外时间进矩阵并与第 9 节成本模型对照；host 块预取与 MoE 同池。
+- [ ] 3c. 文档：F10 第 10 节 M4 置完成态；`RESULTS.md` 补满填臂；勾选。
+
+状态（2026-10-27）：**第一步 + 2a 已完成（1a-1d 与 2a，`RESULTS.md` 0.10/0.11）**，2b 部分完成（staging 与
+5% 对账随 2c）、2g/3a 未开工。阻塞链：1a/1b -> 2a（已满足）-> 2c（下一个，io 池 + 传输执行子 +
+`prefetch_submit_seq/_wait_seq` 接入）-> 2g（另需第 24 条）-> 3a。
+
 ### 0.1 根因重述（为什么 A 排第一）
 
 2026-10-23 的归因测量（`RESULTS.md` 0.2）把原先的三条假设换成了下面五条实测事实：
@@ -88,12 +195,21 @@
 - 验收：同 prompt 第二次运行，prefill 段时间 < 1 s，`temp 0` 下输出与首次运行逐字一致。
 - 报表规则：PP 必须分成"冷 PP"（无检查点）与"热复用"两列，不得混写成一个 PP。
 
-### D（P1）：预算解算器一体化（F2 + F7 + F8 合并成一个式子）
+### D（P0，2026-10-27 评审升级）：预算解算器一体化（F2 + F7 + F8 合并成一个式子）
 
-- 把 dense、KV（按 A 的增长口径）、score 缓冲（按 B 的块口径）、compute、bank、RS 状态放进 `common/fit.cpp` 同一个式子，
-  输出 KV 放哪、RS 放哪、ub、bank 四项，而不是现在的分段扣减。
-- 复用 `common_moe_plan_get()`，不新增规划器。
+> 升级理由见 0.0：放置主权分裂是三个结构风险之首，score 预留按设备扣的记错账在判决 18 之前就是它的后果。
+> 升级同时是把风险做小：这一步不动任何搬运代码，本期只落在 `common/fit.cpp` 内部。
+
+- 把 dense、KV（按 A 的增长口径）、score 缓冲（按 B 的块口径）、compute（设备按 `RESULTS.md` 0.2 表 A 的
+  n_ctx 回归，host 按 `96.18 + 0.2 x KV`）、bank、RS 状态放进 `common/fit.cpp` 同一个式子，
+  输出 KV 放哪、RS 放哪、ub、bank 四项，外加一张 `Placement[资源][层] -> {vram, ram, ssd}` 表与总账，
+  而不是现在的分段扣减。
+- 复用 `common_moe_plan_get()`，不新增规划器。`llama-store` 第 2 步（F12 第 4 节）接管数值决策时
+  把该式子**整体搬进** store、fit 收成申报薄壳，不写第二套预算算术。
 - 验收：在三档 x 每档 3 个 bank 的消融里，规划器推荐值与实测最优 bank 的 argmax 一致。
+  追加（2026-10-27 评审）：0.4/0.5 的三档读数在 r=2 噪声内复现、`reallocs` 不增；
+  4096 档的 500 MiB 缺口（`DECISIONS.md` 第 6 节第 15 条：margins 地板 256 + 未归因 compute 464）
+  必须在表分解里逐项可读，不再靠日志反解。
 
 ### E（P1）：ub 与 bank 联合调参
 
@@ -130,11 +246,13 @@
    (b) 同一 `-nkvo` 下 16K-256K 的 `sched_reserve`：设备 compute 578.02 -> 1712.02（+1134.0 MiB），host compute = `96.18 + 0.2 x KV`。
 2. **A + B1 已落地并验收**（`RESULTS.md` 0.3）：PP x2.67、TG x2.16、三档 ok、rm 峰值 -7.2 GiB。
    **B2 随后落地并验收**（`RESULTS.md` 0.4，F6 先行）：8176 档 PP 478 -> 680、TG 13.7 -> 20.4，三档 ok。
-   下一步按收益排：F3（6144 差 61 slots/组就能开预取）-> E（`ub 2048/3072/4096` 联合调参，B2 已解锁）
-   -> C（前缀检查点）与 D（预算式一体化）。
-2. A + B 同一轮实现。只做 A 看不到 compute 预留的收益。
-3. C 紧随 A（依赖 KV 变小）。
-4. D 收尾统一规划器；E 跟 B 一起调参。
+   下一步按收益排（**2026-10-27 评审重排**，依据见 0.0）：
+   ~~F3~~ 已关闭（`DECISIONS.md` 第 6 节第 14 条）；**D 升 P0 先行**（记账先于搬运，第一步不动搬运代码，
+   验收形态是复现读数，不是新收益）-> E（`ub 2048/3072/4096` 联合调参，B2 已解锁）-> C（前缀检查点）。
+2. A + B 同一轮实现。只做 A 看不到 compute 预留的收益。（已按此执行。）
+3. C 紧随 A（依赖 KV 变小）；D 的第一步与 C 无依赖，可在此之前插入。
+4. 收敛的第二、三步不再单列编号：拆 moe-cache 机械侧 = `llama-store` M1/M2（F12 第 11 节），
+   KV 页接 store = F10 M4 的落地路径。
 5. F、G 等 F6 质量门。
 
 每轮都要更新四份文档：`RESULTS.md` 矩阵新增对应臂，`DECISIONS.md` 登记开关与未结项，`README.md` 若口径变化则同步。
@@ -190,7 +308,8 @@ SSD 只能进 **预取批次**（提前若干层、批量顺序读）和 **prefi
 
 ### F0 显存档位可测（已落地并验证）
 
-`GGML_VK_VRAM_LIMIT_MIB` 在设备初始化时 hold back 差额。已验证：日志出现 `VRAM limited to ...`；
+`GGML_VK_VRAM_LIMIT_MIB` 在设备初始化时 hold back 差额（**旧 env，已并进 `--store-vram-mib`**，
+语义不变）。已验证：日志出现 `VRAM limited to ...`；
 `vklimit-probe.cpp` 报告 free 等于设定值（6144 档 6142.9 MiB、4096 档 4094.9 MiB）；
 跑批器能采到 `held` 并从峰值里扣掉；规划器随档位变化（同口径下 8176 档给 bank 1547、4096 档给 0）。
 矩阵首版读数在 `RESULTS.md` 第 0 节。
@@ -356,7 +475,10 @@ PP 与 TG 都有 r=2 可复现的差值，并同表记录 splits、`used`、`RS 
    装不下时在规划阶段就把该层标成 host/CPU 或降精度，而不是运行中撞到 miss 才去读盘。
 
 验收：一条 RAM 受限 profile（把可用内存压到 resident 门槛以下）里 (a) bank 非零、
-(b) decode 关键路径 pread 次数 = 0（`GGML_SCHED_TRACE` 证明）、(c) pp2048 >= 同配置 resident 的 70%、(d) `ctest` 32/32。
+(b) decode 关键路径 pread 次数 = 0（`GGML_SCHED_TRACE` 证明）、
+(c) pp2048 双对照（2026-10-27 评审改）：(c1) >= 同配置 resident 的 70% 只证明"窗口有用"，不证明"窗口是好方案"，
+因为 RAM 压力测试本身会改变 CPU 侧（pinned pool 会挤掉 page cache）；结论以 (c2) 同 RAM 压力下
+"无窗口、纯 mmap 退化"的第三臂内比较为准，(c1) 留作下界； (d) `ctest` 32/32。
 混合精度那条腿（热 Q4_K + 冷 IQ2/IQ3）仍先受 F6 与 repack KLD 的门禁。
 
 ### F10 分块（paged）KV：块表间接寻址，原地扩展（**新增，容量路线，取代 A 第二阶段的 LSE 分段**）
@@ -417,11 +539,18 @@ A 第一阶段有三个结构性问题，它们都来自"一张连续大张量"�
 
 #### 3. 数据结构
 
-- **块 `kv_block`**：BS 个 cell 的全部注意力层 K/V，是一个 ggml backend buffer（默认 device-local，可选 host-visible）。
+- **页 `kv_page`**：`BS` 个 cell 的全部注意力层 K/V，是一个 ggml backend buffer（默认 device-local，可选 host-visible）。
   块内布局 `[layer][K|V][cell][row]`，同一层在块内是连续的 `BS x row` 矩阵，FA tile 的局部性不变。
-  每 cell 20 KiB（10 层 x K/V x f16，与 `RESULTS.md` 0.3 的 160 MiB / 8192 cells 一致），BS=2048 时块为 40 MiB。
-- **块表 `kv_block_table`**：每 stream 一张，`uint64 addr[n_ctx / BS]`，Vulkan 时放在设备 SSBO，CPU 时放在主机数组。
-  `addr[b]` 为块 b 的基址（Vulkan 为 BDA，CPU 为指针），层内偏移为 `layer_idx * layer_stride + kv_off`，由 shader 计算。
+  每 cell 20 KiB（10 层 x K/V x f16，与 `RESULTS.md` 0.3 的 160 MiB / 8192 cells 一致）。
+- **页大小固定为 128 cells = 2.5 MiB**（2026-10-27，`--kv-block` 移除）：
+  `256K / 128 = 2048 页`，正好整除，没有半页。128 是 FA tile（64 / 128）的整数倍，
+  **分页 FA / SET_ROWS 的现有假设不用改**，这是选它而不是选"专家大小 1.945 MiB"的唯一理由。
+- **不再和专家同尺寸**：单个 Q4_K_M 专家是 `2,039,808 B = 1.945 MiB`（41 层 x 256 专家，每层三元组 498 MiB），
+  一页 KV 是 2.5 MiB，两者差 28%。store 的 slab 分配器因此有两个 size class（专家 1.945 MiB / KV 页 2.5 MiB），
+  句柄与搬运接口仍是一套。想强行同尺寸就得把页改成 99 cells，那要改 FA tile 假设 - **已否决**（2026-10-27）。
+- **块表 `kv_block_table`**：每 stream 一张，`uint64 addr[n_ctx / BS]`（256K 下 2048 项，16 KiB），
+  Vulkan 时放在设备 SSBO，CPU 时放在主机数组。
+  `addr[b]` 为页 b 的基址（Vulkan 为 BDA，CPU 为指针），层内偏移为 `layer_idx * layer_stride + kv_off`，由 shader 计算。
 - **锚张量 `anchor`**：一个不分配数据的 f16 ggml 张量，`ne = [n_embd_k_gqa, n_ctx, n_stream]`，挂在设备 buffer 上，
   只用来让调度器把依赖它的 FA/SET_ROWS 放到正确 backend。`get_k/get_v` 继续返回对锚的 `ggml_view_4d`，
   `ne/nb` 与现在一致，`src/llama-kv-cache.cpp:1510-1550` 的视图代码基本不动。
@@ -429,7 +558,7 @@ A 第一阶段有三个结构性问题，它们都来自"一张连续大张量"�
 - **分配器**：空闲链表 + 每块状态 `{addr, placement(dev|host), refcount(M5 预留)}`。
   `ensure_blocks(n_extra)` 取代 `ensure_capacity`：`need = used_max + n_extra`，`while cap < need: alloc_block()`。
 
-#### 3.1 块大小（BS）选型：容量粒度参数，不是性能参数
+#### 3.1 块大小（BS）选型：容量粒度参数，不是性能参数（历史，BS 已固定为 128）
 
 BS 只影响以下四项，其中没有一项直接作用在 PP/TG 的算子上：
 
@@ -441,7 +570,10 @@ BS 只影响以下四项，其中没有一项直接作用在 PP/TG 的算子上�
 | FA 表查询次数 | 按 K/V tile 计数，与 BS 无关（BS 只需 >= tile 且为其倍数） | 同 | 无 |
 | B-lite gather 的 dispatch 数与 scratch | 更少 / 更小 | 更多 / 更大 | 只影响验证路径（M2a）的 PP |
 
-结论：默认 2048，理由是边界粒度细、浪费小，不是因为更快。8192 只在 M2b 实测证明 dispatch 或表查询开销不可忽略时才启用。
+结论（历史）：当时默认 2048，理由是边界粒度细、浪费小，不是因为更快。
+**2026-10-27 推翻**：`--kv-block` 移除，BS 固定 128（2.5 MiB），选它的理由变成"FA tile 整数倍 + 2048 页整除 256K"，
+不是容量粒度；上表的边界粒度与表项数结论按 128 重算时都更优（表项 2048 项），只有 gather 的 dispatch 数会涨，
+由 M3 实测。
 
 #### 4. ggml 与图层接口
 
@@ -497,7 +629,7 @@ BS 只影响以下四项，其中没有一项直接作用在 PP/TG 的算子上�
 
 5.5 放置与显存限额
 
-- `GGML_VK_VRAM_LIMIT_MIB`（F0）经 hold-back 让新块分配失败。失败时**只把这一块放到 host-visible 内存**，
+- `GGML_VK_VRAM_LIMIT_MIB`（F0，**已并进 `--store-vram-mib`**）经 hold-back 让新块分配失败。失败时**只把这一块放到 host-visible 内存**，
   而不是整棵 cache 粘住。这是相对现状最大的改进。
 - host-visible 块：BDA 同样可用，FA 直接经 PCIe 读。它的作用是容量，不是 TG 加速。
 
@@ -546,10 +678,15 @@ BS 只影响以下四项，其中没有一项直接作用在 PP/TG 的算子上�
 #### 8. 开关与默认
 
 - `--kv-page` / `--no-kv-page`（env `LLAMA_ARG_KV_PAGE`）、`--kv-page-auto auto|on|off`
-  （env `LLAMA_ARG_KV_PAGE_AUTO`）、`--kv-block N`（默认 2048，必须是 256 的倍数）。
+  （env `LLAMA_ARG_KV_PAGE_AUTO`）。`--kv-block N` **已移除**（2026-10-27）：页大小固定为单个 Q4_K_M 专家，
+  一页 128 cells（见第 3 节），不再对外暴露块大小。下面 3.1 的 BS 选型只作为历史理由保留。
 - 默认值：**off**。`--kv-page-auto auto` 让 `common/fit.cpp` 的预算判决（`DECISIONS.md` 第 4 节开关表、
   第 6 节第 16 条；实测 4096 档判分页、6144/8176 判连续）。M2b + L1 的验收本来允许直接改 auto，
   但 `DECISIONS.md` 第 6 节第 17 条的 10K 输出差异未定性，所以默认值先不动。
+  （2026-10-27 评审补充：默认值按证据强度判，与 A/B2 的位级等价同一标准。第 17 条的差异已由 `grow()`
+  修复解决（该节另有记录）；现在仍不改的理由是收益侧没有长上下文真实读数：目标口径 10K 的 KV 只有
+  320 MiB、三档都放得下（F11 第 1 节），4096 档换到的只是"页级降级的安全性"且 PP 低 3-5%；
+  session 台阶定性（`DECISIONS.md` 第 20 条）之前不动默认。）
 - 每次退回都打印一次原因（`kv-page disabled: <reason>`）。
 
 #### 9. 成本模型（M0/M2 实测前的估算基线）
@@ -679,6 +816,10 @@ M1 CPU 参考 + 分配器（默认 off）**已完成 2026-10-23，读数见 `RES
   真正的长上下文逐位验收放在 M2b 的 256K + 10K 口径。
 - 已知遗留：设备 K/V 被守卫挡下（`device K/V needs the paged Vulkan kernel (M2b)`）；
   K-shift 逐块化与 server 的 slot 恢复压力测试留到 M3。
+- **2026-10-27 评审补充：冻结等价性回归集**。分页改动的回归风险不在新代码，而在"看似无关的 opt-in 路径"
+  绕过守卫（SET_ROWS 融合门发生过一次，`DECISIONS.md` 第 5 节）。把第 7 节的自动退回条件与第 5.8 节的
+  两条 opt-in 冲突（`use_dequant_kv` 分页必须显式关、`use_sparse` 退回连续）冻结成 `tests/test-kv-page`
+  的显式用例清单，每个退回条件一条；以后动 FA / SET_ROWS / 图复用必跑该清单，不靠本文档记忆。
 
 M2a B-lite（验证，不改 FA shader）
 
@@ -738,7 +879,8 @@ M5（可选）：量化 K/V 分页；块级前缀共享（seq_cp 的 copy-on-wri
 
 ## 4. 建议顺序
 
-以第 0 节为最高优先级，本节保留原有的分级依据。
+以第 0 节为最高优先级，本节保留原有的分级依据。2026-10-27 评审把 D 升 P0、并给出三步收敛（见第 0 节 0.0），
+本节的 P0/P1/P2 归属段以 0.0 为准。
 
 P0 先跑通并解耦：F1（`:1910` 的 producer/lookup 边界要在调度分片阶段解决；调度器的 pre/post 回调都在 split
 计算的前后且返回 `void`，不能把 producer 挪进前一个 split，删守卫更不行）+ F7（先归因再解耦）+ F8 的三项归因
@@ -829,8 +971,9 @@ F6 已于 2026-10-23 落地（`bash bench/tools/quality-gate.sh`），所以 9.5
 - **host 块臂在目标口径造不出来**：10K cells 的 KV 只有 320 MiB，三档的设备都能放下；
   显式 `-B 3072` 只会让 bank 和 compute 互相挤（4096 档 PP 379 -> 169.9），产生不了 host 块。
   host 块只在工作集本身超过设备（`n_kv` 约 10 万以上）时出现，那是 L2(b) 的区间，见 3.1 的区间表。
-- 仍未做：`--kv-block` > 2048 在 gather 下与连续布局不同（`DECISIONS.md` 第 6 节第 18 条）；
-  默认值仍是 `--kv-page` off（`--kv-page-auto` 可用但 4096 档比连续布局低 3-5%，换的是块级降级的安全性）。
+- ~~仍未做：`--kv-block` > 2048 在 gather 下与连续布局不同~~ **作废（2026-10-27）**：`--kv-block` 已移除，
+  页固定为 128 cells（tile 对齐，FA 假设不用改）；默认值仍是 `--kv-page` off（`--kv-page-auto` 可用但 4096 档
+  比连续布局低 3-5%，换的是页级降级的安全性）。
 
 (a) 工作区（KV cache 持有）
 
@@ -991,26 +1134,39 @@ L1 验收线：
 2. ~~工作区 cap 默认 256 MiB、初始 32 MiB~~ **已按此落地**：`--kv-gather-mib` 默认 256，fit 扣 32 MiB。
 3. host 块与 L1 同批进 F10 M4 验收：**仍待做**，和 L1d 的矩阵一起。
 
-## F12 统一存储子系统（设计目标，2026-10-27 立，未开工）
+## F12 统一存储子系统 llama-store（本机 VRAM/RAM/SSD 的抽象层，常开，预算可手设）
 
-把 VRAM / RAM / SSD 当成一个柜子集合来管理：放置与搬运全部收进子系统，调度者只发"取物需求"。
-这一条取代 F5 的"SSD 单独一套"与 F9 的"RAM 单独一套"的说法——容量层不再各写一套判据。
+`llama-store` 是**本机三类硬件的抽象层**，但第一版只接管**两类对象**：专家权重（按专家粒度）与 KV 页（按 page）。
+核心目标只有一个 - **高性能的专家预取**；其余模块（dense 权重、compute buffer、staging、加载路径）**一律不动**，
+只要求把占用申报给 store，否则总预算不成立。对外只做四件事 - 分配、驻留、搬运、记账；
+放置策略与搬运执行都在这一层。这一条取代 F5 的"SSD 单独一套"与 F9 的"RAM 单独一套"。
 
 ### 1. 边界（解耦的是决策，不是信息）
 
-- **归子系统**：每个对象（专家层、层块、前缀 KV 段、KV 块）当前在哪个柜子、什么时候搬、搬到哪、
-  这次取要付的代价；热点提升与淘汰也归它。
+- **归子系统**：专家对象与 KV 页的分配、驻留、搬运、预取、淘汰、记账；三个预算及其内部分配。
 - **不归它**：怎么把结果接进计算图。图只发一个请求、拿一个句柄，不感知层数与柜子名。
+- **其他模块不改**：
+  - dense 权重 / compute buffer / staging 的分配仍走现有路径（loader、调度器、`llama_memory`），
+    只在初始化与扩容时向 store 申报（`store_declare(kind, bytes)`），由 store 从总预算里扣掉。
+  - 加载方式不变：`lazy_read`、mmap、resident 判定、`lazy_read` 的 4 GiB 门槛全部照旧；
+    专家读进 host 之后按层分组、按专家注册给 store（`store_adopt(kind = expert, il, ie, bytes)`）。
+- **KV 按页**：页固定 **128 cells = 2.5 MiB**（tile 对齐，`--kv-block` 已移除），页是句柄与搬运单位，
+  复用 F10/F11 的块表间接寻址；专家（1.945 MiB）与 KV 页是 store 的两个 size class。
 - **调度者必须随请求给的信息**：`要哪些对象`、`在哪一步用`（层号 / ubatch 序号）、`能不能等`。
   缺了"在哪一步用"，子系统只能事后反应：要么过度预取把热点挤出去，要么预取不足退化成同步等待。
   现在的"预取只提前 1 层"就是没有这条信息时写死的折中。
+- **store 不猜下一步**：路由预测（rolling promotion、按历史命中率提升）留在调用方，
+  store 只按收到的 use_step 排 deadline。否则它迟早要理解"序列"与"路由"，KV 页就没法干净地共用一套接口了。
+- **常开**：没有"关掉 store"的开关（用户要求，见第 11 节）。要复现旧行为就走预算参数与新参数，
+  不靠旁路回退；store 建不起来（无 GPU、无 SSD 预算）时自动降级为"只有 RAM 一层"并告警，不得 abort。
 
 ### 2. 两种取物与它们的硬约束
 
 - `能等 = 否`（同步交物）：这类请求永远存在，因为"用了哪几个专家"本身就是 GPU 在这层的中途算出来的
   （F1 的 `:1910` 就是这个性质的后果，不是 bug）。同步交物必须**只等这一次搬运**，
   不能退化成整设备 fence——这是子系统的前置原语，也就是 `DECISIONS.md` 未结项 19。
-- `能等 = 是`（异步预取）：返回一个"稍后要等"的凭据（序号），凭据之间互不阻塞，先到的先可用。
+- `能等 = 是`（异步预取）：**立刻**返回一个可用的句柄，不是"稍后要等的凭据"；数据是否到位由句柄状态说，
+  消费前在消费点等。语义见第 5 节。
 - **句柄要能在执行期改变**：图建好之后钉死的是设备地址，柜子一换就错。
   复用 F10/F11 已经造好的间接寻址（块表经 `op_params` 传、内核按表寻址、长 prefill 先 gather），
   不另设计一套。
@@ -1027,6 +1183,251 @@ SSD 随机读 0.81 GB/s、1.95 MiB 一次 2.4 ms，解码单步要 206 MiB -> 25
 1. 先做等待原语（序号化：提交返回序号，可按序号等待，多批同时在飞）——它与接口无关，做了不白做。
    **已落地**（2026-10-27，`RESULTS.md` 0.6 E）：`ggml_backend_vk_prefetch_submit_seq` / `_wait_seq`，
    验证工具 `bench/tools/wait-seq.cpp`。调度器与 MoE cache 还没用它，那是 `DECISIONS.md` 未结项 19 剩下的半条。
-2. 第一刀切在 SSD 层：它当前占用 0 字节，接进来不碰已验收的显存 / 内存路径，用空地先把接口与代价函数立起来。
-3. 再把显存的 SLRU / 整层驻留 / 预取环逐步搬进同一个脑子；`common/fit.cpp` 的预算判决改成向子系统查询，
-   而不是自己算一遍（对应 D 那条"预算解算器一体化"）。
+2. 骨架 + 预算：句柄表、共享池、三个预算参数先立起来，并接管 `common_moe_plan_get()` 的**数值决策**
+   （搬运暂时仍走旧 MoE cache 路径）。这一步不改行为，只换"谁算"，所以能用 ±1% 判等。
+   与 D 的对齐（2026-10-27 评审）：D 的统一预算式先落 `common/fit.cpp`（`THREE-TIER.md` 第 0 节 0.0 的第一步），
+   本步接管时把那个式子**整体搬进** store，`fit.cpp` 收成申报 + 打印的薄壳；过渡期两处并存即第二套算术，
+   按 `DECISIONS.md` 第 5 节"预算解算只有一个所有者"处理。
+3. MoE cache 变客户端：搬运交给 store，策略（SLRU / 整层驻留 / 预取环）先留在原处，等读数说话再移。
+4. SSD 冷层进预算（`--store-ssd-mib` > 0）：它当前占用 0 字节，是最安全的一刀，放在这里而不是最前面，
+   因为"常开"意味着不能先发布一个半截的 store。
+5. KV 分页块与前缀 KV 段接入，`common/fit.cpp` 收成解析 + 打印的薄壳。里程碑与验收见第 11 节。
+
+### 5. 两种取物的接口语义（2026-10-27 需求定稿）
+
+子系统只有两个入口，调用方用"能不能等"选，其余全部由子系统决定：
+
+| | 同步取 `store_acquire` | 异步取 `store_prefetch` |
+|---|---|---|
+| 返回时机 | 数据到位后才返回 | **立刻**返回 |
+| 返回物 | ready 句柄，可被内核解引用 | 句柄立即可用于传参/进图，数据未必到位 |
+| 谁等 | 调用线程阻塞，**只等这一个对象所属的批次** | 不阻塞；由消费点的 `store_wait` 等 |
+| 典型调用点 | decode 里"GPU 刚算出这层用了哪几个专家" | prefill 的下一层、下一 token 的可预测需求、前缀 KV 复用 |
+
+- 同步取永远存在，且必须只等序号（`ggml_backend_vk_prefetch_wait_seq`），不得退化成 `ggml_backend_synchronize`：
+  否则 F12 就把未结项 19 想删的整设备 drain 又固化了一遍。
+- 异步取"立刻返回可访问句柄"的前提是**句柄不是裸地址**：句柄 = 槽号 + 代际号，由子系统持有的间接表
+  解析成当前落点。执行期换柜子只改表，不改图、不重建图。
+- 未 ready 的句柄被消费属于未定义行为，`store_wait(handle)` 是唯一的合法消费点。建图阶段就检查
+  "每个被解引用的句柄前面有 wait"：缺了不许以异步状态接进图，退回同步取后重试并计数，
+  不留给调用方自觉。
+- 一次 `store_acquire` 只保证这一个对象到位；同层其它对象要一次到位就合并成一次批量请求，
+  批量之间用序号排序，先到先可用。
+
+### 6. 线程池（异步取的执行者）
+
+- **进程内只有一个**共享池，归子系统所有。复用 `ggml_threadpool` 那套实现（MoE cache 现在的
+  `hybrid_tp` 是它的私有版本，`src/llama-moe-cache.cpp:471-482`），不新增每 cache 一个池，
+  也不占用 CPU 计算池（会被 GEMM 的长任务堵住）。
+- 池线程只做**发起与登记**：H2D/S2H 走 Vulkan 传输队列（`ggml_backend_vk_prefetch_submit_seq`），
+  SSD 走重叠读，RAM<->VRAM 走 pinned staging。真正的搬运在拷贝引擎或内核里，所以池不需要大：
+  默认 `min(2, max(1, hw/4))`，`--store-threads` 可覆盖。
+- **池内线程绝不允许阻塞等待**。池任务只提交搬运并挂序号/完成回调；要等的人在调用线程上等。
+  否则同步取会排在预取后面，decode 单步直接死掉。
+- 同步取插队：同步请求进池的高优先级队列（后进先出）；在途预取允许在粗检查点取消
+  （对象已被淘汰、层已过、目标槽被复用）。取消不是错误，只计数 `store_pool_cancel`。
+- 池建不起来、池满、后端不暴露 prefetch 接口时，异步**退化为同步**（调用线程自己搬）+ 一次性 warning，
+  **不得 abort**（`DECISIONS.md` 第 5 节）。
+
+### 7. 三个预算参数（对外唯一的旋钮）
+
+| 参数 | 默认 | 语义 |
+|---|---|---|
+| `--store-vram-mib` | 0 = 自动（设备可用量） | **整个运行期的 VRAM 总预算**：dense 权重、专家 bank、KV、compute buffer、staging 全算在内。手设 4096 / 6144 就是档位 |
+| `--store-ram-mib` | 0 = 自动（空闲 RAM - 系统留量） | **整个运行期的 RAM 总预算**：resident 权重、`-nkvo` 的 KV、staging、mmap 页的驻留采样值 |
+| `--store-ssd-mib` | 0 = 关 | 冷层容量上限；路径用 `--store-ssd-path` |
+
+- **预算的构成** = 对象占用（专家 + KV 页）+ 申报占用（dense / compute / staging，由既有分配器报数）。
+  store 不接管别人的分配器，只要求报数，这样"不影响其他模块"和"总预算成立"能同时满足。
+- **只有一个 VRAM 参数**：`--store-vram-mib 4096` 就等于"这台机器跑在 4G 上"，不再有额外的设备档位旋钮。
+  旧 env `GGML_VK_VRAM_LIMIT_MIB` 已移除，语义并进这一个参数。
+- 预算是**硬顶**：store 初始化时把预算之外的部分 hold back（日志 `VRAM limited to ...` 保留），
+  这样即使某条路径没走 store，也吃不掉那部分；最终态由 store 自己的分配器保证，hold back 只是兜底。
+- **不允许绕过 store 访问**：专家与 KV 页只能经 store 分配/取用；其他分配（dense、compute、staging）
+  必须在初始化与扩容时 `store_declare` 申报，未申报即越权。
+  申报是**硬边界不是礼貌**：debug 构建对账失败直接 `GGML_ABORT`（这是开发期不变量，不是运行期容量条件），
+  release 只告警并计数 `store_undeclared_bytes`；申报值必须能被 `GGML_VK_MEMORY_LOGGER` 独立复核，
+  对账式：进程总量 vs `store_bytes_in(vram) + declared(vram)`，差 > 5% 即缺陷。
+- **mmap 页不是账外资源**：loader 照旧建映射、照旧 `lazy_read`，但专家所在的映射区间用
+  `store_attach_mapping` 把句柄登记给 store；store 只对**专家区间**控常驻
+  （`madvise(MADV_DONTNEED)` / `PrefetchVirtualMemory`），驻留页数定期采样
+  （Windows `QueryWorkingSetEx`、Linux `mincore`）记进 RAM 预算。不复制数据、不自管 `pread`。
+
+- 三个预算**互不挪用**：显存不够不会去借 SSD，也不会把 RAM 预算折算成显存。跨层只走搬运，不走预算合并。
+- 手设值是**硬上限**：超了由 store 自行降级（缩 bank / 关 SSD 冷层 / 退回 mmap）并计数，
+  不 abort，warning 一次性 + 次数。
+- 内部分配（专家 bank 多少、KV 工作集多少、staging 多少、预取环几槽）由 store 自己算，**不暴露成 CLI**；
+  但结果必须在启动日志与记账里可见（`store_split: vram expert/KV/staging = ...`），否则无法复核。
+- 现有 CLI 的关系：`--moe-cache-mib`、`-nkvo` / `-kvg`、`--kv-page*`、`-ncmoe` / `--cpu-moe` 全部降级为
+  **强制覆盖**（用户显式给了就听用户的），不给时由 store 按 fit/auto 决定。`--moe-cache-mib` 解释为
+  "专家块的建议上限"：未手设 `--store-vram-mib` 时完全照用；手设预算且建议值超出时才 clamp 并打一行 warning。
+  这样旧臂的 bank 值仍可逐位复现，clamp 只发生在新的手设预算臂上。
+- 第一版策略**照搬现状**：bank 大小与 KV 页数按 `common_moe_plan_get()` 现在算出的值，
+  预取用现有 SLRU + 2 槽环（提前 1 层），只换执行者。margins、score 预留、resident 门槛仍由 `fit.cpp` 算并申报，
+  不搬进 store。要换新策略（含 M2 的 `use_step` 预取）必须先有 A/B 读数，按第 11 节的门槛验收。
+
+### 8. 句柄的三条硬约束
+
+1. 搬运期间目标槽被 pin 住，不可淘汰。否则会出现"搬完发现落地处已经被别人占用"。
+2. 淘汰只允许发生在代际号未变、无 in-flight、无未消费句柄时；不满足就跳过并计数 `store_evict_deferred`。
+3. 释放显式化（`store_release` 或作用域句柄）。漏释放等于槽泄漏，按层打泄漏计数进日志。
+
+- **单原语要求（2026-10-27 架构评审）**：第 2 条的三道检查（代际未变 / 无 in-flight / 无未消费句柄）在
+  解引用、淘汰、回收三条路径上必须共用**同一个原语**（一次持锁或一个序号范围判定）；slab 的无 GPU 单测
+  必须证明"淘汰走的就是解析用的那个判忙函数"。分三处各写一份即缺陷，那会重演 `:1910` 的形状：
+  正确性绑在实现形状上而不是数据结构上（`DECISIONS.md` 判决 27 与第 5 节）。
+
+### 9. 与现有组件的关系（不许长成平行子系统）
+
+| 现有 | 变化 |
+|---|---|
+| `llama_moe_cache`（SLRU / 整层驻留 / 2 槽预取环 / bank 大小 / 搬运） | 整体交给 store：**专家的放置、预算、预取都归 store**，cache 只剩"按句柄取专家并接进图"。整层驻留保留为放置提示 + 批次单位 + 统计维度 |
+| `common/fit.cpp` 的 `common_moe_plan_get()` | 只保留"非 store 占用"的计算并申报（`store_declare`）；bank / KV 的分给 store（M4） |
+| 分页 KV（F10/F11） | 页就是句柄；页固定 128 cells = 2.5 MiB，`--kv-block` 已移除；块表与 `store_acquire` / `store_wait` 是同一套 |
+| `hybrid_thread` / `hybrid_tp`（`src/llama-moe-cache.cpp:394-403`） | 并入共享池，删掉私有版本 |
+| `llama-model-loader` / `llama-mmap` | **加载方式不变**（`lazy_read` / mmap / resident 全照旧）；只把含专家的映射区间 `store_attach_mapping` 登记（第 12 节） |
+
+### 10. 记账（矩阵列之外，第一版就要有）
+
+`store_sync_waits` / `store_sync_wait_ms` / `store_prefetch_issued` / `store_prefetch_lead_steps` /
+`store_prefetch_wasted`（发了但没在 use_step 前被消费）/ `store_hits_by_tier`（vram / ram / ssd）/
+`store_evict_deferred` / `store_inflight_pins` / `store_ssd_sync_rejected` / `store_pool_cancel` /
+`store_split`（三个预算各自分给了谁）/ `store_bytes_in(vram|ram|ssd)`（越权检查的分母）/
+`store_file_resident_mib`（mmap 驻留采样值，file 层用）。
+
+`store_prefetch_wasted` 是这套接口唯一的自检指标：它高说明 use_step 给错了，不是硬件慢。
+`store_sync_wait_ms` 必须能对上现在的 `cpy_sync`（`RESULTS.md` 0.7：单步 58.5 ms 里 42.3 ms），
+对不上就是记账口径错了，不是收益。
+
+### 11. 常开、A/B 与里程碑
+
+- **常开怎么 A/B**：store 没有关掉的开关，所以对照靠预算参数复现旧行为（`--store-vram-mib` 设成与旧档位相同的
+  总值，或直接用旧 `--moe-cache-mib` 覆盖值），而不是旁路回退。任何"必须先关 store 才能跑通"的设计都算设计错误。
+- 这与 `AGENTS.md` 的"新行为一律带开关"不冲突：常开的是 store 这个**基础设施**，不是某项新策略；
+  store 内部每项新策略（新淘汰算法、新预取提前量、SSD 放置规则）仍然各带开关并登记 `DECISIONS.md` 第 4 节。
+- **M0 等待原语 已落地**（`RESULTS.md` 0.6 E）。
+- **M1 专家注册 + 预算骨架**：专家按"层 + 专家子对象"两级注册，预取策略照搬现状（SLRU + 2 槽环、提前 1 层），
+  只换执行者；上线 `store_declare`（dense / compute / staging 报数）与 `store_split`。
+  M1 期间允许一个**影子模式**（store 只记录"我会怎么放、怎么搬"，执行仍走旧路径）用来对齐两套决策，
+  **M1 结束必须删除** - 留着它就是事实上的总开关。
+  验收：同口径 PP/TG 与基线差 <= 1%（8176 档 PP 506.7 / TG 17.2），越权差 <= 5%，
+  并给一张 `hit %` 的新旧对照表（按层 / 按专家两种口径都要出）。
+- **M2 预取升级（核心 KPI，唯一以收益验收的一步）**：`use_step` 驱动的异步取替代"提前 1 层"，
+  共享池搬运、可取消。验收：`store_prefetch_wasted` 比 M1 下降 >= 50%，
+  **TG 提升 >= 15% 才算收益**（< 15% 只算持平，按未结项 20 的规则）。
+- **M3 KV 页接入**（页固定 128 cells = 2.5 MiB）**与 SSD 冷专家**（`--store-ssd-mib` > 0）：
+  验收 `test-kv-page`、10K 输出逐字、`FA 5332/5332`、`SET_ROWS 319/319`（页没变，理论上应与现有分页路径一致）；
+  单步路径 SSD 同步取放行次数 = 0、`status = ok`、abort 清单不新增。
+- **M4** `common/fit.cpp` 只算"非 store 占用"并申报，bank 与 KV 的分配交给 store；
+  `common_moe_plan_get()` 删除或转调。
+
+收益验收仍守 15%（未结项 20）；M1/M2 是"不回退"门，用 ±1% 判，两者的口径不能混用。
+
+风险有两条，都要在 M1 就量出来：抽象层把已验收的显存路径拖慢（所以 M1 只换"谁算"，不换搬运实现）；
+句柄间接寻址在热路径多一次查表，预期 < 1%，超了就不许进单步路径，只留给 prefill 与预取。
+
+### 12. 加载方式与注册粒度（2026-10-27 定案）
+
+**加载方式一个字不改**：loader 继续按现在的路径解析、映射、`lazy_read`、resident / mmap 判定；
+store 只在专家数据落进 host 之后接手 - 按层分组、按专家注册，此后这些专家的驻留与搬运归 store。
+
+- **KV 按页**：页固定 128 cells（2.5 MiB，tile 对齐），页是句柄与搬运单位，`--kv-block` 已移除；
+  专家是另一个 size class（1.945 MiB），两者共用一套 slab 分配器与句柄。
+
+- **注册粒度：层 + 专家子对象（两级）**。层是分组与记账单位（`store_group(il)`，41 个），
+  专家权重是层内的子对象（每个专家张量一个子句柄，约 3 万个）。
+  **搬运、预取、淘汰的单位是专家子对象**；层负责"一起判命中、一起提交预取批次、按层报 hit %"。
+  索引两跳：`层 -> 专家数组下标`，两级都是 O(1)。
+- **为什么不再扁平到"单个专家"**：扁平后 3 万多个对象没有父节点，`bank` 的整层驻留、一层一次提交的预取批次、
+  按层统计的 `hit %` 全都要在调用方把父子关系重新拼回去 - 等于把分组关系藏在使用者那里。
+  两级结构把分组显式化，同时不牺牲搬运粒度。
+- **为什么不只按层**：一层专家 116-330 MiB，8 GiB 设备上放不下几层，只能提前 1 层 -
+  这正是现在 `cpy_sync` 42.3 ms 的来源。搬运单位必须细到专家，否则预取没有腾挪空间。
+- **代价要认**：41 个层组 + 3 万多个专家子对象，句柄表与索引必须两级 O(1)（数组下标，不是 `map`）；
+  淘汰单位是专家子对象，`bank` 原来的"整层驻留"保留为**放置提示 + 批次单位 + 统计维度**，不再直接等于分配单位。
+  命中统计要能同时给出"按层"和"按专家"两种口径，M1 要在同一轮里都打出来。
+- **为什么其他模块不注册**：dense 权重整个 run 不换层，注册只多一次查表；compute buffer 是每图的临时品。
+  两者只影响"还剩多少预算"，申报即可，不动它们的分配路径。
+- **mmap 只对专家区间移交**：`store_attach_mapping` 登记含专家的区间，其余区间仍归 loader / OS，store 不碰。
+
+判据收口：要注册的对象必须满足"run 内会换层，且换层单位就是计算单位"。
+专家子对象满足（换的是单个专家）；层是它天然的分组，不单独作为搬运单位；KV 页满足（page 是搬运单位）；
+dense 不满足（永不换层）。上一版讨论里"字节全归 store"的说法作废，只保留"专家与 KV 页全归 store"。
+
+## F13 子系统划分与边界（2026-10-27 定；配套 F12）
+
+F12 定 store 做什么，本节定**边界画在哪**：哪些该独立成模块、哪些坚决不拆、store 内部怎么切。
+以后每加一个模块，先用第 1 节的判据过一遍。
+
+### 1. 判据（四条，至少满足三条才拆）
+
+1. **生命周期不同**：谁先创建、谁先销毁（store 必须死在 backend 之前）。
+2. **失败模式不同**：坏文件是事实错误必须硬失败，容量不足只能降级，两者不能共用返回值。
+3. **变化频率不同**：一周改三次的（策略、预取）不该和半年不动的（加载、内核）绑在一起。
+4. **有不变量能脱离 GPU 单独测**。
+
+反向信号也要认：拆完两边必须互相回调才能完成一件事，那不是解耦，是把一个模块拆成两个更难调的东西。
+
+### 2. store 内部：三个单元 + 一层薄壳（不另立子系统）
+
+| 单元 | 职责 | 独立性要求 |
+|---|---|---|
+| `store-slab` | 分配、句柄（槽 + 代际）、pin、size class（专家 1.945 MiB / KV 页 2.5 MiB） | 纯数据结构，**无 GPU 可单测**；use-after-free 的唯一来源，越界与代际失配必须断言 |
+| `store-io` | 搬运执行、共享池、序号完成、取消、代价表 | 唯一碰 Vulkan / 文件句柄的地方；换后端只动这里 |
+| `store-policy` | 放哪、预取谁、淘汰谁 | 唯一该频繁变动与 A/B 的地方；M2 的策略实验只改这里 |
+
+- 对外只有薄壳：`store_acquire / store_prefetch / store_wait / store_release / store_declare`。
+- 三者共享同一份驻留状态，**不拆成独立子系统**（拆了就要互相回调）。
+- 现状反例就是 `src/llama-moe-cache.cpp`（2082 行，SLRU + 预取环 + 上传 + 私有 worker + 统计 + 图接线挤在一起）。
+  store 的第一版必须避免复刻这个形状。
+
+### 3. 该独立成子系统的四个（S1 就是第 2 节的 store 三单元）
+
+**S0 `llama-trace`（诊断与记账）— 先做，约一天**
+计数器现在散在 `hybrid_waits`、`pf_*`、`promote_*`、`reallocs`、`splits` 各处，汇总靠脚本猜，
+未结项 21（PERF_LOGGER 的 GEMM/FA 行被整类丢掉）就是猜错的后果。
+做统一注册表 + 一次结构化 dump；以后新增指标不改脚本。落点 `src/llama-trace.{h,cpp}`。
+
+**S2 `ggml-sched-plan`（执行计划与可见性）— P0，store M2 的前置**
+`ggml/src/ggml-backend.cpp`（2400 行）现在同时管：分片决策、图分配、拷贝调度、event / 序号可见性；
+`src/llama-context.cpp`（3982 行）与 `src/llama-graph.cpp`（3638 行）还要配合"producer 必须和 lookup 同分片"
+这类正确性约定（`:1910` 的根因）。抽出一个模块，独占"这一步有几次拷贝、谁等谁、什么时候可见"，
+并输出可打印的 plan（`skp_splits` / `skp_copies` / `skp_cpy_sync`）。
+
+- 与 store 的接口：store 给"这批必须在第几步之前到位"，sched-plan 返回"要等到的序号"。
+  **store 不自己等整设备 fence**；反过来 sched-plan 也不知道 store 内部有几个 size class。
+- 验收（目标口径）：`cpy_sync` 从 42.3 ms 降到 **< 20 ms**，输出逐字相同，`splits` 不劣化；
+  TG 收益按未结项 20 的 15% 门槛判（理论上限约 26 t/s）。
+
+**S3 `kv-seq`（KV 语义与簿记）— 与 store 分开**
+`src/llama-kv-cache.cpp`（2920 行）里混了 seq↔cell 映射、shift、扩容、页表、放置。
+**seq↔cell、shift、state 恢复留在 KV 层，页的物理位置与搬运去 store。**
+否则 store 迟早要理解"序列"，那它就不是硬件抽象了。落点 `src/llama-kv-seq.{h,cpp}`，
+对外接口（`get_n_kv`、`n_cells`）不变；验收与 M3 同批，PPL 与 10K 输出逐字不变。
+
+**S4 `store-file`（SSD 文件层）— store-io 下的独立文件，M3 之后**
+队列深度、`FILE_FLAG_NO_BUFFERING` 对齐、重叠读的机制与 H2D 没有一行可复用。
+随机 1.95 MiB = 0.81 GB/s 是设备上限（4 线程 qd4 也无收益），所以这里不做无谓优化，
+只保证：只服务 SSD 预算、只在预取批次与前缀 KV 复用里出现、绝不进单步路径。
+
+### 4. 明确不拆
+
+| 东西 | 为什么 |
+|---|---|
+| ggml 算子 / Vulkan kernel | 多一层间接就是纯损失，性能代码要贴着硬件写 |
+| 量化 / 反量化 | 已是独立编译单元，再拆没收益 |
+| CLI 解析（`common/arg.cpp` 4729 行） | 拆了只是搬家，没有不变量可守 |
+| CPU 计算池与 IO 池 | **不得合并**：计算池被 GEMM 长任务占住，IO 要低延迟，优先级相反 |
+
+### 5. 顺序与依赖
+
+| 序 | 事项 | 前置 | 验收 |
+|---|---|---|---|
+| S0 | `llama-trace` | 无 | 一次 dump 覆盖 F12 第 10 节全部 `store_*` 列；`summarize_perf.py` 不再猜 key |
+| S1 | store 三单元（slab / io / policy） | 与 M1 同批 | slab 与 policy 无 GPU 单测通过；policy 可热换而 slab 不动 |
+| S2 | `ggml-sched-plan` | S0 | `cpy_sync` < 20 ms、输出逐字、TG 按 15% 门槛 |
+| S3 | `kv-seq` | M3 | PPL / 10K 逐字不变；store 不出现任何 seq 相关字段 |
+| S4 | `store-file` | M3、`--store-ssd-mib` > 0 | 单步路径 0 次 SSD；冷层命中 >= 85% |
+
+S2 是 store M2 收益的上限：预取能重叠多少，取决于调度器肯不肯让搬运和计算同时在飞。
+所以 S2 排在 M2 之前，而不是「等 store 上线再看」。
