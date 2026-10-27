@@ -7657,6 +7657,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const uint32_t bn = pipeline->wg_denoms[1];
     const uint64_t max_tiles = ggml_vk_mul_mat_id_max_tiles(n_as, nei0 * nei1, bn);
+    // [GGML_VK_ID_TILE_TRACE] the tile chosen from the assumed average n_sel; compare it against the real
+    // per-slot counts from LLAMA_MOE_IDS_TRACE to judge how many times the expert weights get re-read
+    static const bool id_tile_trace = getenv("GGML_VK_ID_TILE_TRACE") != nullptr;
+    if (id_tile_trace) {
+        fprintf(stderr, "vk_id_tile: m=%u n=%u k=%u n_as=%u n_sel=%u bn=%u max_tiles=%llu\n",
+                ne01, nei0 * nei1, ne10, n_as, n_sel, bn, (unsigned long long) max_tiles);
+    }
     const uint64_t row_ids_offset = 1 + 2 * max_tiles;
     const uint64_t row_map_words = row_ids_offset + max_tiles * bn;
 

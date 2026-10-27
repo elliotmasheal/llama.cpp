@@ -1056,6 +1056,34 @@ struct llama_moe_cache::impl {
         trace_records++;
     }
 
+    // [LLAMA_MOE_IDS_TRACE] selections per bank slot of one layer: the histogram the tile selector would need
+    void trace_distribution(ggml_backend_t backend, const ggml_tensor * sel, int32_t il, int32_t n_slots) {
+        std::vector<int32_t> ids(ggml_nelements(sel));
+        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+        ggml_backend_synchronize(backend);
+
+        std::vector<int32_t> cnt(n_slots > 0 ? (size_t) n_slots : 0, 0);
+        for (const int32_t s : ids) {
+            if (s >= 0 && s < (int32_t) cnt.size()) {
+                cnt[s]++;
+            }
+        }
+        size_t touched = 0;
+        int32_t  max_cnt = 0;
+        int32_t  bucket[6] = {0, 0, 0, 0, 0, 0};  // <=8, <=16, <=32, <=64, <=128, >128
+        for (const int32_t c : cnt) {
+            if (c == 0) {
+                continue;
+            }
+            touched++;
+            max_cnt = std::max(max_cnt, c);
+            bucket[c <= 8 ? 0 : c <= 16 ? 1 : c <= 32 ? 2 : c <= 64 ? 3 : c <= 128 ? 4 : 5]++;
+        }
+        LLAMA_LOG_INFO("moe_ids_trace: layer %d ids %zu slots %d touched %zu mean %.1f max %d buckets 8/16/32/64/128/+ = %d %d %d %d %d %d\n",
+                il, ids.size(), n_slots, touched, touched ? (double) ids.size()/touched : 0.0, max_cnt,
+                bucket[0], bucket[1], bucket[2], bucket[3], bucket[4], bucket[5]);
+    }
+
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
@@ -1865,6 +1893,12 @@ struct llama_moe_cache::impl {
             }
         }
         const int64_t n_tokens = lookup != nullptr ? ggml_nelements(lookup->src[1]) / n_expert_used : 0;
+        // [LLAMA_MOE_IDS_TRACE] the tile selector needs the per-expert row counts but the ids live on the device:
+        // this readback distorts the timing, so it is off by default and only for measuring the distribution
+        static const bool ids_trace = getenv("LLAMA_MOE_IDS_TRACE") != nullptr;
+        if (ids_trace && lookup != nullptr && !l.full) {
+            trace_distribution(backend, lookup->src[1], il, groups[l.ig].n_slots);
+        }
         const bool pf = pf_enabled && pf_pos[il] >= 0 && n_tokens >= pf_min_tokens;
         if (pf) {
             if (pf_pos[il] == 0) {
