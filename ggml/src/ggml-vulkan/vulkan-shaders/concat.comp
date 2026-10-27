@@ -5,7 +5,45 @@
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
+// dim 0 with row-contiguous sources: one workgroup per (i1,i2,i3) row, two flat
+// segment copies. The host selects it only when all three rows are contiguous, so
+// the row base is a plain stride sum and no i0..i3 decomposition is needed.
+#define FAST_UNROLL 4u
+
+void concat_rows() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint n_a  = p.ne00;
+    const uint n_b  = p.ne10;
+    const uint a_base = get_aoffset() + gl_WorkGroupID.z * p.nb03 + gl_WorkGroupID.y * p.nb02 + gl_WorkGroupID.x * p.nb01;
+    const uint b_base = get_boffset() + gl_WorkGroupID.z * p.nb13 + gl_WorkGroupID.y * p.nb12 + gl_WorkGroupID.x * p.nb11;
+    const uint d_base = get_doffset() + gl_WorkGroupID.z * p.nb23 + gl_WorkGroupID.y * p.nb22 + gl_WorkGroupID.x * p.nb21;
+    const uint step = gl_WorkGroupSize.x * FAST_UNROLL;
+
+    // k-major so consecutive lanes touch consecutive units; FAST_UNROLL loads in flight
+    for (uint base = 0; base < n_a; base += step) {
+        [[unroll]] for (uint k = 0; k < FAST_UNROLL; ++k) {
+            const uint col = base + k * gl_WorkGroupSize.x + tid;
+            if (col < n_a) {
+                data_d[d_base + col] = data_a[a_base + col];
+            }
+        }
+    }
+    for (uint base = 0; base < n_b; base += step) {
+        [[unroll]] for (uint k = 0; k < FAST_UNROLL; ++k) {
+            const uint col = base + k * gl_WorkGroupSize.x + tid;
+            if (col < n_b) {
+                data_d[d_base + n_a + col] = data_b[b_base + col];
+            }
+        }
+    }
+}
+
 void main() {
+    if (p.param1 > 0.0f) {
+        concat_rows();
+        return;
+    }
+
     const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
     const int dim = p.param3;
 

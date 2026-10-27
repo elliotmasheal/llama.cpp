@@ -326,6 +326,46 @@ bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor * src1
     // Quantized tensor rows are block-aligned when created.
     return ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(src1) && ggml_is_contiguous_rows(dst);
 }
+
+// dim 0 row copy: one workgroup per (i1,i2,i3) row, both segments read flat, so it
+// needs row-contiguous tensors and one dispatchable row per workgroup.
+static bool ggml_vk_concat_fast_ok(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const bool concat_fast_enabled = [] {
+        const char * env = getenv("GGML_VK_CONCAT_FAST");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    if (!concat_fast_enabled || src0 == nullptr || src1 == nullptr) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(dst, 0) != 0 || ggml_is_quantized(dst->type)) {
+        return false;
+    }
+
+    const uint32_t unit_size = ggml_vk_concat_unit_size(dst->type);
+    if (unit_size != 2 && unit_size != 4 && unit_size != 8) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(src0) || !ggml_is_contiguous_rows(src1) || !ggml_is_contiguous_rows(dst)) {
+        return false;
+    }
+    // the segment counts and row strides reach the shader in units of unit_size
+    if (src0->nb[1] % unit_size != 0 || src1->nb[1] % unit_size != 0 || dst->nb[1] % unit_size != 0) {
+        return false;
+    }
+
+    const auto max_wg = ctx->device->properties.limits.maxComputeWorkGroupCount;
+    const int64_t ne1 = dst->ne[1], ne2 = dst->ne[2], ne3 = dst->ne[3];
+    if (ne1 <= 0 || ne2 <= 0 || ne3 <= 0 ||
+        ne1 > (int64_t) max_wg[0] || ne2 > (int64_t) max_wg[1] || ne3 > (int64_t) max_wg[2]) {
+        return false;
+    }
+    // the shader indexes with uint32, same bound as the generic path
+    if (ggml_nbytes(src0) > UINT32_MAX || ggml_nbytes(src1) > UINT32_MAX || ggml_nbytes(dst) > UINT32_MAX) {
+        return false;
+    }
+    return true;
+}
 static bool vk_instance_initialized = false;
 
 vk_instance_t vk_instance;
@@ -9935,6 +9975,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements = { ne, 1, 1 };
             }
 
+            // dim 0 row copy: one workgroup per (i1,i2,i3) row, the dispatch divides by wg_denoms
+            if (op == GGML_OP_CONCAT && ggml_vk_concat_fast_ok(ctx, src0, src1, dst)) {
+                elements = { (uint32_t) dst->ne[1] * pipeline->wg_denoms[0],
+                             (uint32_t) dst->ne[2], (uint32_t) dst->ne[3] };
+            }
+
             if (pipeline == ctx->device->pipeline_cpy_transpose_02_32 ||
                 pipeline == ctx->device->pipeline_cpy_transpose_02_16) {
                 // 32x32 tiles over dims 0 and 2; dim1 and dim3 are the batch
@@ -10727,7 +10773,7 @@ void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggm
         ne10, (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], nb10, (uint32_t)src1->nb[1] / unit_size, (uint32_t)src1->nb[2] / unit_size, (uint32_t)src1->nb[3] / unit_size,
         ne20, (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], nb20, (uint32_t) dst->nb[1] / unit_size, (uint32_t) dst->nb[2] / unit_size, (uint32_t) dst->nb[3] / unit_size,
         0,
-        0.0f, 0.0f, op_params[0],
+        ggml_vk_concat_fast_ok(ctx, src0, src1, dst) ? 1.0f : 0.0f, 0.0f, op_params[0],
     }};
     ggml_vk_op_f32<vk_op_concat_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_CONCAT, std::move(pc));
 }
