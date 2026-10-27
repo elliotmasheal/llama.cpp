@@ -608,6 +608,13 @@ struct common_params {
     bool moe_hybrid = false;   // small batches compute the experts that are not in the MoE cache on the CPU
     int32_t fit_plan = 1;      // memory plan rules: 1 = tier-scaled margins and per-group prefetch, 0 = legacy
 
+    // llama-store (bench/THREE-TIER.md F12): always-on; the knobs replace the old env, 0 = auto
+    int64_t store_vram_mib = 0; // run-wide VRAM budget, also the visible tier; 0 = auto (device free)
+    int64_t store_ram_mib  = 0; // run-wide RAM budget; 0 = auto (free RAM - system reserve)
+    int64_t store_ssd_mib  = 0; // cold-expert capacity; 0 = off
+    int32_t store_threads  = 0; // io pool size; 0 = auto min(2, max(1, hw/4))
+    int32_t store_exec     = 0; // transfer routing of the store: 0 = caller's own path, 1 = via store, 2 = + seq wait
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

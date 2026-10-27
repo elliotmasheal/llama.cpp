@@ -2868,6 +2868,62 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--store-vram-mib"}, "N",
+        "whole-run VRAM budget for llama-store in MiB: dense weights, expert bank, KV, compute and staging\n"
+        "all count against it, and anything above it is held back, so it doubles as the visible tier\n"
+        "(4096 / 6144 / 8176; default: auto, the free device memory; replaced the old GGML_VK_VRAM_LIMIT_MIB env)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.store_vram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_STORE_VRAM_MIB"));
+    add_opt(common_arg(
+        {"--store-ram-mib"}, "N",
+        "whole-run RAM budget for llama-store in MiB: resident weights, KV when offloaded, staging and the mmap\n"
+        "resident sampling (default: auto, free RAM minus a system reserve)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.store_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_STORE_RAM_MIB"));
+    add_opt(common_arg(
+        {"--store-ssd-mib"}, "N",
+        "cold-expert capacity on SSD in MiB for llama-store; the SSD never serves the single-step decode path\n"
+        "(default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.store_ssd_mib = value;
+        }
+    ).set_env("LLAMA_ARG_STORE_SSD_MIB"));
+    add_opt(common_arg(
+        {"--store-threads"}, "N",
+        "io-pool thread count for llama-store transfers (default: min(2, max(1, hw/4)))",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.store_threads = value;
+        }
+    ).set_env("LLAMA_ARG_STORE_THREADS"));
+    add_opt(common_arg(
+        {"--store-exec"}, "N",
+        "llama-store transfer routing for the MoE whole-layer prefetch: 0 = the cache keeps its own path\n"
+        "(default), 1 = submissions route through store-io with unchanged primitives, 2 = also waits only on\n"
+        "the layer's own batch number (bench/THREE-TIER.md F12 5; the wait-shift payoff is 2g/M2)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 2) {
+                throw std::invalid_argument("expected 0, 1 or 2");
+            }
+            params.store_exec = value;
+        }
+    ).set_env("LLAMA_ARG_STORE_EXEC"));
+    add_opt(common_arg(
         {"--moe-hybrid"},
         "small batches compute the MoE experts that are not in the GPU cache on the CPU (requires --moe-cache-mib)",
         [](common_params & params) {
