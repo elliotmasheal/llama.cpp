@@ -6596,8 +6596,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // (e.g. q3_K/q6_K use the cm1 k-tile split, q4_K does not)
     static const bool mm_pipe_trace = getenv("GGML_VK_MM_PIPELINE_TRACE") != nullptr;
     if (mm_pipe_trace) {
-        fprintf(stderr, "vk_mm_pipe: dense a=%s m=%u n=%u k=%u aligned=%d pipe=%s\n",
-                ggml_type_name(src0->type), ne01, ne11, ne00, (int) aligned, pipeline->name.c_str());
+        fprintf(stderr, "vk_mm_pipe: dense a=%s m=%u n=%u k=%u aligned=%d bm=%u bn=%u pipe=%s\n",
+                ggml_type_name(src0->type), ne01, ne11, ne00, (int) aligned,
+                pipeline->wg_denoms[0], pipeline->wg_denoms[1], pipeline->name.c_str());
     }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
