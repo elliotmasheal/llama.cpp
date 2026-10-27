@@ -30,7 +30,8 @@ llama-cli -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on \
 - **`--kv-page` 默认仍是 off**：`--kv-page-auto auto` 让 `common/fit.cpp` 判决（扣掉 score 预留后没有余量就开分页，
   3 个档位的实测判决见 `RESULTS.md` 6.5），`--kv-page` / `--no-kv-page` 强制开/关。分页臂必须配 `-K`（KV 在设备），
   gather 的稠密工作区由 `--kv-gather-mib`（默认 256）封顶。默认值不改的原因：4096 档分页比连续布局低 3-5%，
-  换到的只是块级降级的安全性（`DECISIONS.md` 第 6 节第 16 条）；`--kv-block` > 2048 在 gather 下仍有偏差（第 18 条）。
+  换到的只是页级降级的安全性（`DECISIONS.md` 第 6 节第 16 条）；`--kv-block` 已移除（页固定 128 cells = 2.5 MiB，
+  等于旧 2048 口径的 1/16，块表 2048 项）。
 - `used` 里的 KV 只算当前分配，不再等于 `n_ctx x 20 KiB`；比较不同臂时先看日志的 `K/V grown to N cells`
   （连续布局）或 `paged K/V: N blocks of M cells`（分页）。
 - 长跨距注意力的 score 缓冲由 `-fac/--fa-chunk-mib`（默认 256）封顶，query 维按预算切块；`-fac 0` 是旧行为
@@ -38,7 +39,7 @@ llama-cli -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on \
 - 不加 `--moe-cache-mib` 时由内存规划器（`common_moe_plan_get()`）自己算 bank，这就是"自适应 RAM 条件"。
   规划器规则由 `--fit-plan`（默认 1）选：1 = margins 随档缩放、score 预留跟着注意力放置、预取环按 expert group 判；
   0 = 旧规则，只用于 A/B（`RESULTS.md` 0.5）。`LLAMA_FIT_PLAN` 是同一开关的 env 形式。
-- 显存档位用 `GGML_VK_VRAM_LIMIT_MIB` 实现，见第 2 节。
+- 显存档位由 `llama-store` 的参数表达（`--store-vram-mib`），见第 2 节；旧 env `GGML_VK_VRAM_LIMIT_MIB` 已并进来。
 - 电源：「平衡」方案 + AC 供电（`bench/env/power.txt` 记 GUID），dGPU 上不得有其它推理进程，
   `-lm none` 还要求至少 22 GiB 空闲 RAM。脚本会先检查这三条，不合格直接停。
 
@@ -46,13 +47,23 @@ llama-cli -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on \
 
 | 维度 | 怎么造出来 | 语义 |
 |---|---|---|
-| VRAM 4G / 6G / 8G | `GGML_VK_VRAM_LIMIT_MIB=4096` / `6144` / 不设（8176） | 设备初始化时一次性 hold back「当前可用 - 目标值」的 device-local 内存。`VK_EXT_memory_budget` 按进程计数，所以 `llama-fit-params`、MoE bank 规划器、后续每次分配看到的都是缩小后的预算 |
+| VRAM 4G / 6G / 8G | `--store-vram-mib 4096` / `6144` / 8176 | **整机 VRAM 总预算**（dense 权重 + 专家 bank + KV + compute + staging）。store 初始化时把预算之外的部分 hold back，日志出现 `VRAM limited to ...`；依赖 memory budget 扩展，集显不生效。旧 env `GGML_VK_VRAM_LIMIT_MIB` 已并进这一个参数 |
+| RAM 总预算 | `--store-ram-mib N`（0 = 自动） | 整机 RAM 总预算，含 resident 权重、`-nkvo` 的 KV、staging 与 mmap 页的驻留采样值 |
 | RAM 充足 / 不足 | `-lm none`（resident）/ `-lm mmap`（或 `LLAMA_AUTO_RESIDENT=0`） | resident 门槛是 `n_bytes x 1.25 + 1 GiB`，20.2 GiB 模型要约 26.3 GiB 空闲；不足时 AUTO 自动退回 mmap，而 mmap 下 bank 与预取被守卫强制为 0 |
+
+三个预算（vram / ram / ssd）都是**整机总预算**，不是 store 的私有份额：预算 = 对象占用（专家 + KV 页）
++ 申报占用（dense / compute / staging）。store 只接管前两类，其他分配**路径不改**但必须申报，
+验证口径见 `THREE-TIER.md` F12 第 7 节。同一条臂要写明手设了什么、生效了多少，
+`used = peak - held` 仍按第 3 节口径算。
 
 已知边界：`GGML_VK_VRAM_LIMIT_MIB` 对 UMA（集显）不生效；**设备初始化之前的查询仍会看到完整预算**
 （`ggml_backend_dev_memory` 本身不创建设备），所以顺序敏感的调用要确认日志里已经出现 `VRAM limited to ...`。
 用 `bench/tools/vklimit-probe.cpp` 可以在不加载模型的情况下核对某个档的报告值。
 设备不支持 memory budget 扩展时只缩真实容量、不改报告值。
+
+迁移期（M1 之前）：`run-matrix.sh` 里 `-T` 仍传旧 env `GGML_VK_VRAM_LIMIT_MIB`。
+M1 落地时同步改成传 `--store-vram-mib`，判据仍是日志里的 `VRAM limited to ...`，
+两者数值必须一样（6144 -> 6142.9、4096 -> 4094.9）。
 
 2026-10-23 实测（`a44e13e08` + 工作区，桌面占用后的空闲 7378.8 MiB）：不设 = 7378.8；
 `=6144` -> hold back 1234.8 MiB，init 后报 **6142.9**；`=4096` -> hold back 3282.8 MiB，init 后报 **4094.9**；
@@ -64,22 +75,33 @@ Vulkan0（680M，UMA）两次都是 22842.2 MiB，不受影响。
 `-T` 显存档 / `-C` ctx / `-B` bank / `-K` KV 在 GPU / `-L` load 模式 / `-r` 重复 / `-E` 附加 env /
 `-a` 臂名 / `-A` 该臂的附加 CLI 参数）：
 
-`arm | tier | run | load | ctx | KV | bank | ncmoe | PP t/s | TG t/s | VRAM peak | held | VRAM used | RAM peak | reallocs | hit % | host blk | gather MiB | status`
+`arm | vram | run | load | ctx | KV | bank | ncmoe | PP t/s | TG t/s | VRAM peak | held | VRAM used | RAM peak | reallocs | hit % | host blk | gather MiB | status`
 
-- `arm` 是 `-a` 给的名字，跨臂比较只看同一 `tier` 下的同名行。
+- `arm` 是 `-a` 给的名字，跨臂比较只看同一 `vram` 下的同名行。
+  `vram` 是**档位**（`--store-vram-mib` 的生效值，4096 / 6144 / 8176），不是 `llama-store` 的三层；
+  store 的分层命中看 `store_hits_by_tier`（vram / ram / ssd），两者不要混读。
 - `host blk` = 落在 host 的 K/V 块数（分页臂的容量指标，对应日志 `K/V block N placed on the host`）；
   `gather MiB` = 分页 prefill 稠密工作区长到的最大值，连续布局恒为 0。
   `gather MiB` 只在 `--kv-page` 下非零，`--kv-gather-mib 0` 是它的对照。
 
 - `VRAM peak` 取**每进程独占**（`\GPU Process Memory(pid_<pid>*)\Dedicated Usage` 的峰值），
   设备总量 8176 MiB 里桌面已占约 0.5-1.4 GiB，看设备总量会误判。
-- `held` 是 `GGML_VK_VRAM_LIMIT_MIB` 自己 hold back 的那块，它也计入进程独占峰值，
+- `held` 是 `--store-vram-mib` 自己 hold back 的那块（旧 env `GGML_VK_VRAM_LIMIT_MIB` 的同义物，已并进来），它也计入进程独占峰值，
   所以真实足迹看 `used = peak - held`。设定值高于当时空闲时不会 hold back
   （本机当时空闲 7378.8 MiB，所以 `8176` 档等价于"不限"）。
 - `status` 必须是 `ok`。出现 `abort` / `vram-oom` 是缺陷，不是"配置不对"，要当成待修项记进 `DECISIONS.md`。
 - 改了注意力图、分块、KV 或任何数值路径的轮次，必须附质量门的读数（`bash bench/tools/quality-gate.sh`，
   输出 `PPL | mean KLD | same top p | PASS/FAIL`）。它不在矩阵脚本里，因为要读 2 GB 的 logits 基线。
 - 同档同配置的臂之间比收益；跨档、跨电源态的数字不可直接比。
+- F12 子系统落地后的臂还要报 `store_sync_waits` / `store_sync_wait_ms` / `store_prefetch_wasted` /
+  `store_hits_by_tier`（vram/ram/ssd）/ `store_evict_deferred` / `store_inflight_pins` /
+  `store_ssd_sync_rejected` / `store_pool_cancel` / `store_split`（定义见 `THREE-TIER.md` F12 第 10 节）。
+- 调度侧的臂（`THREE-TIER.md` F13 S2 之后）还要报 `skp_splits` / `skp_copies` / `skp_cpy_sync`；
+  这三个数与 `GGML_SCHED_TRACE=1` 的原始行必须能对上，对不上算测量错误。
+- 落地 `llama-trace` 后，所有计数走它的一次结构化 dump，不再靠 `summarize_perf.py` 猜 key
+  （未结项 21 就是猜错的后果）。
+- 表之外必须附一段白话总结（改了什么、快慢多少、为什么、下一步），术语用类比带过；
+  通俗化不得省略口径与 `status`，风格要求见 `AGENTS.md` 的"回复风格"。
 - `THREE-TIER.md` 第 4 节的 P0 归因（F7 / F8）除上表外还要报四项，它们不在现成的矩阵列里：
   每 eval 的 `splits`（`GGML_SCHED_TRACE=1`）、日志里的 `RS buffer size`、
   `-nkvo` 下长跨距时**设备** compute buffer 的增量（`GGML_VK_MEMORY_LOGGER`）、
@@ -113,9 +135,10 @@ Vulkan0（680M，UMA）两次都是 22842.2 MiB，不受影响。
 14. 不带 `-v` 时这个 fork 的 INFO 日志（`common_moe_plan_impl`、`sched_graph_realloc`、`hit rate`、`VRAM limited`）
     一条都不出，所以 `held`/`reallocs`/`hit` 这几列必须有 `-v`。
 15. **`bash` 必须是 Git Bash，不能是 WSL 的 `/usr/bin/bash`**。2026-10-23 用 WSL bash 跑 `run-matrix.sh` 时：
-    `GGML_VK_VRAM_LIMIT_MIB` 没有传给 interop 起来的 `.exe`（日志里没有 `VRAM limited`，三档 bank 完全一样），
+    旧 env `GGML_VK_VRAM_LIMIT_MIB` 没有传给 interop 起来的 `.exe`（日志里没有 `VRAM limited`，三档 bank 完全一样），
     用 Windows pid 采显存的采样也全为 0（`peak`/`used`/`RAM` 列都是 0），只有 PP/TG 是"不限档"的真实读数。
-    判据：日志里必须出现 `VRAM limited to ...`，否则整批 `tier` 列作废。用
+    判据：日志里必须出现 `VRAM limited to ...`，否则整批档位列作废。换成 CLI 参数（`--store-vram-mib`）后
+    这个漏传不会再发生，但"档位没生效"的判据仍要照查。用
     `"C:\Program Files\Git\bin\bash.exe" -c ...` 启动；Git Bash 的 `PATH` 以 `/mingw64/bin` 开头且没有 `/mnt/`，
     WSL 的 `PATH` 以 `/usr/local/sbin` 开头并带 `/mnt/c/...`，一眼可辨。
 16. **RAM 刚被腾出来时，`-lm none` 的失败长得像显存缺陷**：2026-10-24 在用户刚结束一个 19 GiB 的 chat 进程后
