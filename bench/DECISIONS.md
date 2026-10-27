@@ -81,6 +81,20 @@
     0.3 的 8176 臂 bank 1481 MiB = 406 slots/组，实际是关的（`prefetch needs 512 slots per group`），
     当时文档写"预取打开"作废；0.4 的 cap 256 之后才是 791 slots/组、真的打开。
     以后引用预取状态必须以 cache 的 `prefetch needs ...` 行与 `splits` 为准，不读规划器那一句。
+    **2026-10-27 已修**（判决 20）：判据搬进规划器，按 group 算 1860 MiB，与 cache 侧一致。
+20. **6 GiB 档的瓶颈是预算归属，不是容量**（2026-10-27，`RESULTS.md` 0.5 A）：
+    `margins` 从固定 1024 改成 `max(256, min(margins, free/8))` 后，6144 档 bank 1644 -> 1908 MiB，
+    跨过 per-group 预取门槛 1860 MiB，hit 14.6% -> 55.1%、splits 114 -> 42 量级，
+    **PP 393.9 -> 509.5（+29.3%）、TG 12.35 -> 15.8（+28.3%）**，臂内方差 < 1%。
+    8176 档中性（只多 110 MiB，预取本来已开）；4096 档见判决 21。开关 `--fit-plan`（默认 1）。
+21. **小 bank 是负优化，必须设地板**（2026-10-27，`RESULTS.md` 0.5 C）：
+    4096 档在 margins 缩放后得到 116 MiB 的 bank（64 slots），hit 0.0%、TG 12.4 -> 10.3（-17%），
+    因为每层多了一次 lookup split 却没有任何命中。地板取 `n_expert_used * per_expert * n_layer_expert / 4`（145 MiB）。
+    所以"4 GiB 档 bank 非零可达"要成立，必须先腾出 500 MiB 以上（margins 地板 256 + 未归因 compute 464 是仅有的两块）。
+22. **方阵跨度的注意力留在 FA 是对的**（2026-10-27，`RESULTS.md` 0.5 读数 4）：
+    `n_kv == n_q`（一个 prompt 的第一个 ubatch）换到 chunked matmul 后 total +2.5-5%、SOFT_MAX +37-72 ms、PP 更低。
+    FA 在 hsk 256 上 Br=8 要重读 K/V 256 遍，但这一档每层 K/V 只有 2 MB，落在 Infinity Cache 里；
+    matmul 路径的 score 缓冲有 4 遍物化往返，反而更贵。`LLAMA_FA_SPAN_SQUARE` 默认关。
 
 ## 3. 已证伪清单（勿重做）
 
@@ -116,6 +130,8 @@
 | 全 barrier 关闭（racy） | +21% TG，是 barrier 优化的上界，不是收益 |
 | RDNA2 上的 cooperative matrix | 驱动侧显式只放行 RDNA3/RDNA4，cm2 是 NV 专属 |
 | FA decode 的 split-K 与 block_cols 调参 | auto 28 是局部最优（438 us），4/8/14/32/42/56/224 全更慢；bc64 无差异 |
+| 方阵跨度（`n_kv == n_q`）改走 chunked matmul | total +2.5-5%、SOFT_MAX +37-72 ms、PP 更低：2 MB/层的 K/V 在 Infinity Cache 里，256 次重读比重物化 score 便宜（`RESULTS.md` 0.5 读数 4） |
+| 按真实每专家行数把 id GEMM 的 tile 从 `bn=32` 换成 `bn=64` | 探针实测分布 `mean 64.3`、分桶 `10/10/60/91/59/25`（`RESULTS.md` 0.6 D）：tile 数 589->364 省约 0.6 ms 的 A 重读，但填充行数 18,848->23,296 多约 1.6 ms 计算，**净负**。`n_sel` 被 821 个 slot 摊薄是真，但它不是这 3.58 TF 缺口的来源 |
 | `test-backend-ops perf FLASH_ATTN_EXT` 当 decode 基线 | 1717 us 对 in-situ 445 us（kv_view 非连续） |
 | B1 lazy 专家单独做 | NO-GO：`TENSOR_READ_LAZY` 对 `ffn_*_exps` 无调用点，`--lazy-mode on` 等价 mmap；mmap+cache 5.8/5.2 对 mmap 无 cache 18.0/10.2 |
 | SSD 进 decode 关键路径 | 0.81 GB/s x 206 MiB/token = 258 ms → 3.9 t/s |
@@ -130,7 +146,7 @@
 | `LLAMA_MOE_PREFETCH_MIN_TOKENS` / `_MAX_FULL` / `_TIME` / `_DEBUG` | 512 / 4 / - | 门槛与诊断 | 诊断不影响性能 |
 | `LLAMA_MOE_STAGE_IDS` | 开 | ids 回读并入产生它的 split | 关：tg32 29.08 → 27.84，h2d 2.3 → 4.3 ms/token |
 | `LLAMA_FA_LONG_KV_MIB` | 1536 | 长 KV 走 matmul 判据的 score 缓冲上限，0 = 关 | 关：pp8192 187 → 293.9；10k@16K 上开 = PP +24% |
-| `GGML_VK_Q6K_BK2` | 开 | AMD q6_K dense l-tile BK_STEP=2 | 两向皆负，**建议默认关**（保留前提：MUL_MAT 2275/2275） |
+| `GGML_VK_Q6K_BK2` | **不在树里**（2026-10-27 复核：HEAD `44bd79305` 与工作区的 `git grep` 都只命中本文档与 `RESULTS.md`，源码 0 处） | 原记：AMD q6_K dense l-tile BK_STEP=2 | 原记的"两向皆负，**建议默认关**"**无法复现也无法回归**：代码里没有这个开关。`RESULTS.md` 那行"关 `_bk2` -> pp512 417.1 对 262.9"要么按 BK_STEP 的真实实现位置重测，要么标作废 |
 | `LLAMA_MOE_DEFER_UPLOAD` + `GGML_VK_DEFERRED_COPIES` | 关 | down 的 miss 走第二条 transfer 时间线 | +1.5% tg32 |
 | `--moe-hybrid`（cparam） | 关，且 `llama-context.cpp` 里硬置 false | 图内 CPU 算 miss | 6.1 对 15.9，负优化 |
 | `LLAMA_MOE_HYBRID_EXEC` / `_T` / `_POLL` | 关 / 1 / - | 脱离调度器的常驻 worker 执行器 | 18.26 对 21.24 |
@@ -141,9 +157,14 @@
 | `GGML_VK_VRAM_LIMIT_MIB` | 未设 | **显存档位模拟**，见 `README.md` 第 2 节 | 2026-10-23 报告值已验证；各档性能未测 |
 | `-kvg` / `--kv-grow` | **-1（auto）** | K/V 初始 cells：-1 = 按工作集增长（上限 `n_ctx`，设备失败回退 host）、0 = 一次分配 `n_ctx`、>0 = 指定初始 cells | 256K+10K：PP 178.5 -> 477、TG 6.4 -> 13.8、RAM 峰值 -7.2 GiB；`0` 时 PP 239.4（`RESULTS.md` 0.3） |
 | `-fac` / `--fa-chunk-mib` | **256** | 长跨距 prefill 注意力每块 score 的上限；query 维按预算切块，0 = 整段一块（旧行为）。规划器的 score 预留同步取这个值 | 8176 档：0 -> PP 458、64 -> 657、128 -> 673、**256 -> 680**、512 -> 627（`RESULTS.md` 0.4） |
+| `--fit-plan N` / `LLAMA_FIT_PLAN` | **1** | 内存规划器规则。1 = margins 随档缩放（`max(256, min(margins, free/8))`）、score 预留跟着注意力放置（`offload_kqv`）、预取环按 expert group 判、145 MiB 小 bank 地板；0 = 旧规则（固定 1024 margin、score 无条件扣设备、930 MiB 总 bank 判据） | 6144 档 **PP +29.3% / TG +28.3%**（bank 1644 -> 1908，hit 14.6 -> 55.1%）；8176 中性；4096 加地板后与旧规则逐位相同（`RESULTS.md` 0.5） |
+| `GGML_VK_CONCAT_FAST` | **开** | CONCAT 在 `dim==0` 且三方 `is_contiguous_rows`、非量化、unit 2/4/8 时走"一 WG 一行、两段平铺"的快路径，删掉每 4 B 三次 idiv；0 = 原标量路径 | CONCAT 合计 268 -> 226 ms（perf logger，-16%），端到端 -1.4% eval；`test-backend-ops -o CONCAT` 198/198、质量门 PASS（`RESULTS.md` 0.5 读数 5） |
+| `LLAMA_FA_SPAN_SQUARE` | **关** | 1 = 方阵跨度（`n_kv == n_q`）也走 chunked matmul，而不是留给 FA | **负**：total +2.5-5%、SOFT_MAX +37-72 ms（`RESULTS.md` 0.5 读数 4、判决 22）；保留只为复核 |
 | `--kv-page` / `--kv-block` / `--no-kv-page` / `--kv-page-auto`（**M1/M2b/L1 已进树**，见 `THREE-TIER.md` F10/F11） | **off**；auto 需显式 `--kv-page-auto auto`；`--kv-block` 2048 | K/V 改为固定大小块 + 块表：扩容零拷贝、峰值 = 1 块、块级设备/host 放置。auto 由 `common/fit.cpp` 判决：扣掉 score 预留后设备没有余量就开分页，`-nkvo` 下恒关 | M1（CPU 内核）逐位相同；**M2b 设备路径已打开并验收**（`RESULTS.md` 6.4）：PPL 2.1676 对 2.1676、4535 token 逐字相同、质量门 KLD -0.000000 / top-p 100%、FA 5332/5332、SET_ROWS 319/319、`ctest` 33/33。三档矩阵见 `RESULTS.md` 6.5；10K prompt 的输出一致性未过（第 6 节第 17 条） |
 | `--kv-gather-mib` / `LLAMA_ARG_KV_GATHER_MIB`（F11 L1） | **256**；0 = 关 | 分页 prefill 的稠密 K/V 工作区上限：长跨距注意力先把块 gather 进工作区，再走 `-fac` 的 chunked matmul；按工作集 2 倍增长，失败退回分页 FA 并计数 | 正确性：gather 与连续布局逐字节相同（`test-kv-page`，CPU+Vulkan）；10K prompt 下分页与连续布局的输出逐字相同（`RESULTS.md` 6.6）。目标口径 PP（r=2 均值）：6144 档 378.9 对连续 385.6、4096 档 360.6 对 379.5；`--kv-gather-mib 0` 是 311.6 / 307.6（`RESULTS.md` 6.5） |
-| `GGML_SCHED_TRACE` / `GGML_MOE_COPY_TRACE` / `GGML_VK_TIME_COPIES` / `GGML_VK_MEMORY_LOGGER` / `GGML_VK_PERF_LOGGER` | 关 | 诊断；PERF_LOGGER 拖慢 decode 2.6x | 只看占比 |
+| `LLAMA_MOE_IDS_TRACE` | 未设（关） | 探针：在 slot lookup 处回读 ids，按 bank slot 打印每层的路由分布（`touched/mean/max/分桶`）。**会强制一次整设备同步**，只用于测量分布 | 已测出 prefill 真实分布 `touched 252-256 mean 64.3 max 322-734`（`RESULTS.md` 0.6 D）；带它跑 PP 502.8 对不带 502.4 |
+| `GGML_VK_ID_TILE_TRACE` | 未设（关） | 探针：每个 MUL_MAT_ID 打印 `m/n/k/n_as/n_sel/bn/max_tiles`，即 tile 选择器按平均行数选完的结果 | bank 路径 `n_as=821 -> n_sel=20 -> bn=32`，非 bank `n_as=256 -> n_sel=64 -> bn=64`（`RESULTS.md` 0.6 D） |
+| `GGML_SCHED_TRACE` / `GGML_MOE_COPY_TRACE` / `GGML_VK_TIME_COPIES` / `GGML_VK_MEMORY_LOGGER` / `GGML_VK_PERF_LOGGER` | 关 | 诊断；PERF_LOGGER 拖慢 decode 端到端约 2.6x（这是**端到端**系数，不是每个 kernel 的系数：大 prefill kernel 的读数接近真值） | 看份额要用 `bench/tools/summarize_perf.py <log> --agg`；按精确 key 求和会漏掉所有带形状后缀的 GEMM/FA 行（见未结项 21） |
 | `GGML_VK_FA_TRACE` | 未设 | 每个不同的 FA 形状打一行（path/Br/Bc/D_split/sparse/dequant_kv），F10 M0b 用它定案 | 诊断，只打几种形状 |
 | `GGML_SCHED_HW_SIGNAL` / `_HW_PIPELINE` / `_HW_NOWAIT`、`GGML_MOE_CACHE_MAX_FULL` / `_LRU_DIV`、`LLAMA_ROUTING_DIAG` | 已回退，不在树里 | 见第 3 节 | - |
 
@@ -177,6 +198,23 @@
 
 优先级按 `THREE-TIER.md` 第 4 节：P0 = 本口径跑通与解耦，P1 = 同配置最优，P2 = 跑更大模型。
 
+**2026-10-27 复核后的执行顺序**（编号不重排，避免打乱本节内部"第 N 条"的交叉引用；来源
+`.research/review-20261027/README.md` 第 4/5 节）：
+
+| 序 | 事项 | 本节条目 |
+|---|---|---|
+| 1 | 补一条 256K + `GGML_SCHED_TRACE=1` 的握手实测，替掉借用的 32K/2026-10-20 锚点；顺带给 session 级台阶定性 | 第 20 条 |
+| 2 | ~~修 PERF_LOGGER 的 GEMM/FA 行~~ 已证为脚本误判并修好（`--agg`）；改用新排名：**prefill 口径 MUL_MAT 39.1% + MUL_MAT_ID 31.7%** | 第 21 条（已关闭） |
+| 3 | 去掉每层整设备 drain：单 backend 的 fence ring，或把 ids 回读改成显式 timeline 等待 | 第 19 条 |
+| 4 | ~~`:1910` 改回退 + 计数~~ **已关闭**（2026-10-27，`RESULTS.md` 0.6 A/B）；F1 剩下的 4 处 abort 转成第 1 条的尾巴 | 第 1 条（F1） |
+| 5 | 算子轴改靶：id GEMM 的 tile 宽度已按真实分布算成净负（第 3 节），现在排第一的是 **dense MUL_MAT 39.1%** 里的 q6_K 段（`m=8192 n=2048 k=2048` 单 key 4.7%，3.6 TF 对 q4_K 6.3-6.6 TF） | 第 9 条 |
+| 6 | 464 MiB 未归因的设备 compute（4096 档 bank 要非零的唯一剩余来源） | 第 15 条 |
+| 7 | 补 PP 份额账缺的 281 ms，否则不能用"差 964 ms"排 ROI | 第 22 条 |
+| 8 | Vulkan `MUL_MAT_ID_MASK`（TG 破 27 t/s 平台的唯一路径） | 本节没有，见 `THREE-TIER.md` F4 |
+
+`--fit-plan 1`（判决 20）已经把原顺序里"预算归属"那一批（F3 与 F8 的归属腿）做完并实测，所以本表不再列；
+F7 状态解耦、F9 有界 pinned 窗口仍按 `THREE-TIER.md` 第 4 节的位置。
+
 1. **P0，F1**：目标工况当前跑不通。8 GiB 可见 + `256K ctx + -nkvo` + 规划器 bank 时，第一个 prefill
    ubatch 在 layer 1 抛 `llama-moe-cache.cpp:1910` 的分片不变量 abort（6144 档在 layer 0 同样复现）。
    **2026-10-23 补充**：32K + `-nkvo` + `--moe-cache-mib 1719` 同样在 layer 1 抛，所以触发条件是
@@ -190,6 +228,11 @@
    仍失败则禁用 worker 并上报可恢复错误；`:128` 属映射不变量故障，按 `:154` 的前置条件它应不可达。
    另有一处读码发现要一起修：`src/llama-moe-cache.cpp:1562` 用 group 索引 `l.ig` 去索引 `devices`，
    单 GPU 多 group 时会取错 backend，bank 拆组会扩大暴露面。
+   **2026-10-27：`:1910` 这一处已关闭**（`RESULTS.md` 0.6 A/B）——`-nkvo` 且不在整层预取路径上时图上不再发
+   slot lookup（`src/llama-graph.cpp:2708`），ids 与 lookup 同侧时改成整层 ring 上传 + 计数（`-v` 里的
+   `llama_moe_cache: split fallbacks ...`）。原必崩配置（32K + `-nkvo` + `--moe-cache-mib 1719`）现在 `exit=0`
+   且输出连贯；目标工况 `split fallbacks = 0`，PP/TG/hit/bank 与 0.5 一致，`ctest` 33/33。
+   **F1 仍未结**：其余 4 处 `GGML_ABORT`（`:128`、`:2013`、`:2045`、`:1740`）与 `:1562` 的 group 索引错。
 2. **P0，F7**：`-nkvo` 同时把 GDN 状态（O(n_seq_max)，实测 62.81 MiB 常数，与 n_ctx 无关）和 KV（O(n_ctx)，256K 下 5120.00 MiB）
    丢到 host，30 个 recurrent 层的 `SSM_CONV` / `GATED_DELTA_NET` 与注意力子图一起被拖到 CPU
    （`src/llama-model.cpp:2904`/`:2915`/`:2918`；`src/llama-memory-hybrid.cpp:34-65`；
@@ -224,6 +267,8 @@
 7. repack 的 KLD != 0 未修，这是混合精度分层路线（唯一能改 TG 屋顶线的选项）的前置门。
 8. 独立小 draft 模型（需要同 tokenizer/vocab 且受 arch 裁剪限制）与 ReBAR/SAM 两项可行性筛查至今没做。
 9. q6_K dense 的真实缺口（1.4x）还没定位到 MMQ 的哪一段；GEMV 向量化已被判无空间。
+   **2026-10-27 更新**：定位手段没坏（第 21 条），新排名的 `MUL_MAT` 39.1% 里就含 q6_K 的
+   `m=8192 n=2048 k=2048` key（4.7%），可以直接用 `--agg` 的 top 精确 key 起手指。
 10. **F6 已关闭**（2026-10-23）：`tools/perplexity/` 从 git 历史恢复，`bench/tools/quality-gate.sh` 一条命令给出
     PPL 与 KLD（基线 PPL 5.798313、logits 基线 2.0 GB 在 `F:/LLM/kld/`），B2 用它验收过（`RESULTS.md` 7.1）。
     限制：10K 文本最多 `-c 4096`（要求 >= 2 x n_ctx tokens），质量门验证算法等价，不是 256K 数值。
@@ -269,15 +314,13 @@
     （`tools/server/server-context.cpp:3972`），压缩后必须补校验，否则静默漏历史；
     (c) 只留洞不降 `n_kv`（`src/llama-kv-cache.cpp:1494-1508`），必须借块表压缩 cell 编号，否则 PP/TG 都不省。
     压缩改数值，验收走已落地的 F6 质量门。
-14. **P1，F3 现在是 6144 档的钥匙**：B2 之后这一档 bank 1644 MiB = 451 slots/组，双环要 512，
-    差 61 slots（约 220 MiB）。两条候选：规划器在决定 bank 时先把双环预留算进去（优先保预取，牺牲 LRU slots），
-    或者把"每组 2 x n_expert"的门槛改成分块层预取 / 允许 1 环 + 同步上传。
-    **已量化收益**（`RESULTS.md` 0.4 读数 5）：同档强给 `--moe-cache-mib 1920` -> PP 490 -> 678（+38%）、
-    TG 14.5 -> 19.2、hit 14.6% -> 55.2%、splits 114 -> 42、used 5161 MiB（余约 1 GiB），`status = ok`。
-    所以这条不是"要不要"，而是"怎么让规划器自己给出 1920"。
-15. **P1，4096 档 bank 仍是 0**：`-fac 256` 之后 score 预留只有 256 MiB，surplus 仍然不够（`RESULTS.md` 0.4 读数 6）。
-    这一档要么论证"0 就是最优"，要么继续查设备 compute 的其它归属（0.2 表 A 的 +1134 MiB 已在 A 里按工作集收掉，
-    剩下的固定项还没拆）。
+14. **P1，F3 已关闭**（2026-10-27）：6144 档缺的 61 slots/组不再靠强给 `--moe-cache-mib 1920`，
+    而是由 `--fit-plan 1` 的 margins 缩放自己给到 1908 MiB（判决 20、`RESULTS.md` 0.5 A）。
+    实测方向与 0.4 的前瞻臂一致（PP 393.9 -> 509.5、TG 12.35 -> 15.8，同 session 配对）。
+15. **P1，4096 档 bank 仍是 0，且 116 MiB 量级已证负**（2026-10-27 更新）：`-fac 256` 之后 score 预留 256 MiB，
+    margins 缩放再给 512 MiB，surplus 只到 372 MiB，减去 256 MiB slack 得 116 MiB = 64 slots -> hit 0%、TG -17%
+    （`RESULTS.md` 0.5 C），所以加了 145 MiB 地板把它归零。要继续推进这一档，必须再腾出 500 MiB 以上：
+    候选只剩 margins 地板（256 MiB）与未归因的 464 MiB compute（`RESULTS.md` 0.4 与 0.3 同 n_kv 的 720 MiB 差值）。
 16. **`--kv-page-auto` 已落地，默认仍 off**（2026-10-24）：`common_params.kv_page` 是三态（`-1` auto / `0` / `1`，默认 0），
     `common_moe_plan` 新增 `kv_page` 与 `kv_init_bytes`，判据是 `surplus - fa_score`（规划器给 bank 的那笔余量）
     是否为负，且要求 `offload_kqv`（`-nkvo` 下恒关）。日志两行：
@@ -295,6 +338,39 @@
     `--kv-gather-mib` 非零时不同，`--kv-gather-mib 0` 时与连续布局逐字相同，所以问题在
     `build_paged_dense` 对大于 2048 的块的假设上（未定位）。默认 2048 不受影响；ctor 在 `kv_block > 2048`
     时打 warning（`src/llama-kv-cache.cpp`）。要启用更大的块之前先补这条。
+
+19. **P1，去掉每层整设备 drain**（`.research/review-20261027/README.md` 2.1，2026-10-27 复核）：目标工况是单 GPU，
+    `pipeline_parallel` 恒 false 的唯一有效阻挡是 `cparams.moe_cache_size == 0`（`src/llama-context.cpp:600-606`，
+    注释即 "not supported by the MoE cache"）；多设备那条其实是满足的（`-ncmoe 41` 让专家权重留在 host，
+    日志 `llama_context: backend_ptrs.size() = 2`）。于是 `n_copies = 1`、events 全 NULL
+    （`ggml/src/ggml-backend.cpp:2174`、`:2207-2211`），每次等待都落到 `ggml_backend_synchronize`
+    （`:1909-1914`、`:1920-1925`）。这与第 3 节那五项"调度重排"不是一件事：那五项在 drain 模型内搬时间，本条要去掉 drain。
+    两条路径：给单 backend 建 fence ring，或把 ids 回读改成显式 timeline 等待。
+    **必须一起改的三处协议**：post-split 回调只在 `!parallel` 时注册（`src/llama-context.cpp:836-840`）；
+    ids staging 的可见性依赖"调度器在下一个 copy 回调前等过 backend"（`src/llama-moe-cache.cpp:1524-1525`）；
+    未 staging 的分支是无条件 `get_async + synchronize`（`:1928-1929`）。
+    收益量级只有 32K 口径的 `cpy_sync 12.3 ms/token`（`RESULTS.md:448`），256K 口径未测，要在第 20 条之后重估。
+    **2026-10-27 后端原语已落地**（`RESULTS.md` 0.6 E，F12 的第一步）：`ggml_backend_vk_prefetch_submit_seq` 返回批次
+    序号、`ggml_backend_vk_prefetch_wait_seq(seq)` 只等到该序号，命令缓冲按序号排队回收，多批可同时在飞；
+    实测等小批 2.64 ms 时 1 GiB 那批仍在飞，而等最新是 76.51 ms。**仍未结**：调度器还没有用它——
+    `ggml_backend_sched` 在 `n_copies == 1` 时仍走整设备 fence（`:1909-1914`、`:1920-1925`），
+    MoE cache 的 ids 回读也仍带一次 `ggml_backend_synchronize`（`src/llama-moe-cache.cpp:1928-1929`）。
+    把这两处换成序号等待，才算真正去掉每层 drain。
+20. **P0，目标口径的调度读数缺失**（2026-10-27）：splits / copy / cpy_sync 三个数仍然只有 32K 口径
+    （`RESULTS.md` 3：2026-10-20、`09cacdfd8`、cache 6144、tg32、hit 60.9%），而统一工况是 256K + 10K + hit 57.6%。
+    要补：一条 `256K + GGML_SCHED_TRACE=1` 的 run，跑批器必报列加 `session id` 与 `n_kv`（`bench/README.md` 第 3 节）。
+    同时给 session 级台阶定性：`RESULTS.md` 0.5 的 8176 档是 511.7，0.4 是 679.5（低约 25%，同臂 r1/r2 只差 1%）。
+    **在定性之前，任何 <15% 的收益都不能验收**（0.5 读数 6 已禁止两节混算）。
+21. **已关闭（2026-10-27）：所谓"PERF_LOGGER 不输出 GEMM 与 FA 行"是汇总脚本的误判，不是 profiler 坏了**。
+    `GGML_VK_PERF_LOGGER` 的 key 带形状后缀（`MUL_MAT_VEC q4_K m=2048 n=2 k=4096`、`MUL_MAT_ID ... n_expert=821 batch=2048`、
+    `FLASH_ATTN_EXT ...`），按"纯 op 名"过滤求和会把 GEMM/FA 整类丢掉。已给 `bench/tools/summarize_perf.py` 加
+    `--agg`（按基名聚合 + top 精确 key）。用 `bench/raw/p0-20261027/concat/fast1-1.err`（目标工况 prefill 口径）重算：
+    **MUL_MAT 39.1% + MUL_MAT_ID 31.7% = 70.8%**，单一最大 key `MUL_MAT_ID q4_K m=512 n=8 k=2048 n_expert=821 batch=2048`
+    就占 14.6%（反推 3.58 TF，与 in-situ 3.5-3.7 TF 吻合），FA 只有 3.9%。
+    推论：算子轴的验收手段一直是好的，第 8/9 条（id GEMM tile、q6_K 缺口）**没有被挡住**；
+    而 PP 的份额账要按这份新排名重写，第 3/4 节那批 FA 为主的锚点已过期（判决 22 同向）。
+22. **P1，PP 份额账不平**（2026-10-27）：`RESULTS.md` 4 的每 ubatch 份额按行相加是 2733 ms，表合计写 3014 ms
+    （= 实测 `2048/680`），**缺 281 ms 未列项**。补齐之前，"对 2.05 s 的 PP1000 门槛差 964 ms"不能用来排 ROI。
 
 新增行为（F7 的 offload 开关、F8 的分块开关）落地时必须进第 4 节开关表，默认值由目标口径实测决定；
 `-kvg/--kv-grow` 已按此规则登记（默认 -1，实测见 `RESULTS.md` 0.3）。

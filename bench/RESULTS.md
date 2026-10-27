@@ -263,6 +263,150 @@ K/V 读取与 softmax 范围也不变，只是把一次 1280 MiB 的 score 换�
    同批短深度回归对照（`llama-bench -p 512 -n 32 -r 3 --moe-cache-mib 3584`）：pp512 374.29 ± 0.36、
    tg32 25.68 ± 0.87，对 0.1 节的 376.42 / 25.53 无回归。
 
+### 0.5 规划器 v2（`--fit-plan 1`，默认）+ CONCAT 快路径（2026-10-27）
+
+代码改动（设计来源 `.research/review-20261027/`，四份文档只记读数）：
+
+1. `margins` 从固定 1024 MiB 改成 `max(256, min(margins, free/8))`（`common/fit.cpp`）。
+2. `fa_score` 只在注意力真的跑在设备上时才从设备 surplus 扣（判据 `offload_kqv`，同一文件）。
+3. 预取双环按 **expert group** 判：`bank >= 2 * expert_total / n_layers_of_that_group`。
+   本模型 2 组各 20 层 -> **1860 MiB**；旧式是拿总 bank 比 `2 * n_expert * per_expert` = 930 MiB（平均层字节）。
+   分组键是新增的 `llama_moe_geometry::expert_layout`（`src/llama-ext.h` / `src/llama-model.cpp`）。
+4. 小 bank 地板：`bank < n_expert_used * per_expert * n_layer_expert / 4`（本模型 145 MiB）时归零。
+5. CONCAT dim 0 行拷贝快路径（`GGML_VK_CONCAT_FAST`，默认开）：`concat.comp` + `ggml-vulkan.cpp`。
+6. `LLAMA_FA_SPAN_SQUARE`（默认**关**，已证伪，见读数 4）。
+
+口径：AGENTS 统一口径（`-c 262144 -ub 2048 -f prompt10k.txt -n 64 -ncmoe 41 -lm none`），`-K` = KV 驻设备（不加 `-nkvo`），
+「平衡」+ AC，dGPU 独占。**本轮全部结论来自同 session 配对或交替跑**，因为本 session 的 PP 在 4 次重复里从 487.7 掉到
+378.8（±15%），足以吃掉一次真实的 +10%；跨 session 更不可比（见读数 6）。
+
+**A. 6144 档，交替配对（r=1 x2，2026-10-27 10:2x）**
+
+| 臂 | PP t/s | TG t/s | bank MiB | hit % | prefetch |
+|---|---:|---:|---:|---:|---|
+| `--fit-plan 0`（旧规则）r1 | 394.5 | 12.3 | 1644 | 14.6 | 关 |
+| `--fit-plan 1`（v2）r1 | **510.1** | **15.7** | 1908 | 55.1 | 开 |
+| `--fit-plan 0` r2 | 393.3 | 12.4 | 1644 | 14.6 | 关 |
+| `--fit-plan 1` r2 | **508.8** | **15.9** | 1908 | 55.1 | 开 |
+
+**PP +29.3%、TG +28.3%，臂内方差 < 1%**。机制：margins 1024 -> 760 让 bank 从 1644 涨到 1908，
+跨过 cache 自己的 per-group 门槛（1860 MiB），预取从关变开。`THREE-TIER.md` F3 关闭。
+
+**B. 8176 档 A/B/A（同一 session，交替 4 次）**
+
+| 臂 | PP t/s | TG t/s |
+|---|---:|---:|
+| base | 487.7 | 13.7 |
+| v2 | 461.9 | 13.6 |
+| base | 403.7 | 13.4 |
+| v2 | 378.8 | 14.6 |
+
+同一臂的两点差 21%，臂间差在其内 -> 8176 判**中性**（v2 只多 110 MiB bank，预取两侧都已开）。
+
+**C. 4096 档与 bank 地板**
+
+| 臂 | bank MiB | PP t/s | TG t/s | hit % |
+|---|---:|---:|---:|---:|
+| base | 0 | 360.5 | 12.4 | - |
+| v2（加地板之前） | 116 | 359.9 | **10.3** | 0.0 |
+| v2（加地板之后） | 0 | 385.7 | 12.7 | - |
+| base（同批对照） | 0 | 385.2 | 12.7 | - |
+
+116 MiB = 64 slots 的 bank 只买到每层的 lookup split，一笔 hit 都没有 -> 地板规则成立；加地板后与 base 逐位相同。
+
+**D. 新默认的矩阵（`--fit-plan 1` 默认 + CONCAT 快路径默认开，3 档 x r=2，2026-10-27 10:3x）**
+
+| tier | run | bank | PP t/s | TG t/s | peak MiB | held MiB | used MiB | RAM peak MiB | reallocs | hit % | status |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 8176 | 1 | auto (2989) | **511.7** | **16.6** | 6231 | 0 | 6231 | 19482 | 2 | 58.7 | ok |
+| 8176 | 2 | auto (2989) | 511.7 | 16.5 | 6231 | 0 | 6231 | 19482 | 2 | 58.7 | ok |
+| 6144 | 1 | auto (1908) | 501.2 | 15.4 | 6385 | 1234.8 | 5150 | 19480 | 2 | 55.1 | ok |
+| 6144 | 2 | auto (1908) | 510.1 | 15.7 | 6385 | 1234.8 | 5150 | 19481 | 2 | 55.1 | ok |
+| 4096 | 1 | 0 | 385.1 | 12.0 | 6535 | 3282.8 | 3252 | 19485 | 1 | - | ok |
+| 4096 | 2 | 0 | 385.6 | 12.1 | 6535 | 3282.8 | 3252 | 19484 | 1 | - | ok |
+
+三档 `status = ok`，档内 r1/r2 差 <= 1.8%。
+
+读数：
+
+1. **6 GiB 档的钥匙一直是预算归属，不是容量**：同一块显存，1024 MiB 的固定 margin 就少 6 个 slot/组，
+   差 61 slots 正是 0.4 读数 5 里"前瞻臂强给 1920 才拿到 +38%"的那 61 个。现在规划器自己给出 1908。
+2. **预取是否打开必须按 cache 的 per-group 判据算**。旧式的 930 MiB 是平均层字节的两倍；两组各 20 层时真实需求
+   1860 MiB（0.1 的"若归属改对"表预告 1848，本轮实测落地）。
+3. **4 GiB 档在 116 MiB 量级上"bank 非零"是负优化**（TG -17%、hit 0%）。`DECISIONS.md` 未结项 15 里
+   "bank 非零在算术上可达"仍然成立，但要求腾出 500 MiB 以上（margins 地板 256 + 未归因 compute 464 是仅有的两块）。
+4. **方阵跨度（`n_kv == n_q`，一个 prompt 的第一个 ubatch）换到 chunked matmul 更慢**：
+   total 2947/3028 ms 对 2870/2888（perf logger 口径），SOFT_MAX 535 -> 572/607、MUL 396 -> 404/411、PP 也低。
+   机制：这一档每层 K/V 只有 2 MB，落在 Infinity Cache 里，FA 的 256 次重读比 score 缓冲的 4 遍物化便宜。
+   `LLAMA_FA_SPAN_SQUARE` 保留为开关，默认关（`DECISIONS.md` 第 3 节）。
+5. **CONCAT 快路径**：perf logger 口径 CONCAT 合计 282.2/253.5 -> 226.9/224.3 ms（**-16%**），
+   端到端约 -42 ms / 5 个 ubatch（-1.4% eval）。门禁：`test-backend-ops -o CONCAT -b Vulkan1` **198/198**、
+   `ctest` **33/33**、质量门 **PASS**（`mean KLD -0.000000`、`same top p 100.000%`）。
+   不是第 4 节那个 751 ms 的量级：那行是 2026-10-22、transpose 物化落地**之前**的读数。
+6. **本 session 的绝对 PP 比 0.4 那批低 25-30%**（8176: 511.7 对 679.5；6144: 505 对 490）。
+   同一臂的 r1/r2 差只有 1%，所以这不是噪声，是 session 级台阶（`0.4` 也记过 25% 的跨 session 漂移）。
+   **禁止**拿本节数字与 0.4 混算收益；本节的所有收益都是同 session 配对值。
+7. 本轮 profile 已复核，**"没有 GEMM 与 FA 行"是汇总脚本的误判**（2026-10-27）：按精确 key 分组时，
+   GEMM/FA 的 key 都带形状后缀（`MUL_MAT_VEC q4_K m=2048 n=2 k=4096`、`FLASH_ATTN_EXT ...`），被"只取纯 op 名"
+   的过滤整类丢掉。`bench/tools/summarize_perf.py <log> --agg` 现在按基名聚合，`concat/fast1-1.err`
+   （目标工况，`-n 8`，即 prefill 口径，653 张表）的真实份额是：
+   **MUL_MAT 39.1%、MUL_MAT_ID 31.7%**（合计 70.8%）、GATED_DELTA_NET 4.3%、FLASH_ATTN_EXT 3.9%、SOFT_MAX 3.0%、
+   CONT 2.9%、RMS_NORM_MUL 2.8%、MUL 2.1%、CONCAT 1.2%、MUL_MAT_VEC 1.1%。
+   最大的单一 key 是 `MUL_MAT_ID q4_K m=512 n=8 k=2048 n_expert=821 batch=2048` = **14.6%**（296 次，反推 3.58 TF，
+   与 4/5 节独立测到的 in-situ 3.5-3.7 TF 一致）。所以 "2.6x 放大" 是 decode 端到端的系数，不是每个 kernel 的系数，
+   大 kernel 的 logger 读数接近真值；FA 在本口径只占 3.9%，与判决 22 的方向一致。
+8. 数字来源：`bench/raw/p0-20261027/{base,v2,pl2,default,concat,fasq,aba}/`，脚本 `bench/raw/p0-20261027/*.sh`。
+
+### 0.6 红线 F1 的 `:1910` 降级 + id GEMM 的 tile 探针（2026-10-27）
+
+改动：`-nkvo`（注意力在宿主）且不在整层预取路径上时，图上不再发 slot lookup（`src/llama-graph.cpp:2708`）；
+`src/llama-moe-cache.cpp` 里"ids 与本 split 的 lookup 同侧"从 `GGML_ABORT` 改成走整层 ring 上传并计数。
+
+**A. 崩溃配置现在能跑**（`-c 32768 -nkvo --moe-cache-mib 1719 -ncmoe 41`）
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| 结果 | layer 1 `GGML_ABORT` | `exit=0`，输出连贯（`The user just said "hello"...`） |
+| PP / TG | 无读数 | 24.0 / 7.4 t/s（5 token 的 prompt，只作"能跑"的证据，不作性能数） |
+| 机制 | - | 日志 `prefetch needs 512 slots per group, group 0 has 472, disabled` -> `pf_batch` 恒假 -> 守卫生效，splits 287/278 |
+
+**B. 目标工况无回归**（8176 档、256K + 10K、`-ncmoe 41 -lm none`，r=1）：PP **502.4** / TG **17.1**、
+hit **58.74%**、bank **2986.17 MiB**、`split fallbacks = 0`，对 0.5 D 的 511.7 / 16.6 / 58.7% / 2989 MiB 同档同参。
+带探针那轮 502.8 / 16.0，说明 `LLAMA_MOE_IDS_TRACE` 那次回读对 PP 基本无扰。
+
+**C. 门禁**：`test-backend-ops -o MUL_MAT_ID -b CPU` / `-b Vulkan1`、`-o MUL_MAT_ID_MASK -b CPU`、
+`-o MUL_MAT -b Vulkan1` 全 OK；`ctest` **33/33**。
+
+**D. id GEMM 的 tile 探针（这次能定论）**
+
+真实路由分布（prefill，`ids 16384`，`slots 821`）：`touched 252-256`、**`mean 64.0-65.0`**、`max 322-734`，
+分桶 `<=8/<=16/<=32/<=64/<=128/>128` = `10/10/60/91/59/25`（layer 1）。
+选择器实际取到：`n_as=821 -> n_sel=20 -> bn=32, max_tiles=1332`；同一次运行的非 bank 路径是
+`n_as=256 -> n_sel=64 -> bn=64, max_tiles=511`。所以 `n_sel` 确实被 slot 数摊薄到真值的约 1/3.2。
+
+但按上面的分桶估（桶内取中值）：换成 `bn=64` 时每层 tile 数 589 -> 364（A 矩阵少读约 133 x 590 KB = 0.6 ms），
+代价是 tile 内填充 18,848 -> 23,296 行（多用 4,448 行 x 2x512x2048 = 9.5 GFLOP，约 1.6 ms）——**净负**。
+这与第 3 节"id GEMM 的 tile 参数已证伪"一致，并给出原因：3.58 TF 对 6.04 渐近的缺口不在 tile 宽度上。
+数字来源：`bench/raw/redline-20261027/{nkvo-fix,t1-clean,t2-trace}.{out,err}`。
+
+**E. 等待原语（F12 的第一步，2026-10-27）**：Vulkan 侧新增按序号的搬运等待
+（`ggml_backend_vk_prefetch_submit_seq` 返回批次序号、`_wait_seq(seq)` 只等到该序号；旧的 `prefetch_wait` 语义不变，
+等于等最新）。命令缓冲从"只留最后一批"改成按序号排队回收，所以多批能同时在飞。
+独立验证 `bench/tools/wait-seq.cpp`（先提 1 MiB 再提 1 GiB）：
+
+| 量 | 读数 | 说明 |
+|---|---:|---|
+| `wait_seq(小)` | **2.64 ms** | 1 GiB 那批仍在飞，没有被它拖住 |
+| `wait_seq(大)` | 72.39 ms | 1 GiB / 72.4 ms = **14.8 GB/s**，与第 5 节独立测的 H2D 14.2-14.3 GB/s 同口径 |
+| `wait(最新)` 对照 | 76.51 ms | 等全部，正是原来唯一能做的事 |
+| 数据校验 | 4/4 OK | 两批各自的载荷都对 |
+
+门禁与回归：`MUL_MAT_ID` CPU / `MUL_MAT_ID_MASK` CPU / `MUL_MAT_ID` Vulkan1 / `MUL_MAT` Vulkan1 /
+`FLASH_ATTN_EXT` Vulkan1 / `CONCAT` Vulkan1 **0 FAIL**；`ctest` **33/33**；
+统一工况（8176 档、256K + 10K）PP **506.7** / TG **17.2**，预取侧 `190 layers, 88350 MiB, 185 host waits, 0 fallbacks`
+与本节 B 的那轮逐字相同，记账改动没有影响现有调用方。
+探针第一次跑出的 `small-data MISMATCH` 是探针自身缺陷（x/y 的暂存复用了载荷缓冲），修正后通过。
+
 ## 1. 8 GiB 档 短上下文消融阶梯
 
 2026-10-23，`a44e13e08` + 工作区，构建 10:38，「平衡」+ AC，r=2，公共参数

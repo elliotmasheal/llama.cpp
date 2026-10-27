@@ -36,6 +36,8 @@ llama-cli -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on \
 - 长跨距注意力的 score 缓冲由 `-fac/--fa-chunk-mib`（默认 256）封顶，query 维按预算切块；`-fac 0` 是旧行为
   （整段一块，`RESULTS.md` 0.4 有五个 cap 的消融）。改这个值要同时看 bank 与 `reallocs`。
 - 不加 `--moe-cache-mib` 时由内存规划器（`common_moe_plan_get()`）自己算 bank，这就是"自适应 RAM 条件"。
+  规划器规则由 `--fit-plan`（默认 1）选：1 = margins 随档缩放、score 预留跟着注意力放置、预取环按 expert group 判；
+  0 = 旧规则，只用于 A/B（`RESULTS.md` 0.5）。`LLAMA_FIT_PLAN` 是同一开关的 env 形式。
 - 显存档位用 `GGML_VK_VRAM_LIMIT_MIB` 实现，见第 2 节。
 - 电源：「平衡」方案 + AC 供电（`bench/env/power.txt` 记 GUID），dGPU 上不得有其它推理进程，
   `-lm none` 还要求至少 22 GiB 空闲 RAM。脚本会先检查这三条，不合格直接停。
