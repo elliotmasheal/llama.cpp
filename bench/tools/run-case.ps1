@@ -9,6 +9,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Bin,      # llama-bench | llama-cli | test-backend-ops
     [Parameter(Mandatory = $true)][string]$Args,     # argument string (paths without spaces)
     [string]$RepoRoot   = "E:\fastLlama",
+    [string]$BinDir     = "",    # set to run another build, e.g. D:\Scoop\apps\llama.cpp-vulkan\current
     [string]$ResultsDir = "",
     [string]$Env        = "",
     [int]$IntervalMs    = 1000
@@ -53,7 +54,7 @@ $job = Start-Job -FilePath "$ScriptDir\monitor.ps1" -ArgumentList $csv, $Interva
 Start-Sleep -Milliseconds 800
 
 # --- run benchmark ---------------------------------------------------------
-$binPath = Join-Path $RepoRoot "build-vulkan\bin\$Bin.exe"
+if ($BinDir) { $binPath = Join-Path $BinDir "$Bin.exe" } else { $binPath = Join-Path $RepoRoot "build-vulkan\bin\$Bin.exe" }
 Write-Host "> $binPath $Args"
 $ErrorActionPreference = "Continue"
 if ($Env) {
@@ -90,6 +91,7 @@ if ($m.Count -gt 0) {
         "gpu_util_pct_max" = [math]::Round(($m | Measure-Object gpu_util_pct -Maximum).Maximum, 1)
         "gpu_ded_mb_peak"  = [math]::Round(($m | Measure-Object gpu_ded_mb -Maximum).Maximum, 0)
         "proc_ws_gb_peak"  = [math]::Round(($m | Measure-Object proc_ws_mb -Maximum).Maximum / 1024, 2)
+        "proc_gpu_mb_peak" = [math]::Round(($m | Measure-Object proc_gpu_mb -Maximum).Maximum, 0)
     }
 } else {
     $stat = @{ "wall_s" = $dur; "note" = "no samples" }

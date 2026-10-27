@@ -21,7 +21,7 @@ $counters = @(
 $totalMb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1MB, 0)
 $nproc   = [Environment]::ProcessorCount
 
-"t_ms,cpu_pct,mem_avail_mb,mem_used_mb,disk_read_mbs,disk_write_mbs,gpu_util_pct,gpu_ded_mb,gpu_shared_mb,proc_cpu_pct,proc_ws_mb" |
+"t_ms,cpu_pct,mem_avail_mb,mem_used_mb,disk_read_mbs,disk_write_mbs,gpu_util_pct,gpu_ded_mb,gpu_shared_mb,proc_cpu_pct,proc_ws_mb,proc_gpu_mb" |
     Set-Content -Encoding ascii $Out
 
 $stop = "$Out.stop"
@@ -57,11 +57,16 @@ while (-not (Test-Path $stop)) {
         $gded  = Sum-ByPath $cs "*gpu adapter memory*\dedicated usage"
         $gshr  = Sum-ByPath $cs "*gpu adapter memory*\shared usage"
 
-        $procCpu = 0.0; $procWs = 0.0
+        $procCpu = 0.0; $procWs = 0.0; $procGpu = 0.0
         $p = Get-Process | Where-Object { $_.ProcessName -like "$ProcName*" } |
                 Sort-Object WorkingSet64 -Descending | Select-Object -First 1
         if ($p) {
             $procWs = [math]::Round($p.WorkingSet64 / 1MB, 1)
+            # per-process VRAM: the adapter total also counts the desktop and any held-back budget
+            try {
+                $pg = Get-Counter -Counter "\GPU Process Memory(pid_$($p.Id)*)\Dedicated Usage" -MaxSamples 1 -ErrorAction Stop
+                $procGpu = [math]::Round((($pg.CounterSamples.CookedValue | Measure-Object -Sum).Sum / 1MB), 0)
+            } catch { $procGpu = 0.0 }
             $now = $sw.Elapsed.TotalSeconds
             $procCpu = [math]::Round((($p.CPU - $prevCpu) / ($now - $prevWall)) * 100.0 / $nproc, 1)
             $prevCpu = $p.CPU
@@ -70,8 +75,8 @@ while (-not (Test-Path $stop)) {
 
         $t = $sw.ElapsedMilliseconds
         $row = [string]::Format([Globalization.CultureInfo]::InvariantCulture,
-            "{0},{1:0.0},{2:0},{3:0},{4:0.0},{5:0.0},{6:0.0},{7:0},{8:0},{9:0.0},{10:0.0}",
-            $t, $cpu, $avail, ($totalMb - $avail), ($dr / 1MB), ($dw / 1MB), $gpu, ($gded / 1MB), ($gshr / 1MB), $procCpu, $procWs)
+            "{0},{1:0.0},{2:0},{3:0},{4:0.0},{5:0.0},{6:0.0},{7:0},{8:0},{9:0.0},{10:0.0},{11:0}",
+            $t, $cpu, $avail, ($totalMb - $avail), ($dr / 1MB), ($dw / 1MB), $gpu, ($gded / 1MB), ($gshr / 1MB), $procCpu, $procWs, $procGpu)
         Add-Content -Encoding ascii $Out $row
     } catch {
         # counters can briefly fail while the GPU is busy; skip the sample
