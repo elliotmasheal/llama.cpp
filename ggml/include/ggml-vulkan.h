@@ -30,6 +30,11 @@ GGML_BACKEND_API bool ggml_backend_vk_prefetch_tensor(ggml_backend_t backend, st
 GGML_BACKEND_API void ggml_backend_vk_prefetch_submit(ggml_backend_t backend);
 GGML_BACKEND_API void ggml_backend_vk_prefetch_wait(ggml_backend_t backend);
 
+// [F12 storage] the same timeline addressed by sequence: submit returns the number it signals, waiting one
+// number leaves the later batches in flight. prefetch_wait waits the newest, so existing callers are unchanged.
+GGML_BACKEND_API uint64_t ggml_backend_vk_prefetch_submit_seq(ggml_backend_t backend);
+GGML_BACKEND_API void ggml_backend_vk_prefetch_wait_seq(ggml_backend_t backend, uint64_t seq);
+
 // [F10 paged K/V] device address of a buffer, 0 when the device cannot expose one.
 // Resolved through ggml_backend_reg_get_proc_address, see ggml_backend_vk_reg_get_proc_address.
 GGML_BACKEND_API uint64_t ggml_backend_vk_buffer_get_device_address(ggml_backend_buffer_t buffer);

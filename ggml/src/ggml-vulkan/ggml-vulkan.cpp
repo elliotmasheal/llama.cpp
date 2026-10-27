@@ -13703,12 +13703,12 @@ bool ggml_backend_vk_prefetch_tensor(ggml_backend_t backend, ggml_tensor * tenso
     return true;
 }
 
-void ggml_backend_vk_prefetch_submit(ggml_backend_t backend) {
-    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+// record what has been queued as one batch on the prefetch timeline and return its sequence number, 0 if empty
+static uint64_t ggml_vk_prefetch_submit(ggml_backend_vk_context * ctx) {
     // the small copy that the compute of the layer does need goes first, then the prefetch reads behind it
     ggml_vk_submit_transfer_ctx(ctx);
     if (ctx->prefetch_ctx.expired()) {
-        return;
+        return 0;
     }
     vk_context cpy_ctx = ctx->prefetch_ctx.lock();
     vk_command_buffer * cmd_buffer = cpy_ctx->s != nullptr ? cpy_ctx->s->buffer : nullptr;
@@ -13719,26 +13719,47 @@ void ggml_backend_vk_prefetch_submit(ggml_backend_t backend) {
 
     ggml_vk_submit(cpy_ctx, {});
     ctx->prefetch_ctx.reset();
-    ctx->prefetch_cmd_buffer = cmd_buffer;
+    ctx->prefetch_inflight.push_back({ ctx->prefetch_semaphore.value, cmd_buffer });
+    return ctx->prefetch_semaphore.value;
+}
+
+void ggml_backend_vk_prefetch_submit(ggml_backend_t backend) {
+    ggml_vk_prefetch_submit((ggml_backend_vk_context *) backend->context);
+}
+
+uint64_t ggml_backend_vk_prefetch_submit_seq(ggml_backend_t backend) {
+    return ggml_vk_prefetch_submit((ggml_backend_vk_context *) backend->context);
+}
+
+// wait for one batch of the timeline: batches after seq stay in flight, so deliveries are taken in submit order
+void ggml_backend_vk_prefetch_wait_seq(ggml_backend_t backend, uint64_t seq) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (seq == 0 || seq > ctx->prefetch_semaphore.value) {
+        return;
+    }
+    const vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, ctx->prefetch_semaphore.s, seq};
+    VK_CHECK(ctx->device->device.waitSemaphores(swi, UINT64_MAX), "prefetch wait", ctx->device);
+    // the command buffers of the waited batches are done, they can go back to the pool
+    for (auto it = ctx->prefetch_inflight.begin(); it != ctx->prefetch_inflight.end();) {
+        if (it->first > seq) {
+            break;
+        }
+        if (it->second != nullptr) {
+            it->second->in_use = false;
+            it->second->buf.reset();
+        }
+        it = ctx->prefetch_inflight.erase(it);
+    }
+    // the next compute submission waits on the already signaled value: no stall, but it makes the
+    // transfer writes visible to the shaders that read them
+    ctx->prefetch_wait.s = ctx->prefetch_semaphore.s;
+    ctx->prefetch_wait.value = seq;
+    ctx->prefetch_wait_pending = true;
 }
 
 void ggml_backend_vk_prefetch_wait(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    if (ctx->prefetch_semaphore.value == 0) {
-        return;
-    }
-    const vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, ctx->prefetch_semaphore.s, ctx->prefetch_semaphore.value};
-    VK_CHECK(ctx->device->device.waitSemaphores(swi, UINT64_MAX), "prefetch wait", ctx->device);
-    // the command buffer of the batch is done, it can go back to the pool
-    if (ctx->prefetch_cmd_buffer != nullptr) {
-        ctx->prefetch_cmd_buffer->in_use = false;
-        ctx->prefetch_cmd_buffer->buf.reset();
-        ctx->prefetch_cmd_buffer = nullptr;
-    }
-    // the next compute submission waits on the already signaled value: no stall, but it makes the
-    // transfer writes visible to the shaders that read the layer
-    ctx->prefetch_wait = ctx->prefetch_semaphore;
-    ctx->prefetch_wait_pending = true;
+    ggml_backend_vk_prefetch_wait_seq(backend, ctx->prefetch_semaphore.value);
 }
 
 // paged K/V: the kernels address blocks by device address, so the cache has to ask the buffer
@@ -16790,6 +16811,8 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
         { "ggml_backend_vk_prefetch_tensor", (void *) ggml_backend_vk_prefetch_tensor },
         { "ggml_backend_vk_prefetch_submit", (void *) ggml_backend_vk_prefetch_submit },
         { "ggml_backend_vk_prefetch_wait",   (void *) ggml_backend_vk_prefetch_wait   },
+        { "ggml_backend_vk_prefetch_submit_seq", (void *) ggml_backend_vk_prefetch_submit_seq },
+        { "ggml_backend_vk_prefetch_wait_seq",   (void *) ggml_backend_vk_prefetch_wait_seq   },
         { "ggml_backend_vk_buffer_get_device_address", (void *) ggml_backend_vk_buffer_get_device_address },
     };
     for (const auto & entry : prefetch_api) {

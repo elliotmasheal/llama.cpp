@@ -1272,7 +1272,8 @@ struct ggml_backend_vk_context {
     // that the compute queue never waits for it. The host waits for it only when the layer is consumed.
     vk_context_ref prefetch_ctx;
     vk_semaphore prefetch_semaphore {};
-    vk_command_buffer * prefetch_cmd_buffer {};
+    // batches on the timeline not yet waited by the host, as (signaled value, command buffer) in submit order
+    std::vector<std::pair<uint64_t, vk_command_buffer *>> prefetch_inflight;
     // a computed prefetch value that the next compute submission waits on, for memory visibility
     vk_semaphore prefetch_wait {};
     bool prefetch_wait_pending {};
