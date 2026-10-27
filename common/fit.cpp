@@ -946,10 +946,14 @@ static bool common_moe_plan_impl(
         return true;
     }
 
+    // unified ledger of this plan (THREE-TIER.md 0.0.1 step 1): every budget term comes from the
+    // single measurement above and is placed once here; the solve below only reads ledger entries
+    // and does not re-derive any term (DECISIONS.md: the ledger is the one owner of the arithmetic)
+    common_moe_ledger ledger;
     int64_t kv_bytes    = 0;
     int64_t compute     = 0;
-    int64_t model_bytes = (int64_t) dmds.back().mb.model;
-    int64_t surplus     = 0;
+    int64_t model_dev   = 0;
+    int64_t free_vram   = 0;
     int64_t margin_used = 0;
     for (size_t id = 0; id < nd; id++) {
         // a flat margin costs 25% of a 4 GiB tier and 17% of a 6 GiB one; the bank only needs allocation
@@ -961,9 +965,18 @@ static bool common_moe_plan_impl(
         margin_used += margin;
         kv_bytes    += (int64_t) dmds[id].mb.context;
         compute     += (int64_t) dmds[id].mb.compute;
-        model_bytes += (int64_t) dmds[id].mb.model;
-        surplus     += (int64_t) dmds[id].free - (int64_t) dmds[id].mb.total() - margin;
+        model_dev   += (int64_t) dmds[id].mb.model;
+        free_vram   += (int64_t) dmds[id].free;
     }
+
+    ledger.dense      = {"dense weights",     model_dev, (int64_t) dmds.back().mb.model};
+    ledger.kv_context = {"KV + RS (context)", kv_bytes,  (int64_t) dmds.back().mb.context};
+    ledger.compute    = {"compute buffers",   compute,   (int64_t) dmds.back().mb.compute};
+    ledger.margin     = {"margin reserve",    margin_used};
+    ledger.free_vram  = free_vram;
+    ledger.free_ram   = (int64_t) dmds.back().free;
+    const int64_t model_bytes = ledger.dense.vram + ledger.dense.ram;
+    int64_t surplus     = free_vram - model_dev - kv_bytes - compute - margin_used;
 
     int64_t expert_total = 0;
     int64_t layer_bytes  = 0;
@@ -975,9 +988,13 @@ static bool common_moe_plan_impl(
     int64_t fa_score = cparams_plan.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED ? 0 :
         llama_fa_long_kv_reserve_bytes(meas.n_head, meas.n_ubatch, meas.n_ctx, cparams_plan.fa_chunk_mib);
     // without offload_kqv the whole attention subgraph is pinned to the host (llama-graph.cpp), so the
-    // score buffer is host memory and must not be taken from the device surplus
+    // score buffer is host memory and must not be taken from the device surplus; the ledger keeps the
+    // term on the tier where it lives
     if (plan_v2 && !cparams_plan.offload_kqv) {
+        ledger.fa_score = {"fa score buffer", 0, fa_score};
         fa_score = 0;
+    } else {
+        ledger.fa_score = {"fa score buffer", fa_score, 0};
     }
 
     // --kv-page auto: `surplus` is what the MoE bank would get, i.e. the device room left after the model,
@@ -988,10 +1005,10 @@ static bool common_moe_plan_impl(
     const int64_t kv_slack = surplus - fa_score;
     const bool    kv_page  = kv_page_auto ? (cparams_plan.offload_kqv && kv_slack < 0) : cparams_plan.kv_page;
 
-    surplus -= fa_score;
-
     // the paged prefill gather keeps one dense K/V workspace in device memory (bench/THREE-TIER.md F11)
     const int64_t kv_gather = kv_page ? llama_kv_gather_reserve_bytes(cparams_plan.kv_gather_mib) : 0;
+    ledger.kv_gather = {"kv gather workspace", kv_gather};
+    surplus -= fa_score;
     surplus -= kv_gather;
     for (const int64_t b : geo.expert_bytes) {
         expert_total += b;
@@ -1055,6 +1072,7 @@ static bool common_moe_plan_impl(
     const bool pinned = host_fits && !mmap_load;
 
     bank = pinned ? bank : 0;
+    ledger.bank = {"moe bank (solved)", bank};
     const bool prefetch = nd == 1 && pinned && bank >= ring;
 
     out->cache_bytes = (size_t) bank;
@@ -1066,6 +1084,7 @@ static bool common_moe_plan_impl(
     out->resident    = pinned;
     out->kv_page     = kv_page;
     out->kv_init_bytes = kv_bytes;
+    out->ledger      = ledger;
 
     LOG_INF("%s: %d expert layers, %d experts (top %d), %.1f MiB of experts per layer, %.1f GiB in total\n",
             __func__, geo.n_layer_expert, geo.n_expert, geo.n_expert_used,
@@ -1102,6 +1121,22 @@ static bool common_moe_plan_impl(
     }
     LOG_INF("%s: whole-layer prefetch %s (two rings need %.1f MiB, needs one device and pinned host experts)\n",
             __func__, prefetch ? "available" : "not available", (double) ring/MiB);
+
+    // the ledger is the term-by-term view of what this plan solved from (0.0.1 1a); the store reads
+    // the same terms to build its split (2a), so the print must stay one line per entry
+    static const common_moe_ledger_entry * ledger_entries[] = {
+        &ledger.dense, &ledger.kv_context, &ledger.compute,
+        &ledger.fa_score, &ledger.kv_gather, &ledger.margin, &ledger.bank,
+    };
+    for (const common_moe_ledger_entry * e : ledger_entries) {
+        if (e->vram == 0 && e->ram == 0 && e->ssd == 0) {
+            continue;
+        }
+        LOG_INF("%s: ledger %-20s %9.1f %9.1f %9.1f MiB (vram/ram/ssd)\n",
+                __func__, e->name, e->vram/(double)MiB, e->ram/(double)MiB, e->ssd/(double)MiB);
+    }
+    LOG_INF("%s: ledger room %9.1f MiB free vram, surplus %9.1f MiB\n",
+            __func__, free_vram/(double)MiB, surplus/(double)MiB);
 
     if (pinned) {
         LOG_INF("%s: host RAM %.1f GiB free, a resident load needs %.1f GiB: host experts can be pinned\n",

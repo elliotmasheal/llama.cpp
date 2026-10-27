@@ -21,6 +21,39 @@ struct common_fit_extra_model {
     bool shares_model;
 };
 
+// tiers of the unified memory ledger, see bench/THREE-TIER.md 0.0.1 step 1 (SSD is reserved for the
+// cold experts of the store, F12)
+enum common_moe_tier {
+    COMMON_MOE_TIER_VRAM = 0,
+    COMMON_MOE_TIER_RAM  = 1,
+    COMMON_MOE_TIER_SSD  = 2,
+};
+
+// one line of the unified memory ledger: a budget term with its placement per tier. The plan solve
+// consumes entries and never re-derives them, so this ledger is the single owner of the budget
+// arithmetic (bench/DECISIONS.md hard constraint). v1 entries are tier sums; the per-layer placement
+// of dense weights stays in the fit tensor split and the per-page placement of KV follows with the
+// store (0.0.1 2a/3a)
+struct common_moe_ledger_entry {
+    const char * name = "";
+    int64_t      vram = 0;
+    int64_t      ram  = 0;
+    int64_t      ssd  = 0;
+};
+
+struct common_moe_ledger {
+    common_moe_ledger_entry dense;      // dense weights, measured
+    common_moe_ledger_entry kv_context; // measured context class: KV workset + recurrent state (RS
+                                        // is unsplit until F7, the entry stays so the store gets both lines)
+    common_moe_ledger_entry compute;    // scheduler compute buffers, measured
+    common_moe_ledger_entry fa_score;   // reserved: long cross-chunk prefill score buffer
+    common_moe_ledger_entry kv_gather;  // reserved: paged prefill dense K/V workspace
+    common_moe_ledger_entry margin;     // planned free-memory reserve target, subtracted from the room
+    common_moe_ledger_entry bank;       // solved: the expert cache
+    int64_t free_vram = 0;              // room the solve started from
+    int64_t free_ram  = 0;
+};
+
 // device memory budget for the MoE cache, see bench/THREE-TIER.md
 struct common_moe_plan {
     size_t  cache_bytes = 0;    // recommended cache size, 0 = keep all experts on the host
@@ -34,6 +67,7 @@ struct common_moe_plan {
     // so paging keeps the working set there (bench/THREE-TIER.md F11)
     bool    kv_page     = false;
     int64_t kv_init_bytes = 0;  // bytes of the initial K/V allocation at this configuration
+    common_moe_ledger ledger;   // the term-by-term budget the plan solved from (0.0.1 1a)
 };
 
 // measures the model once and fills the plan, returns false if the model is not a MoE model
