@@ -26,6 +26,9 @@ public:
     // [LLAMA_MOE_PREFETCH] the token count of the graph being built, selects the prefetch path for large ubatches
     void set_batch_tokens(int64_t n_tokens) const;
 
+    // true while the graph being built is on the prefetch path: its copies upload whole layers and need no ids
+    bool prefetch_batch() const;
+
     // true if the experts of layer il that are not in the cache are computed on the CPU from the host weights
     bool hybrid(int32_t il) const;
 

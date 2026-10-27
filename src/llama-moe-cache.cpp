@@ -358,6 +358,7 @@ struct llama_moe_cache::impl {
     size_t pf_layers  = 0;
     size_t pf_waits   = 0;
     size_t pf_fallbacks = 0;
+    size_t n_split_degrades = 0;          // lookups whose ids are produced in the same split (bench/THREE-TIER.md F1)
     int64_t pf_wait_us  = 0;              // [LLAMA_MOE_PREFETCH_TIME] host time spent waiting for the prefetch
     int64_t pf_copy_us  = 0;              // [LLAMA_MOE_PREFETCH_TIME] host time spent in the prefetch callback
 
@@ -1904,11 +1905,27 @@ struct llama_moe_cache::impl {
         // the selected experts must be computed in an earlier split
         // the scheduler starts a new split at the lookup because it reads a host weight, but only if the split already has inputs
         const ggml_tensor * sel = lookup->src[1];
+        bool same_split = false;
         for (int i = 0; i < n_nodes; ++i) {
             const ggml_tensor * node = ggml_graph_node(graph, i);
             if (node == sel || node == sel->view_src) {
-                GGML_ABORT("the experts of layer %d are selected in the same split as their MoE cache lookup", il);
+                same_split = true;
+                break;
             }
+        }
+        if (same_split) {
+            // the ids are produced in this split, so they cannot be read here: upload the whole layer instead,
+            // the ring map covers every expert and needs no ids (slow but correct, bench/THREE-TIER.md F1)
+            if (n_split_degrades++ == 0) {
+                LLAMA_LOG_WARN("%s: layer %d selects its experts in the lookup's own split, using the whole-layer upload\n",
+                        __func__, il);
+            }
+            if (!copy_prefetch(backend, src, dst, il)) {
+                LLAMA_LOG_ERROR("%s: whole-layer upload of layer %d failed, copying the previous slot map\n",
+                        __func__, il);
+                return false;
+            }
+            return true;
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
 
@@ -2112,6 +2129,10 @@ struct llama_moe_cache::impl {
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
+        if (n_split_degrades > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: split fallbacks (ids produced in the lookup's split): %zu\n",
+                    n_split_degrades);
+        }
         if (pf_layers > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: prefetch: %zu layers, %.2f MiB uploaded, %zu host waits, %zu fallbacks\n",
                     pf_layers, pf_bytes/1024.0/1024.0, pf_waits, pf_fallbacks);
@@ -2143,6 +2164,10 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
 
 ggml_tensor * llama_moe_cache::get_experts_static(const ggml_tensor * w) const {
     return pimpl->get_experts_static(w);
+}
+
+bool llama_moe_cache::prefetch_batch() const {
+    return pimpl->pf_batch;
 }
 
 bool llama_moe_cache::hybrid(int32_t il) const {

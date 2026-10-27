@@ -2704,6 +2704,14 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     // the selected experts are 3D [n_expert_used, 1, n_tokens] for some architectures, the token count
     // must come from the element count so that the prefetch path sees the real ubatch size
     moe_cache->set_batch_tokens(ggml_nelements(selected_experts) / selected_experts->ne[0]);
+
+    // with the attention on the host the scheduler puts the routing producer in this lookup's own split, so the
+    // copy callback cannot read the ids; only the prefetch path is safe there, it uploads whole layers without
+    // ids (bench/THREE-TIER.md F1)
+    if (!cparams.offload_kqv && !moe_cache->prefetch_batch()) {
+        return nullptr;
+    }
+
     ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
     if (slot_map == nullptr) {
         return nullptr;
