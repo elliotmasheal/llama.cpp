@@ -8,9 +8,10 @@
 2026-10-23 16:3x-17:1x，`a44e13e08` + 工作区、构建 12:47，平衡 + AC，dGPU 独占，
 `bash bench/tools/run-matrix.sh`，公共参数 `-dev Vulkan1 -ngl 99 -fa on -t 5 -b 2048 -ub 2048 -ncmoe 41
 -f bench/prompts/prompt10k.txt -n 64 --temp 0 --no-warmup --no-display-prompt -v`，r=1。
-`KV=host` 即 `-nkvo`；`used = peak - held`，`held` 是 `GGML_VK_VRAM_LIMIT_MIB` 自己 hold back 的部分。
+`KV=host` 即 `-nkvo`；`used = peak - held`，`held` 是显存档位模拟自己 hold back 的部分
+（历史读数用的是旧 env `GGML_VK_VRAM_LIMIT_MIB`，2026-10-27 起并入 `--store-vram-mib`，数值不变）。
 
-| tier | load | ctx | KV | bank | PP t/s | TG t/s | peak MiB | held MiB | used MiB | RAM peak MiB | reallocs | status |
+| vram | load | ctx | KV | bank | PP t/s | TG t/s | peak MiB | held MiB | used MiB | RAM peak MiB | reallocs | status |
 |---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|
 | 不限 | none | 262144 | host | auto (1547) | - | - | 4660 | 0 | 4660 | 25404 | 0 | **abort** `:1910` layer 1 |
 | 6144 | none | 262144 | host | auto | - | - | 2623 | 1234.8 | 1388 | 25403 | 0 | **abort** `:1910` layer 0 |
@@ -169,7 +170,7 @@ host 侧 compute 精确等于 `96.18 + 0.2 x KV`（7 个点全中）。设备侧
 命令：`bash bench/tools/run-matrix.sh -T 8176,6144,4096 -K -r 2 -O bench/raw/kvgrow-20261023`
 （`-K` = KV 在 GPU；其余参数与第 0 节相同，未加 `--moe-cache-mib`，由 planner 自算 bank）。
 
-| tier | run | bank | PP t/s | TG t/s | peak MiB | held MiB | used MiB | RAM peak MiB | reallocs | status |
+| vram | run | bank | PP t/s | TG t/s | peak MiB | held MiB | used MiB | RAM peak MiB | reallocs | status |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | 8176 | 1 | auto (1481) | **478.5** | **13.7** | 5082 | 0 | 5082 | **19390** | 3 | ok |
 | 8176 | 2 | auto (1481) | 475.6 | 13.7 | 5082 | 0 | 5082 | 19389 | 3 | ok |
@@ -210,7 +211,7 @@ K/V 读取与 softmax 范围也不变，只是把一次 1280 MiB 的 score 换�
 命令：`bash bench/tools/run-matrix.sh -T 8176,6144,4096 -K -r 2 -O bench/raw/b2-chunk256-20261023`
 （`-K` = KV 在 GPU，其余与第 0 节相同；`-fac` 默认值已进二进制，矩阵不需要额外参数）。
 
-| tier | run | bank MiB | slots/group | prefetch | PP t/s | TG t/s | peak MiB | held MiB | used MiB | RAM peak MiB | reallocs | hit % | status |
+| vram | run | bank MiB | slots/group | prefetch | PP t/s | TG t/s | peak MiB | held MiB | used MiB | RAM peak MiB | reallocs | hit % | status |
 |---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | 8176 | 1 | 2879.2 | 791 | 开 | **679.9** | **20.3** | 6122 | 0 | 6122 | 19481 | 2 | 57.6 | ok |
 | 8176 | 2 | 2879.2 | 791 | 开 | 679.0 | 20.5 | 6122 | 0 | 6122 | 19481 | 2 | 57.6 | ok |
@@ -316,7 +317,7 @@ K/V 读取与 softmax 范围也不变，只是把一次 1280 MiB 的 score 换�
 
 **D. 新默认的矩阵（`--fit-plan 1` 默认 + CONCAT 快路径默认开，3 档 x r=2，2026-10-27 10:3x）**
 
-| tier | run | bank | PP t/s | TG t/s | peak MiB | held MiB | used MiB | RAM peak MiB | reallocs | hit % | status |
+| vram | run | bank | PP t/s | TG t/s | peak MiB | held MiB | used MiB | RAM peak MiB | reallocs | hit % | status |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | 8176 | 1 | auto (2989) | **511.7** | **16.6** | 6231 | 0 | 6231 | 19482 | 2 | 58.7 | ok |
 | 8176 | 2 | auto (2989) | 511.7 | 16.5 | 6231 | 0 | 6231 | 19482 | 2 | 58.7 | ok |
@@ -652,6 +653,9 @@ vkpage.exe info | table | bench 131072 20 256
 `ggml_set_rows_set_paged`，见 `THREE-TIER.md` 4 节）。M1 只实现 CPU 内核，设备 K/V 会被守卫挡下并打
 `kv-page disabled: device K/V needs the paged Vulkan kernel (M2b)`。
 
+> 2026-10-27 口径变更：`--kv-block` 已移除，页固定 128 cells = 2.5 MiB。
+> 本节 6.2-6.6 的读数都是旧块大小（2048 / 256 / 4096 / 8192）拍的，复现时不能再照抄参数。
+
 单元级（`tests/test-kv-page.cpp`，已进 CTest，共 33 个用例）：
 
 | 检查 | 结果 |
@@ -955,3 +959,230 @@ prefill 侧同口径：每 ubatch 墙钟 4.03 s（2048/507.6），`cpy_sync` 均
   但受未结项 7（repack 的 KLD != 0）阻塞，且共享专家每 token 都用，精度损失比稀疏专家更贵，必须过质量门。
 - **减解包**（每 tile 解一次进 LDS，而不是每个 K 步解一次）：是 kernel 改写，不是调 tile；
   第 3 节那三条 q6_K/tile 实验之所以全负，现在有了机制解释——它们改的是几何，没碰解包指令数。
+
+### 0.9 与官方 Scoop 构建（b11763）的目标口径对比（2026-10-27）
+
+对照对象：`D:\Scoop\apps\llama.cpp-vulkan\current`（0.7.0-dev build **11763**，commit `a01ce9ffc`，Clang 20.1.8，
+scoop 装的是同一份 upstream master 的快照）；本分支 `build-vulkan`（build **11915**，commit `a6cda676a` + 工作区，MinGW 16.2.0）。
+「平衡」+ AC，dGPU 独占，`-lm none` 前逐臂检查空闲 RAM（实测 32.8-34.3 GiB）。两臂交替跑，每臂 r=2。
+
+公共参数：`-m Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -fa on -t 5 -b 2048 -ub 2048 -c 262144
+-f bench/prompts/prompt10k.txt -n 64 --temp 0 --no-warmup --no-display-prompt -lm none -ncmoe 41 -v`。
+两边都吃掉 10438 tok（`slot print_timing`），PP/TG 取自同一行。
+
+官方没有 `-kvg` / `--kv-page` / `-fac` / `--fit-plan`，只有 `-c` / `-nkvo` / `-ctk,-ctv` / `--moe-cache-mib`（上游已有 cache，
+默认 0）可调，所以它的臂只能在这些旋钮里找。
+
+**A. 目标工况（256K ctx + 10K prompt）**
+
+| 臂 | 构建 | 配置 | PP t/s | TG t/s | GPU 独占峰值 MiB | RAM 峰值 MiB | status |
+|---|---|---|---:|---:|---:|---:|---|
+| 默认 | fork | auto bank 2989, KV grow 320 MiB | **469.9 / 509.3** | **16.6 / 17.0** | 6231 | 19482 | ok |
+| 关 cache | fork | `--moe-cache-mib 0` | 384.8 / 386.0 | 12.1 / 12.3 | 3239 | 19484 | ok |
+| 出厂 | 官方 | `-ncmoe 41`，`-ngl`/cache 用默认值 | 149.5 | 9.0 | 5892 | 22713 | ok（fit 砍到 30/42 层、KV 落宿主） |
+| q8 KV | 官方 | `-ngl 99 -ctk q8_0 -ctv q8_0` | 149.4 / 147.4 | 14.5 / 14.3 | 5585 / 4753 | 20287 | ok |
+| host KV | 官方 | `-ngl 99 -nkvo` | 145.3 / 149.3 | 6.9 / 6.9 | 3151 | 25457 | ok |
+| q8 KV + 小 bank | 官方 | 同上 + `--moe-cache-mib 512` | 104.7 | 7.8 | 8143 | 19109 | ok（超卖） |
+| f16 KV 在设备 + cache | 官方 | `-ngl 99 --moe-cache-mib 2986` | - | - | - | - | **ErrorDeviceLost** |
+| host KV + cache | 官方 | `-ngl 99 -nkvo --moe-cache-mib 2986` | - | - | - | - | **abort `:577`** |
+
+后两行是 `bench/raw/e2e-official-20261027/{off-1,off-2,off-nkvo256k}.bench.log`（同日 16:28-16:37），
+其余是本轮的 `r2-*` / `r3-*` / `r4-*`。
+
+**B. 交叉对照：32K ctx 与 llama-bench 短口径**
+
+32K 档两边 KV 都能驻设备，旋钮可完全对齐；`llama-bench -p 2048 -n 32`（`n_ctx = 2080`）只用来隔离 kernel 与上传路径。
+
+| 口径 | 构建 | 配置 | PP t/s | TG t/s | 备注 |
+|---|---|---|---:|---:|---|
+| 32K cli | fork | `--moe-cache-mib 0` | 386.0 / 386.6 | 12.3 / 12.5 | splits 121/82，mask 8192 |
+| 32K cli | 官方 | 默认（bank 0） | 149.0 / 148.6 | 14.8 / 15.2 | splits 121/82，mask 32768，KV 640 MiB |
+| 32K cli | fork | auto bank 2989 | 418.1 / 510.2 | 13.4 / 16.9 | hit 58.74% |
+| 32K cli | 官方 | `--moe-cache-mib 2989` | 150.2 / 150.5 | 9.9 / 9.8 | hit 65.10%，GPU 5750 MiB |
+| bench 2K | fork | `-ncmoe 41 --moe-cache-mib 0` | 432.1 ± 42 | 12.15 ± 1.47 | `pp2048` / `tg32` |
+| bench 2K | 官方 | `-ncmoe 41` | 233.4 ± 46 | 16.60 ± 0.39 | 同上 |
+
+读数：
+
+1. **目标工况的默认对默认是 PP x3.3（470-509 对 148）、TG x1.17（16.8 对 14.4）**。
+   但官方的 14.4 是 q8_0 KV 换来的；要同等 f16 KV，它只能 `-nkvo`（TG 6.9），此时 **TG x2.4**。
+2. **最干净的对照是"同旋钮、都关 cache"**：fork 385.4 / 12.2 对官方 147.3 / 6.9，**PP x2.62、TG x1.77**。
+   这一臂两边都是 f16 KV、bank 0、`-ncmoe 41`，差别只剩本分支的代码。
+3. **PP 的差距主要不在 KV/ctx，而在宿主专家路径**：`llama-bench pp2048`（n_ctx 2080）已经是 432.1 对 233.4（x1.85）；
+   32K 档同旋钮 386.3 对 149.2（x2.59）。官方的 PP 在 32K（149）与 256K（147）几乎一样，说明它本来就没被 ctx 卡住，
+   而是被"41 层专家每 ubatch 从宿主上传"卡住。机制上最可能是本分支的延迟/异步拷贝路径
+   （`ggml_backend_set_tensor_async_deferred` / `wait_deferred`）把这 18 GiB/ubatch 的重叠做掉了，
+   但本轮没有逐 split 的 trace，这一条留作归因假设（0.7 的 decode 侧反而还留着 42.3 ms 的 `cpy_sync`）。
+4. **本分支的 ctx 相关收益在容量与 TG 上**：`-kvg -1` 让 256K + 10K 的 KV 只有 320 MiB（16384 cells），
+   mask 宽度 8192/16384 对 262144。官方 256K 的 f16 KV 是 5120 MiB，和 8 GiB 档不共存，只能降精度（q8_0 = 2720 MiB）
+   或下宿主；TG 从 14.4 掉到 6.9 就是"注意力离开设备"的价。官方的 `-fit` 也不肯缩 ctx，日志是
+   `projected to use 26413 MiB ... vs. 7312 MiB of free`、`context size set by user to 262144 -> no change`、
+   `with only dense weights in device memory there is still a total deficit of 1670 MiB`，
+   最后它自己把 42 层砍到 30 层、KV 落到宿主（PP 149.5 / TG 9.0）。
+5. **上游的 cache 在目标工况帮不上忙，还会倒扣**：f16 KV 在设备 + 2986 MiB bank 直接 `ErrorDeviceLost`
+   （5120 + 1302 dense + 1744 compute + 2986 早已超过 7378 MiB 的可用）；q8 KV + 512 MiB bank 的
+   PP 104.7 / TG 7.8、GPU 峰值 8143 MiB，是小 bank 的典型抖动。32K 档同 bank 也印证方向相反：
+   官方 TG 15.0 -> 9.85（-34%），fork 12.2 -> 16.8（+38%）。
+6. **官方在 `-nkvo` + 非零 bank 上仍抛 `llama-moe-cache.cpp:577`**（"the experts of layer 0 are selected in
+   the same split as their MoE cache lookup"），即上游还没有 0.6 那条降级。所以官方在目标工况要么没 cache，
+   要么崩溃，第三条路不存在。
+7. **方差不小，别跨 session 搬倍数**：fork 32K 同臂 PP 418/510（18%）、TG 13.4/16.9（26%），
+   官方四次都在 2% 内。目标工况 fork PP 470/509（8%）、TG 16.6/17.0（2%）。
+   本节所有倍数都来自同 session 交替臂，口径见 `README.md` 第 4 节。
+8. 出处：`bench/raw/e2e-official-20261027/`（`r2-*` `r3-*` `r4-*` `r5-*` `r6-*` 的 `.out/.err`、
+   `round2.csv` ... `round6.csv`，脚本 `run2.sh` ... `run6.sh`；官方失败臂 `off-1/off-2/off-nkvo256k`）。
+
+### 0.10 统一预算式（Placement 账本，0.0.1 第 1a/1b/1c 步）（2026-10-27）
+
+代码改动（`common/fit.h` + `common/fit.cpp`，设计来源 `THREE-TIER.md` 0.0 评审）：
+
+1. `common/fit.h` 新增 `common_moe_ledger` / `common_moe_ledger_entry`（vram/ram/ssd 三列 + 命名），账本挂在
+   `common_moe_plan::ledger` 上；`common_moe_plan_impl` 的一次测量产出全部条目，解算式只剩一个：
+   `surplus = free_vram - dense(vram) - KV+RS(context, vram) - compute(vram) - margins`，
+   预留项（`fa_score` / `kv_gather`）是账本条目，在同一个式子里减，不再"先扣再加也不回填"。
+2. `--kv-page auto` 的判据、slack 规则、小 bank 地板、per-group 预取环判据**逐项保持原算术**（字节级不动的
+   前提是不让 0.4/0.5 的读数漂移）；`--fit-plan 0` 仍走旧 margin/score/环形判据，只是也经账本产出。
+3. 新增逐项打印：`ledger <name> <vram> <ram> <ssd> MiB` + `ledger room <free> / surplus <s>`（`-v` 下）。
+4. 界定（v1 的取舍）：**RS 仍在"KV + RS (context)"一项里**（测量侧 context 类不拆；拆分归 F7 的
+   `--rs-offload`，账本条目已留位）；逐层放置表（dense 按 tensor split、KV 按页）随 store 2a/3a 进来，v1 是分层汇总。
+
+验收协议（比 1c 清单更严）：**同 session 新旧二进制 A/B**——`git stash` 两文件回退重编 = 旧臂，
+三档 x r=2、全部 `-K`（KV 驻设备，目标工况）；规律读数 6 的教训，不拿本批和 0.4/0.5 跨 session 混算。
+出处：`bench/raw/led-1c/{new,old}/`，脚本 `run-ab.sh`，比对器 `cmp-plan.sh`；预检臂 `bench/raw/ledger-1a-8176*/`。
+
+**A. 规划器决策逐字相同**（`cmp-plan.sh` 去掉时间戳与新增 ledger 行后 diff 为空，r1/r2 同案）：
+
+| tier | margins MiB | score 预留 | 预取环 | bank（recommend） | 结论 |
+|---|---:|---:|---:|---:|---|
+| 8176 | 914.1 | 256.0（注意力在设备） | 1860.0 | 2989.1 MiB | 新旧逐字相同 |
+| 6144 | 760 | 256.0 | 1860.0 | 1908.4 MiB | 新旧逐字相同 |
+| 4096 | 503.7 | 256.0 | 1860.0 | **0**（"no device memory for a cache"） | 新旧逐字相同 |
+
+4096 档的 500 MiB 缺口现在**逐项可读**（满足 1c 的要求）：`free 4029.9 - dense 1302.9 - KV+RS 222.8
+- compute 1372.0 - margins 503.7 - score 256.0 = surplus 372.4`，slack 规则减去 256 后剩 116.4 MiB（64 slots），
+低于 145 MiB 小 bank 地板 -> 归 0。这就是未结项 15 的算术，不用再拿日志反解。
+
+**B. 配对 PP/TG（三档 x r=2，`-K`，同 session，2026-10-27）**
+
+| tier | 新规划器 PP/TG（r1，r2） | 旧规划器 PP/TG（r1，r2） | 判 |
+|---|---|---|---|
+| 8176 | 448.5/13.5，477.5/13.3 | 508.5/17.0，508.1/17.0 | PP 与 TG 均为 session 漂移同型（见读数 1） |
+| 6144 | 506.4/16.1，506.7/16.1 | 505.7/16.1，507.1/16.2 | 持平（差 <= 0.3%） |
+| 4096 | 383.3/12.6，383.3/12.6 | 383.8/12.7，383.4/12.6 | 持平（差 <= 0.2%） |
+
+读数：
+
+1. **两臂的机器行为相同**（8176 r1 对照：`88350.00 MiB uploaded / 185 host waits / 0 fallbacks`，
+   `38 layers stream through 2 rings (1728.0 MiB)`，peak/used/held 三档逐字相同），规划器决策又逐字相同 ->
+   运行路径没有第二个自由度。8176 的 PP/TG 差判 **session 漂移**：同一新二进制的 r1->r2 自己漂了 6.5%
+   （448.5 -> 477.5），且新旧两组的绝对值分别落在已记录的台阶两端（0.5 B：PP 487.7 -> 378.8、TG 13.4-14.6；
+   0.5 D：TG 16.5-16.6），两组数字各自的二三档配对差 <= 0.3%；不判回归。
+2. **坦白记录：本批新臂先跑、旧臂后跑**，8176 的顺序效应方向恰好与漂移方向一致，若要绝对数字谁高谁低，
+   应按 0.5 A 的交替 A/B/A 重排；本轮不另跑，理由：1a/1b 的命题是"决策等价 + 零行为差"，B 表只作旁证。
+3. 新臂 4096 档 `hit` 空列 = bank 0 的预期空值，与 0.5 D 表一致；`status` 12 个 run 全 `ok`，`reallocs`
+   8176/6144 = 2、4096 = 1，与 0.5 D 一致。
+4. 预检臂（不带 `-K`，矩阵脚本默认 `-nkvo`）：KV 落 host 时 bank 自动给出 3553.5 MiB、PP 147.8/TG 5.9 ——
+   与 `RESULTS.md` 0.2 的 `-nkvo` x2.4-x2.7 税同型，且 `:1910` 已不崩（0.6 A），属预期退化口径，不是缺陷。
+   说明矩阵脚本默认臂与 0.3 起的目标工况（KV 驻设备）有一个 `-K` 之差，用矩阵读数时要看 `kv` 列。
+5. 门禁：`ctest` **33/33**；新增打印不改变任何决策路径（A 部分为证）。质量门未跑：本改动不接触数值
+   路径（规划器是分配决策），按 `bench/README.md` 第 4 节口径，质量门只给动注意力/精度/数值路径的改动。
+
+留作下一步：账本已是 store 2a 的消费面（`--store-*` 接管时读 `common_moe_plan::ledger`）；
+RS 拆分与逐层表在 F7/2a 落的时候补进同一账本。
+
+### 0.11 llama-store 骨架（2a + 2b 的申报部分，2026-10-27）
+
+代码改动（`src/llama-store*.h/cpp` 六个新文件 + `common/arg.cpp`、`common/common.h`、`common/common.cpp`，
+设计来源 `THREE-TIER.md` F12/F13、0.0 评审；骨架 = 常开、无总开关、零行为改动）：
+
+1. **三单元分文件编译**（DECISIONS 第 5 节"不得合回一个文件"）：`llama-store-slab`（纯分配器：class/slot/代数句柄、
+   pin/in-flight/unconsumed、`busy()` 单原语）、`llama-store-policy`（默认策略：adopt 落 RAM；热插拔接口），
+   `llama-store-io`（记账计数器 + 2c 的线程池占位，池未创建）。
+2. **薄壳**：`llama_store_init/free/declare/adopt_expert/commit`；五入口中 `acquire/prefetch/wait/release`
+   属 2c（有传输执行子才有语义），文件里未实现，调用面暂无使用者，这是骨架的界定不是偷工。
+3. **两级注册**（F12 12）：专家按"层 + 专家子对象"注册（本模型 40 层 x 256 = 10240 个，层内数组 O(1)）；
+   机器行为还照旧（专家物理字节仍在 dense buffer 里），adopt 现在只是 registry 记账。
+4. **CLI**：`--store-vram/ram/ssd-mib`、`--store-threads`（env `LLAMA_ARG_STORE_*`）；vram 参数在
+   init 最前置把值写进 `GGML_VK_VRAM_LIMIT_MIB`，hold back 走 F0 的既有路径（设备枚举之前生效）。
+5. **消费面**：lctx 创建成功后用 `llama_get_memory_breakdown` 分机/主申报 dense 与 compute（`store_declare`），
+   专家 adopt 后 `store_commit` 打印 `store_split`（vram/ram 各一行：declared + adopted + 预算内余量）。
+   store 挂在 `common_init_result::impl` 最后一个成员位，析构先于 context（F13 生命周期）。
+
+**A. 零行为差验证（8176 `-K` r=1，`bench/raw/store-2a-smoke*`）**
+
+| 臂 | bank | PP/TG | hit % | reallocs | status |
+|---|---|---|---:|---:|---|
+| store 常开（smoke3） | auto (2989.1) | 481.8 / 17.0 | 58.7 | 2 | ok |
+| 0.10 新规划器同臂（同日早） | auto (2989.1) | 477.5 / 13.3 | 58.7 | 2 | ok |
+
+planner 决策与 0.10 相同（bank 2989.1、环 1860、4096 归 0 不变），`prefetch` 行为行（uploaded/waits/fallbacks）
+与 hit 58.7% 复原；PP/TG 绝对值在 0.5/0.9 已记录的 session 台阶带内（TG 13-17），不据其判收益。
+
+**B. store_split 读数（一眼账）**
+
+```
+store_split: vram accounted 2650.9 = dense 1302.9 compute 1348.0 staging 0 ... + adopted 0
+store_split: vram free within budget 4662.0          # auto = plan ledger 的 free_vram
+store_split: ram  accounted 18968.9 = dense 18872.8 compute 96.1 ... + adopted co-located 18600.0
+store_split: ram  free within budget 12138.7
+```
+
+读数：
+
+1. **adopted 与 declared 的双计已防住**：host 专家的物理字节今天在 dense buffer 里，骨架期的 split
+   把 adopted 只计作 registry（`co-located` 标记，不进 accounted sum）；2c repack 把专家搬进 store 自有
+   窗口后同一行自动并入，不需要回头改这里。
+2. **compute 申报值（1348.0）对 plan ledger 的 reserve（1372.0）差 24 MiB**：前者是 context breakdown 的
+   实际 sched buffer，后者是 reserve 图预留；reserve >= allocated 方向正常，记账以申报为准。
+3. **`--store-vram-mib 4096` 的 hold back 链验证**（`bench/raw/store-2a-holdback/`，不加 `-T` 档位）：
+   `VRAM limited to 4096.0 MiB, 3282.8 MiB of 7378.8 MiB held back`，随后规划器 ledger 与 4096 档臂
+   **逐字相同**（room 4029.9 / surplus 372.4），bank 归 0，CSV `held 3282.8`、PP 383.4 / TG 12.6、
+   `status = ok`。参数旋钮 = 硬顶 + visible tier 的语义在 CLI 上成立；旧 env 仍是迁移期机制
+   （`run-matrix.sh -T` 不动）。
+4. **两个骨架期缺陷在本轮抓出并修掉**（都从读数流程里抓的）：adopt 初版每层 class 只造 16 槽，
+   10496 个对象里 10224 个被 "left behind"（加 `grow_class` 分段扩容，容量不足仍不 abort）；
+   adopted 曾被计入 accounted sum，复现出 ram "free -6318.9" 的负数（改 co-located 计法）。
+   两个修复都有单测分支。
+5. 门禁：`ctest` **34/34**（新增 `test-store-slab`：busy 三守卫位、槽复用 + 代数、stale 句柄不可 evict、
+   分层记账、满类拒分配后 grow 成功）；Vulkan 算子门禁未触发（不碰 kernel/scheduler）。
+6. 出处：`bench/raw/store-2a-{smoke,smoke2,smoke3,holdback}/`。
+7. 界定（与 2b/2c 的边界）：staging 申报、5% 越权对账（需 memory-logger 对账脚本）、五入口的传输语义
+   都在 2c 收口；`--store-ram-mib` 的 auto 分母（free - 4 GiB 系统留量常数）目前只体现在 split 行，
+   默认值按 M1 读数复核后再定。
+
+### 0.12 传输执行子路由（2c 第一刀，`--store-exec` 0/1/2，2026-10-27）
+
+代码改动（`src/llama-store*` + `src/llama-moe-cache.cpp` + arg/common 参数，2 值语义见表）：
+
+1. store-io 新增绑定面：`llama_store_bind_backend`（进程内一次解析五个 proc 地址，
+   含 0.6 E 的 `submit_seq/wait_seq`），MoE cache 的 `pf.tensor/submit/wait` 三个调用点改为
+   `pf_tensor_route/pf_submit_route/pf_wait_route` 三条路由函数——**策略（SLRU/整层驻留/提前一层/双环）不动**。
+2. `--store-exec 0/1/2`（env `LLAMA_ARG_STORE_EXEC`，默认 **0**）：0 = 旧路径；1 = 提交/等待**经 store-io 路由**、
+   原语不变；2 = 层内等待只等本批序号（`pf_seq_last`）。promotion/回填路径（`:1867`、`:2061`、`:2141`）
+   **保持 raw drain**：那些等待必须清空整条传输队列才能发布 slot map，混进序号语义会破坏正确性。
+3. 老的六个 `pf*` 计数留在 cache；store-io 侧新增 `store_exec_submissions/fallbacks`（本轮非零才打印）。
+
+**A. A/B/A 读数（8176 `-K`，同 session 交替两轮，`bench/raw/exec-2c/m{0,1,2}-p{1,2}`）**
+
+| mode | pass1 PP/TG | pass2 PP/TG | hit % | prefetch 行为行 |
+|---|---|---|---:|---|
+| 0（旧路径） | 507.9 / 17.0 | 460.7 / 14.3 | 58.7 | 190 层 / 88350 MiB / 185 waits / 0 fallbacks |
+| 1（路由经 store） | 507.6 / 17.0 | 508.6 / 16.9 | 58.7 | 同上，逐字相同 |
+| 2（序号等待） | 508.3 / 16.9 | 507.2 / 16.9 | 58.7 | 同上，逐字相同 |
+
+读数：
+
+1. **mode 1/2 是"路由零行为差"的验收臂**：决策（bank auto 2989.1）、hit、内存（峰值 6231、held 0）、
+   prefetch 行为行全部逐字相同；pass1 中三臂 PP 差 < 0.2%，TG 差 < 0.6%。pass2 里 mode 0 单臂
+   460.7/14.3 的下沉是 session 台阶（0.10 读数 1 的同型，同批路由臂无下沉），按位移规则不判差异。
+2. **mode 2 的语义界定**：双环模式下同一时刻在飞的只有一层批次，"等本批"与"等最新"当前**数学等价**；
+   它的价值是序号管线（0.6 E）接进了主路径、store-io 计数器开始真实记账。真正的等待时机收益
+   （等待时间后移、多批次同时在飞）属 **2g/M2 的 use_step**，本轮不评读数。
+3. **输出等价**：temp 0 短跑（32 token）mode 0 与 mode 2 生成文本逐字一致（diff 只剩时序行）；
+   prefill 的 ring 路径覆盖在 A 表的 10K prompt 里。
+4. 门禁：`ctest` **34/34**；无 kernel/scheduler 改动，Vulkan 算子门禁不新增。
+5. 出处：`bench/raw/exec-2c/{m0,m1,m2}-{p1,p2}/` 与 `/tmp/out-m{0,2}.txt`短跑。
+
+剩余（2c 收口，不是本轮）：M2 的 use_step 驱动预取（等待时机收益 + `store_prefetch_wasted` 验收）；
+promotion/回填路径入 store 计数（需要批次标签区分目的）；staging 申报与 5% 越权对账；
+`--store-exec` 默认值由 M2 读数决定（本轮保持 0）。
