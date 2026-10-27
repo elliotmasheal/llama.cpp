@@ -44,12 +44,15 @@ llama-cli -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on `
 bash bench/tools/run-matrix.sh -T 8176,6144,4096 -r 2
 ```
 
-- 显存档位用 `GGML_VK_VRAM_LIMIT_MIB=<MiB>` 实现：设备初始化时 hold back 差额，
-  于是 `llama-fit-params`、MoE bank 规划器和每次分配看到的都是缩小后的预算。集显不生效。
+- 显存档位由 `--store-vram-mib <MiB>` 表达（旧 env `GGML_VK_VRAM_LIMIT_MIB` 已并进来）：
+  它是**整机 VRAM 总预算**（dense 权重 + 专家 bank + KV + compute + staging），store 把预算之外的部分 hold back，
+  所以 store 之外也没人能吃掉。集显不生效（hold back 依赖 memory budget 扩展）。
+  4096 / 6144 就是档位，不需要第二个参数。
 - RAM 条件用 `-lm none`（resident，模型全入内存）与 `-lm mmap`（内存不足档）两臂；
-  不加 `--moe-cache-mib` 时由 `common_moe_plan_get()` 自己算 bank，这就是"自适应"。
+  不加 `--moe-cache-mib` 时 bank 由规划器算（现为 `common_moe_plan_get()`，`llama-store` M1 之后归 store），
+  这就是"自适应"。
 - 电源：「平衡」方案 + AC 供电 + dGPU 上无其它推理进程（GUID 与机器事实见 `bench/env/`）。
-- 必报列：`tier | load | bank | ncmoe | -nkvo | PP | TG | VRAM peak | held | VRAM used | RAM peak | reallocs | hit % | status`。
+- 必报列：`vram | load | bank | ncmoe | -nkvo | PP | TG | VRAM peak | held | VRAM used | RAM peak | reallocs | hit % | status`。
   `VRAM peak` 取**每进程独占**（`\GPU Process Memory(pid_<pid>*)\Dedicated Usage` 峰值），不要看设备总量；
   真实足迹看 `used = peak - held`（`held` 是显存档自己 hold back 的部分，它也计入进程峰值）。
 - `status` 不是 `ok`（`abort` / `vram-oom`）算缺陷，要进 `bench/DECISIONS.md` 的未结项，不能当成"配置不对"忽略。
@@ -78,6 +81,33 @@ bash bench/tools/run-matrix.sh -T 8176,6144,4096 -r 2
 `-o FLASH_ATTN_EXT -b Vulkan1` = 5332/5332（2026-10-23 已补齐）、
 `ctest --test-dir build-vulkan` = 32/32。`-o MUL_MAT_ID_MASK -b Vulkan1` = 0/0，因为 Vulkan 侧还没有这个 op。
 动注意力数值（含 `-fac` 分块）再加一条：`bash bench/tools/quality-gate.sh` 必须 `GATE PASS`。
+
+### 4. llama-store：本机 VRAM/RAM/SSD 的抽象层（常开，F12 未开工）
+
+`llama-store`（拟 `src/llama-store.{h,cpp}`）是本机三类硬件的抽象层，对外只做四件事：分配、驻留、搬运、记账。
+上层（图、MoE cache、KV）只看见层、预算与句柄；**MoE cache 也交给它**，cache 只按句柄取专家接进图，
+不再自己算 bank、自己搬。子系统**常开，没有总开关**；细节与里程碑见 `THREE-TIER.md` F12。
+
+- **只接管两类对象**：专家（**层 + 专家子对象**两级）与 KV 页（固定 128 cells = 2.5 MiB，`--kv-block` 已移除）。
+  dense 权重、compute buffer、staging 的**分配路径与加载方式全部不改**，只向 store 申报占用
+  （`store_declare`）；未申报即越权。
+- 对外唯一的旋钮是三个**整机总预算**：`--store-vram-mib` / `--store-ram-mib` / `--store-ssd-mib`
+  （0 = 由 fit/auto 定），预算 = 对象占用（专家 + KV 页）+ 申报占用（dense / compute / staging）。
+  内部怎么分由 store 决定，但 `store_split` 必须打进启动日志；三个预算互不挪用。
+- 越权检查：`GGML_VK_MEMORY_LOGGER` 的进程总量与 `store_bytes_in(vram) + declared(vram)` 差 > 5%
+  即算越权，按缺陷处理。
+- **加载方式不变**：`lazy_read` / mmap / resident 判定全照旧；只把含专家的映射区间
+  `store_attach_mapping` 登记给 store，store 只控专家区间的常驻（`madvise` / 驻留页采样）。
+- 两种取物：`store_acquire` 同步阻塞，**只等这一批搬运**（序号等待，不得退化成整设备 fence），返回 ready 句柄；
+  `store_prefetch` **立刻**返回句柄（槽号 + 代际号，经间接表解析），数据由共享线程池搬，消费点 `store_wait`。
+- 线程池进程内唯一（`--store-threads`，默认 2），只负责发起与登记，池内绝不阻塞等待；
+  同步取插队、预取可取消；池不可用时异步退化为同步并计数，不得 abort。
+- 句柄不是裸地址；搬运期间目标槽被 pin；淘汰要过"代际未变 + 无在途 + 无未消费句柄"三道检查。
+- **模型加载不归它**：GGUF 解析、张量类型、mmap、`lazy_read` 留在 loader；专家落进 host 后按
+  层 + 专家子对象注册，KV 按页注册，其余不注册（见 `THREE-TIER.md` F12 第 12 节）。
+- 代价表由 store 给出并执行：SSD 对单步关键路径直接返回不可用并计数 `store_ssd_sync_rejected`。
+- 预取策略第一版照搬现状（SLRU + 整层驻留提示 + 2 槽环），只换执行者；**M2 才是收益步**，
+  用 `use_step` 取代"提前 1 层"，TG 提升 >= 15% 才算收益（未结项 20 的规则）。
 
 ## 仓库裁剪范围
 
@@ -117,15 +147,19 @@ pp512 直接腰斩，所以基准测试要显式 `-lm none`。
   `ggml_backend_set_tensor_async_deferred()` / `wait_deferred()`、`ggml_backend_buft_get_max_alloc_size()`。
 - Vulkan 侧 API：`ggml_backend_vk_prefetch_tensor/submit/wait`（`ggml/include/ggml-vulkan.h`）。
 - MTP / 投机解码：`--spec-type draft-mtp`，`LLM_TENSOR_NEXTN_*`，draft 循环在 `common/speculative.cpp`。
+- 跨层搬运的**唯一**入口（F12，未开工）：`llama-store`，见 `THREE-TIER.md` F12；已落地的只有等待原语
+  `ggml_backend_vk_prefetch_submit_seq` / `_wait_seq`（`ggml/include/ggml-vulkan.h`，验证工具 `bench/tools/wait-seq.cpp`）。
+- store 内部固定三单元 + 薄壳（`store-slab` / `store-io` / `store-policy`），不另立子系统；
+  计划中的子系统（`llama-trace` / `ggml-sched-plan` / `kv-seq` / `store-file`）与判据见 `THREE-TIER.md` F13。
 
 ## 文件索引
 
 ```
-AGENTS.md                     本文件：目标、期望约束、门禁、索引
+AGENTS.md                     本文件：目标、回复风格、期望约束、门禁、索引
 bench/README.md               测试口径、显存/内存档位实现、必报列、测量陷阱、目录说明
 bench/RESULTS.md              数字的唯一来源（含尚未开测的目标矩阵）
 bench/DECISIONS.md            可达性判决、已证伪清单、开关表、代码级硬约束、未结项
-bench/THREE-TIER.md           三层协同的现状判定、缺口 F0-F10 与顺序
+bench/THREE-TIER.md           三层协同的现状判定、缺口 F0-F13（F12 = 常开的 llama-store，F13 = 子系统边界）
 bench/prompts/                prompt10k.txt(10428 tok) prompt20k.txt(19758 tok) + d3 的两份
 bench/env/                    power.txt（电源方案 GUID）、machine.txt（采集的硬件事实）
 bench/tools/                  run-matrix.sh（矩阵，bash） quality-gate.sh（PPL+KLD，bash）
@@ -180,6 +214,11 @@ skills/code-review/SKILL.md   写代码/加注释前读
 - 不得用 `GGML_ABORT` 处理容量不足、内存不足、路由过散这类运行期条件。
 - 不得把只在一个显存档、一个 bank、一个电源态下成立的结论写进文档。
 - 不得为了让数字好看而跳过 `-nkvo`、跳过小显存档或缩短 prompt。
+- 不得在调用方另写第三套跨层搬运（显存/MoE cache/KV 之外）。新搬运一律走 `llama-store` 的两个入口；
+  子系统落地前只允许扩展现有 MoE cache 路径，并在 `THREE-TIER.md` F12 记一笔。
+- 不得为了 A/B 方便给 `llama-store` 加总开关（它是常开基础设施）；对照用三个预算参数复现旧行为。
+- 不得把路由预测（下一层要哪些专家、rolling promotion）塞进 store；store 只按调用方给的 use_step 排 deadline。
+- 不得合并 CPU 计算池与 IO 池（GEMM 长任务会把搬运饿死）；store 的池只归 `store-io`。
 
 ## 参考
 
