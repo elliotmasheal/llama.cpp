@@ -134,6 +134,8 @@ llama_build(test-backend-ops.cpp LINK ggml)
 
 llama_build_and_test(test-kv-page.cpp LINK ggml)
 
+llama_build_and_test(test-store-slab.cpp)
+
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
