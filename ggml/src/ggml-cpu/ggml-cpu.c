@@ -388,6 +388,9 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot                  = ggml_vec_dot_iq4_xs_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        .vec_dot_x2               = ggml_vec_dot_iq4_xs_q8_K_x2,
+#endif
     },
     [GGML_TYPE_Q8_K] = {
         .from_float               = quantize_row_q8_K,
@@ -1750,6 +1753,182 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+// ggml_compute_forward_mul_mat_id_swiglu
+
+// work data of one fused node: a quantized copy of the layer input per thread, the gate and up results of
+// every slot, plus the swiglu result in the vec_dot format. ggml_graph_plan and the kernel must agree
+static size_t ggml_mul_mat_id_swiglu_wsize(int n_threads, const struct ggml_tensor * node) {
+    const struct ggml_tensor * up  = node->src[0];
+    const struct ggml_tensor * ids = node->src[4];
+
+    const enum ggml_type vec_dot_type = type_traits_cpu[up->type].vec_dot_type;
+
+    size_t size = (size_t) n_threads * (ggml_row_size(vec_dot_type, up->ne[0]) + 64);
+    // gate and up of every slot land here before the swiglu: splitting them into their own work items is
+    // what keeps the first phase balanced when the thread count does not divide the slot count
+    size += (size_t) ids->ne[0] * (2*up->ne[1]*sizeof(float) + 64);
+    size += (size_t) ids->ne[0] * (ggml_row_size(vec_dot_type, up->ne[1]) + 64);
+    return size;
+}
+
+static void ggml_compute_forward_mul_mat_id_swiglu(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst,
+        const struct ggml_tensor * mask) {
+
+    const struct ggml_tensor * up   = dst->src[0];
+    const struct ggml_tensor * gate = dst->src[1];
+    const struct ggml_tensor * down = dst->src[2];
+    const struct ggml_tensor * cur  = dst->src[3];
+    const struct ggml_tensor * ids  = dst->src[4];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t ne00 = up->ne[0]; // n_embd, the width of the layer input
+    const int64_t ne01 = up->ne[1]; // n_ff, the width of the swiglu result
+
+    const int n_slot = (int) ids->ne[0];
+    const int n_tok  = (int) ids->ne[1];
+
+    const enum ggml_type type = up->type;
+
+    ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
+    enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    ggml_from_float_t const from_float   = type_traits_cpu[vec_dot_type].from_float;
+    // [GGML_MMID_SWIGLU_X2] two rows per vec_dot: +4-6% at -t 1/2/4, -2% at -t 5 (bench/RESULTS.md 0.15.6),
+    // so off by default until a shape or thread count shows a solid win
+    const bool use_x2 = getenv("GGML_MMID_SWIGLU_X2") != NULL && atoi(getenv("GGML_MMID_SWIGLU_X2")) != 0;
+    ggml_vec_dot_x2_t const vec_dot_x2   = use_x2 ? type_traits_cpu[type].vec_dot_x2 : NULL;
+
+    // a work item is one quantized block, so every thread writes a whole block of the swiglu result
+    const int64_t blk = ggml_blck_size(vec_dot_type);
+
+    GGML_ASSERT(ne00 % blk == 0 && ne01 % blk == 0 && blk <= 256);
+    GGML_ASSERT(params->wsize >= ggml_mul_mat_id_swiglu_wsize(nth, dst));
+
+    char * wdata_cur = params->wdata;
+
+    const size_t xq_size   = ggml_row_size(vec_dot_type, ne00);
+    const size_t actq_size = ggml_row_size(vec_dot_type, ne01);
+
+    char * xq   = incr_ptr_aligned((void **) &wdata_cur, (size_t) nth * xq_size, 64);
+    char * act  = incr_ptr_aligned((void **) &wdata_cur, (size_t) n_slot * 2*ne01*sizeof(float), 64);
+    char * actq = incr_ptr_aligned((void **) &wdata_cur, (size_t) n_slot * actq_size, 64);
+
+    char * xq_cur = xq + (size_t) ith * xq_size;
+
+    if (mask != NULL && ith == 0) {
+        // a masked slot reads as exactly 0, the graph adds the slots without a mask
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+
+    const int64_t nblk1 = (ne01 + blk - 1) / blk;
+    const int64_t nblk2 = (ne00 + blk - 1) / blk;
+    // phase 1a writes plain floats, so its blocks are free of the quantization size and can stay fine
+    // grained: a thread count that does not divide the slot count then still splits evenly
+    const int64_t blk1a  = 64;
+    const int64_t nblk1a = (ne01 + blk1a - 1) / blk1a;
+
+    for (int64_t t = 0; t < n_tok; ++t) {
+        // every thread converts what it reads, the gate and the up projection share the copy
+        from_float((const float *) cur->data + t*ne00, xq_cur, (int) ne00);
+
+        // phase 1a: gate and up are separate work items, which keeps the split even when the thread count
+        // does not divide the slot count (5 threads, 8 slots: 16 blocks either way, but 32 here)
+        const int64_t n1 = (int64_t) n_slot * 2 * nblk1a;
+        for (int64_t it = ith; it < n1; it += nth) {
+            const int     mat   = (int) ((it / nblk1a) % 2); // 0 = gate, 1 = up
+            const int64_t r0    = (it % nblk1a) * blk1a;
+            const int     slot  = (int) (it / (2*nblk1a));
+            const int64_t r1    = MIN(r0 + blk1a, ne01);
+            const int64_t nr    = r1 - r0;
+
+            const int32_t e   = *(const int32_t *) ((const char *) ids->data  + t*ids->nb[1]  + slot*ids->nb[0]);
+            const int32_t mv  = mask == NULL ? 1 :
+                                *(const int32_t *) ((const char *) mask->data + t*mask->nb[1] + slot*mask->nb[0]);
+            if (mv == 0) {
+                continue;
+            }
+
+            const struct ggml_tensor * w = mat == 0 ? gate : up;
+            const char * row = (const char *) w->data + (size_t) e*w->nb[2] + r0*w->nb[1];
+            float      * out = (float *) act + ((size_t) slot*2 + mat)*ne01 + r0;
+
+            int64_t i = 0;
+            if (vec_dot_x2 != NULL) {
+                for (; i + 1 < nr; i += 2) {
+                    vec_dot_x2(ne00, &out[i], row + i*w->nb[1], row + (i+1)*w->nb[1], xq_cur);
+                }
+            }
+            for (; i < nr; ++i) {
+                vec_dot(ne00, &out[i], 0, row + i*w->nb[1], 0, xq_cur, 0, 1);
+            }
+        }
+
+        ggml_barrier(params->threadpool);
+
+        // phase 1b: silu(gate)*up of the block, quantized in place for the down projection
+        const int64_t n1b = (int64_t) n_slot * nblk1;
+        for (int64_t it = ith; it < n1b; it += nth) {
+            const int     slot = (int) (it / nblk1);
+            const int64_t r0   = (it % nblk1) * blk;
+            const int64_t r1   = MIN(r0 + blk, ne01);
+
+            const int32_t mv  = mask == NULL ? 1 :
+                                *(const int32_t *) ((const char *) mask->data + t*mask->nb[1] + slot*mask->nb[0]);
+            if (mv == 0) {
+                continue;
+            }
+
+            const float * g = (const float *) act + (size_t) slot*2*ne01 + r0;
+            const float * u = g + ne01;
+
+            float tmp[256];
+            const int64_t nr = r1 - r0;
+            GGML_ASSERT(nr <= (int64_t) (sizeof(tmp)/sizeof(tmp[0])));
+
+            // gate goes first: ggml_vec_swiglu_f32 computes silu(x)*g with x = gate, g = up
+            ggml_vec_swiglu_f32((int) nr, tmp, g, u);
+            from_float(tmp, actq + (size_t) slot*actq_size + (r0/blk)*ggml_type_size(vec_dot_type), (int) nr);
+        }
+
+        ggml_barrier(params->threadpool);
+
+        // phase 2: the down projection of a slot reads only the swiglu result of that slot
+        const int64_t n2 = (int64_t) n_slot * nblk2;
+        for (int64_t it = ith; it < n2; it += nth) {
+            const int     slot = (int) (it / nblk2);
+            const int64_t r0   = (it % nblk2) * blk;
+            const int64_t r1   = MIN(r0 + blk, ne00);
+
+            const int32_t e   = *(const int32_t *) ((const char *) ids->data  + t*ids->nb[1]  + slot*ids->nb[0]);
+            const int32_t mv  = mask == NULL ? 1 :
+                                *(const int32_t *) ((const char *) mask->data + t*mask->nb[1] + slot*mask->nb[0]);
+            if (mv == 0) {
+                continue;
+            }
+
+            const char * d_row = (const char *) down->data + (size_t) e*down->nb[2] + r0*down->nb[1];
+            const char * a_vec = actq + (size_t) slot * actq_size;
+            float      * out   = (float *) ((char *) dst->data + t*dst->nb[2] + (size_t) slot*dst->nb[1]) + r0;
+
+            const int64_t nr = r1 - r0;
+            int64_t i = 0;
+            if (vec_dot_x2 != NULL) {
+                for (; i + 1 < nr; i += 2) {
+                    vec_dot_x2(ne01, &out[i], d_row + i*down->nb[1], d_row + (i+1)*down->nb[1], a_vec);
+                }
+            }
+            for (; i < nr; ++i) {
+                vec_dot(ne01, &out[i], 0, d_row + i*down->nb[1], 0, a_vec, 0, 1);
+            }
+        }
+    }
+}
+
+/////////////////////////////////
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -1886,6 +2065,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_ID_MASK:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor, tensor->src[3]);
+            } break;
+        case GGML_OP_MUL_MAT_ID_SWIGLU:
+            {
+                ggml_compute_forward_mul_mat_id_swiglu(params, tensor, tensor->src[5]);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2382,6 +2565,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_MUL_MAT_ID_MASK:
+        case GGML_OP_MUL_MAT_ID_SWIGLU:
         case GGML_OP_OUT_PROD:
         case GGML_OP_SET_ROWS:
             {
@@ -2935,6 +3119,10 @@ struct ggml_cplan ggml_graph_plan(
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
+                    } break;
+                case GGML_OP_MUL_MAT_ID_SWIGLU:
+                    {
+                        cur = ggml_mul_mat_id_swiglu_wsize(n_tasks, node);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

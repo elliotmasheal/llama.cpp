@@ -1113,9 +1113,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "MUL_MAT_ID_MASK",
+    "MUL_MAT_ID_SWIGLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1231,9 +1232,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "X[i]*Y*mask",
+    "swiglu(X[i]*Y)*Z",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3458,6 +3460,43 @@ struct ggml_tensor * ggml_mul_mat_id_mask(
 
     result->op     = GGML_OP_MUL_MAT_ID_MASK;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_mul_mat_id_swiglu
+
+struct ggml_tensor * ggml_mul_mat_id_swiglu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * mask) {
+    GGML_ASSERT(up->type == gate->type && up->type == down->type);
+    GGML_ASSERT(up->ne[0] == gate->ne[0] && up->ne[1] == gate->ne[1] && up->ne[2] == gate->ne[2]);
+    GGML_ASSERT(down->ne[0] == up->ne[1] && down->ne[1] == up->ne[0] && down->ne[2] == up->ne[2]);
+    GGML_ASSERT(up->ne[0] == b->ne[0]);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids->ne[1] == b->ne[2] && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(!ggml_is_transposed(up) && !ggml_is_transposed(gate) && !ggml_is_transposed(down));
+    if (mask != NULL) {
+        GGML_ASSERT(mask->type == GGML_TYPE_I32);
+        GGML_ASSERT(mask->ne[0] == ids->ne[0] && mask->ne[1] == ids->ne[1]);
+        GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
+    }
+
+    const int64_t ne[4] = { down->ne[1], ids->ne[0], ids->ne[1], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ID_SWIGLU;
+    result->src[0] = up;
+    result->src[1] = gate;
+    result->src[2] = down;
+    result->src[3] = b;
+    result->src[4] = ids;
+    result->src[5] = mask;
 
     return result;
 }

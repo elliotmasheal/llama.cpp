@@ -8,6 +8,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <atomic>
+#include <chrono>
+#include <random>
+#include <thread>
+#include <vector>
+
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -522,7 +528,8 @@ struct bench_row_mmid {
 // cne1 = k * batch / n_experts rows per expert on average. repack is n/a where no repack
 // kernel exists. Errors are vs the vec-only reference (use_ref).
 static bench_row_mmid bench_mul_mat_id(ggml_backend_t backend, int64_t K, int64_t R, int64_t n_experts,
-                                       int64_t k, int64_t b_slots, int64_t batch, ggml_type quant_type) {
+                                       int64_t k, int64_t b_slots, int64_t batch, ggml_type quant_type,
+                                       bool timing_only = false) {
     bench_row_mmid row;
     row.name = ggml_type_name(quant_type);
     row.time_std = row.time_repack = row.time_tiled = 0.0;
@@ -580,13 +587,23 @@ static bench_row_mmid bench_mul_mat_id(ggml_backend_t backend, int64_t K, int64_
 
     const size_t flush_size = 256 * 1024 * 1024;
     void * flush_buf = malloc(flush_size);
-    const int n_reps = 5;
+    const int n_reps = timing_only ? 7 : 5;
+
+    // the scaling sweep only wants the production path: the scalar reference takes minutes at 256 experts
+    if (timing_only) {
+        cpu_set_use_ref(backend, false);
+        row.time_std = time_graph_compute_best(backend, gf, n_reps, flush_buf, flush_size);
+        free(flush_buf);
+        ggml_backend_buffer_free(buf_rep);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return row;
+    }
 
     // std in-process (use_ref bypasses the tiled gate; the vec_dot is the same optimized one)
     cpu_set_use_ref(backend, true);
     row.time_std = time_graph_compute_best(backend, gf, n_reps, flush_buf, flush_size);
 
-    // tiled in-process (the parent holds TILED_MM=1 forced on)
     cpu_set_use_ref(backend, false);
     row.time_tiled = time_graph_compute_best(backend, gf, n_reps, flush_buf, flush_size);
 
@@ -650,28 +667,515 @@ static void print_mmid_table(int64_t K, int64_t R, int64_t n_experts, int64_t k,
     }
 }
 
+// thread scaling of the std MUL_MAT_ID path at the qwen35moe decode shape: 256 experts, top-8, one token.
+// Reports GB/s of expert bytes read, so "concurrency" and "clock" can be told apart with an outside
+// frequency sampler (bench/RESULTS.md 0.15)
+// mode 0: thread sweep at batch 1; mode 1: batch sweep at one thread count (per-op fixed cost probe)
+static void run_mmid_scale(ggml_backend_t backend, int n_threads_run, int mode) {
+    struct scale_shape { const char * name; int64_t K, R; } shapes[] = {
+        // qwen35moe: expert_feed_forward_length 512, n_embd 2560; gate, up and down are all [n_embd, n_ff]
+        { "expert", 2560, 512 },
+    };
+    const ggml_type types[] = { GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K };
+    const int thread_counts[] = { 1, 2, 4, 5, 8 };
+    const int batch_counts[]  = { 1, 2, 4, 8, 16 };
+
+    if (mode == 1) {
+        printf("\nMMID batch sweep, E=256 experts, 8 used per token, thr=%d (per op fixed cost probe)\n", n_threads_run);
+        printf("%-8s %5s %10s %10s %10s %10s\n", "type", "batch", "ms", "GB/s", "ms/64MB", "GB/s/thread");
+    } else {
+        printf("\nMMID thread scaling, E=256 experts, 8 used per token, batch=1 (std vec_dot path)\n");
+        printf("%-10s %-8s %4s %10s %10s %12s\n", "shape", "type", "thr", "ms", "GB/s", "GB/s/thread");
+    }
+    for (size_t it = 0; it < sizeof(types)/sizeof(types[0]); ++it) {
+        for (size_t is = 0; is < sizeof(shapes)/sizeof(shapes[0]); ++is) {
+            const int64_t K = shapes[is].K;
+            const int64_t R = shapes[is].R;
+            if (mode == 1) {
+                const int nt = n_threads_run > 0 ? n_threads_run : 5;
+                cpu_set_n_threads(backend, nt);
+                for (size_t ib = 0; ib < sizeof(batch_counts)/sizeof(batch_counts[0]); ++ib) {
+                    const int batch = batch_counts[ib];
+                    // the tokens of a batch reuse the same 8 experts, so the bytes are batch independent
+                    const size_t bytes = (size_t) ggml_row_size(types[it], K) * (size_t) R * 8;
+                    bench_row_mmid row = bench_mul_mat_id(backend, K, R, 256, 8, 1, batch, types[it], true);
+                    const double ms = row.time_std * 1e3;
+                    printf("%-8s %5d %10.3f %10.2f %10.3f %10.2f\n",
+                           ggml_type_name(types[it]), batch, ms,
+                           bytes / row.time_std / 1e9, ms / batch, bytes / row.time_std / 1e9 / nt);
+                }
+                fflush(stdout);
+                continue;
+            }
+            const size_t bytes = (size_t) ggml_row_size(types[it], K) * (size_t) R * 8;
+            for (size_t ic = 0; ic < sizeof(thread_counts)/sizeof(thread_counts[0]); ++ic) {
+                const int nt = thread_counts[ic];
+                if (n_threads_run > 0 && nt != n_threads_run) {
+                    continue;
+                }
+                cpu_set_n_threads(backend, nt);
+                bench_row_mmid row = bench_mul_mat_id(backend, K, R, 256, 8, 1, 1, types[it]);
+                const double ms = row.time_std * 1e3;
+                printf("%-10s %-8s %4d %10.3f %10.2f %12.2f\n",
+                       shapes[is].name, ggml_type_name(types[it]), nt, ms,
+                       bytes / row.time_std / 1e9, bytes / row.time_std / 1e9 / nt);
+            }
+            fflush(stdout);
+        }
+    }
+}
+
+// one graph_compute with one MUL_MAT_ID node over k experts: the per node cost as the expert count grows
+static double time_mmid_node(ggml_backend_t backend, int64_t k, int64_t K, int64_t R, ggml_type type,
+                             void * flush_buf, size_t flush_size) {
+    struct ggml_init_params ip = { 1024*1024*1024, nullptr, true };
+    struct ggml_context * ctx = ggml_init(ip);
+
+    int64_t ne_as[4] = { K, R, k, 1 };
+    struct ggml_tensor * src0 = ggml_new_tensor(ctx, type, 4, ne_as);
+    struct ggml_tensor * src1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, 1);
+    struct ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, 1);
+    struct ggml_tensor * dst  = ggml_mul_mat_id(ctx, src0, src1, ids);
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, dst);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (buf == nullptr) {
+        fprintf(stderr, "error: failed to allocate the node buffers\n");
+        exit(1);
+    }
+
+    float * b  = gen_rand_f32(K);
+    float * as = gen_rand_f32(K * R * k);
+    int32_t * i32 = (int32_t *) malloc(k * sizeof(int32_t));
+    fill_tensor(src1, b, 1, K, GGML_TYPE_F32);
+    fill_tensor(src0, as, R * k, K, type);
+    for (int64_t e = 0; e < k; ++e) {
+        i32[e] = (int32_t) e;
+    }
+    ggml_backend_tensor_set(ids, i32, 0, k*sizeof(int32_t));
+    free(i32);
+    free(as);
+    free(b);
+
+    const double t = time_graph_compute_best(backend, gf, 7, flush_buf, flush_size);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return t;
+}
+
+// A 64 element add costs nothing, so whatever it measures is the harness itself: the 256 MB L3 flush
+// leaves dirty lines whose writeback lands inside the next timed region.
+static double time_tiny(ggml_backend_t backend, void * flush_buf, size_t flush_size) {
+    struct ggml_init_params ip = { 1024*1024, nullptr, true };
+    struct ggml_context * ctx = ggml_init(ip);
+
+    struct ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+    struct ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, ggml_add(ctx, a, b));
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    const double t = time_graph_compute_best(backend, gf, 7, flush_buf, flush_size);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return t;
+}
+
+// Is the per-op cost of a MUL_MAT_ID a per graph_compute cost (fork/join) or a per node cost?
+// N independent nodes reading N disjoint expert sets run in one graph, then as N calls of one node.
+// A fused op only removes the per node share; the fork/join stays. qwen35moe decode shape, batch 1.
+static void run_mmid_chain(ggml_backend_t backend, int n_threads_run) {
+    const int64_t K = 2560;
+    const int64_t R = 512;
+    const int64_t k = 8;
+    const int     counts[] = { 1, 2, 4 };
+    const ggml_type type = GGML_TYPE_IQ4_XS;
+    const int nt = n_threads_run > 0 ? n_threads_run : 5;
+    cpu_set_n_threads(backend, nt);
+
+    const size_t flush_size = 256 * 1024 * 1024;
+    void * flush_buf = malloc(flush_size);
+
+    printf("\nMMID chain, K=%lld R=%lld k=%lld, thr=%d, %s: one graph with N nodes vs N calls\n",
+           (long long) K, (long long) R, (long long) k, nt, ggml_type_name(type));
+    printf("%6s %16s %12s %16s %12s\n", "nodes", "ms one graph", "ms/node", "ms N calls", "ms/call");
+
+    cpu_set_use_ref(backend, false);
+
+    double t_first = 0.0, t_last = 0.0;
+    int    n_first = 0, n_last = 0;
+
+    for (size_t ic = 0; ic < sizeof(counts)/sizeof(counts[0]); ++ic) {
+        const int N = counts[ic];
+
+        struct ggml_init_params ip = { 1024*1024*1024, nullptr, true };
+        struct ggml_context * ctx = ggml_init(ip);
+
+        int64_t ne_as[4] = { K, R, 8*N, 1 };
+        struct ggml_tensor * src0 = ggml_new_tensor(ctx, type, 4, ne_as);
+        struct ggml_tensor * src1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, 1);
+
+        struct ggml_tensor * ids[4] = { nullptr };
+        struct ggml_tensor * dst[4] = { nullptr };
+        for (int i = 0; i < N; ++i) {
+            ids[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, 1);
+            dst[i] = ggml_mul_mat_id(ctx, src0, src1, ids[i]);
+        }
+
+        struct ggml_cgraph * gf = ggml_new_graph(ctx);
+        for (int i = 0; i < N; ++i) {
+            ggml_build_forward_expand(gf, dst[i]);
+        }
+        struct ggml_cgraph * gf_one[4] = { nullptr };
+        for (int i = 0; i < N; ++i) {
+            gf_one[i] = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf_one[i], dst[i]);
+        }
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (buf == nullptr) {
+            fprintf(stderr, "error: failed to allocate the chain buffers\n");
+            exit(1);
+        }
+
+        float * b  = gen_rand_f32(K);
+        float * as = gen_rand_f32(K * R * 8 * N);
+        fill_tensor(src1, b, 1, K, GGML_TYPE_F32);
+        fill_tensor(src0, as, R * 8 * N, K, type);
+        for (int i = 0; i < N; ++i) {
+            int32_t i32[8];
+            for (int e = 0; e < k; ++e) {
+                i32[e] = (int32_t) (i*8 + e);
+            }
+            ggml_backend_tensor_set(ids[i], i32, 0, k*sizeof(int32_t));
+        }
+        free(as);
+        free(b);
+
+        const double t_graph = time_graph_compute_best(backend, gf, 7, flush_buf, flush_size);
+        double t_calls = 0.0;
+        for (int i = 0; i < N; ++i) {
+            t_calls += time_graph_compute_best(backend, gf_one[i], 7, flush_buf, flush_size);
+        }
+        printf("%6d %16.3f %12.3f %16.3f %12.3f\n",
+               N, t_graph*1e3, t_graph*1e3/N, t_calls*1e3, t_calls*1e3/N);
+        fflush(stdout);
+
+        if (N == counts[0]) { t_first = t_graph*1e3; n_first = N; }
+        if (N == counts[sizeof(counts)/sizeof(counts[0]) - 1]) { t_last = t_graph*1e3; n_last = N; }
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    // time(N) = fixed + marginal*N over the two endpoints: fixed is the per graph_compute share
+    const double marginal = (t_last - t_first) / (n_last - n_first);
+    printf("fit: per node %.3f ms, per graph_compute %.3f ms (fork/join + graph setup)\n",
+           marginal, t_first - marginal*n_first);
+
+    // one node, more experts: the same total bytes spread over 1, 2 or 3 expert groups tells whether the
+    // cost follows the data or carries a per node share that a fused gate/up/down would pay only once
+    printf("\nMMID one node, K=%lld R=%lld thr=%d %s: expert sweep\n",
+           (long long) K, (long long) R, nt, ggml_type_name(type));
+    printf("%6s %10s %10s %10s\n", "k", "MiB", "ms", "GB/s");
+    const int64_t ks[] = { 8, 16, 24 };
+    double t_k8 = 0.0, t_k24 = 0.0;
+    for (size_t ik = 0; ik < sizeof(ks)/sizeof(ks[0]); ++ik) {
+        const double t = time_mmid_node(backend, ks[ik], K, R, type, flush_buf, flush_size);
+        const double mib = (double) ggml_row_size(type, K) * (double) R * (double) ks[ik] / 1048576.0;
+        printf("%6lld %10.1f %10.3f %10.2f\n", (long long) ks[ik], mib, t*1e3, mib*1048576.0/(t*1e9));
+        if (ks[ik] == 8)  { t_k8  = t*1e3; }
+        if (ks[ik] == 24) { t_k24 = t*1e3; }
+    }
+    printf("3 nodes of 8 = %.3f ms vs 1 node of 24 = %.3f ms (fused gate/up/down upper bound)\n",
+           3.0*t_k8, t_k24);
+
+    // what the harness itself adds: the tiny graph must be microseconds, anything above is the flush
+    const double t_h = time_tiny(backend, flush_buf, flush_size);
+    const double t_n = time_tiny(backend, NULL, 0);
+    printf("harness: tiny graph %.3f ms with the L3 flush, %.3f ms without (flush writeback = %.3f ms)\n",
+           t_h*1e3, t_n*1e3, (t_h - t_n)*1e3);
+    fflush(stdout);
+    free(flush_buf);
+}
+
+// The fused expert feed forward against the four node sequence the layer builds today, at the qwen35moe
+// decode shape: gate/up [n_embd, n_ff], down [n_ff, n_embd], 8 experts, one token, two slots masked off.
+static void run_mmid_fused(ggml_backend_t backend, int n_threads_run) {
+    const int64_t n_embd = 2560;
+    const int64_t n_ff   = 512;
+    const int64_t k      = 8;
+    const ggml_type type = GGML_TYPE_IQ4_XS;
+    const int nt = n_threads_run > 0 ? n_threads_run : 5;
+    cpu_set_n_threads(backend, nt);
+
+    struct ggml_init_params ip = { 1024*1024*1024, nullptr, true };
+    struct ggml_context * ctx = ggml_init(ip);
+
+    int64_t ne_w[4] = { n_embd, n_ff, k, 1 };
+    int64_t ne_d[4] = { n_ff, n_embd, k, 1 };
+    struct ggml_tensor * up   = ggml_new_tensor(ctx, type, 4, ne_w);
+    struct ggml_tensor * gate = ggml_new_tensor(ctx, type, 4, ne_w);
+    struct ggml_tensor * down = ggml_new_tensor(ctx, type, 4, ne_d);
+    struct ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, 1);
+    struct ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, 1);
+    struct ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, 1);
+    struct ggml_tensor * w    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, 1);
+
+    auto combine = [&](ggml_tensor * down_out) {
+        ggml_tensor * w_cpu = ggml_mul(ctx, down_out, w);
+        ggml_tensor * sum   = nullptr;
+        for (int64_t i = 0; i < k; ++i) {
+            ggml_tensor * view = ggml_view_2d(ctx, w_cpu, n_embd, 1, w_cpu->nb[2], i*w_cpu->nb[1]);
+            sum = sum == nullptr ? view : ggml_add(ctx, sum, view);
+        }
+        return sum;
+    };
+
+    // the four node sequence of src/llama-moe-cache.cpp register_hybrid
+    ggml_tensor * up_r   = ggml_mul_mat_id_mask(ctx, up,   x, ids, mask);
+    ggml_tensor * gate_r = ggml_mul_mat_id_mask(ctx, gate, x, ids, mask);
+    ggml_tensor * act_r  = ggml_swiglu_split(ctx, gate_r, up_r);
+    ggml_tensor * dn_r   = ggml_mul_mat_id_mask(ctx, down, act_r, ids, mask);
+    ggml_tensor * out_r  = combine(dn_r);
+
+    // the fused node
+    ggml_tensor * fused  = ggml_mul_mat_id_swiglu(ctx, up, gate, down, x, ids, mask);
+    ggml_tensor * out_f  = combine(fused);
+
+    struct ggml_cgraph * gf_r = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf_r, out_r);
+    struct ggml_cgraph * gf_f = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf_f, out_f);
+
+    // which node carries the time: the gate/up dot is 2560 long over 512 rows, the down dot is 512
+    // long over 2560 rows, so the two do the same bytes with 5x the number of vec_dot calls
+    struct { const char * name; ggml_tensor * out; } per_op[] = {
+        { "up",      ggml_mul_mat_id_mask(ctx, up,   x, ids, mask) },
+        { "gate",    ggml_mul_mat_id_mask(ctx, gate, x, ids, mask) },
+        { "swiglu",  act_r },
+        { "down",    dn_r },
+        { "mul+sum", out_r },
+    };
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (buf == nullptr) {
+        fprintf(stderr, "error: failed to allocate the fused test buffers\n");
+        exit(1);
+    }
+
+    float * x_data = gen_rand_f32(n_embd);
+    ggml_backend_tensor_set(x, x_data, 0, ggml_nbytes(x));
+    free(x_data);
+
+    float * w_up   = gen_rand_f32(n_embd*n_ff*k);
+    float * w_gate = gen_rand_f32(n_embd*n_ff*k);
+    float * w_down = gen_rand_f32(n_ff*n_embd*k);
+    fill_tensor(up,   w_up,   n_ff*k, n_embd, type);
+    fill_tensor(gate, w_gate, n_ff*k, n_embd, type);
+    fill_tensor(down, w_down, n_embd*k, n_ff, type);
+    free(w_up);
+    free(w_gate);
+    free(w_down);
+
+    const int32_t ids_data[8]  = { 3, 1, 7, 0, 5, 2, 6, 4 };
+    const int32_t mask_data[8] = { 1, 1, 1, 0, 1, 1, 0, 1 };
+    float w_data[8];
+    for (int64_t i = 0; i < k; ++i) {
+        w_data[i] = 0.125f*(float) (i + 1);
+    }
+    ggml_backend_tensor_set(ids,  ids_data,  0, k*sizeof(int32_t));
+    ggml_backend_tensor_set(mask, mask_data, 0, k*sizeof(int32_t));
+    ggml_backend_tensor_set(w,    w_data,    0, k*sizeof(float));
+
+    cpu_set_use_ref(backend, false);
+
+    float * ref = (float *) malloc(n_embd*sizeof(float));
+    float * got = (float *) malloc(n_embd*sizeof(float));
+    ggml_backend_graph_compute(backend, gf_r);
+    ggml_backend_tensor_get(out_r, ref, 0, ggml_nbytes(out_r));
+    ggml_backend_graph_compute(backend, gf_f);
+    ggml_backend_tensor_get(out_f, got, 0, ggml_nbytes(out_f));
+
+    float max_err = 0.0f, rms = 0.0f;
+    compare_f32(ref, got, n_embd, &max_err, &rms);
+    printf("\nMMID fused gate/up/swiglu/down, n_embd=%lld n_ff=%lld k=%lld, thr=%d, %s\n",
+           (long long) n_embd, (long long) n_ff, (long long) k, nt, ggml_type_name(type));
+    printf("4 nodes vs 1 fused node: max_err %.3e, rms %.3e\n", max_err, rms);
+
+    const size_t flush_size = 256 * 1024 * 1024;
+    void * flush_buf = malloc(flush_size);
+
+    // alternate the two graphs rep by rep: the machine drifts by more than the effect, so only paired
+    // runs are comparable, and the minimum of each arm still sees cold data
+    const int n_rep = 15;
+    double best_r = 1e30, best_f = 1e30;
+    double ratio[15];
+    time_graph_compute(backend, gf_r);
+    time_graph_compute(backend, gf_f);
+    for (int i = 0; i < n_rep; ++i) {
+        memset(flush_buf, 0xAB, flush_size);
+        const double t_r = time_graph_compute(backend, gf_r);
+        memset(flush_buf, 0xAB, flush_size);
+        const double t_f = time_graph_compute(backend, gf_f);
+        if (t_r < best_r) { best_r = t_r; }
+        if (t_f < best_f) { best_f = t_f; }
+        ratio[i] = t_r/t_f;
+    }
+    // median of the paired ratios, robust to the odd rep that lands on a core migration
+    for (int i = 1; i < n_rep; ++i) {
+        const double key = ratio[i];
+        int j = i - 1;
+        while (j >= 0 && ratio[j] > key) { ratio[j + 1] = ratio[j]; --j; }
+        ratio[j + 1] = key;
+    }
+    const double t_r = best_r;
+    const double t_f = best_f;
+
+    // which node carries the time: the gate/up dot is 2560 long over 512 rows, the down dot is 512
+    // long over 2560 rows, so the two do the same bytes with 5x the number of vec_dot calls
+    for (size_t i = 0; i < sizeof(per_op)/sizeof(per_op[0]); ++i) {
+        ggml_cgraph * g = ggml_new_graph(ctx);
+        ggml_build_forward_expand(g, per_op[i].out);
+        const double t = time_graph_compute_best(backend, g, 7, flush_buf, flush_size);
+        const size_t bytes = (per_op[i].out->op == GGML_OP_MUL_MAT_ID_MASK) ? ggml_nbytes(per_op[i].out->src[0]) : 0;
+        if (bytes > 0) {
+            printf("  %-8s %8.3f ms  %.1f MiB  %.2f GB/s\n", per_op[i].name, t*1e3,
+                   bytes/1048576.0, (double) bytes/(t*1e9));
+        } else {
+            printf("  %-8s %8.3f ms\n", per_op[i].name, t*1e3);
+        }
+    }
+    free(flush_buf);
+
+    const double mib = (double) ggml_row_size(type, n_embd)*n_ff*k*2.0/1048576.0 +
+                       (double) ggml_row_size(type, n_ff)*n_embd*k/1048576.0;
+    printf("4 nodes %.3f ms (%.2f GB/s), 1 fused %.3f ms (%.2f GB/s), min-ratio %.2fx, median paired %.2fx\n",
+           t_r*1e3, mib*1048576.0/(t_r*1e9), t_f*1e3, mib*1048576.0/(t_f*1e9), t_r/t_f, ratio[n_rep/2]);
+    fflush(stdout);
+
+    free(ref);
+    free(got);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+}
+
+// Best of n of a block read over a fixed buffer, scattered or linear. The hybrid worker reads the
+// expert weights from the host buffer of the GPU backend, so this compares that memory with plain RAM.
+static double read_blocks_best(const char * base, size_t bytes, size_t block, size_t n_blocks,
+                               int n_threads, bool scatter, int reps) {
+    const size_t n_in = bytes / block;
+    double best = 1e30;
+    for (int r = 0; r < reps; ++r) {
+        std::atomic<uint64_t> acc{0};
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::thread> ths;
+        for (int i = 0; i < n_threads; ++i) {
+            ths.emplace_back([&, i] {
+                std::mt19937_64 rng(0x9e3779b97f4a7c15ull*(i + 1) + r);
+                uint64_t sum = 0;
+                const size_t per = n_blocks / n_threads;
+                size_t blk = scatter ? (size_t)(rng() % n_in) : (size_t) i*per;
+                for (size_t b = 0; b < per; ++b) {
+                    const char * p = base + blk*block;
+                    for (size_t off = 0; off < block; off += 64) {
+                        sum += *(const uint64_t *)(p + off);
+                    }
+                    blk = scatter ? (size_t)(rng() % n_in) : (blk + 1) % n_in;
+                }
+                acc.fetch_add(sum, std::memory_order_relaxed);
+            });
+        }
+        for (auto & t : ths) {
+            t.join();
+        }
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (dt < best) {
+            best = dt;
+        }
+        if (acc.load() == 0xdeadbeefull) {
+            printf(" ");
+        }
+    }
+    return best;
+}
+
+static void probe_host_buft() {
+    const size_t size_mib  = 512;
+    const size_t block_kib = 1928;
+    const size_t n_blocks  = 320;
+    const int    reps      = 3;
+
+    printf("\nCPU read of the host buffer of every device: %zu MiB, %zu KiB blocks, %zu blocks per run\n",
+           size_mib, block_kib, n_blocks);
+
+    for (size_t id = 0; id < ggml_backend_dev_count(); ++id) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(id);
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
+        if (buft == nullptr) {
+            continue;
+        }
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size_mib << 20);
+        if (buf == nullptr) {
+            printf("  %-24s alloc failed\n", ggml_backend_buft_name(buft));
+            continue;
+        }
+        char       * base  = (char *) ggml_backend_buffer_get_base(buf);
+        const size_t bytes = size_mib << 20;
+        memset(base, 0x5a, bytes); // fault in every page first, write-combined memory needs a fair start
+        printf("  %-24s (%s)\n", ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
+        for (int t : {1, 2, 4, 5}) {
+            const double ds = read_blocks_best(base, bytes, block_kib << 10, n_blocks, t, true,  reps);
+            const double dl = read_blocks_best(base, bytes, block_kib << 10, n_blocks, t, false, reps);
+            printf("    %d threads scatter %6.2f GB/s, linear %6.2f GB/s\n", t,
+                   (double) n_blocks*(block_kib << 10)/ds/1e9,
+                   (double) n_blocks*(block_kib << 10)/dl/1e9);
+        }
+        ggml_backend_buffer_free(buf);
+    }
+}
+
 int main(int argc, char ** argv) {
     bool run_bench = false;
+    bool probe_buft = false;
     bool run_fuzz = false;
+    int  mmid_scale = -1; // -1 = off, 0 = all thread counts, >0 = one count
+    int  mmid_batch = -1; // -1 = off, 0 = default thread count, >0 = that thread count, batch sweep
+    int  mmid_chain = -1; // -1 = off, 0 = default thread count, >0 = that thread count, graph vs calls probe
+    int  mmid_fused = -1; // -1 = off, 0 = default thread count, >0 = that thread count, fused op check
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--bench") == 0) {
             run_bench = true;
         } else if (strcmp(argv[i], "--fuzz") == 0) {
             run_fuzz = true;
+        } else if (strcmp(argv[i], "--mmid-scale") == 0) {
+            mmid_scale = (i + 1 < argc) ? atoi(argv[++i]) : 0;
+        } else if (strcmp(argv[i], "--mmid-batch") == 0) {
+            mmid_batch = (i + 1 < argc) ? atoi(argv[++i]) : 0;
+        } else if (strcmp(argv[i], "--mmid-chain") == 0) {
+            mmid_chain = (i + 1 < argc) ? atoi(argv[++i]) : 0;
+        } else if (strcmp(argv[i], "--mmid-fused") == 0) {
+            mmid_fused = (i + 1 < argc) ? atoi(argv[++i]) : 0;
+        } else if (strcmp(argv[i], "--host-buft") == 0) {
+            probe_buft = true;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", argv[i]);
             return 1;
         }
     }
 
-    // Enable tiled MM, also force tiled MM even when unprofitable for benchmarks
+    // Enable tiled MM, also force tiled MM even when unprofitable for benchmarks. The scaling mode
+    // measures the production path, so it leaves both switches alone
+    if (mmid_scale < 0 && mmid_batch < 0 && mmid_chain < 0 && mmid_fused < 0) {
 #if defined(_WIN32)
-    _putenv("GGML_CPU_TILED_MM=1");
-    _putenv("GGML_CPU_TILED_MM_FORCE=1");
+        _putenv("GGML_CPU_TILED_MM=1");
+        _putenv("GGML_CPU_TILED_MM_FORCE=1");
 #else
-    setenv("GGML_CPU_TILED_MM", "1", 1);
-    setenv("GGML_CPU_TILED_MM_FORCE", "1", 1);
+        setenv("GGML_CPU_TILED_MM", "1", 1);
+        setenv("GGML_CPU_TILED_MM_FORCE", "1", 1);
 #endif
+    }
 
     ggml_backend_load_all();
     ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
@@ -679,6 +1183,37 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to initialize the CPU backend\n");
         return 1;
     }
+
+    if (probe_buft) {
+        probe_host_buft();
+        ggml_backend_free(backend);
+        return 0;
+    }
+
+    if (mmid_fused >= 0) {
+        run_mmid_fused(backend, mmid_fused);
+        ggml_backend_free(backend);
+        return 0;
+    }
+
+    if (mmid_chain >= 0) {
+        run_mmid_chain(backend, mmid_chain);
+        ggml_backend_free(backend);
+        return 0;
+    }
+
+    if (mmid_batch >= 0) {
+        run_mmid_scale(backend, mmid_batch, 1);
+        ggml_backend_free(backend);
+        return 0;
+    }
+
+    if (mmid_scale >= 0) {
+        run_mmid_scale(backend, mmid_scale, 0);
+        ggml_backend_free(backend);
+        return 0;
+    }
+
     cpu_set_n_threads(backend, 8);
     // base case, smoke each quant type
     test_matmul(backend, 256, 512, 256, GGML_TYPE_Q6_K);

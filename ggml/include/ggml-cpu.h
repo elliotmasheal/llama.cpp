@@ -114,11 +114,18 @@ extern "C" {
     typedef void (*ggml_vec_dot_t)  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT x, size_t bx,
                                        const void * GGML_RESTRICT y, size_t by, int nrc);
 
+    // two weight rows against one activation: the point is that two row streams stay in flight while a
+    // single vec_dot call keeps about one row in flight, which is what caps a batch 1 gemv
+    typedef void (*ggml_vec_dot_x2_t)(int n, float * GGML_RESTRICT s,
+                                      const void * GGML_RESTRICT x0, const void * GGML_RESTRICT x1,
+                                      const void * GGML_RESTRICT y);
+
     struct ggml_type_traits_cpu {
         ggml_from_float_t        from_float;
         ggml_vec_dot_t           vec_dot;
         enum ggml_type           vec_dot_type;
         int64_t                  nrows; // number of rows to process simultaneously
+        ggml_vec_dot_x2_t        vec_dot_x2; // optional, NULL when the type has no two row dot
     };
 
     GGML_BACKEND_API const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);

@@ -1943,7 +1943,13 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 
     // wait for the split backend to finish using the input before overwriting it
-    ggml_backend_sched_wait_backend(sched, split_backend_id, info);
+    // a host weight copy runs a callback that reads host memory the previous split filled (the routed
+    // ids), so that case needs the host to observe the completion, not just the device
+    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input)) {
+        ggml_backend_sched_sync_backend(sched, split_backend_id, info);
+    } else {
+        ggml_backend_sched_wait_backend(sched, split_backend_id, info);
+    }
 
     if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {

@@ -603,6 +603,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_MUL_MAT_ID_MASK,
+        GGML_OP_MUL_MAT_ID_SWIGLU,
 
         GGML_OP_COUNT,
     };
@@ -1515,6 +1516,20 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_mul_mat_id_mask(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * mask);
+
+    // the whole expert feed forward of a MoE layer in one node, CPU only:
+    //   act = silu(gate_e b) * (up_e b), out = down_e act, per selected expert e = ids[i, t]
+    // the gate and the up projection share one conversion of `b`, and one node replaces four, which is
+    // where the win is: a node over 5 MiB pays a fixed ramp (bench/RESULTS.md 0.15.3)
+    // `mask` is optional and follows ggml_mul_mat_id_mask
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_swiglu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * down,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids,
             struct ggml_tensor  * mask);

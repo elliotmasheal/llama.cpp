@@ -4170,3 +4170,81 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+
+// Two rows at once: the q8_K block is loaded once and reused, and the two weight row streams stay in
+// flight together. A single vec_dot call keeps about one row in flight, which is what caps batch 1 gemv.
+void ggml_vec_dot_iq4_xs_q8_K_x2(int n, float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vxa, const void * GGML_RESTRICT vxb,
+        const void * GGML_RESTRICT vy) {
+    assert(n % QK_K == 0);
+
+    const block_iq4_xs * GGML_RESTRICT xa = vxa;
+    const block_iq4_xs * GGML_RESTRICT xb = vxb;
+    const block_q8_K   * GGML_RESTRICT y  = vy;
+
+    const int nb = n / QK_K;
+
+#if defined __AVX2__
+    const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
+    const __m128i m4b = _mm_set1_epi8(0x0f);
+
+    __m256 acca = _mm256_setzero_ps();
+    __m256 accb = _mm256_setzero_ps();
+
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const int8_t  * q8  = y[ibl].qs;
+        const uint8_t * qsa = xa[ibl].qs;
+        const uint8_t * qsb = xb[ibl].qs;
+        uint16_t sha = xa[ibl].scales_h;
+        uint16_t shb = xb[ibl].scales_h;
+        __m256i sa1 = _mm256_setzero_si256();
+        __m256i sa2 = _mm256_setzero_si256();
+        __m256i sb1 = _mm256_setzero_si256();
+        __m256i sb2 = _mm256_setzero_si256();
+        for (int ib = 0; ib < QK_K/32; ib += 2) {
+            const __m256i q8b_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8b_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+
+            const __m128i qabits_1 = _mm_loadu_si128((const __m128i*)qsa); qsa += 16;
+            const __m128i qabits_2 = _mm_loadu_si128((const __m128i*)qsa); qsa += 16;
+            const __m128i qbbits_1 = _mm_loadu_si128((const __m128i*)qsb); qsb += 16;
+            const __m128i qbbits_2 = _mm_loadu_si128((const __m128i*)qsb); qsb += 16;
+
+            const int16_t lsa1 = ((xa[ibl].scales_l[ib/2] & 0xf) | ((sha << 4) & 0x30)) - 32;
+            const int16_t lsa2 = ((xa[ibl].scales_l[ib/2] >>  4) | ((sha << 2) & 0x30)) - 32;
+            const int16_t lsb1 = ((xb[ibl].scales_l[ib/2] & 0xf) | ((shb << 4) & 0x30)) - 32;
+            const int16_t lsb2 = ((xb[ibl].scales_l[ib/2] >>  4) | ((shb << 2) & 0x30)) - 32;
+            sha >>= 4;
+            shb >>= 4;
+
+            const __m256i qab_1 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(qabits_1, 4), m4b)),
+                                                  _mm_shuffle_epi8(values128, _mm_and_si128(qabits_1, m4b)));
+            const __m256i qab_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(qabits_2, 4), m4b)),
+                                                  _mm_shuffle_epi8(values128, _mm_and_si128(qabits_2, m4b)));
+            const __m256i qbb_1 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(qbbits_1, 4), m4b)),
+                                                  _mm_shuffle_epi8(values128, _mm_and_si128(qbbits_1, m4b)));
+            const __m256i qbb_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(qbbits_2, 4), m4b)),
+                                                  _mm_shuffle_epi8(values128, _mm_and_si128(qbbits_2, m4b)));
+
+            sa1 = _mm256_add_epi32(_mm256_madd_epi16(mul_add_epi8(qab_1, q8b_1), _mm256_set1_epi16(lsa1)), sa1);
+            sa2 = _mm256_add_epi32(_mm256_madd_epi16(mul_add_epi8(qab_2, q8b_2), _mm256_set1_epi16(lsa2)), sa2);
+            sb1 = _mm256_add_epi32(_mm256_madd_epi16(mul_add_epi8(qbb_1, q8b_1), _mm256_set1_epi16(lsb1)), sb1);
+            sb2 = _mm256_add_epi32(_mm256_madd_epi16(mul_add_epi8(qbb_2, q8b_2), _mm256_set1_epi16(lsb2)), sb2);
+        }
+        acca = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(xa[ibl].d)*y[ibl].d),
+                _mm256_cvtepi32_ps(_mm256_add_epi32(sa1, sa2)), acca);
+        accb = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(xb[ibl].d)*y[ibl].d),
+                _mm256_cvtepi32_ps(_mm256_add_epi32(sb1, sb2)), accb);
+    }
+
+    s[0] = hsum_float_8(acca);
+    s[1] = hsum_float_8(accb);
+#else
+    UNUSED(xa);
+    UNUSED(xb);
+    UNUSED(y);
+    UNUSED(nb);
+    ggml_vec_dot_iq4_xs_q8_K_generic(n, &s[0], 0, vxa, 0, vy, 0, 1);
+    ggml_vec_dot_iq4_xs_q8_K_generic(n, &s[1], 0, vxb, 0, vy, 0, 1);
+#endif
+}
