@@ -919,6 +919,10 @@ static bool common_moe_plan_impl(
     // the plan is the budget that a cache would get, so measure without one
     cparams_plan.moe_cache_size = 0;
     cparams_plan.moe_hybrid     = false;
+    // the probe must measure the same footprint whatever the scheduler copy count of the real run is:
+    // with copies the split inputs are duplicated and the measured weights/compute inflate, which
+    // used to zero the bank on --sched-parallel on
+    cparams_plan.sched_parallel = 0;
 
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0;
@@ -1047,12 +1051,19 @@ static bool common_moe_plan_impl(
             if (geo.expert_bytes[i] <= 0) {
                 continue;
             }
-            int64_t n_same = 0;
+            int64_t n_same      = 0;
+            int64_t group_bytes = 0;
             for (size_t j = 0; j < geo.expert_bytes.size(); ++j) {
-                n_same += geo.expert_layout[j] == geo.expert_layout[i] && geo.expert_bytes[j] > 0 ? 1 : 0;
+                if (geo.expert_layout[j] == geo.expert_layout[i] && geo.expert_bytes[j] > 0) {
+                    n_same++;
+                    group_bytes += geo.expert_bytes[j];
+                }
             }
-            if (n_same > 0) {
-                ring_need = std::max(ring_need, 2*expert_total/n_same);
+            // the ring is two whole layers of this group, so divide the group bytes, not the global total:
+            // a layer whose layout is unique used to demand two whole models of slots and killed the rings
+            // a group with a single layer cannot host two rings, it must not set the requirement either
+            if (n_same >= 2) {
+                ring_need = std::max(ring_need, 2*group_bytes/n_same);
             }
         }
         if (ring_need > 0) {

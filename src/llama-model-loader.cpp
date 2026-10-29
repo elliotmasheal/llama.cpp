@@ -1121,14 +1121,33 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+// host experts of a MoE layer get their own buffer, so a layer frozen in the VRAM bank can free it later
+static int32_t bucket_for_tensor(ggml_backend_buffer_type_t buft, const LLM_TN_IMPL & tn) {
+    if (tn.bid < 0) {
+        return 0;
+    }
+    try {
+        if (llm_tensor_info_for(tn.tensor).op != GGML_OP_MUL_MAT_ID) {
+            return 0;
+        }
+    } catch (const std::out_of_range &) {
+        return 0;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr || buft != ggml_backend_dev_host_buffer_type(dev)) {
+        return 0;
+    }
+    return tn.bid + 1;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, int32_t bucket) -> ggml_context * {
+        const ctx_key key { buft, is_lazy, bucket };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1335,7 +1354,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
-        ggml_context * ctx = ctx_for_buft(buft);
+        // no weights were loaded, so no host experts: the bucket is always the shared one
+        ggml_context * ctx = ctx_for_buft(buft, 0);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
         return ret;
@@ -1373,7 +1393,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
-    ggml_context * ctx = ctx_for_buft(buft);
+    ggml_context * ctx = ctx_for_buft(buft, bucket_for_tensor(buft, tn));
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {

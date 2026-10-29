@@ -78,6 +78,10 @@ public:
     // the backends and the cache buffers are freed
     void wait_promotion();
 
+    // free the host experts of the layers that are frozen in the bank, they never read their host copy again
+    // the model cannot serve a second context afterwards, the caller checks that
+    size_t release_frozen_host(const llama_model & model);
+
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);

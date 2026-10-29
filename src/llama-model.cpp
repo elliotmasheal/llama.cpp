@@ -963,6 +963,18 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    // host experts of one MoE layer: the context and the buffers that carry them, freed once the layer is frozen
+    struct moe_host_layer {
+        ggml_context * ctx = nullptr;
+        std::vector<ggml_backend_buffer_t> bufs;
+        size_t bytes = 0;
+    };
+    std::vector<moe_host_layer> moe_host_layers;
+
+    // released host experts cannot be restored, so a second context on the same model is refused
+    mutable int n_ctx_alive = 0;
+    mutable bool moe_host_released = false;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -1693,6 +1705,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
             buf_ptrs.emplace_back(buf.get());
+        }
+
+        if (ctx_key.bucket > 0) {
+            const size_t il = (size_t) ctx_key.bucket - 1;
+            if (pimpl->moe_host_layers.size() <= il) {
+                pimpl->moe_host_layers.resize(il + 1);
+            }
+            auto & rec = pimpl->moe_host_layers[il];
+            rec.ctx = ctx;
+            for (const auto & buf : bufs) {
+                rec.bufs.emplace_back(buf.get());
+                rec.bytes += ggml_backend_buffer_get_size(buf.get());
+            }
         }
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
@@ -2444,6 +2469,58 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+size_t llama_model::release_moe_host_experts(int il) const {
+    if (il < 0 || (size_t) il >= pimpl->moe_host_layers.size()) {
+        return 0;
+    }
+    auto & rec = pimpl->moe_host_layers[il];
+    if (rec.bufs.empty()) {
+        return 0;
+    }
+
+    // the graph reads these experts through the frozen bank view, so the host copy must never be touched again
+    for (ggml_tensor * t = ggml_get_first_tensor(rec.ctx); t != nullptr; t = ggml_get_next_tensor(rec.ctx, t)) {
+        t->data   = nullptr;
+        t->buffer = nullptr;
+    }
+
+    for (ggml_backend_buffer_t raw : rec.bufs) {
+        for (auto & [ctx_ptr, bufs] : pimpl->ctxs_bufs) {
+            for (auto & buf : bufs) {
+                if (buf.get() == raw) {
+                    buf.release();
+                }
+            }
+            bufs.erase(std::remove_if(bufs.begin(), bufs.end(), [](const ggml_backend_buffer_ptr & b) { return !b; }), bufs.end());
+        }
+        ggml_backend_buffer_free(raw);
+    }
+
+    const size_t bytes = rec.bytes;
+    rec.bufs.clear();
+    rec.bytes = 0;
+    pimpl->moe_host_released = true;
+    return bytes;
+}
+
+bool llama_model::has_released_moe_host() const {
+    return pimpl->moe_host_released;
+}
+
+void llama_model::ctx_attach() const {
+    pimpl->n_ctx_alive++;
+}
+
+void llama_model::ctx_detach() const {
+    if (pimpl->n_ctx_alive > 0) {
+        pimpl->n_ctx_alive--;
+    }
+}
+
+int llama_model::n_ctx_alive() const {
+    return pimpl->n_ctx_alive;
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {

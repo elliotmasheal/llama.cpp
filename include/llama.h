@@ -399,6 +399,14 @@ extern "C" {
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         bool moe_hybrid;       // small batches compute the experts that are not in the MoE cache on the CPU, requires moe_cache_size > 0 [EXPERIMENTAL]
 
+        // free the host experts of the whole layers that stay resident in the MoE cache, the freed memory cannot be
+        // restored, so the model can serve only one context afterwards [EXPERIMENTAL]
+        bool moe_free_frozen_host;
+
+        // double buffered scheduling with backend events: -1 = auto (multi-device pipeline parallelism
+        // only), 0 = off, 1 = also on one device, where the MoE cache is the only user of the events [EXPERIMENTAL]
+        int32_t sched_parallel;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

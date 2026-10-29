@@ -63,6 +63,7 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+    int32_t sched_parallel;  // -1 auto, 0 off, 1 also on one device (see llama_context_params)
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

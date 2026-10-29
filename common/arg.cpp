@@ -2868,6 +2868,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-free-frozen-host"},
+        "free the host experts of the whole layers that stay resident in the MoE cache\n"
+        "the freed pinned memory cannot be restored, so only one context may use the model afterwards\n"
+        "(bench/THREE-TIER.md F12)",
+        [](common_params & params) {
+            params.moe_free_frozen_host = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_FREE_FROZEN_HOST"));
+    add_opt(common_arg(
+        {"--sched-parallel"}, "[on|off|auto]",
+        "double buffer the split inputs and wait on backend events instead of draining the device between splits\n"
+        "'auto' (default) only enables it for multi-device pipeline parallelism; 'on' also enables it on one device,\n"
+        "where the MoE cache copies host experts once per layer and the per-layer drain is the whole cost\n"
+        "(bench/THREE-TIER.md F13 S2, DECISIONS.md item 28)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.sched_parallel = 1;
+            } else if (is_falsey(value)) {
+                params.sched_parallel = 0;
+            } else if (is_autoy(value)) {
+                params.sched_parallel = -1;
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --sched-parallel: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_env("LLAMA_ARG_SCHED_PARALLEL"));
+    add_opt(common_arg(
         {"--store-vram-mib"}, "N",
         "whole-run VRAM budget for llama-store in MiB: dense weights, expert bank, KV, compute and staging\n"
         "all count against it, and anything above it is held back, so it doubles as the visible tier\n"

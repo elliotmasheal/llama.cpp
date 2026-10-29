@@ -146,15 +146,20 @@ struct llama_model_loader {
     };
 
     // lazy tensors need dedicated context
+    // bucket > 0 gives the host experts of layer bucket-1 their own context, so their buffer can be freed alone
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        int32_t bucket;
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
+            }
+            if (lhs.bucket != rhs.bucket) {
+                return lhs.bucket < rhs.bucket;
             }
             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
         }

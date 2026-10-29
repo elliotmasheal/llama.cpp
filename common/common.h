@@ -606,6 +606,8 @@ struct common_params {
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     bool moe_cache_size_set = false; // whether --moe-cache-mib was given, otherwise the memory plan may set it
     bool moe_hybrid = false;   // small batches compute the experts that are not in the MoE cache on the CPU
+    bool moe_free_frozen_host = false; // free the host experts of the whole layers that stay resident in the cache
+    int32_t sched_parallel = -1; // scheduler events: -1 = auto (multi-device only), 0 = off, 1 = also on one device
     int32_t fit_plan = 1;      // memory plan rules: 1 = tier-scaled margins and per-group prefetch, 0 = legacy
 
     // llama-store (bench/THREE-TIER.md F12): always-on; the knobs replace the old env, 0 = auto

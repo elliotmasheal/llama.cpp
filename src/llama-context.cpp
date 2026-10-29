@@ -251,6 +251,11 @@ llama_context::llama_context(
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
+    // a context that freed the host experts of the frozen layers cannot be followed by another one
+    if (model.has_released_moe_host()) {
+        throw std::runtime_error("the host experts of this model were released, a second context is not supported");
+    }
+
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
@@ -442,6 +447,7 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.sched_parallel = params.sched_parallel;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -596,14 +602,18 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
         // TODO: move these checks to ggml_backend_sched
-        // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
-        bool pipeline_parallel =
-            model.n_devices() > 1 &&
+        // the scheduler keeps one copy of the split inputs per slot and waits on backend events instead of
+        // draining the device; the MoE cache copies host weights once per layer, so it pays off on one device too
+        const bool sched_parallel_ok =
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
-            cparams.offload_kqv &&
-            !model.has_tensor_overrides() &&
-            cparams.moe_cache_size == 0; // not supported by the MoE cache
+            cparams.offload_kqv;
+        // the explicit switch also accepts tensor overrides: -ncmoe puts the experts on the host, which is
+        // exactly the case where the per-layer host weight copy wants the events
+        const bool sched_parallel_auto = model.n_devices() > 1 && cparams.moe_cache_size == 0 &&
+            !model.has_tensor_overrides();
+        bool pipeline_parallel = sched_parallel_ok &&
+            (cparams.sched_parallel > 0 || (cparams.sched_parallel < 0 && sched_parallel_auto));
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -628,7 +638,12 @@ llama_context::llama_context(
         cparams.pipeline_parallel = pipeline_parallel;
 
         if (cparams.pipeline_parallel) {
-            LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+            LLAMA_LOG_INFO("%s: pipeline parallelism enabled (%d device%s, the split inputs are double buffered)\n", __func__,
+                    model.n_devices(), model.n_devices() == 1 ? "" : "s");
+            if (model.n_devices() == 1 && cparams.moe_cache_size == 0) {
+                LLAMA_LOG_WARN("%s: sched parallel on one device without the MoE cache has no host weight to overlap, "
+                        "the doubled input copies are pure overhead\n", __func__);
+            }
         }
 
         if (params.moe_hybrid && cparams.moe_cache_size == 0) {
@@ -643,6 +658,17 @@ llama_context::llama_context(
                 LLAMA_LOG_INFO("%s: MoE cache: the experts that are not resident are computed on the CPU\n", __func__);
             }
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, moe_hybrid);
+        }
+
+        // the banks are filled and synchronized at this point, the frozen layers do not need their host copy
+        // this context is not attached yet, so any other live context means the model is shared
+        if (moe_cache && params.moe_free_frozen_host) {
+            if (model.n_ctx_alive() > 0) {
+                LLAMA_LOG_WARN("%s: --moe-free-frozen-host needs a single context, %d are alive, skipped\n", __func__, model.n_ctx_alive());
+            } else {
+                moe_cache->wait_promotion();
+                moe_cache->release_frozen_host(model);
+            }
         }
 
         sched_reserve();
@@ -665,6 +691,10 @@ llama_context::llama_context(
     }
 
     llama_fault_diag("load_done", 0);
+
+    // attach only after every throw site: a throwing constructor never runs the destructor, so an
+    // early attach would leave the count high forever
+    model.ctx_attach();
 }
 
 llama_context::~llama_context() {
@@ -673,6 +703,7 @@ llama_context::~llama_context() {
     if (moe_cache) {
         moe_cache->wait_promotion();
     }
+    model.ctx_detach();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -833,9 +864,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_pre_split_callback(sched.get(), sched_pre_split, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
-    // without events the scheduler drains the backend before the next copy callback, so the staged
-    // readback is visible to the host there; with events the wait is device-side and it is not
-    if (moe_cache && !parallel) {
+    // the staged ids readback joins the submission of the split that produces the ids; the host side
+    // visibility comes from the copy callback's host event wait, which exists once the scheduler has events
+    if (moe_cache) {
         ggml_backend_sched_set_post_split_callback(sched.get(), sched_post_split, this);
     }
 }
@@ -4191,6 +4222,8 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_hybrid                  =*/ false,
+        /*.moe_free_frozen_host        =*/ false,
+        /*.sched_parallel              =*/ -1,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

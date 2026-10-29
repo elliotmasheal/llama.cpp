@@ -887,6 +887,15 @@ struct llama_model {
 
     ggml_backend_buffer_type_t select_buft(int il) const;
 
+    // host experts of one MoE layer: freed once the layer is frozen in the VRAM bank, cannot be restored
+    size_t release_moe_host_experts(int il) const;
+    bool   has_released_moe_host() const;
+
+    // a model whose host experts were released cannot serve a second context
+    void ctx_attach() const;
+    void ctx_detach() const;
+    int  n_ctx_alive() const;
+
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;

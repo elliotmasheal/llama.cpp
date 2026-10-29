@@ -80,6 +80,29 @@ struct moe_cache_slru {
         n_protected = 0;
     }
 
+    // give the slots [first, first + count) back to the pool: the prefetch rings overwrote the experts
+    // they held, the rest of the residency map is still valid
+    void release(int32_t first, int32_t count) {
+        const int32_t last = std::min(n_slots, first + count);
+        // the ring maps are written by the prefetch callback without key_of, so every entry that
+        // points into the range has to be dropped, not only the ones key_of knows about
+        for (int32_t * map : slot_map) {
+            if (map == nullptr) {
+                continue;
+            }
+            for (int32_t e = 0; e < n_expert; ++e) {
+                const int32_t s = map[e] - slot_base;
+                if (s >= first && s < last) {
+                    map[e] = -1;
+                }
+            }
+        }
+        for (int32_t s = std::max(0, first); s < last; ++s) {
+            key_of[s] = -1;
+            move(s, false);
+        }
+    }
+
     // move slot s to the most recently used end of a segment
     void move(int32_t s, bool protect) {
         const bool from = is_protected[s];
@@ -126,7 +149,8 @@ struct moe_cache_slru {
                 }
             }
         }
-        GGML_ABORT("no SLRU victim");
+        // every slot holds an expert of this layer that the request selects: capacity, the caller degrades
+        return -1;
     }
 
     struct fill {
@@ -158,11 +182,25 @@ struct moe_cache_slru {
 
         int32_t * slots = slot_map[il];
 
+        // the misses must fit the slots this request may evict; checked before anything is mutated so a
+        // failed plan leaves the residency map and the LRU lists untouched (the caller degrades)
+        for (int32_t e : uniq) {
+            n_hit += slots[e] >= 0;
+        }
+        size_t n_evictable = 0;
+        for (int32_t s = 0; s < n_slots; ++s) {
+            const int32_t key = key_of[s];
+            n_evictable += key < 0 || key / n_expert != il || seen[key % n_expert] != seen_gen;
+        }
+        if (uniq.size() - n_hit > n_evictable) {
+            n_hit = 0;
+            return false;
+        }
+
         // promote hits before choosing victims for misses
         for (int32_t e : uniq) {
             if (slots[e] >= 0) {
                 touch(slots[e] - slot_base);
-                n_hit++;
             }
         }
         // sorted misses usually get consecutive slots, so the uploads can be merged
@@ -172,6 +210,10 @@ struct moe_cache_slru {
                 continue;
             }
             const int32_t s = victim(il);
+            if (s < 0) {
+                // the pre-check above guarantees a victim, so this is unreachable
+                return false;
+            }
             if (key_of[s] >= 0) {
                 slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
             }
@@ -238,13 +280,15 @@ struct llama_moe_cache::impl {
         size_t host_bytes = 0;
         int32_t n_slots = 0;              // total hub slots, zero slot included at the end only when hybrid
         int32_t n_full  = 0;              // first n_full layers keep every expert in the bank
-        bool pf_dirty = false;            // the prefetch rings overwrote the SLRU slots of this group
+        int32_t ring_slots = 0;           // slots the two prefetch rings overwrite, zero if the group has no ring
+        bool pf_dirty = false;            // the prefetch rings overwrote the first ring_slots slots of this group
         moe_cache_slru slru;
     };
 
     struct layer {
         int32_t ig = -1;                    // -1 if the layer is not cached
         bool full = false;                  // every expert of the layer is in the bank
+        bool host_only = false;             // the LRU pool could not plan its ids, later graphs read the host experts
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
         ggml_tensor * miss_mask = nullptr;  // I32 [n_expert_used_max, max_batch] in host memory, hybrid only
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
@@ -273,7 +317,8 @@ struct llama_moe_cache::impl {
         ggml_tensor * ids     = nullptr; // I32 [n_expert_used, 1, 1]
         ggml_tensor * mask    = nullptr; // I32 [n_expert_used, 1], 1 = compute on the CPU
         ggml_tensor * weights = nullptr; // F32 [1, n_expert_used, 1]
-        ggml_tensor * out     = nullptr; // F32 [n_embd, 1], the sum of the misses
+        ggml_tensor * out     = nullptr; // F32 [n_embd, 1, n_used], unweighted, summed in the combine
+        int32_t       n_used  = 0;
 
         ggml_cgraph * graph = nullptr;
         ggml_cplan    cplan = {};
@@ -286,6 +331,7 @@ struct llama_moe_cache::impl {
         const ggml_tensor * src_weights = nullptr;
 
         int32_t seq = -1; // the submission sequence number, -1 if the worker has nothing to wait for
+        int64_t t_submit = 0; // wall clock of the submit, the combine turns it into the overlap window
     };
 
     static constexpr int64_t max_batch = 32;
@@ -347,8 +393,10 @@ struct llama_moe_cache::impl {
     };
 
     bool pf_enabled = false;
-    bool pf_requested = false;             // LLAMA_MOE_PREFETCH, also reserves the rings from the LRU pool
-    int32_t pf_max_full = 4;               // static whole layers per group kept for decode when prefetch is on
+    bool pf_requested = false;             // LLAMA_MOE_PREFETCH, the rings overwrite slots of the LRU pool
+    // the rings share the slots with the decode LRU: whole layers cost decode hits (RESULTS.md 0.16),
+    // so the default keeps every slot for the LRU and the A/B knob can still freeze up to 4 per group
+    int32_t pf_max_full = 0;               // static whole layers per group kept for decode when prefetch is on
     int64_t pf_min_tokens = 512;           // below this the whole-layer bytes cost more than the gather saves
     bool pf_batch = false;                 // the graph being built uses the prefetch path
     bool pf_pass_dirty = false;            // a prefetch pass overwrote the LRU pools, rebuild them before a small batch
@@ -368,6 +416,7 @@ struct llama_moe_cache::impl {
     uint64_t       pf_seq_prev = 0; // the sequence number of the batch previously submitted (waits for it when mode >= 2)
     uint64_t       pf_seq_last = 0;
     size_t n_split_degrades = 0;          // lookups whose ids are produced in the same split (bench/THREE-TIER.md F1)
+    size_t n_plan_fallbacks = 0;          // lookups whose ids do not fit the LRU pool, the layer reads host experts
     int64_t pf_wait_us  = 0;              // [LLAMA_MOE_PREFETCH_TIME] host time spent waiting for the prefetch
     int64_t pf_copy_us  = 0;              // [LLAMA_MOE_PREFETCH_TIME] host time spent in the prefetch callback
 
@@ -386,6 +435,7 @@ struct llama_moe_cache::impl {
     // [LLAMA_MOE_HYBRID_EXEC] the worker and its mailbox: the slot map callback submits a layer, the combine
     // callback of the same layer waits, so at most one job is in flight
     bool                 hybrid_exec  = false;
+    bool                 hybrid_off   = false; // the worker failed, later graphs use the in-graph CPU branch
     // the misses of a decode token are 1-3 experts per layer, so one thread beats a pool: the barriers of the
     // ~12 tiny ops per layer cost more than they save
     int32_t              hybrid_threads = 1;
@@ -412,8 +462,12 @@ struct llama_moe_cache::impl {
     ggml_threadpool_t   hybrid_tp     = nullptr;
     size_t              hybrid_waits  = 0;
     size_t              hybrid_skips  = 0; // layers whose experts were all in the bank
+    size_t              hybrid_failures = 0; // worker jobs that failed and were rerun on the combine thread
+    size_t              hybrid_missing  = 0; // combines without a submitted job after the executor was turned off
     int64_t             hybrid_wait_us = 0; // host time blocked in the combine callback
     int64_t             hybrid_jobs_us = 0; // worker time
+    size_t              hybrid_miss_experts = 0; // experts the worker computed, counts each slot once
+    int64_t             hybrid_wall_us = 0; // submit to combine, the window the GPU had to overlap
     size_t              hybrid_inp_staged  = 0;
     size_t              hybrid_inp_sync    = 0; // the readback was not staged, the submit had to drain
     size_t              hybrid_w_staged    = 0;
@@ -422,6 +476,7 @@ struct llama_moe_cache::impl {
     // [LLAMA_MOE_HYBRID_EXEC] rolling residency: every lookup plans the next token with the LRU and starts the
     // promotion through the prefetch batch, the map published to the device lags one token behind the plan
     bool  rolling = false;
+    bool  rolling_off = false; // a promotion did not fit, switch to the static residency at the next lookup
     std::vector<ggml_tensor *>        promote_map;     // [n_layer] pinned map that the device map is copied from
     std::vector<uint8_t>              promote_pending; // [n_layer] the promotion of the layer is in flight
     std::vector<moe_cache_slru::fill> promote_fills;
@@ -648,15 +703,12 @@ struct llama_moe_cache::impl {
                 promote_pending.assign(model.layers.size(), 0);
                 LLAMA_LOG_INFO("%s: rolling residency enabled, the promoted experts go through the prefetch batch\n", __func__);
             }
-            for (const group & g : groups) {
-                if (hybrid_mode) {
-                    // the rings are disabled in hybrid mode, the slots stay in the LRU pool
-                    continue;
-                }
-                if (g.n_slots != 0 && g.n_slots < 2*g.ref[0]->ne[2]) {
-                    LLAMA_LOG_WARN("%s: prefetch needs %d slots per group, group %td has %d, disabled\n",
-                            __func__, 2*g.ref[0]->ne[2], &g - groups.data(), g.n_slots);
-                    pf_requested = false;
+            for (group & g : groups) {
+                // the groups that cannot host two rings keep their slots as a plain LRU: the prefetch
+                // stream is per group (init_prefetch), so only these layers read host experts on prefill
+                if (!hybrid_mode && g.n_slots != 0 && g.n_slots < 2*g.ref[0]->ne[2]) {
+                    LLAMA_LOG_INFO("%s: group %td has %d slots, below two rings (%d), its layers keep the plain LRU\n",
+                            __func__, &g - groups.data(), g.n_slots, 2*g.ref[0]->ne[2]);
                 }
             }
         }
@@ -668,14 +720,16 @@ struct llama_moe_cache::impl {
             }
             const int32_t n_expert = g.ref[0]->ne[2];
             // whole layers never copy host experts during prefill, at most 5 per group so the LRU pool still helps decode
-            // the prefetch rings take two whole layers of slots, the rest of the static whole layers are
-            // kept for decode, LLAMA_MOE_PREFETCH_MAX_FULL sets how many per group
+            // the prefetch rings overlay the first two whole layers of the LRU pool, so they leave the static
+            // whole layers alone and LLAMA_MOE_PREFETCH_MAX_FULL caps them (0 by default, see RESULTS.md 0.16)
             constexpr int32_t max_full = 5;
             int32_t n_full = std::min(max_full, g.n_slots / n_expert);
             if (pf_requested) {
                 n_full = std::min(n_full, std::max(0, (g.n_slots - 2*n_expert) / n_expert));
-                n_full = std::min(n_full, pf_max_full);
             }
+            // the cap applies in both modes; without the rings a frozen whole layer only costs bank,
+            // so the no-ring path keeps none (RESULTS.md 0.16: 4 static 52.88% hit vs 0 static 68.04%)
+            n_full = pf_requested ? std::min(n_full, pf_max_full) : 0;
             n_full = std::min(n_full, (int32_t) g.layers.size() - 1);
             // do not starve the LRU pool: a bank that is mostly whole layers is worse than the plain static placement
             while (n_full > 0 && g.n_slots - n_full*n_expert < g.n_slots/5) {
@@ -877,6 +931,10 @@ struct llama_moe_cache::impl {
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
 
             for (group & g : groups) {
+                // a dropped group never initialized its slru, its slot map is an empty vector
+                if (g.n_slots == 0) {
+                    continue;
+                }
                 for (int32_t il : g.layers) {
                     if (layers[il].slot_map != nullptr) {
                         g.slru.slot_map[il] = (int32_t *) layers[il].slot_map->data;
@@ -895,7 +953,6 @@ struct llama_moe_cache::impl {
             }
         }
         ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
         for (size_t id = 0; id < devices.size(); ++id) {
             const device & d = devices[id];
             if (d.host_bytes == 0) {
@@ -914,7 +971,6 @@ struct llama_moe_cache::impl {
         for (const layer & l : layers) {
             n_cached_layers += l.ig >= 0;
         }
-
         const char * trace_path = getenv("LLAMA_MOE_TRACE");
         if (trace_path != nullptr && trace_path[0] != '\0') {
             trace_file = fopen(trace_path, "ab");
@@ -1101,13 +1157,15 @@ struct llama_moe_cache::impl {
         const group & g = groups[l.ig];
 
         // a whole layer reads the bank through a static view, it needs no slot map
-        if (l.full) {
+        if (l.full || l.host_only) {
             return nullptr;
         }
 
-        // the prefetch path maps every expert to a ring slot, the map is written by the copy callback
+        // the prefetch path maps every expert to a ring slot, the map is written by the copy callback.
+        // a cached layer without a ring reads its host experts for a prefetch batch: its LRU pool cannot
+        // map that many ids, and the graph has to bind the host tensor here, not in the copy callback
         if (pf_batch) {
-            return l.slot_map;
+            return pf_enabled && pf_pos[il] >= 0 ? l.slot_map : nullptr;
         }
 
         // in hybrid mode the misses are computed on the CPU, so the residency map is always used for small batches
@@ -1411,7 +1469,19 @@ struct llama_moe_cache::impl {
             return;
         }
         pf_pos.assign(layers.size(), -1);
+        size_t n_plain = 0;
         for (group & g : groups) {
+            // a group without a bank owns no slots and never streams
+            if (g.banks.empty()) {
+                continue;
+            }
+            // a group that cannot host two rings keeps the plain LRU, its layers never stream and read
+            // their host experts for a prefetch batch (get_slot_map)
+            if (g.n_slots < 2*g.ref[0]->ne[2]) {
+                n_plain += g.layers.size();
+                continue;
+            }
+            g.ring_slots = 2*g.ref[0]->ne[2];
             for (int32_t il : g.layers) {
                 if (il >= (int32_t) model.hparams.n_layer() || layers[il].full) {
                     continue;
@@ -1430,10 +1500,26 @@ struct llama_moe_cache::impl {
         pf_enabled = true;
         size_t ring_bytes = 0;
         for (const group & g : groups) {
+            if (g.banks.empty() || g.n_slots < 2*g.ref[0]->ne[2]) {
+                continue;
+            }
             ring_bytes += 2*n_expert*g.banks[0]->nb[2]*g.banks.size();
         }
-        LLAMA_LOG_INFO("%s: prefetch: %zu layers stream through 2 rings (%.1f MiB), min ubatch tokens %lld\n",
-                __func__, pf_order.size(), ring_bytes/1024.0/1024.0, (long long) pf_min_tokens);
+        LLAMA_LOG_INFO("%s: prefetch: %zu layers stream through 2 rings (%.1f MiB), %zu layers keep the plain LRU, "
+                "min ubatch tokens %lld\n",
+                __func__, pf_order.size(), ring_bytes/1024.0/1024.0, n_plain, (long long) pf_min_tokens);
+    }
+
+    // the two rings overwrite the first ring_slots slots of every ring group: drop just those LRU
+    // entries, the experts outside the rings stay valid across the prefetch pass
+    void release_rings() {
+        for (group & g : groups) {
+            if (g.ring_slots > 0) {
+                g.slru.release(0, g.ring_slots);
+                g.pf_dirty = true;
+            }
+        }
+        pf_pass_dirty = true;
     }
 
     // large ubatches take the prefetch path, the residency map of the LRU pool is stale after it
@@ -1443,12 +1529,14 @@ struct llama_moe_cache::impl {
         }
         const bool batch = n_tokens >= pf_min_tokens;
         if (!batch) {
+            // the prefetch pass is over: the ring slots go back to the LRU, the rest of the map survived
             for (group & g : groups) {
                 if (g.pf_dirty) {
-                    g.slru.invalidate();
+                    g.slru.release(0, g.ring_slots);
                     g.pf_dirty = false;
                 }
             }
+            pf_pass_dirty = false;
         }
         pf_batch = batch;
         static const bool dbg = getenv("LLAMA_MOE_PREFETCH_DEBUG") != nullptr;
@@ -1478,7 +1566,8 @@ struct llama_moe_cache::impl {
     }
 
     // [LLAMA_MOE_PREFETCH] whole-layer slot map, the compute reads the bank through the ring slots
-    bool copy_prefetch(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, int32_t il) {
+    // sync_first uploads this layer now instead of waiting for the previous layer to have done it
+    bool copy_prefetch(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, int32_t il, bool sync_first = false) {
         const int32_t pos = pf_pos[il];
         if (pos < 0) {
             return false;
@@ -1491,19 +1580,19 @@ struct llama_moe_cache::impl {
         static const bool time_it = getenv("LLAMA_MOE_PREFETCH_TIME") != nullptr;
         const int64_t t0 = time_it ? ggml_time_us() : 0;
 
-        if (pos == 0) {
+        if (pos == 0 || sync_first) {
             // the first layer cannot be hidden, the compute of the previous layer is done at this point
-            if (!prefetch_layer(backend, 0)) {
+            if (!prefetch_layer(backend, pos)) {
                 return false;
             }
-            // this batch is layer 0's upload: mode < 2 waits for the latest (draining, unchanged semantics),
+            // this batch is this layer's upload: mode < 2 waits for the latest (draining, unchanged semantics),
             // mode 2 waits for its own batch number (nothing later in flight anyway at this point)
             pf_submit_route(backend);
             const int64_t tw = time_it ? ggml_time_us() : 0;
             pf_wait_route(backend);
             pf_waits++;
             pf_wait_us += time_it ? ggml_time_us() - tw : 0;
-            if (time_it) {
+            if (time_it && pos == 0) {
                 fprintf(stderr, "moe_prefetch_first: first layer upload %.3f ms\n", (ggml_time_us() - tw)/1000.0);
             }
         } else {
@@ -1658,7 +1747,7 @@ struct llama_moe_cache::impl {
     }
 
     ggml_tensor * get_cpu_out(int32_t il) const {
-        if (!hybrid_exec || il < 0 || il >= (int32_t) hybrid_jobs.size()) {
+        if (!hybrid_exec || hybrid_off || il < 0 || il >= (int32_t) hybrid_jobs.size()) {
             return nullptr;
         }
         return hybrid_jobs[il].graph != nullptr ? hybrid_jobs[il].cpu_out : nullptr;
@@ -1668,7 +1757,7 @@ struct llama_moe_cache::impl {
     // a layer that does not match keeps the in-graph branch, the worker is only used by the layers registered here
     bool register_hybrid(int32_t il, const ggml_tensor * inp, const ggml_tensor * weights,
                          const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down) const {
-        if (!hybrid_exec || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (!hybrid_exec || hybrid_off || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return false;
         }
         hybrid_job & j = hybrid_jobs[il];
@@ -1725,24 +1814,33 @@ struct llama_moe_cache::impl {
         j.weights = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, weights->ne);
 
         // the ggml builders take non-const srcs but do not write them
-        ggml_tensor * up_cpu   = ggml_mul_mat_id_mask(ctx, const_cast<ggml_tensor *>(up),   j.inp, j.ids, j.mask);
-        ggml_tensor * gate_cpu = ggml_mul_mat_id_mask(ctx, const_cast<ggml_tensor *>(gate), j.inp, j.ids, j.mask);
-        ggml_tensor * act      = ggml_swiglu_split(ctx, gate_cpu, up_cpu);
-        ggml_tensor * down_cpu = ggml_mul_mat_id_mask(ctx, const_cast<ggml_tensor *>(down), act, j.ids, j.mask);
-        ggml_tensor * w_cpu    = ggml_mul(ctx, down_cpu, j.weights);
-
-        ggml_tensor * sum = nullptr;
-        for (int64_t i = 0; i < n_used; ++i) {
-            ggml_tensor * view = ggml_view_2d(ctx, w_cpu, hybrid_n_embd, 1, w_cpu->nb[2], i*w_cpu->nb[1]);
-            sum = sum == nullptr ? view : ggml_add(ctx, sum, view);
+        // [LLAMA_MOE_HYBRID_FUSED] one node for gate, up, swiglu and down. Measured at 1.0x against the
+        // four node sequence (bench/RESULTS.md 0.15.4), so it stays off until a kernel level change pays
+        static const bool fused = getenv("LLAMA_MOE_HYBRID_FUSED") != nullptr && atoi(getenv("LLAMA_MOE_HYBRID_FUSED")) != 0;
+        // the fused kernel writes whole quantized blocks, a shape that does not divide keeps the four nodes
+        const bool fused_ok = fused && up->type == gate->type && up->type == down->type &&
+            up->ne[0] % 256 == 0 && up->ne[1] % 256 == 0;
+        ggml_tensor * down_cpu = nullptr;
+        if (fused_ok) {
+            down_cpu = ggml_mul_mat_id_swiglu(ctx,
+                const_cast<ggml_tensor *>(up), const_cast<ggml_tensor *>(gate), const_cast<ggml_tensor *>(down),
+                j.inp, j.ids, j.mask);
+        } else {
+            ggml_tensor * up_cpu   = ggml_mul_mat_id_mask(ctx, const_cast<ggml_tensor *>(up),   j.inp, j.ids, j.mask);
+            ggml_tensor * gate_cpu = ggml_mul_mat_id_mask(ctx, const_cast<ggml_tensor *>(gate), j.inp, j.ids, j.mask);
+            ggml_tensor * act      = ggml_swiglu_split(ctx, gate_cpu, up_cpu);
+            down_cpu = ggml_mul_mat_id_mask(ctx, const_cast<ggml_tensor *>(down), act, j.ids, j.mask);
         }
-        j.out = sum;
+        // the weighted sum runs in the combine callback: eight graph nodes cost more in threadpool
+        // barriers than the 20K fma of the sum costs in flops
+        j.out    = down_cpu;
+        j.n_used = (int32_t) n_used;
 
         j.graph = ggml_new_graph_custom(ctx, graph_size, false);
         ggml_build_forward_expand(j.graph, j.out);
 
         j.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type()));
-        if (!j.buf || ggml_nbytes(j.out) != (size_t) hybrid_n_embd*sizeof(float)) {
+        if (!j.buf || ggml_nbytes(j.out) != (size_t) hybrid_n_embd*sizeof(float)*n_used) {
             return fail("failed to allocate the worker graph");
         }
         j.cplan = ggml_graph_plan(j.graph, hybrid_threads, hybrid_tp);
@@ -1794,6 +1892,7 @@ struct llama_moe_cache::impl {
         // the combine of the previous layer waits first, so the mailbox holds one job
         GGML_ASSERT(hybrid_completed == hybrid_submitted);
         j.seq = ++hybrid_submitted;
+        j.t_submit = ggml_time_us();
         hybrid_slot = il;
         lock.unlock();
         hybrid_cv.notify_one();
@@ -1805,33 +1904,81 @@ struct llama_moe_cache::impl {
         int32_t seq;
         {
             std::lock_guard<std::mutex> lock(hybrid_mtx);
-            GGML_ASSERT(j.seq >= 0 && "the slot map callback of the layer must submit the job first");
             seq = j.seq;
             j.seq = -1;
+        }
+        if (seq < 0) {
+            // the executor was turned off mid graph: this graph still has the combine node, its CPU misses
+            // are gone. count it and add zeros, the next graph uses the in-graph CPU branch
+            if (hybrid_missing++ == 0) {
+                LLAMA_LOG_WARN("%s: layer %d has no worker job, its CPU misses are dropped\n", __func__, il);
+            }
+            std::memset(j.out_host->data, 0, ggml_nbytes(j.out_host));
+            ggml_backend_tensor_set_async(backend, j.cpu_out, j.out_host->data, 0, ggml_nbytes(j.out_host));
+            return;
         }
         if (seq == 0) {
             // every expert was in the bank, the combine only adds zeros
             hybrid_skips++;
-            std::memset(j.out_host->data, 0, ggml_nbytes(j.out));
-            ggml_backend_tensor_set_async(backend, j.cpu_out, j.out_host->data, 0, ggml_nbytes(j.out));
+            std::memset(j.out_host->data, 0, ggml_nbytes(j.out_host));
+            ggml_backend_tensor_set_async(backend, j.cpu_out, j.out_host->data, 0, ggml_nbytes(j.out_host));
             return;
         }
         const int64_t t0 = ggml_time_us();
+        hybrid_wall_us += t0 - j.t_submit;
+        bool failed = false;
         {
             std::unique_lock<std::mutex> lock(hybrid_mtx);
             hybrid_cv_done.wait(lock, [&] { return hybrid_completed >= seq || hybrid_stop; });
-            if (hybrid_failed) {
-                GGML_ABORT("the hybrid executor worker failed");
+            failed = hybrid_failed;
+            hybrid_failed = false;
+        }
+        if (failed) {
+            // the worker's CPU graph failed: rerun the job on the combine thread. This is an operator or
+            // backend failure, not capacity; a single rerun keeps the token correct
+            if (hybrid_failures++ == 0) {
+                LLAMA_LOG_WARN("%s: the hybrid worker failed, layer %d is rerun on the combine thread\n", __func__, il);
+            }
+            if (ggml_graph_compute(j.graph, &j.cplan) != GGML_STATUS_SUCCESS) {
+                // the same graph failed twice: drop this layer's CPU contribution, count it and keep the
+                // executor off the later graphs (they fall back to the in-graph CPU branch)
+                LLAMA_LOG_ERROR("%s: the hybrid worker failed twice on layer %d, its misses are dropped\n", __func__, il);
+                std::memset(j.out->data, 0, ggml_nbytes(j.out));
+                hybrid_off = true;
             }
         }
         hybrid_wait_us += ggml_time_us() - t0;
         hybrid_waits++;
+        if (layers[il].miss_mask != nullptr) {
+            const int32_t * m = (const int32_t *) layers[il].miss_mask->data;
+            // only the first n_expert_used entries belong to the token, the rest of the 2d mask is stale
+            const int64_t n = layers[il].miss_mask->ne[0];
+            for (int64_t i = 0; i < n; ++i) {
+                hybrid_miss_experts += m[i] != 0;
+            }
+        }
 
-        // the worker output is pageable, copy it to the pinned staging first: an async copy of a pageable
-        // source goes through the staging buffer and drains the device
-        GGML_ASSERT(ggml_nbytes(j.out) == ggml_nbytes(j.out_host));
-        memcpy(j.out_host->data, j.out->data, ggml_nbytes(j.out));
-        ggml_backend_tensor_set_async(backend, dst, j.out_host->data, 0, ggml_nbytes(j.out));
+        // the worker returns the n_used expert outputs unweighted, the weighted sum is a straight fma loop
+        GGML_ASSERT(ggml_nbytes(j.out) == (size_t) hybrid_n_embd*sizeof(float)*j.n_used);
+        {
+            const int64_t n_embd = hybrid_n_embd;
+            const float * dw = (const float *) j.out->data;
+            const float * ew = (const float *) j.weights->data;
+            float       * ow = (float *) j.out_host->data;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                float s = 0.0f;
+                for (int32_t e = 0; e < j.n_used; ++e) {
+                    s += dw[(size_t) e*n_embd + i]*ew[e];
+                }
+                ow[i] = s;
+            }
+        }
+        ggml_backend_tensor_set_async(backend, dst, j.out_host->data, 0, ggml_nbytes(j.out_host));
+
+        // the cli never frees the context, so the destructor log never runs: land the counters once per token
+        if (hybrid_waits % layers.size() == 0) {
+            hybrid_log();
+        }
     }
 
     void hybrid_worker() {
@@ -1863,9 +2010,30 @@ struct llama_moe_cache::impl {
 
     // the promotion copies write into the banks, the context calls this before the backends are freed
     void wait_promotion() {
-        if (rolling && pf.ok() && !devices.empty()) {
+        if ((rolling || rolling_off) && pf.ok() && !devices.empty()) {
             pf.wait(devices[0].backend);
         }
+    }
+
+    // the whole layers read their experts from the bank only, the host copy is dead weight
+    size_t release_frozen_host(const llama_model & model) {
+        size_t  bytes = 0;
+        int32_t n     = 0;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            const layer & l = layers[il];
+            if (!l.full || l.ig < 0 || l.experts.empty()) {
+                continue;
+            }
+            const size_t freed = model.release_moe_host_experts((int) il);
+            if (freed > 0) {
+                bytes += freed;
+                n++;
+            }
+        }
+        if (n > 0) {
+            LLAMA_LOG_INFO("%s: released the host experts of %d frozen layers, %.2f MiB\n", __func__, n, bytes/1024.0/1024.0);
+        }
+        return bytes;
     }
 
     // the combine add of the hybrid executor runs on the device, the worker result is uploaded before the
@@ -1902,12 +2070,17 @@ struct llama_moe_cache::impl {
         if (hybrid_waits == 0) {
             return;
         }
-        LLAMA_LOG_INFO("llama_moe_cache: hybrid executor: %zu jobs (%zu layers skipped, all hits), worker %.3f ms, "
-                "combine wait %.3f ms (%.3f ms and %.3f ms per job), staged inp %zu/%zu, weights %zu/%zu\n",
-            hybrid_waits, hybrid_skips, hybrid_jobs_us/1000.0, hybrid_wait_us/1000.0,
-            hybrid_jobs_us/1000.0/hybrid_waits, hybrid_wait_us/1000.0/hybrid_waits,
+        LLAMA_LOG_INFO("llama_moe_cache: hybrid executor: %zu jobs (%zu layers skipped, all hits), %zu miss experts (%.2f per job), "
+                "worker %.3f ms, wall %.3f ms, combine wait %.3f ms (per job %.3f / %.3f / %.3f worker/wall/wait), staged inp %zu/%zu, weights %zu/%zu\n",
+            hybrid_waits, hybrid_skips, hybrid_miss_experts, (double) hybrid_miss_experts/hybrid_waits,
+            hybrid_jobs_us/1000.0, hybrid_wall_us/1000.0, hybrid_wait_us/1000.0,
+            hybrid_jobs_us/1000.0/hybrid_waits, hybrid_wall_us/1000.0/hybrid_waits, hybrid_wait_us/1000.0/hybrid_waits,
             hybrid_inp_staged, hybrid_inp_staged + hybrid_inp_sync,
             hybrid_w_staged, hybrid_w_staged + hybrid_w_sync);
+        if (hybrid_failures > 0 || hybrid_missing > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: hybrid executor failures: %zu worker jobs rerun, %zu combines without a job\n",
+                    hybrid_failures, hybrid_missing);
+        }
         if (rolling || promote_bytes > 0 || promote_fallbacks > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: rolling residency: %zu waits, wait %.3f ms (%.3f ms per layer), "
                     "promoted %.1f MiB, %zu fallbacks\n",
@@ -1957,13 +2130,8 @@ struct llama_moe_cache::impl {
         const bool pf = pf_enabled && pf_pos[il] >= 0 && n_tokens >= pf_min_tokens;
         if (pf) {
             if (pf_pos[il] == 0) {
-                // the rings overwrite the slots of the LRU pool, rebuild the residency map before a
-                // small batch reuses it, the rings of this pass start from empty
-                for (group & gg : groups) {
-                    gg.slru.invalidate();
-                    gg.pf_dirty = true;
-                }
-                pf_pass_dirty = true;
+                // the rings overwrite the first slots of the LRU pools, only those entries are dropped
+                release_rings();
             }
             if (getenv("LLAMA_MOE_PREFETCH_DEBUG") != nullptr) {
                 LLAMA_LOG_INFO("%s: layer %d prefetch path, tokens %lld\n", __func__, il, (long long) n_tokens);
@@ -1971,10 +2139,10 @@ struct llama_moe_cache::impl {
             return copy_prefetch(backend, src, dst, il);
         }
         if (pf_pass_dirty) {
-            // the small batch after a prefetch pass rebuilds the residency map from scratch
+            // the small batch after a prefetch pass drops the ring entries, the rest of the map is still valid
             for (group & gg : groups) {
                 if (gg.pf_dirty) {
-                    gg.slru.invalidate();
+                    gg.slru.release(0, gg.ring_slots);
                     gg.pf_dirty = false;
                 }
             }
@@ -2042,6 +2210,17 @@ struct llama_moe_cache::impl {
         observe_ids(il, ids);
 
         if (hybrid_mode) {
+            if (rolling && rolling_off) {
+                // a promotion of the previous token did not fit: drain it and rebuild the static residency.
+                // the rolling maps (-1 = miss) are replaced here, so the switch itself keeps this token valid
+                if (this->pf.ok()) {
+                    this->pf.wait(backend);
+                }
+                rolling     = false;
+                rolling_off = false;
+                resident    = false;
+                std::fill(promote_pending.begin(), promote_pending.end(), 0);
+            }
             if (!resident) {
                 build_residency();
             }
@@ -2093,7 +2272,7 @@ struct llama_moe_cache::impl {
             }
 
             // the residency map is copied as is, the misses are computed by the CPU branch from the host experts
-            if (hybrid_exec && n_tokens == 1 && hybrid_jobs[il].graph != nullptr) {
+            if (hybrid_exec && !hybrid_off && n_tokens == 1 && hybrid_jobs[il].graph != nullptr) {
                 if (n_hit == (size_t) n_ids) {
                     // no miss in this layer, the combine reads zeros and the worker stays idle
                     hybrid_job & j = hybrid_jobs[il];
@@ -2113,12 +2292,17 @@ struct llama_moe_cache::impl {
 
             // plan the next token and promote the planned experts now, no other token reads these slots: the
             // victims selected by the plan are not used by this token and the previous split is drained
-            if (rolling) {
+            if (rolling && !rolling_off) {
                 size_t n_hit_plan = 0;
                 if (!g.slru.plan(il, ids.data(), ids.size(), promote_fills, n_hit_plan)) {
-                    GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
-                }
-                if (!promote_fills.empty()) {
+                    // capacity: the next token's promotion does not fit the pool. keep the rolling map format
+                    // for the rest of this token and rebuild the static residency at the next lookup
+                    if (promote_fallbacks++ == 0) {
+                        LLAMA_LOG_WARN("%s: the experts of layer %d do not fit the promotion pool, rolling residency disabled\n",
+                                __func__, il);
+                    }
+                    rolling_off = true;
+                } else if (!promote_fills.empty()) {
                     bool ok = true;
                     for (const auto & f : promote_fills) {
                         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
@@ -2130,13 +2314,16 @@ struct llama_moe_cache::impl {
                         }
                     }
                     if (!ok) {
-                        // the planned experts are not in the bank, drop the rolling plan and rebuild the static
-                        // residency so that the next lookup computes the misses on the CPU
+                        // the planned experts are not in the bank: keep this token's maps, drain the partial
+                        // batch and switch to the static residency at the next lookup
                         if (promote_fallbacks++ == 0) {
                             LLAMA_LOG_WARN("%s: promotion of layer %d failed, rolling residency disabled\n", __func__, il);
                         }
-                        rolling  = false;
-                        resident = false;
+                        rolling_off = true;
+                        promote_pending[il] = 0;
+                        if (this->pf.ok()) {
+                            this->pf.wait(backend);
+                        }
                     } else {
                         this->pf.submit(backend);
                         promote_pending[il] = 1;
@@ -2148,7 +2335,22 @@ struct llama_moe_cache::impl {
 
         size_t n_hit = 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
-            GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+            // capacity, not a bug: the ids select more experts than the pool has slots. The graph of this
+            // split is already bound to the bank, so serve the whole layer through the ring and keep the
+            // layer off the cache from the next graph on. get_slot_map bounds the ids by the pool size, so
+            // this is a safety net, not the normal path (bench/DECISIONS.md P0)
+            if (n_plan_fallbacks++ == 0) {
+                LLAMA_LOG_WARN("%s: layer %d does not fit the LRU pool, reading its host experts from now on\n",
+                        __func__, il);
+            }
+            if (pf_pos[il] >= 0 && !g.banks.empty()) {
+                release_rings();
+                return copy_prefetch(backend, src, dst, il, /*sync_first=*/true);
+            }
+            // no ring to serve the whole layer: the layer is off the cache from the next graph on
+            LLAMA_LOG_ERROR("%s: layer %d cannot serve %zu experts from %d slots\n", __func__, il, ids.size(), g.slru.n_slots);
+            layers[il].host_only = true;
+            return false;
         }
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
@@ -2222,6 +2424,10 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: split fallbacks (ids produced in the lookup's split): %zu\n",
                     n_split_degrades);
         }
+        if (n_plan_fallbacks > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: LRU plan fallbacks (layer switched to host experts): %zu\n",
+                    n_plan_fallbacks);
+        }
         if (pf_layers > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: prefetch: %zu layers, %.2f MiB uploaded, %zu host waits, %zu fallbacks\n",
                     pf_layers, pf_bytes/1024.0/1024.0, pf_waits, pf_fallbacks);
@@ -2264,7 +2470,7 @@ bool llama_moe_cache::hybrid(int32_t il) const {
 }
 
 bool llama_moe_cache::hybrid_exec() const {
-    return pimpl->hybrid_exec;
+    return pimpl->hybrid_exec && !pimpl->hybrid_off;
 }
 
 ggml_tensor * llama_moe_cache::get_cpu_out(int32_t il) const {
@@ -2306,6 +2512,10 @@ void llama_moe_cache::stage_inputs(ggml_backend_t backend, ggml_cgraph * graph) 
 
 void llama_moe_cache::wait_promotion() {
     pimpl->wait_promotion();
+}
+
+size_t llama_moe_cache::release_frozen_host(const llama_model & model) {
+    return pimpl->release_frozen_host(model);
 }
 
 bool llama_moe_cache::wait_deferred(ggml_backend_t backend, ggml_cgraph * graph) {

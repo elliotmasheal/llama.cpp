@@ -1852,6 +1852,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.moe_cache_size = params.moe_cache_size;
     cparams.moe_hybrid     = params.moe_hybrid;
+    cparams.moe_free_frozen_host = params.moe_free_frozen_host;
+    cparams.sched_parallel = params.sched_parallel;
 
     return cparams;
 }
