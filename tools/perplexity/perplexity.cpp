@@ -459,7 +459,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     if (!params.logits_file.empty()) {
         logits_stream.open(params.logits_file.c_str(), std::ios::binary);
         if (!logits_stream.is_open()) {
-            LOG_ERR("%s: failed to open %s for writing\n", __func__, params.logits_file.c_str());
+            LOG_ERR("%s: failed to open %s for writing (errno = %d: %s)\n", __func__, params.logits_file.c_str(), errno, strerror(errno));
             return {};
         }
         LOG_INF("%s: saving all logits to %s\n", __func__, params.logits_file.c_str());
