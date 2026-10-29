@@ -1,27 +1,28 @@
 #!/bin/bash
 # run-matrix.sh - unified target matrix: 256K ctx + 10K prompt on emulated small-VRAM tiers.
+# Target口径: IQ4_XS, -ncmoe 40, KV on GPU, the tier is the run-wide --store-vram-mib budget.
 #
 # The child runs with plain shell redirection. Do not "improve" this into PowerShell
 # Start-Process -RedirectStandardError: pumping a -v child through it measured 4.5x slower decode.
 #
 # Usage:
-#   bench/tools/run-matrix.sh                          # 8176,6144,4096 at ctx 262144 with -nkvo
-#   bench/tools/run-matrix.sh -T 8176 -C 16384 -B 3584 -K   # one arm, KV on GPU
+#   bench/tools/run-matrix.sh                          # 8176,6144,4096 at ctx 262144, KV on GPU
+#   bench/tools/run-matrix.sh -T 8176 -C 16384 -B 3584 # one arm, explicit ctx and bank
 #   bench/tools/run-matrix.sh -L mmap                  # the RAM-short tier
-#   bench/tools/run-matrix.sh -K -a paged -A "--kv-page"   # one named arm with extra CLI args (F11 L1d)
+#   bench/tools/run-matrix.sh -a paged -A "--kv-page"  # one named arm with extra CLI args (F11 L1d)
 set -u
 
 cd "$(dirname "$0")/../.." || exit 1
 export PATH="/d/Scoop/apps/mingw/current/bin:$PATH"
 
-MODEL="F:/LLM/llm/Ornith-1.5-35B-Q4_K_M.gguf"
+MODEL="F:/LLM/llm/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"
 EXE="build-vulkan/bin/llama-cli.exe"
 PROMPT="bench/prompts/prompt10k.txt"
 TIERS="8176,6144,4096"
 CTX=262144
 BANK=auto
-NCMOE=41
-KV_ON_GPU=0
+NCMOE=40
+KV_ON_GPU=1
 LOAD=none
 REPEAT=1
 GEN=64
@@ -100,10 +101,12 @@ run_arm() { # $1 = tier, $2 = run index
     [ "$BANK" = auto ] || set -- "$@" --moe-cache-mib "$BANK"
     [ "$NCMOE" -ge 0 ] && set -- "$@" -ncmoe "$NCMOE"
     [ "$KV_ON_GPU" -eq 1 ] || set -- "$@" -nkvo
+    # target口径: the tier is the run-wide store budget, not the old env only
+    set -- "$@" --store-vram-mib "$tier"
     # the arm's extra flags (F11: --kv-page / --kv-gather-mib)
     [ "${#EXTRA_ARGS[@]}" -eq 0 ] || set -- "$@" "${EXTRA_ARGS[@]}"
 
-    GGML_VK_VRAM_LIMIT_MIB=$tier env $EXTRA_ENV "$EXE" "$@" > "$out" 2> "$err" &
+    env $EXTRA_ENV "$EXE" "$@" < /dev/null > "$out" 2> "$err" &
     job=$!
     # \$! is an MSYS pid, the GPU counter needs the Windows one; preflight guarantees a single child
     winpid=""

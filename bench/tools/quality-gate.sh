@@ -10,18 +10,20 @@
 #   bench/tools/quality-gate.sh -R           # (re)record the baseline logits, prints PPL only
 #   bench/tools/quality-gate.sh -C 8192 -f bench/prompts/prompt20k.txt
 #
-# The baseline file is ~2.0 GB at -C 4096 (2 chunks), keep it off the repo.
+# The baseline file is ~2.0 GB at -C 4096 (2 chunks), keep it off the repo (`.gate/` is ignored).
+# It lives under the repo root because a sandboxed child can only create files in directories that
+# inherit the workspace write ACE; `bench/` and other pre-existing subdirectories do not.
 set -u
 
 cd "$(dirname "$0")/../.." || exit 1
 export PATH="/d/Scoop/apps/mingw/current/bin:$PATH"
 
-MODEL="F:/LLM/llm/Ornith-1.5-35B-Q4_K_M.gguf"
+MODEL="F:/LLM/llm/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"
 EXE="build-vulkan/bin/llama-perplexity.exe"
 PROMPT="bench/prompts/prompt10k.txt"
 CTX=4096
 CHUNKS=2
-BASE="F:/LLM/kld/qwen35moe-10k-c4096.kld"
+BASE=".gate/qwen35moe-10k-c4096.kld"
 RECORD=0
 OUT=""
 
@@ -45,10 +47,11 @@ done
 mkdir -p "$OUT" || exit 1
 
 # the same shape as the target口径 minus the context length: resident, experts on the host, FA on
-COMMON=(-m "$MODEL" -dev Vulkan1 -ngl 99 -ncmoe 41 -fa on -t 5 -b 2048 -ub 2048
-        -c "$CTX" -lm none --chunks "$CHUNKS" -f "$PROMPT" -v)
+COMMON=(-m "$MODEL" -dev Vulkan1 -ngl 99 -ncmoe 40 -fa on -t 5 -b 2048 -ub 2048
+        -c "$CTX" -lm none --store-vram-mib 8176 --chunks "$CHUNKS" -f "$PROMPT" -v)
 
 if [ "$RECORD" -eq 1 ]; then
+    mkdir -p "$(dirname "$BASE")" || exit 1
     echo "recording the baseline logits to $BASE"
     "$EXE" "${COMMON[@]}" --kl-divergence-base "$BASE" > "$OUT/record.out" 2> "$OUT/record.err"
     rc=$?

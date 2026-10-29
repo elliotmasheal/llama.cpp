@@ -1,166 +1,84 @@
-# bench 索引与测试口径
+# bench - 口径、跑法、必报列
 
-本目录是这个 fork 唯一的实测记录处。2026-10-23 起从 54 份文档合并成 4 份，职责不重叠：
+四份文档只放结论，不存过程：本文件 = 怎么跑，`RESULTS.md` = 数字，`DECISIONS.md` = 判决与红线，
+`THREE-TIER.md` = 三层与缺口。旧读数查 git 历史；`bench/raw/` 只放本批产物（2026-10-29 已清空）。
 
-| 文件 | 只放什么 | 谁在读 |
-|---|---|---|
-| `bench/README.md` | 测试口径、档位定义、怎么跑、测量陷阱 | 每次跑数之前 |
-| `bench/RESULTS.md` | 数字的唯一来源（含日期、分支、电源态、配置） | 报收益、对比基线 |
-| `bench/DECISIONS.md` | 判决、已证伪清单、开关表、代码级硬约束、未结项 | 决定下一步做什么 |
-| `bench/THREE-TIER.md` | 三层（VRAM+RAM+SSD）与自适应的现状、缺口、步骤 | 动 cache / fit / loader 之前 |
+## 1. 目标口径（唯一）
 
-被合并删除的 54 份 md 与原始日志不再维护，需要原文时查 git 历史（提交 `a44e13e08` 及其之前的工作区）。
-
-## 1. 统一目标口径
-
-优化目标：**256K ctx + 10K prompt**，在 qwen35moe（Ornith-1.5-35B-Q4_K_M，20.2 GiB）上追求 PP/TG 最大化，
-显存、内存、SSD 三层协同，且**显存与内存都不足时 SSD 必须能当临时缓冲**。
-
-每一轮优化都要在目标环境参数下测，不允许只在短上下文档上测完再外推：
+模型 `F:\LLM\llm\Qwen3.6-35B-A3B-UD-IQ4_XS.gguf`（16.96 GiB，4.25 bpw；40 层 x 256 专家，top-8）。
+`UD-Q4_K_XL`（21.28 GiB）的 resident 门槛 27.6 GiB 高于本机空闲约 25.5 GiB，`-lm none` 会退 mmap
+（bank 与预取被强制 0），所以 8 GiB 档的 resident 基准用 IQ4_XS。换文件等于换口径，跨文件 PP/TG 不得混算。
 
 ```
-llama-cli -m F:\LLM\llm\Ornith-1.5-35B-Q4_K_M.gguf -dev Vulkan1 -ngl 99 -fa on \
-  -t 5 -b 2048 -ub 2048 -c 262144 -f bench\prompts\prompt10k.txt -n 64 \
+llama-cli -m F:\LLM\llm\Qwen3.6-35B-A3B-UD-IQ4_XS.gguf -dev Vulkan1 -ngl 99 -fa on `
+  -t 5 -b 2048 -ub 2048 -c 262144 -ncmoe 40 -f bench\prompts\prompt10k.txt -n 64 `
   --temp 0 --no-warmup --no-display-prompt -lm none -v
+
+bash bench/tools/run-matrix.sh -T 8176,6144,4096 -r 2
 ```
 
-- **K/V 默认按工作集分配**（`-kvg -1`，见 `DECISIONS.md` 第 4 节）：256K + 10K 只用 320 MiB，驻设备。
-  所以本口径**不再加 `-nkvo`**；`-nkvo` 只用于"工作集超过显存"的对照臂，且它和 `--moe-cache-mib` 非零同时出现会触发
-  `llama-moe-cache.cpp:1910`（F1 未修）。要复现旧行为用 `-kvg 0`（一次分配 `n_ctx`，256K 下 5120 MiB）。
-- **`--kv-page` 默认仍是 off**：`--kv-page-auto auto` 让 `common/fit.cpp` 判决（扣掉 score 预留后没有余量就开分页，
-  3 个档位的实测判决见 `RESULTS.md` 6.5），`--kv-page` / `--no-kv-page` 强制开/关。分页臂必须配 `-K`（KV 在设备），
-  gather 的稠密工作区由 `--kv-gather-mib`（默认 256）封顶。默认值不改的原因：4096 档分页比连续布局低 3-5%，
-  换到的只是页级降级的安全性（`DECISIONS.md` 第 6 节第 16 条）；`--kv-block` 已移除（页固定 128 cells = 2.5 MiB，
-  等于旧 2048 口径的 1/16，块表 2048 项）。
-- `used` 里的 KV 只算当前分配，不再等于 `n_ctx x 20 KiB`；比较不同臂时先看日志的 `K/V grown to N cells`
-  （连续布局）或 `paged K/V: N blocks of M cells`（分页）。
-- 长跨距注意力的 score 缓冲由 `-fac/--fa-chunk-mib`（默认 256）封顶，query 维按预算切块；`-fac 0` 是旧行为
-  （整段一块，`RESULTS.md` 0.4 有五个 cap 的消融）。改这个值要同时看 bank 与 `reallocs`。
-- 不加 `--moe-cache-mib` 时由内存规划器（`common_moe_plan_get()`）自己算 bank，这就是"自适应 RAM 条件"。
-  规划器规则由 `--fit-plan`（默认 1）选：1 = margins 随档缩放、score 预留跟着注意力放置、预取环按 expert group 判；
-  0 = 旧规则，只用于 A/B（`RESULTS.md` 0.5）。`LLAMA_FIT_PLAN` 是同一开关的 env 形式。
-- 显存档位由 `llama-store` 的参数表达（`--store-vram-mib`），见第 2 节；旧 env `GGML_VK_VRAM_LIMIT_MIB` 已并进来。
-- 电源：「平衡」方案 + AC 供电（`bench/env/power.txt` 记 GUID），dGPU 上不得有其它推理进程，
-  `-lm none` 还要求至少 22 GiB 空闲 RAM。脚本会先检查这三条，不合格直接停。
+口径五条，改一条就不是同一口径：
 
-## 2. 显存与内存档位
+1. `-ncmoe 40` 显式给：专家留在 host 才有 bank。缺省时 `-ngl 99` 把专家算进 GPU 权重，规划器判
+   "no device memory for a cache"、bank 0。
+2. KV 按工作集增长（`-kvg -1`，默认）：256K+10K 只用 320 MiB 且驻设备，所以不加 `-nkvo`。
+   `-kvg 0` 复现旧行为（一次 5120 MiB）；`-nkvo` 只用于"工作集超过显存"的对照臂。
+3. 长跨距 score 按 query 分块（`-fac 256`，默认）；`-fac 0` 是整段一块的旧行为。
+4. 不指定 `--moe-cache-mib` 时 bank 由规划器给（"自适应"），规则由 `--fit-plan 1`（默认）选。
+5. 电源「平衡」+ AC，dGPU 上无其它推理进程，`-lm none` 要求 >= 22 GiB 空闲 RAM。
 
-| 维度 | 怎么造出来 | 语义 |
+## 2. 档位 = 三个整机预算
+
+| 维度 | 怎么造 | 语义 |
 |---|---|---|
-| VRAM 4G / 6G / 8G | `--store-vram-mib 4096` / `6144` / 8176 | **整机 VRAM 总预算**（dense 权重 + 专家 bank + KV + compute + staging）。store 初始化时把预算之外的部分 hold back，日志出现 `VRAM limited to ...`；依赖 memory budget 扩展，集显不生效。旧 env `GGML_VK_VRAM_LIMIT_MIB` 已并进这一个参数 |
-| RAM 总预算 | `--store-ram-mib N`（0 = 自动） | 整机 RAM 总预算，含 resident 权重、`-nkvo` 的 KV、staging 与 mmap 页的驻留采样值 |
-| RAM 充足 / 不足 | `-lm none`（resident）/ `-lm mmap`（或 `LLAMA_AUTO_RESIDENT=0`） | resident 门槛是 `n_bytes x 1.25 + 1 GiB`，20.2 GiB 模型要约 26.3 GiB 空闲；不足时 AUTO 自动退回 mmap，而 mmap 下 bank 与预取被守卫强制为 0 |
+| 显存 4G/6G/8G | `--store-vram-mib 4096` / `6144` / `8176` | 整机 VRAM 总预算（dense + bank + KV + compute + staging）。store 把预算外 hold back，日志 `VRAM limited to ...`。旧 env `GGML_VK_VRAM_LIMIT_MIB` 已并入 |
+| RAM 总预算 | `--store-ram-mib N`（0 = auto） | resident 权重 + `-nkvo` 的 KV + staging + mmap 页 |
+| SSD 冷层 | `--store-ssd-mib N`（0 = 不参与） | 只做容量层，不进 decode |
+| resident / mmap | `-lm none` / `-lm mmap` | resident 门槛 `n_bytes x 1.25 + 1 GiB`；mmap 下 pageable 源拷贝慢，bank 与预取强制 0 |
 
-三个预算（vram / ram / ssd）都是**整机总预算**，不是 store 的私有份额：预算 = 对象占用（专家 + KV 页）
-+ 申报占用（dense / compute / staging）。store 只接管前两类，其他分配**路径不改**但必须申报，
-验证口径见 `THREE-TIER.md` F12 第 7 节。同一条臂要写明手设了什么、生效了多少，
-`used = peak - held` 仍按第 3 节口径算。
+预算 = 对象占用（专家 + KV 页）+ 申报占用（dense / compute / staging）；三个预算互不挪用。
+未申报即越权：`GGML_VK_MEMORY_LOGGER` 的进程总量与 `store_bytes_in(vram) + declared(vram)` 差 > 5% 判缺陷。
 
-已知边界：`GGML_VK_VRAM_LIMIT_MIB` 对 UMA（集显）不生效；**设备初始化之前的查询仍会看到完整预算**
-（`ggml_backend_dev_memory` 本身不创建设备），所以顺序敏感的调用要确认日志里已经出现 `VRAM limited to ...`。
-用 `bench/tools/vklimit-probe.cpp` 可以在不加载模型的情况下核对某个档的报告值。
-设备不支持 memory budget 扩展时只缩真实容量、不改报告值。
+## 3. 必报列（缺一不可）
 
-迁移期（M1 之前）：`run-matrix.sh` 里 `-T` 仍传旧 env `GGML_VK_VRAM_LIMIT_MIB`。
-M1 落地时同步改成传 `--store-vram-mib`，判据仍是日志里的 `VRAM limited to ...`，
-两者数值必须一样（6144 -> 6142.9、4096 -> 4094.9）。
+```
+arm | vram | run | load | ctx | KV | bank | ncmoe | PP t/s | TG t/s | VRAM peak | held | used | RAM peak | reallocs | hit % | status
+```
 
-2026-10-23 实测（`a44e13e08` + 工作区，桌面占用后的空闲 7378.8 MiB）：不设 = 7378.8；
-`=6144` -> hold back 1234.8 MiB，init 后报 **6142.9**；`=4096` -> hold back 3282.8 MiB，init 后报 **4094.9**；
-Vulkan0（680M，UMA）两次都是 22842.2 MiB，不受影响。
-
-## 3. 每轮优化要报的列
-
-`bash bench/tools/run-matrix.sh -T 8176,6144,4096 -r 2` 直接产出这些列，缺一不可（参数见脚本 `-h`：
-`-T` 显存档 / `-C` ctx / `-B` bank / `-K` KV 在 GPU / `-L` load 模式 / `-r` 重复 / `-E` 附加 env /
-`-a` 臂名 / `-A` 该臂的附加 CLI 参数）：
-
-`arm | vram | run | load | ctx | KV | bank | ncmoe | PP t/s | TG t/s | VRAM peak | held | VRAM used | RAM peak | reallocs | hit % | host blk | gather MiB | status`
-
-- `arm` 是 `-a` 给的名字，跨臂比较只看同一 `vram` 下的同名行。
-  `vram` 是**档位**（`--store-vram-mib` 的生效值，4096 / 6144 / 8176），不是 `llama-store` 的三层；
-  store 的分层命中看 `store_hits_by_tier`（vram / ram / ssd），两者不要混读。
-- `host blk` = 落在 host 的 K/V 块数（分页臂的容量指标，对应日志 `K/V block N placed on the host`）；
-  `gather MiB` = 分页 prefill 稠密工作区长到的最大值，连续布局恒为 0。
-  `gather MiB` 只在 `--kv-page` 下非零，`--kv-gather-mib 0` 是它的对照。
-
-- `VRAM peak` 取**每进程独占**（`\GPU Process Memory(pid_<pid>*)\Dedicated Usage` 的峰值），
-  设备总量 8176 MiB 里桌面已占约 0.5-1.4 GiB，看设备总量会误判。
-- `held` 是 `--store-vram-mib` 自己 hold back 的那块（旧 env `GGML_VK_VRAM_LIMIT_MIB` 的同义物，已并进来），它也计入进程独占峰值，
-  所以真实足迹看 `used = peak - held`。设定值高于当时空闲时不会 hold back
-  （本机当时空闲 7378.8 MiB，所以 `8176` 档等价于"不限"）。
-- `status` 必须是 `ok`。出现 `abort` / `vram-oom` 是缺陷，不是"配置不对"，要当成待修项记进 `DECISIONS.md`。
-- 改了注意力图、分块、KV 或任何数值路径的轮次，必须附质量门的读数（`bash bench/tools/quality-gate.sh`，
-  输出 `PPL | mean KLD | same top p | PASS/FAIL`）。它不在矩阵脚本里，因为要读 2 GB 的 logits 基线。
-- 同档同配置的臂之间比收益；跨档、跨电源态的数字不可直接比。
-- F12 子系统落地后的臂还要报 `store_sync_waits` / `store_sync_wait_ms` / `store_prefetch_wasted` /
-  `store_hits_by_tier`（vram/ram/ssd）/ `store_evict_deferred` / `store_inflight_pins` /
-  `store_ssd_sync_rejected` / `store_pool_cancel` / `store_split`（定义见 `THREE-TIER.md` F12 第 10 节）。
-- 调度侧的臂（`THREE-TIER.md` F13 S2 之后）还要报 `skp_splits` / `skp_copies` / `skp_cpy_sync`；
-  这三个数与 `GGML_SCHED_TRACE=1` 的原始行必须能对上，对不上算测量错误。
-- 落地 `llama-trace` 后，所有计数走它的一次结构化 dump，不再靠 `summarize_perf.py` 猜 key
-  （未结项 21 就是猜错的后果）。
-- 表之外必须附一段白话总结（改了什么、快慢多少、为什么、下一步），术语用类比带过；
-  通俗化不得省略口径与 `status`，风格要求见 `AGENTS.md` 的"回复风格"。
-- `THREE-TIER.md` 第 4 节的 P0 归因（F7 / F8）除上表外还要报四项，它们不在现成的矩阵列里：
-  每 eval 的 `splits`（`GGML_SCHED_TRACE=1`）、日志里的 `RS buffer size`、
-  `-nkvo` 下长跨距时**设备** compute buffer 的增量（`GGML_VK_MEMORY_LOGGER`）、
-  以及 `sched_reserve` 与 teardown 两侧的 compute 归属（设备 `Vulkan1 compute buffer size` 对 host 的
-  `Vulkan_Host ...`，出现 `does not match expectation` 的 warning 必须原文抄进报告）。
-  这四项决定"状态解耦"与"score / compute 预算归属"值不值得做，缺一项就不允许改代码。
+- `VRAM peak` 取每进程独占（`\GPU Process Memory(pid_<pid>*)\Dedicated Usage` 峰值），不看设备总量。
+- `held` 是档位自己 hold back 的那块，也计入进程峰值；真实足迹 `used = peak - held`。
+- `status` 必须 `ok`；`abort` / `vram-oom` 是缺陷，记入 `DECISIONS.md` 未结项，不许当"配置不对"。
+- 动注意力 / KV / 任何数值路径：附 `bash bench/tools/quality-gate.sh` 的 `PPL | mean KLD | same top p | PASS`。
+- 收益门：同档同配置配对、r=2；< 15% 的差异不验收（session 台阶未定性）。
+- A/B 用的开关不进产品默认；每轮把 ΔPP / ΔTG / 生效条件记入 `RESULTS.md` 2.1 的账本。
+- 表格后附一段白话总结（改了什么、快慢、为什么、下一步），术语用类比带过。
+- 分页臂另报 `host blk`（落在 host 的块数）与 `gather MiB`（稠密工作区峰值），连续布局恒为 0。
+- store 落地后另报 `store_sync_waits` / `store_prefetch_wasted` / `store_hits_by_tier` / `store_split`。
 
 ## 4. 测量陷阱
 
-1. 电源方案是乘性因子：混合电源态与「平衡」之间约 x1.33，跨 session 不可比。
-2. 热漂移：连跑 pp2048 后几次会掉到约 310 t/s，用 `-GapSec 30` 或 r=2 看方差。
-3. `GGML_VK_PERF_LOGGER=1` 把 decode 拖慢约 2.6 倍，prefill 上只汇总到约 77 ms 碎片，与真实不符：
-   只能用看占比，不能看绝对时间；kernel 绝对时间用 `test-backend-ops perf` 隔离微基准。
-4. `llama-bench` 把 `n_ctx` 设成 `n_prompt + n_gen`（`tools/llama-bench/llama-bench.cpp:1337`），
-   所以 `-p 8192` 是 ctx 8192，`-c` 不起作用；目标口径必须走 `llama-cli` 的单轮 prompt 文件法。
-5. Git Bash 里 `$!` 不是 Windows pid，按 pid 采显存会得到 0；必须用 `Start-Process -PassThru`。
-6. 外部推理进程在 GPU 上时整批数据作废（`ErrorOutOfDeviceMemory` 也可能是 RAM 不足，
-   先看 `\Memory\Available MBytes` 再怀疑显存）。
-7. 改完代码要先确认二进制里真的含这个改动（strings/构建时间戳），再做 A/B。
-8. cache 路径的数字来自 `llama-cli`，与 `llama-bench` 差约 2-5%。
+1. 电源是乘性因子（混合电源态与「平衡」约 x1.33），跨 session 不可比。
+2. 热漂移：连跑 pp2048 会掉到约 310 t/s；用 r=2 看方差，别用单次。
+3. `GGML_VK_PERF_LOGGER=1` 把 decode 拖慢约 2.6x，只能看占比；绝对时间用 `test-backend-ops perf` 隔离。
+4. `llama-bench` 把 `n_ctx` 设成 `n_prompt + n_gen`，目标口径必须走 `llama-cli` 的 prompt 文件法。
+5. Git Bash 的 `$!` 不是 Windows pid，按 pid 采显存会得到 0；用 `Start-Process -PassThru` 或按进程名找回。
+6. 外部推理进程在 GPU 上时整批作废；`ErrorOutOfDeviceMemory` 先看 RAM 再看显存。
+7. A/B 前核对二进制时间戳与 `git status`：别人的半成品会让同一命令行差 20%。
+8. 跑批器能造出 4 倍差：PowerShell `-RedirectStandardError` 接 `-v` 子进程；矩阵一律用 bash 重定向。
 9. `ub=1024` 是病态点（66.79 t/s），不要拿它做对照；`-ub 2048` 必须配 `-b 2048`。
-10. 从别的 shell 启动 `build-vulkan/bin/*.exe` 时若 PATH 里没有 MinGW 的 bin，子进程会**秒退且日志 0 字节**，
-    看起来像"配置错误"。`run-matrix.sh` 自己 `export PATH=/d/Scoop/apps/mingw/current/bin:$PATH`。
-11. `run-matrix.sh` 的 dGPU 独占检查是有意的：只要树里有 `llama-*` 进程就报错退出，不去跑一批作废的数据。
-13. **跑批器本身能造出 4 倍差**：2026-10-23 用 PowerShell `Start-Process -RedirectStandardError` 接一个
-    带 `-v` 的子进程，decode 从 21.6 掉到 4.8（同一命令行换 bash 重定向就是 21.6），因为 PowerShell 要逐行搬运
-    子进程日志。跑批器已改成 bash（`run-matrix.sh`，普通 `> out 2> err`，按进程名找回 Windows pid 采显存）；
-    旧的 PowerShell 版退役在 `bench/raw/run-matrix.ps1.superseded`，不要复活它。
-    另一个坑：用 `Start-Process` 起 hidden cmd/.bat 时子进程跑完不退出，会占着显存空转。
-    任何"引擎回归"的结论，都要先用另一种启动方式复现一次再说。
-14. 不带 `-v` 时这个 fork 的 INFO 日志（`common_moe_plan_impl`、`sched_graph_realloc`、`hit rate`、`VRAM limited`）
-    一条都不出，所以 `held`/`reallocs`/`hit` 这几列必须有 `-v`。
-15. **`bash` 必须是 Git Bash，不能是 WSL 的 `/usr/bin/bash`**。2026-10-23 用 WSL bash 跑 `run-matrix.sh` 时：
-    旧 env `GGML_VK_VRAM_LIMIT_MIB` 没有传给 interop 起来的 `.exe`（日志里没有 `VRAM limited`，三档 bank 完全一样），
-    用 Windows pid 采显存的采样也全为 0（`peak`/`used`/`RAM` 列都是 0），只有 PP/TG 是"不限档"的真实读数。
-    判据：日志里必须出现 `VRAM limited to ...`，否则整批档位列作废。换成 CLI 参数（`--store-vram-mib`）后
-    这个漏传不会再发生，但"档位没生效"的判据仍要照查。用
-    `"C:\Program Files\Git\bin\bash.exe" -c ...` 启动；Git Bash 的 `PATH` 以 `/mingw64/bin` 开头且没有 `/mnt/`，
-    WSL 的 `PATH` 以 `/usr/local/sbin` 开头并带 `/mnt/c/...`，一眼可辨。
-16. **RAM 刚被腾出来时，`-lm none` 的失败长得像显存缺陷**：2026-10-24 在用户刚结束一个 19 GiB 的 chat 进程后
-    立刻开跑，前三次 `status=vram-oom`（日志是 `llama_model_load: vk::Queue::submit: ErrorOutOfDeviceMemory`，
-    发生在 18.9 GiB 的 `Vulkan_Host` 专家上传阶段），而同一批后三次全部 `ok`、`ram peak` 19.4 GiB。
-    当时 `FreePhysicalMemory` 只有 9.5 GiB，低于 resident 门槛。所以 `vram-oom` 先看 RAM 再看显存；
-    脚本已在 preflight 里要求 `-lm none` 至少有 22 GiB 空闲 RAM。
-17. 不要在跑批过程中编辑 `run-matrix.sh`：bash 按偏移增量读脚本，改了长度之后尾部会被读成乱码
-    （实测报 `syntax error near unexpected token 'done'`，CSV 本身没坏）。要改就先跑完这一批。
+10. PATH 缺 MinGW 时子进程秒退且日志 0 字节；`run-matrix.sh` 自己 export。
+11. 不带 `-v` 时 INFO 日志（bank / held / hit / reallocs）一条都不出。
+12. `llama-cli` 跑完停在交互提示、留下僵尸（占 RAM、锁 bin），后续臂会静默掉 mmap：stdin 接 NUL，跑完 `Get-Process llama*` 归零。
+13. 顺序跑的臂会静默从 resident 掉到 mmap（日志 `mmap, ... prefetch off`）：每臂确认没有这行，否则作废。
+14. 不在跑批中编辑 `run-matrix.sh`（bash 按偏移读脚本）。
+15. 子进程写文件受沙箱限制（AppContainer ACE）：`llama-perplexity` 的 logits 基线只能写到仓库根下新建的目录；
+    `bench/`、`F:` 等旧目录对子进程是 EACCES(13)。`quality-gate.sh` 默认写 `.gate/`（已 gitignore）。
 
-## 5. 目录里还留着什么
+## 5. 目录
 
 ```
-bench/README.md  RESULTS.md  DECISIONS.md  THREE-TIER.md   四份文档
-bench/prompts/   prompt10k.txt (10428 tok)  prompt20k.txt (19758 tok)
-bench/env/       power.txt  machine.txt                      口径依赖的机器事实
-bench/tools/     run-matrix.sh（矩阵） quality-gate.sh（PPL + KLD 门禁）
-                 monitor.ps1  run-case.ps1  bench10k.ps1  matrix.ps1
-                 ssd_probe.py  membw_probe.py  gguf_dims.py  read_trace.py
-                 summarize_perf.py  vkgate.cpp               可复用探针与门禁
-bench/raw/       每次跑的 .out/.err/.csv 产物（不入库）
+bench/prompts/  prompt10k.txt（10428 tok）  prompt20k.txt（19758 tok）
+bench/env/      power.txt（电源 GUID）  machine.txt（硬件事实）
+bench/tools/    run-matrix.sh（矩阵）  quality-gate.sh（PPL + KLD）  探针（ssd / membw / vkgate）
+bench/raw/      本批产物，不进 git；已清空，旧批次查 git 历史
 ```
-
-原始产物不再进 git。要新证据就重新跑，跑完把结论写进 `RESULTS.md` / `DECISIONS.md`，
-不要再往本目录加第五份 md。
