@@ -136,6 +136,9 @@ llama_build_and_test(test-kv-page.cpp LINK ggml)
 
 llama_build_and_test(test-store-slab.cpp)
 
+# Slice 1 draft: pure domain invariants, not linked into the runtime yet
+llama_build_and_test(test-residency-plan.cpp ../common/residency.cpp LINK llama)
+
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
