@@ -587,7 +587,9 @@ struct llama_moe_cache::impl {
         ggml_perf::event("moe", "plan", il, ggml_perf::now_ns() - t_plan0, 0, fills.size());
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together;
-        // all uploads of the layer are handed to the backend as one batch (one command, one wait)
+        // all uploads of the layer plus the device copy of the slot map are handed to the backend
+        // as one batch (one command set, one wait); the slot map is ordered after the fills so the
+        // device view is consistent with the banks the fills were planned against
         size_t bytes = 0;
         {
             ggml_perf::scope s("moe", "upload", il);
@@ -612,9 +614,12 @@ struct llama_moe_cache::impl {
                     i += n;
                 }
             }
-            if (!batch_tensors.empty()) {
-                ggml_backend_tensor_set_batches_async(backend, batch_tensors.data(), batch_data.data(), batch_offsets.data(), batch_sizes.data(), batch_tensors.size());
-            }
+            batch_tensors.push_back(dst);
+            batch_data.push_back(src->data);
+            batch_offsets.push_back(0);
+            batch_sizes.push_back(ggml_nbytes(src));
+            bytes += ggml_nbytes(src);
+            ggml_backend_tensor_set_batches_async(backend, batch_tensors.data(), batch_data.data(), batch_offsets.data(), batch_sizes.data(), batch_tensors.size());
         }
         ggml_perf::event("moe", "upload_bytes", il, 0, bytes, fills.size());
 
@@ -622,12 +627,8 @@ struct llama_moe_cache::impl {
         st.hits   += n_hit;
         st.misses += fills.size();
         st.bytes  += bytes;
-
-        // the next copy synchronizes the backend before it changes the slot map again
-        {
-            ggml_perf::scope s("moe", "slotmap_up", il, ggml_nbytes(src));
-            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
-        }
+        // the slot map was uploaded as the last entry of the batch above; the next copy
+        // synchronizes the backend before it changes the slot map again
 
         return true;
     }
