@@ -473,6 +473,23 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
     }
 }
 
+void ggml_backend_tensor_set_batches_async(ggml_backend_t backend, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n) {
+    GGML_ASSERT(backend);
+    GGML_ASSERT(n > 0);
+    for (size_t i = 0; i < n; i++) {
+        GGML_ASSERT(tensors[i] && tensors[i]->data != NULL && "tensor not allocated");
+        GGML_ASSERT(offsets[i] + sizes[i] <= ggml_nbytes(tensors[i]) && "tensor write out of bounds");
+    }
+
+    if (backend->iface.set_tensor_batches_async == NULL) {
+        for (size_t i = 0; i < n; i++) {
+            ggml_backend_tensor_set_async(backend, tensors[i], data[i], offsets[i], sizes[i]);
+        }
+        return;
+    }
+    backend->iface.set_tensor_batches_async(backend, tensors, data, offsets, sizes, n);
+}
+
 void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);

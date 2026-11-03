@@ -162,6 +162,12 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) batched variant of set_tensor_async, added at the end to keep the
+        // positional initializers of the other backends valid: entries may target
+        // different tensors (a backend may require them to share one buffer), submitted
+        // as one command with one completion wait (NULL falls back to set_tensor_async)
+        void (*set_tensor_batches_async)(ggml_backend_t backend, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n);
     };
 
     struct ggml_backend {

@@ -3023,6 +3023,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     // group consecutive experts and copy them together
+    st.batch_dst.clear();
+    st.batch_data.clear();
+    st.batch_offsets.clear();
+    st.batch_sizes.clear();
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
             first++;
@@ -3042,7 +3046,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                st.batch_dst.push_back(dst);
+                st.batch_data.push_back((const uint8_t *) src->data + next*expert_size);
+                st.batch_offsets.push_back(next*expert_size);
+                st.batch_sizes.push_back((e - next)*expert_size);
             }
             e   += n;
             next = e;
@@ -3053,10 +3060,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            st.batch_dst.push_back(dst);
+            st.batch_data.push_back((const uint8_t *) src->data + offset);
+            st.batch_offsets.push_back(offset);
+            st.batch_sizes.push_back(size);
         }
 
         first = last + 1;
+    }
+    if (!st.batch_dst.empty()) {
+        ggml_backend_tensor_set_batches_async(backend, st.batch_dst.data(), st.batch_data.data(), st.batch_offsets.data(), st.batch_sizes.data(), st.batch_dst.size());
     }
 
     return true;

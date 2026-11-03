@@ -393,6 +393,12 @@ private:
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
 
+        // scratch for the batched upload of one layer's expert runs
+        std::vector<ggml_tensor *> batch_dst;
+        std::vector<const void *>  batch_data;
+        std::vector<size_t>        batch_offsets;
+        std::vector<size_t>        batch_sizes;
+
         void reset() {
             ids = nullptr;
             ids_data.clear();

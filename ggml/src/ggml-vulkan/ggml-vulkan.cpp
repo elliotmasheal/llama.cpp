@@ -13469,6 +13469,69 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
     ggml_backend_vk_set_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
+static void ggml_backend_vk_set_tensor_batches_async(ggml_backend_t backend, ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n) {
+    VK_LOG_DEBUG("ggml_backend_vk_set_tensor_batches_async(" << n << ")");
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    size_t total = 0;
+    for (size_t i = 0; i < n; i++) {
+        GGML_ASSERT(tensors[i]->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) && "unsupported buffer type");
+        total += sizes[i];
+    }
+    ggml_perf::scope s("vk", "set_batches", 0, total);
+    if (n == 0 || total == 0) {
+        return;
+    }
+
+    vk_context cpy_ctx;
+    if (ctx->device->async_use_transfer_queue) {
+        cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
+    } else {
+        cpy_ctx = ggml_vk_get_compute_ctx(ctx);
+    }
+
+    // one staging region, one copy command per destination buffer, one deferred memcpy
+    // per entry and a single transfer-queue fence wait; the wait retires everything so
+    // the staging space is safe to reuse from offset 0 by the next call
+    ggml_vk_ensure_sync_staging_buffer(ctx, total);
+    ggml_vk_sync_buffers(nullptr, cpy_ctx);
+
+    size_t staging_offset = 0;
+    vk_buffer group_buf = nullptr;
+    std::vector<vk::BufferCopy> slices;
+    auto flush_group = [&]() {
+        if (!slices.empty()) {
+            cpy_ctx->s->buffer->buf.copyBuffer(ctx->sync_staging->buffer, group_buf->buffer, slices);
+            slices.clear();
+        }
+    };
+    for (size_t i = 0; i < n; i++) {
+        ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensors[i]->buffer->context;
+        if (buf_ctx->dev_buffer != group_buf) {
+            flush_group();
+            group_buf = buf_ctx->dev_buffer;
+        }
+        vk::BufferCopy slice;
+        slice.srcOffset = staging_offset;
+        slice.dstOffset = vk_tensor_offset(tensors[i]) + tensors[i]->view_offs + offsets[i];
+        slice.size      = sizes[i];
+        slices.push_back(slice);
+        deferred_memcpy((uint8_t *)ctx->sync_staging->ptr + staging_offset, data[i], sizes[i], &cpy_ctx->in_memcpys);
+        staging_offset += sizes[i];
+    }
+    flush_group();
+
+    if (ctx->device->async_use_transfer_queue && !ctx->device->serialize_submissions) {
+        if (ggml_vk_submit_transfer_ctx(ctx, ctx->fence)) {
+            VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "batches transfer sync waitForFences", ctx->device);
+            ctx->device->device.resetFences({ ctx->fence });
+            ctx->submit_pending = true;
+            ggml_perf::count("vk", "batches_transfer_sync");
+            return;
+        }
+    }
+    ggml_vk_synchronize(ctx);
+}
+
 static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
@@ -15404,6 +15467,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .event_record            = */ ggml_backend_vk_event_record,
     /* .event_wait              = */ ggml_backend_vk_event_wait,
     /* .graph_optimize          = */ ggml_vk_graph_optimize,
+    /* .set_tensor_batches_async = */ ggml_backend_vk_set_tensor_batches_async,
 };
 
 static ggml_guid_t ggml_backend_vk_guid() {

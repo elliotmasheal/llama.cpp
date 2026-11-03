@@ -246,6 +246,12 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
 
+    // scratch for the per-layer batched upload
+    std::vector<ggml_tensor *>      batch_tensors;
+    std::vector<const void *>       batch_data;
+    std::vector<size_t>             batch_offsets;
+    std::vector<size_t>             batch_sizes;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -580,10 +586,15 @@ struct llama_moe_cache::impl {
         }
         ggml_perf::event("moe", "plan", il, ggml_perf::now_ns() - t_plan0, 0, fills.size());
 
-        // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+        // upload the missing experts, consecutive experts going to consecutive slots are uploaded together;
+        // all uploads of the layer are handed to the backend as one batch (one command, one wait)
         size_t bytes = 0;
         {
             ggml_perf::scope s("moe", "upload", il);
+            batch_tensors.clear();
+            batch_data.clear();
+            batch_offsets.clear();
+            batch_sizes.clear();
             for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                 const ggml_tensor * w    = l.experts[ip];
                 ggml_tensor       * bank = g.banks[ip];
@@ -593,10 +604,16 @@ struct llama_moe_cache::impl {
                     while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                         n++;
                     }
-                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                    batch_tensors.push_back(bank);
+                    batch_data.push_back((const uint8_t *) w->data + fills[i].expert*expert_size);
+                    batch_offsets.push_back(fills[i].slot*expert_size);
+                    batch_sizes.push_back(n*expert_size);
                     bytes += n*expert_size;
                     i += n;
                 }
+            }
+            if (!batch_tensors.empty()) {
+                ggml_backend_tensor_set_batches_async(backend, batch_tensors.data(), batch_data.data(), batch_offsets.data(), batch_sizes.data(), batch_tensors.size());
             }
         }
         ggml_perf::event("moe", "upload_bytes", il, 0, bytes, fills.size());
