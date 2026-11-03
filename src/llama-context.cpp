@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-perf-trace.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -10,6 +11,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-warm.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -584,6 +586,26 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
+        }
+
+        // optional background page-cache warmer for host expert weights, independent of the MoE cache
+        if (getenv("GGML_MOE_WARM") != nullptr && !model.no_alloc() && moe_warm == nullptr) {
+            std::vector<std::pair<void *, size_t>> ranges;
+            size_t warm_bytes = 0;
+            for (const auto & layer : model.layers) {
+                for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+                    if (t != nullptr && t->data != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+                        ranges.emplace_back(t->data, ggml_nbytes(t));
+                        warm_bytes += ggml_nbytes(t);
+                    }
+                }
+            }
+            if (!ranges.empty()) {
+                moe_warm = std::make_unique<llama_moe_warmup>();
+                moe_warm->start(std::move(ranges));
+                ggml_perf::count("ctx", "moe_warm_start", warm_bytes);
+                LLAMA_LOG_INFO("%s: expert page warmer started for %.2f GiB of host experts\n", __func__, warm_bytes/1024.0/1024.0/1024.0);
+            }
         }
 
         sched_reserve();
@@ -1677,11 +1699,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        ggml_perf::scope s_prof_build("ctx", "build");
 
         gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1700,15 +1720,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
+        ggml_perf::scope s_prof_inputs("ctx", "set_inputs");
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    ggml_status status;
+    {
+        ggml_perf::scope s_prof_compute("ctx", "compute", 0, 0, ubatch.n_tokens);
+        status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2153,6 +2175,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     do {
+        const int64_t t_step0 = ggml_perf::now_ns();
         const auto & ubatch = mctx->get_ubatch();
 
         // count the outputs in this ubatch
@@ -2230,6 +2253,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+                ggml_perf::scope s_prof_logits("ctx", "logits_get", 0, n_outputs*n_vocab*sizeof(float));
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
         }
@@ -2336,6 +2360,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+
+        ggml_perf::event("ctx", "step", ubatch.n_tokens, ggml_perf::now_ns() - t_step0);
     } while (mctx->next());
 
     if (layer_inp_dev && ev_layer_inp_written) {

@@ -5,6 +5,7 @@
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
+#include "ggml-perf-trace.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -563,30 +564,42 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(ggml_is_contiguous(sel));
 
         ids.resize(ggml_nelements(sel));
-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
-        ggml_backend_synchronize(backend);
+        {
+            ggml_perf::scope s("moe", "ids_get", il, ggml_nbytes(sel));
+            ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+        }
+        {
+            ggml_perf::scope s("moe", "ids_sync", il);
+            ggml_backend_synchronize(backend);
+        }
 
         size_t n_hit = 0;
+        int64_t t_plan0 = ggml_perf::now_ns();
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
+        ggml_perf::event("moe", "plan", il, ggml_perf::now_ns() - t_plan0, 0, fills.size());
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
-        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-            const ggml_tensor * w    = l.experts[ip];
-            ggml_tensor       * bank = g.banks[ip];
-            const size_t expert_size = w->nb[2];
-            for (size_t i = 0; i < fills.size();) {
-                size_t n = 1;
-                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
-                    n++;
+        {
+            ggml_perf::scope s("moe", "upload", il);
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w    = l.experts[ip];
+                ggml_tensor       * bank = g.banks[ip];
+                const size_t expert_size = w->nb[2];
+                for (size_t i = 0; i < fills.size();) {
+                    size_t n = 1;
+                    while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                        n++;
+                    }
+                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                    bytes += n*expert_size;
+                    i += n;
                 }
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
-                bytes += n*expert_size;
-                i += n;
             }
         }
+        ggml_perf::event("moe", "upload_bytes", il, 0, bytes, fills.size());
 
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
@@ -594,7 +607,10 @@ struct llama_moe_cache::impl {
         st.bytes  += bytes;
 
         // the next copy synchronizes the backend before it changes the slot map again
-        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        {
+            ggml_perf::scope s("moe", "slotmap_up", il, ggml_nbytes(src));
+            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        }
 
         return true;
     }

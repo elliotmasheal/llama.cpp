@@ -88,7 +88,7 @@ void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx);
 vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx);
 vk::Semaphore ggml_vk_create_binary_semaphore(ggml_backend_vk_context * ctx);
 vk_context ggml_vk_get_transfer_ctx(ggml_backend_vk_context * ctx);
-bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx);
+bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx, vk::Fence fence = {});
 size_t ggml_vk_align_size(size_t width, size_t align);
 void deferred_memcpy(void * dst, const void * src, size_t size, std::vector<vk_staging_memcpy>* memcpys = nullptr);
 void deferred_memset(void * dst, uint32_t val, size_t size, std::vector<vk_staging_memset>* memsets = nullptr);

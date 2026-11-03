@@ -1,4 +1,5 @@
 #include "ggml-vulkan-common.h"
+#include "ggml-perf-trace.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -51,7 +52,7 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
 }
 
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
-                                       void *import_ptr = nullptr) {
+                                       void *import_ptr = nullptr, bool no_device_local = false) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
     if (size > device->max_buffer_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
@@ -156,6 +157,10 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
             bool done = false;
 
             for (auto mtype_it = memory_type_indices.begin(); mtype_it != memory_type_indices.end(); mtype_it++) {
+                // staging buffers are written/read by the CPU, BAR-mapped device-local memory is slow for that
+                if (no_device_local && (mem_props.memoryTypes[*mtype_it].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+                    continue;
+                }
                 try {
                     buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
                     buf->memory_property_flags = mem_props.memoryTypes[*mtype_it].propertyFlags;
@@ -388,9 +393,17 @@ void ggml_vk_ensure_sync_staging_buffer(vk_device& device, size_t size) {
     if (device->sync_staging == nullptr || device->sync_staging->size < size) {
         VK_LOG_MEMORY("ggml_vk_ensure_sync_staging_buffer(" << size << ")");
         ggml_vk_destroy_buffer(device->sync_staging);
-        device->sync_staging = ggml_vk_create_buffer_check(device, size,
-            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
-            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        // the staging buffer is memcpy'd by the CPU: prefer system memory over BAR-mapped device-local
+        try {
+            device->sync_staging = ggml_vk_create_buffer(device, size,
+                {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent},
+                nullptr, true);
+        } catch (const vk::SystemError& e) {
+            device->sync_staging = ggml_vk_create_buffer_check(device, size,
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        }
     }
 }
 
@@ -398,9 +411,18 @@ void ggml_vk_ensure_sync_staging_buffer(ggml_backend_vk_context * ctx, size_t si
     if (ctx->sync_staging == nullptr || ctx->sync_staging->size < size) {
         VK_LOG_MEMORY("ggml_vk_ensure_sync_staging_buffer(" << size << ")");
         ggml_vk_destroy_buffer(ctx->sync_staging);
-        ctx->sync_staging = ggml_vk_create_buffer_check(ctx->device, size,
-            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
-            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        // the staging buffer is memcpy'd by the CPU: prefer system memory over BAR-mapped device-local
+        try {
+            ctx->sync_staging = ggml_vk_create_buffer(ctx->device, size,
+                {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent},
+                nullptr, true);
+        } catch (const vk::SystemError& e) {
+            ctx->sync_staging = ggml_vk_create_buffer_check(ctx->device, size,
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        }
+        ggml_perf::count("vk", "staging_alloc", (uint64_t)static_cast<VkFlags>(ctx->sync_staging->memory_property_flags));
     }
 }
 
