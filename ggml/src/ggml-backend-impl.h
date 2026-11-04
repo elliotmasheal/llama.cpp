@@ -168,6 +168,11 @@ extern "C" {
         // different tensors (a backend may require them to share one buffer), submitted
         // as one command with one completion wait (NULL falls back to set_tensor_async)
         void (*set_tensor_batches_async)(ggml_backend_t backend, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n);
+        // (optional) streaming variant of set_tensor_batches_async: returns without waiting
+        // for the copies to complete (completion is ordered by the backend's normal async
+        // mechanisms); lets the caller pipeline uploads with compute (NULL falls back to
+        // set_tensor_batches_async)
+        void (*set_tensor_batches_stream_async)(ggml_backend_t backend, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n);
     };
 
     struct ggml_backend {

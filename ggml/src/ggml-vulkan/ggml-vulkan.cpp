@@ -5922,6 +5922,12 @@ bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx, vk::Fence fence)
     return true;
 }
 
+// PLAN-A upload ring: worker-thread staging for expert weight uploads, isolated
+// behind its own header. Included here — after ggml_vk_submit_transfer_ctx and all
+// other helpers its inline methods need, and before the first use of the ring
+// (ggml_backend_vk_free) so vk_upload_ring is a complete type at every use site.
+#include "ggml-vulkan-upload-ring.h"
+
 size_t ggml_vk_align_size(size_t width, size_t align) {
     VK_LOG_DEBUG("ggml_vk_align_size(" << width << ", " << align << ")");
     return CEIL_DIV(width, align) * align;
@@ -13379,6 +13385,12 @@ void ggml_backend_vk_free(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
+    // stop the upload worker and release the ring before any Vulkan teardown
+    if (ctx->upload_ring) {
+        ctx->upload_ring->destroy();
+        ctx->upload_ring.reset();
+    }
+
     ggml_vk_cleanup(ctx);
 
     delete ctx;
@@ -13454,6 +13466,9 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
                 ctx->device->device.resetFences({ ctx->fence });
                 ctx->submit_pending = true;
                 ggml_perf::count("vk", "transfer_sync");
+                if (ctx->upload_ring) {
+                    ctx->upload_ring->retire_all(ctx);   // the fence drain also completed any ring DMAs
+                }
             } else {
                 ggml_vk_synchronize(ctx);
             }
@@ -13526,10 +13541,61 @@ static void ggml_backend_vk_set_tensor_batches_async(ggml_backend_t backend, ggm
             ctx->device->device.resetFences({ ctx->fence });
             ctx->submit_pending = true;
             ggml_perf::count("vk", "batches_transfer_sync");
+            if (ctx->upload_ring) {
+                ctx->upload_ring->retire_all(ctx);   // the fence drain also completed any ring DMAs
+            }
             return;
         }
     }
     ggml_vk_synchronize(ctx);
+}
+
+// streaming variant: the staging memcpy runs on the ring worker thread and the
+// GPU DMA is submitted without waiting, so host memcpy / GPU DMA / GPU compute
+// of the previous layer overlap. Falls back to the blocking path above when the
+// ring is disabled (GGML_VK_UPLOAD_THREAD unset) or the request cannot be staged.
+static void ggml_backend_vk_set_tensor_batches_stream_async(ggml_backend_t backend, ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n) {
+    VK_LOG_DEBUG("ggml_backend_vk_set_tensor_batches_stream_async(" << n << ")");
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    size_t total = 0;
+    for (size_t i = 0; i < n; i++) {
+        GGML_ASSERT(tensors[i]->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) && "unsupported buffer type");
+        total += sizes[i];
+    }
+    ggml_perf::scope s("vk", "set_batches_stream", 0, total);
+    if (n == 0 || total == 0) {
+        return;
+    }
+
+    // lazy init; a NULL ring means disabled and the blocking fallback is used
+    if (!ctx->upload_ring) {
+        ctx->upload_ring = std::make_unique<vk_upload_ring>();
+        if (!ctx->upload_ring->init(ctx, vk_upload_ring::SLOT_CAP * vk_upload_ring::N_SLOTS)) {
+            ctx->upload_ring.reset();
+        }
+    }
+
+    if (ctx->upload_ring) {
+        // submit anything the worker has already finished so the DMA pipeline stays fed
+        ctx->upload_ring->submit_ready(ctx);
+        if (n <= vk_upload_ring::MAX_ENTRIES) {
+            vk_upload_ring::req * r = ctx->upload_ring->begin(ctx, total);
+            if (r != nullptr) {
+                for (size_t i = 0; i < n; i++) {
+                    r->tensors[r->n] = tensors[i];
+                    r->data[r->n]    = data[i];
+                    r->offsets[r->n] = offsets[i];
+                    r->sizes[r->n]   = sizes[i];
+                    r->n++;
+                }
+                ctx->upload_ring->seal(r);
+                return;
+            }
+        }
+        // fall through to the blocking path (ring busy/disabled or too many entries)
+    }
+
+    ggml_backend_vk_set_tensor_batches_async(backend, tensors, data, offsets, sizes, n);
 }
 
 static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
@@ -13667,6 +13733,11 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 
     bool do_transfer = !ctx->compute_ctx.expired();
 
+    if (ctx->upload_ring) {
+        // flush anything the ring staged so the fence below also covers its DMAs
+        ctx->upload_ring->submit_all(ctx);
+    }
+
     if (ggml_vk_submit_transfer_ctx(ctx)) {
         ctx->submit_pending = true;
     }
@@ -13745,6 +13816,10 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
         ctx->compute_ctx.reset();
+    }
+
+    if (ctx->upload_ring) {
+        ctx->upload_ring->retire_all(ctx);   // full drain: every submitted ring DMA is complete
     }
 }
 
@@ -15468,6 +15543,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .event_wait              = */ ggml_backend_vk_event_wait,
     /* .graph_optimize          = */ ggml_vk_graph_optimize,
     /* .set_tensor_batches_async = */ ggml_backend_vk_set_tensor_batches_async,
+    /* .set_tensor_batches_stream_async = */ ggml_backend_vk_set_tensor_batches_stream_async,
 };
 
 static ggml_guid_t ggml_backend_vk_guid() {

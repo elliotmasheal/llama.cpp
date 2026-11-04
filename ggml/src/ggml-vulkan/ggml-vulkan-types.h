@@ -1224,6 +1224,10 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+// PLAN-A upload ring (worker thread); defined in ggml-vulkan-upload-ring.h,
+// created only when GGML_VK_UPLOAD_THREAD=1, NULL otherwise
+struct vk_upload_ring;
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1238,6 +1242,9 @@ struct ggml_backend_vk_context {
     // CPU memcpy into a staging region can never race the GPU DMA reading it
     size_t staging_used = 0;
     vk::Fence fence, almost_ready_fence;
+
+    // PLAN-A upload ring (worker thread); see ggml-vulkan-upload-ring.h
+    std::unique_ptr<vk_upload_ring> upload_ring;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should

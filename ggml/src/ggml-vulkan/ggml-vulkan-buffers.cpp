@@ -389,6 +389,20 @@ void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf,
     buf_offset = (const uint8_t *) ptr - (const uint8_t *) entry.base;
 }
 
+vk_buffer ggml_vk_create_sysmem_buffer(vk_device& device, size_t size) {
+    // dedicated system-memory staging (e.g. the PLAN-A upload ring): the buffer is
+    // memcpy'd by the CPU, so prefer cached system memory over BAR-mapped device-local
+    try {
+        return ggml_vk_create_buffer(device, size,
+            {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent},
+            nullptr, true);
+    } catch (const vk::SystemError& e) {
+        GGML_LOG_WARN("ggml_vulkan: create_sysmem_buffer(%zu) failed: %s\n", size, e.what());
+        return {};
+    }
+}
+
 void ggml_vk_ensure_sync_staging_buffer(vk_device& device, size_t size) {
     if (device->sync_staging == nullptr || device->sync_staging->size < size) {
         VK_LOG_MEMORY("ggml_vk_ensure_sync_staging_buffer(" << size << ")");

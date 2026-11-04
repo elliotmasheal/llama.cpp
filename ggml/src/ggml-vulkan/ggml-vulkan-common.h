@@ -50,6 +50,8 @@ void ggml_vk_host_free(void * ptr);
 void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffer& buf, size_t& buf_offset);
 void ggml_vk_ensure_sync_staging_buffer(vk_device& device, size_t size);
 void ggml_vk_ensure_sync_staging_buffer(ggml_backend_vk_context * ctx, size_t size);
+// dedicated cached system-memory buffer (never BAR); for the PLAN-A upload ring
+vk_buffer ggml_vk_create_sysmem_buffer(vk_device& device, size_t size);
 bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging = false);
 bool ggml_vk_buffer_write_async(vk_context subctx, vk_buffer& dst, size_t offset, const void * src, size_t size, bool sync_staging = false);
 void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height);

@@ -3069,7 +3069,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         first = last + 1;
     }
     if (!st.batch_dst.empty()) {
-        ggml_backend_tensor_set_batches_async(backend, st.batch_dst.data(), st.batch_data.data(), st.batch_offsets.data(), st.batch_sizes.data(), st.batch_dst.size());
+        // streaming variant: the worker thread stages the upload while the GPU
+        // computes the previous layer; falls back to the blocking path internally
+        // when the backend has no streaming support
+        ggml_backend_tensor_set_batches_stream_async(backend, st.batch_dst.data(), st.batch_data.data(), st.batch_offsets.data(), st.batch_sizes.data(), st.batch_dst.size());
     }
 
     return true;

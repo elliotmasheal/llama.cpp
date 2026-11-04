@@ -91,6 +91,10 @@ extern "C" {
     // batched uploads: n writes of sizes[i] bytes from data[i] to offsets[i] of tensors[i],
     // submitted together so backends can use a single command and a single completion wait
     GGML_API void ggml_backend_tensor_set_batches_async(ggml_backend_t backend, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n);
+    // streaming variant of set_batches_async: returns without waiting for the copies to
+    // complete; completion is ordered by the backend's normal async mechanisms, letting
+    // the caller pipeline uploads with compute
+    GGML_API void ggml_backend_tensor_set_batches_stream_async(ggml_backend_t backend, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n);
     GGML_API void ggml_backend_tensor_set_2d_async(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
 
