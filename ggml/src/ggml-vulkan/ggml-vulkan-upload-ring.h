@@ -47,6 +47,14 @@ struct vk_upload_ring {
         size_t        n = 0;
         size_t        staging_off = 0;          // slot base inside the ring buffer
         uint64_t      sem_value_at_submit = 0;  // timeline value covering its DMA
+        // Step 2 speculative fill: DMA must be ordered after all compute submitted at
+        // submit time (the slot may overwrite bank slots / slot maps a compute reads);
+        // the wait is attached once per transfer submission in submit_ready()
+        bool          wait_compute = false;
+        // speculative slots are held back until a fence-drain point (ggml_vk_synchronize):
+        // only there is the compute they must be ordered after already submitted, so the
+        // compute-semaphore wait value taken at submit time covers it
+        bool          hold_until_sync = false;
         enum class state_t : int { free, filling, ready, submitted, retired };
         state_t       state = state_t::free;
     };
@@ -163,8 +171,11 @@ struct vk_upload_ring {
 
     // record copyBuffer commands for every slot the worker has finished and submit
     // them as one transfer submission; never blocks on the worker (a still-filling
-    // slot is simply left for a later call). Returns the number of slots submitted.
-    size_t submit_ready(ggml_backend_vk_context * ctx) {
+    // slot is simply left for a later call). Held slots (speculative fills) are only
+    // included when include_held is set — they are submitted at fence-drain points
+    // where the compute they must follow is already submitted. Returns the number of
+    // slots submitted.
+    size_t submit_ready(ggml_backend_vk_context * ctx, bool include_held = false) {
         if (!ok || submit_seq == push_seq) {
             return 0;
         }
@@ -173,6 +184,9 @@ struct vk_upload_ring {
             std::lock_guard<std::mutex> lk(mtx);
             upto = submit_seq;
             while (upto < push_seq && (int) slots[upto % N_SLOTS].state >= (int) req::state_t::ready) {
+                if (!include_held && slots[upto % N_SLOTS].hold_until_sync) {
+                    break;   // in-order: held slots gate everything behind them
+                }
                 upto++;
             }
         }
@@ -180,6 +194,19 @@ struct vk_upload_ring {
             return 0;   // nothing ready yet: keep the pipeline full, no waiting
         }
         vk_context cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
+        // Step 2: a speculative slot's DMA must not start before the compute that may
+        // still read its destination has finished; attach the compute timeline wait at
+        // the value current at submit time (once per submission covers the whole batch)
+        bool any_wait_compute = false;
+        for (uint64_t s = submit_seq; s < upto; ++s) {
+            if (slots[s % N_SLOTS].wait_compute) {
+                any_wait_compute = true;
+                break;
+            }
+        }
+        if (any_wait_compute && ctx->compute_semaphore.s != VK_NULL_HANDLE) {
+            cpy_ctx->s->wait_semaphores.push_back(ctx->compute_semaphore);
+        }
         // record the copies for every ready slot (host thread; worker only memcpy'd)
         for (uint64_t s = submit_seq; s < upto; ++s) {
             req & r = slots[s % N_SLOTS];
@@ -227,8 +254,8 @@ struct vk_upload_ring {
 
     // blocking flush used at fence-drain points: wait for every pushed slot to
     // become ready, then submit all of them so the caller's subsequent fence wait
-    // also covers the ring's DMAs
-    void submit_all(ggml_backend_vk_context * ctx) {
+    // also covers the ring's DMAs. Held slots are only included when requested.
+    void submit_all(ggml_backend_vk_context * ctx, bool include_held = false) {
         if (!ok || submit_seq == push_seq) {
             return;
         }
@@ -236,26 +263,28 @@ struct vk_upload_ring {
             std::unique_lock<std::mutex> lk(mtx);
             for (uint64_t s = submit_seq; s < push_seq; ++s) {
                 req & r = slots[s % N_SLOTS];
+                if (!include_held && r.hold_until_sync) {
+                    continue;
+                }
                 if ((int) r.state < (int) req::state_t::ready) {
                     cv_host.wait(lk, [&r] { return (int) r.state >= (int) req::state_t::ready; });
                 }
             }
         }
-        submit_ready(ctx);
+        submit_ready(ctx, include_held);
     }
 
-    // full retire (fence drain points): every submitted slot's DMA is complete
+    // full retire (fence drain points). Timeline-query based: a submitted slot is
+    // retired only once the transfer semaphore has passed its DMA's signal value, so
+    // slots submitted after the caller's fence snapshot (speculative fills) are never
+    // recycled while their DMA is in flight.
     void retire_all(ggml_backend_vk_context * ctx) {
         if (!ok) {
             return;
         }
-        std::lock_guard<std::mutex> lk(mtx);
-        retire_seq = submit_seq;
-        for (size_t i = 0; i < N_SLOTS; ++i) {
-            if ((int) slots[i].state >= (int) req::state_t::submitted) {
-                slots[i].state = req::state_t::free;
-            }
-        }
+        std::unique_lock<std::mutex> lk(mtx);
+        retire_completed_locked(ctx, &lk);
+        lk.unlock();
         cv_host.notify_all();
     }
 
@@ -263,6 +292,10 @@ private:
     // retirement of submitted slots whose DMA the timeline semaphore already
     // covers; called with mtx held
     void retire_completed(ggml_backend_vk_context * ctx, std::unique_lock<std::mutex> *) {
+        retire_completed_locked(ctx, nullptr);
+    }
+
+    void retire_completed_locked(ggml_backend_vk_context * ctx, std::unique_lock<std::mutex> *) {
         if (retire_seq == submit_seq) {
             return;
         }

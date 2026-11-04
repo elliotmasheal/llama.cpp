@@ -1132,6 +1132,10 @@ struct vk_context_struct {
     std::vector<std::string> debug_labels;
 
     vk_command_pool * p {};
+
+    // owner's compute timeline (Step 1, GGML_VK_COMPUTE_SEM); set for compute-queue
+    // contexts at creation, signalled once per submission in ggml_vk_submit
+    vk_semaphore * compute_semaphore = nullptr;
 };
 
 typedef std::shared_ptr<vk_context_struct> vk_context;
@@ -1273,6 +1277,13 @@ struct ggml_backend_vk_context {
     vk_context_ref transfer_ctx;
     vk_semaphore transfer_semaphore;
     uint64_t transfer_semaphore_last_submitted {};
+
+    // timeline semaphore signalled by every compute-queue submission (value increments
+    // once per submission). Transfer submissions that must be ordered after compute
+    // (speculative expert fills overwriting bank slots / slot maps a compute may still
+    // read) wait on it at the value current at submit time. Created alongside
+    // transfer_semaphore (independent transfer queue only), gated by GGML_VK_COMPUTE_SEM.
+    vk_semaphore compute_semaphore;
 
     std::vector<vk_context_ref> tensor_ctxs;
 

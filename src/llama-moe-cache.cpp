@@ -581,6 +581,48 @@ struct llama_moe_cache::impl {
 
         size_t n_hit = 0;
         int64_t t_plan0 = ggml_perf::now_ns();
+
+        // speculative-fill probe (GGML_TG_SPEC_PROBE=1): upper bound of the "delta empty"
+        // rate a speculative prefill (last token's selection) could reach for this layer —
+        // every selected expert must be either already mapped in the shadow slot map or
+        // selected in the previous token of the same layer. Logits-free, shadow read-only.
+        static const bool spec_probe = getenv("GGML_TG_SPEC_PROBE") != nullptr;
+        static std::vector<std::vector<int32_t>> probe_prev;
+        static uint64_t probe_total = 0, probe_empty = 0;
+        if (spec_probe) {
+            if (probe_prev.size() < layers.size()) {
+                probe_prev.resize(layers.size());
+            }
+            int32_t * sm = g.slru.slot_map[il];
+            bool covered = sm != nullptr;
+            if (covered) {
+                for (size_t i = 0; i < ids.size() && covered; ++i) {
+                    const int32_t e = ids[i];
+                    if (sm[e] != -1) {
+                        continue;
+                    }
+                    bool in_prev = false;
+                    for (int32_t pe : probe_prev[il]) {
+                        if (pe == e) {
+                            in_prev = true;
+                            break;
+                        }
+                    }
+                    covered = in_prev;
+                }
+            }
+            probe_total++;
+            if (covered) {
+                probe_empty++;
+            }
+            if (probe_total % 4096 == 0) {
+                fprintf(stderr, "%s: spec-probe delta-empty %llu/%llu (%.1f%%)\n", __func__,
+                        (unsigned long long) probe_empty, (unsigned long long) probe_total,
+                        100.0 * probe_empty / probe_total);
+            }
+            probe_prev[il].assign(ids.begin(), ids.end());
+        }
+
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
@@ -619,7 +661,19 @@ struct llama_moe_cache::impl {
             batch_offsets.push_back(0);
             batch_sizes.push_back(ggml_nbytes(src));
             bytes += ggml_nbytes(src);
-            ggml_backend_tensor_set_batches_async(backend, batch_tensors.data(), batch_data.data(), batch_offsets.data(), batch_sizes.data(), batch_tensors.size());
+            // P1a (TG pipeline, GGML_VK_TG_STREAM_FILL=1): hand the layer's fills plus the
+            // slot map to the streaming upload (ring worker staging, DMA submitted without
+            // a host fence wait). Safety mirrors the PP path: the scheduler's per-split
+            // synchronize still runs before this callback, so no compute is in flight when
+            // the DMA is enqueued; the compute side orders itself after the DMA via the
+            // transfer semaphore. Requires GGML_VK_UPLOAD_THREAD=1, otherwise the public
+            // wrapper falls back to the blocking batched upload below.
+            static const bool tg_stream_fill = getenv("GGML_VK_TG_STREAM_FILL") != nullptr;
+            if (tg_stream_fill) {
+                ggml_backend_tensor_set_batches_stream_async(backend, batch_tensors.data(), batch_data.data(), batch_offsets.data(), batch_sizes.data(), batch_tensors.size());
+            } else {
+                ggml_backend_tensor_set_batches_async(backend, batch_tensors.data(), batch_data.data(), batch_offsets.data(), batch_sizes.data(), batch_tensors.size());
+            }
         }
         ggml_perf::event("moe", "upload_bytes", il, 0, bytes, fills.size());
 

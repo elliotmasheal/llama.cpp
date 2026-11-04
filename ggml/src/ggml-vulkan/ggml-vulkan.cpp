@@ -978,6 +978,14 @@ void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
         }
     }
 
+    // Step 1 (GGML_VK_COMPUTE_SEM): every compute-queue submission signals the compute
+    // timeline so transfer submissions can order themselves after in-flight compute
+    // (speculative expert fills must not overwrite bank slots a compute still reads).
+    if (ctx->compute_semaphore != nullptr) {
+        ctx->compute_semaphore->value++;
+        ctx->seqs.back().back().signal_semaphores.push_back(*ctx->compute_semaphore);
+    }
+
     ctx->p->q->handle->submit(submit_infos, fence);
 
     ctx->seqs.clear();
@@ -1079,6 +1087,10 @@ vk_context ggml_vk_create_context(ggml_backend_vk_context * ctx, vk_command_pool
     VK_LOG_DEBUG("ggml_vk_create_context(" << result << ")");
     ctx->gc.contexts.emplace_back(result);
     result->p = &p;
+    // Step 1 (GGML_VK_COMPUTE_SEM): compute-queue contexts signal the owner timeline
+    if (ctx->compute_semaphore.s != VK_NULL_HANDLE && !p.q->transfer_only) {
+        result->compute_semaphore = &ctx->compute_semaphore;
+    }
     return result;
 }
 
@@ -5527,6 +5539,14 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
         ci.setPNext(&tci);
         ctx->transfer_semaphore.s = ctx->device->device.createSemaphore(ci);
         ctx->transfer_semaphore.value = 0;
+
+        // Step 1 (GGML_VK_COMPUTE_SEM): per-submission compute timeline for GPU-side
+        // ordering of speculative fill DMAs; signal sites live in ggml_vk_submit.
+        static const bool compute_sem = getenv("GGML_VK_COMPUTE_SEM") != nullptr;
+        if (compute_sem) {
+            ctx->compute_semaphore.s = ctx->device->device.createSemaphore(ci);
+            ctx->compute_semaphore.value = 0;
+        }
 
         ctx->transfer_cmd_pool.init(ctx->device, ctx->device->transfer_queue.get());
     }
@@ -13120,6 +13140,10 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->compute_cmd_pool.destroy(ctx->device->device);
     if (ctx->device->async_use_transfer_queue) {
         ctx->device->device.destroySemaphore(ctx->transfer_semaphore.s);
+        if (ctx->compute_semaphore.s) {
+            ctx->device->device.destroySemaphore(ctx->compute_semaphore.s);
+            ctx->compute_semaphore.s = vk::Semaphore{};
+        }
 
         ctx->transfer_cmd_pool.destroy(ctx->device->device);
     }
@@ -13738,11 +13762,6 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 
     bool do_transfer = !ctx->compute_ctx.expired();
 
-    if (ctx->upload_ring) {
-        // flush anything the ring staged so the fence below also covers its DMAs
-        ctx->upload_ring->submit_all(ctx);
-    }
-
     if (ggml_vk_submit_transfer_ctx(ctx)) {
         ctx->submit_pending = true;
     }
@@ -13783,6 +13802,13 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             ggml_vk_submit(compute_ctx, {});
         }
         ctx->submit_pending = true;
+    }
+
+    if (ctx->upload_ring) {
+        // flush the ring AFTER the compute submission so held (speculative) slots take
+        // their compute-semaphore wait value with every compute so far included, and
+        // BEFORE the fence submission below so the drain still covers their DMAs
+        ctx->upload_ring->submit_all(ctx, /*include_held=*/true);
     }
 
     if (ctx->submit_pending) {
@@ -14613,6 +14639,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     int submit_node_idx = 0; // index to first node in a batch
 
     ggml_vk_submit_transfer_ctx(ctx);
+
+    // P1a (GGML_VK_TG_STREAM_FILL): flush the upload ring's pending DMAs before any
+    // compute submission of this split takes its transfer_semaphore wait value, so
+    // MUL_MAT_ID cannot read expert weights before the DMA pushed by this split's
+    // copy callback has landed. submit_all waits only for the worker's staging
+    // memcpy (microseconds at TG batch sizes), then submits; the wait value taken
+    // by the first get_compute_ctx below then covers the fill.
+    static const bool tg_stream_fill = getenv("GGML_VK_TG_STREAM_FILL") != nullptr;
+    if (ctx->upload_ring && tg_stream_fill) {
+        ctx->upload_ring->submit_all(ctx);
+    }
 
     vk_context compute_ctx;
     if (vk_perf_logger_enabled) {
