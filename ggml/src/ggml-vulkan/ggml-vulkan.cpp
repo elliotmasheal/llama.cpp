@@ -5886,9 +5886,22 @@ vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
         ggml_vk_ctx_begin(ctx->device, result);
     }
 
-    if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
-        result->s->wait_semaphores.push_back(ctx->transfer_semaphore);
-        ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+    if (ctx->device->async_use_transfer_queue) {
+        // P0 fix: when the upload ring holds sealed-but-unsubmitted reqs, this compute
+        // (the MoE split that consumes the uploaded weights) must wait for their DMA.
+        // synchronize flushes the ring BEFORE any other transfer submission, so the
+        // ring's own submission signals exactly value+1 — wait on that future value.
+        uint64_t wait_value = ctx->transfer_semaphore.value;
+        if (ctx->ring_wait_pending) {
+            wait_value += 1;
+            ctx->ring_wait_pending = false;
+        }
+        if (ctx->transfer_semaphore_last_submitted < wait_value) {
+            vk_semaphore sem = ctx->transfer_semaphore;
+            sem.value = wait_value;
+            result->s->wait_semaphores.push_back(sem);
+            ctx->transfer_semaphore_last_submitted = wait_value;
+        }
     }
 
     return result;
@@ -13618,6 +13631,8 @@ static void ggml_backend_vk_set_tensor_batches_stream_async(ggml_backend_t backe
                     r->n++;
                 }
                 ctx->upload_ring->seal(r);
+                // P0 fix: the next compute submission must wait for this req's DMA
+                ctx->ring_wait_pending = true;
                 return;
             }
         }
@@ -13761,6 +13776,14 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     ggml_perf::scope s("vk", "sync");
 
     bool do_transfer = !ctx->compute_ctx.expired();
+
+    // P0 fix: flush pending ring reqs BEFORE any other transfer submission, so the
+    // future-value wait (value+1) attached at get_compute_ctx is signaled by the
+    // ring's own submission, not by an interleaved one. Held (speculative) slots are
+    // still flushed at their original point below.
+    if (ctx->upload_ring) {
+        ctx->upload_ring->submit_all(ctx, /*include_held=*/false);
+    }
 
     if (ggml_vk_submit_transfer_ctx(ctx)) {
         ctx->submit_pending = true;

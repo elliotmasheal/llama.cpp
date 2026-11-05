@@ -1278,6 +1278,14 @@ struct ggml_backend_vk_context {
     vk_semaphore transfer_semaphore;
     uint64_t transfer_semaphore_last_submitted {};
 
+    // P0 fix (ring DMA vs MoE compute ordering): set by the batched upload path right
+    // after sealing ring reqs, consumed by the next get_compute_ctx — that compute
+    // submission waits on transfer_semaphore.value + 1, the value the ring's next
+    // submission will signal (synchronize flushes the ring BEFORE any other transfer
+    // submission). Guarantees MUL_MAT_ID cannot read expert weights before their DMA
+    // lands, without blocking the host.
+    bool ring_wait_pending {};
+
     // timeline semaphore signalled by every compute-queue submission (value increments
     // once per submission). Transfer submissions that must be ordered after compute
     // (speculative expert fills overwriting bank slots / slot maps a compute may still
